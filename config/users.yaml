@@ -1,0 +1,40 @@
+# FruitcakeAI v5 — Default seed users
+# Used by scripts/seed.py to populate a fresh database.
+# Change passwords before deploying!
+
+users:
+  - username: admin
+    email: admin@fruitcake.local
+    password: changeme123
+    full_name: Administrator
+    role: admin
+    persona: family_assistant
+    library_scopes: ["family_docs", "recipes", "household", "work_docs", "kids_books"]
+    calendar_access: ["family", "personal", "work"]
+
+  - username: parent
+    email: parent@fruitcake.local
+    password: changeme123
+    full_name: Parent User
+    role: parent
+    persona: family_assistant
+    library_scopes: ["family_docs", "recipes", "household"]
+    calendar_access: ["family", "personal"]
+
+  - username: kid
+    email: kid@fruitcake.local
+    password: changeme123
+    full_name: Kid User
+    role: child
+    persona: kids_assistant
+    library_scopes: ["kids_books", "homework"]
+    calendar_access: ["family"]
+
+  - username: guest
+    email: guest@fruitcake.local
+    password: changeme123
+    full_name: Guest User
+    role: guest
+    persona: family_assistant
+    library_scopes: ["family_docs"]
+    calendar_access: []

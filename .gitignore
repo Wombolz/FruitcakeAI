@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment / secrets
+.env
+*.local
+
+# Local overrides / secrets
+*.env.*
+config/*local*.yaml
+config/*secrets*.yaml
+
+# Storage / uploads
+storage/
+
+# Logs
+*.log
+logs/
+
+# Local databases / backups
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+*.backup
+
+# Temp files
+tmp/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp

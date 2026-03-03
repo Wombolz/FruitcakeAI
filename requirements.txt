@@ -1,0 +1,71 @@
+# FruitcakeAI v5 — Python dependencies
+# Install: pip install -r requirements.txt
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.18
+websockets==13.1
+
+# ── LLM / Agent ──────────────────────────────────────────────────────────────
+litellm>=1.82.0
+
+# ── RAG ──────────────────────────────────────────────────────────────────────
+llama-index==0.12.5
+llama-index-vector-stores-postgres==0.3.3
+llama-index-embeddings-huggingface==0.4.0
+llama-index-retrievers-bm25==0.5.0
+# NOTE: llama-index-llms-openai is intentionally NOT listed here.
+# It requires openai<2, which conflicts with litellm>=1.82.0 (needs openai>=2.24.0).
+# We set Settings.llm = None so LlamaIndex's LLM layer is never invoked.
+
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy[asyncio]==2.0.36
+asyncpg>=0.29.0,<0.30.0
+psycopg2-binary>=2.9.6,<3
+pgvector==0.3.6
+alembic==1.14.0
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt>=3.1,<4.1   # passlib 1.7.4 incompatible with bcrypt 4.1+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+PyYAML==6.0.2
+email-validator>=2.0
+
+# ── HTTP / MCP ────────────────────────────────────────────────────────────────
+httpx>=0.23.0,<0.28.0
+# Phase 2 (MCP) — requires Python 3.10+. Uncomment when implementing Sprint 2.1:
+# mcp>=1.0.0
+# sse-starlette>=1.6.5
+
+# ── Web research + RSS (Sprint 2.2) ──────────────────────────────────────────
+beautifulsoup4>=4.12.0
+feedparser>=6.0.0
+
+# ── Calendar integrations (optional — install only if using) ──────────────────
+# Google Calendar: pip install google-api-python-client google-auth
+#   then set GOOGLE_CALENDAR_ENABLED=true in .env
+# Apple CalDAV: pip install caldav icalendar
+#   then set APPLE_CALDAV_ENABLED=true in .env
+
+# ── Document parsing ─────────────────────────────────────────────────────────
+pymupdf==1.25.1
+python-docx==1.1.2
+
+# ── Observability ─────────────────────────────────────────────────────────────
+structlog==24.4.0
+
+# ── ML / Embeddings ──────────────────────────────────────────────────────────
+sentence-transformers==3.3.1
+torch==2.5.1
+transformers==4.47.1
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.24.0
+aiosqlite>=0.19.0      # in-memory SQLite for tests (no postgres needed)

@@ -1,0 +1,104 @@
+"""
+FruitcakeAI v5 — UserContext
+Builds the agent system prompt from the current user's role, persona, and scopes.
+
+The LLM sees this context on every request — it's the primary access control mechanism.
+Persona config (blocked_tools, tone, scopes) is loaded from config/personas.yaml.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, List, Optional
+
+if TYPE_CHECKING:
+    from app.db.models import User
+
+
+@dataclass
+class UserContext:
+    user_id: int
+    username: str
+    role: str                          # admin | parent | child | guest
+    persona: str = "family_assistant"
+    persona_description: str = ""
+    persona_tone: str = "helpful"
+    library_scopes: List[str] = field(default_factory=lambda: ["family_docs"])
+    calendar_access: List[str] = field(default_factory=list)
+    blocked_tools: List[str] = field(default_factory=list)
+    content_filter: str = ""           # "" | "strict"
+    session_id: Optional[int] = None   # set by chat.py for audit logging
+
+    @classmethod
+    def from_user(
+        cls,
+        user: "User",
+        persona_name: Optional[str] = None,
+    ) -> "UserContext":
+        """
+        Build a UserContext from a SQLAlchemy User model.
+
+        persona_name overrides user.persona (used for mid-session /persona switches).
+        Blocked tools, tone, and scopes are loaded from config/personas.yaml.
+        """
+        from app.agent.persona_loader import get_persona
+
+        name = persona_name or user.persona or "family_assistant"
+        pc = get_persona(name)
+
+        # Persona-defined scopes take precedence; fall back to user record scopes.
+        library_scopes = pc.get("library_scopes") or user.library_scopes
+        calendar_access = pc.get("calendar_access") or user.calendar_access
+
+        return cls(
+            user_id=user.id,
+            username=user.username,
+            role=user.role,
+            persona=name,
+            persona_description=pc.get("description", ""),
+            persona_tone=pc.get("tone", "helpful"),
+            library_scopes=library_scopes,
+            calendar_access=calendar_access,
+            blocked_tools=pc.get("blocked_tools", []),
+            content_filter=pc.get("content_filter", ""),
+        )
+
+    def to_system_prompt(self) -> str:
+        lines = [
+            "You are FruitcakeAI, a private, local-first AI assistant for a family household.",
+            "",
+            f"Current user: {self.username} (role: {self.role})",
+            f"Active persona: {self.persona}",
+        ]
+
+        if self.persona_description:
+            lines.append(f"Persona: {self.persona_description}")
+        if self.persona_tone:
+            lines.append(f"Tone: be {self.persona_tone}")
+
+        lines += [
+            "",
+            "Rules:",
+            "- Always cite the source document name when using search_library results.",
+            f"- Only surface documents within the user's permitted scopes: {self.library_scopes}.",
+            "- Be helpful, concise, and privacy-conscious.",
+            "- If you don't find relevant information in the library, say so clearly.",
+        ]
+
+        if self.content_filter == "strict":
+            lines += [
+                "",
+                "Content restrictions (STRICT — child user):",
+                "- Avoid all adult topics, violence, or inappropriate content.",
+                "- Keep explanations simple and age-appropriate.",
+                "- Gently redirect if asked about blocked topics.",
+            ]
+
+        if self.blocked_tools:
+            lines += [
+                "",
+                f"The following tools are NOT available in this persona and must not be used: "
+                f"{', '.join(self.blocked_tools)}.",
+            ]
+
+        return "\n".join(lines)

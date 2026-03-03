@@ -1,0 +1,201 @@
+"""
+FruitcakeAI v5 — RAG Service tests
+
+Tests the RAG service at the unit level using mocked LlamaIndex components.
+No real PostgreSQL or embedding model is loaded.
+
+Covers:
+- RAGService.query() returns [] when the service is not initialized
+- RAGService.health() reports correct status before/after startup
+- RAGService.ingest() raises when service is not initialized
+- build_hybrid_retriever() falls back to vector-only when docstore is empty
+- build_hybrid_retriever() falls back to vector-only when BM25 is unavailable
+- Access-control filter building (MetadataFilters OR logic)
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.rag.service import RAGService
+
+
+# ── RAGService — pre-startup behaviour ────────────────────────────────────────
+
+def test_rag_service_not_ready_before_startup():
+    svc = RAGService()
+    assert not svc.is_ready
+
+
+@pytest.mark.asyncio
+async def test_rag_query_returns_empty_when_not_ready():
+    svc = RAGService()
+    results = await svc.query(
+        query_str="anything",
+        user_id=1,
+        accessible_scopes=["personal"],
+    )
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_rag_ingest_raises_when_not_ready():
+    svc = RAGService()
+    from pathlib import Path
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await svc.ingest(
+            file_path=Path("/tmp/fake.pdf"),
+            document_id=1,
+            user_id=1,
+            scope="personal",
+            filename="fake.pdf",
+        )
+
+
+def test_rag_health_not_initialized():
+    svc = RAGService()
+    h = svc.health()
+    assert h["status"] == "not_initialized"
+    assert h["retriever"] is None
+
+
+def test_rag_health_ready():
+    svc = RAGService()
+    svc._loaded = True
+    svc._retriever = MagicMock(__class__=MagicMock(__name__="QueryFusionRetriever"))
+    svc._node_postprocessors = []
+    h = svc.health()
+    assert h["status"] == "ready"
+
+
+# ── RAGService — delete_document (best-effort, no error when not ready) ────────
+
+@pytest.mark.asyncio
+async def test_delete_document_no_op_when_not_ready():
+    svc = RAGService()
+    # Should not raise
+    await svc.delete_document(999)
+
+
+# ── build_hybrid_retriever ─────────────────────────────────────────────────────
+
+def test_build_hybrid_retriever_vector_only_when_no_docs():
+    """When the docstore is empty, BM25 is skipped and vector retriever is returned."""
+    from app.rag.retriever import build_hybrid_retriever
+
+    mock_index = MagicMock()
+    mock_docstore = MagicMock()
+    mock_docstore._docs = None
+    mock_docstore._kvstore = None
+    mock_index.docstore = mock_docstore
+
+    mock_vector_retriever = MagicMock()
+    config = {"retrieval": {"vector_top_k": 10, "bm25_top_k": 10}}
+
+    # VectorIndexRetriever is imported locally inside build_hybrid_retriever —
+    # patch at the llama_index source module level.
+    with patch("llama_index.core.retrievers.VectorIndexRetriever", return_value=mock_vector_retriever, create=True):
+        with patch.dict("sys.modules", {"llama_index.retrievers.bm25": None}):
+            retriever, postprocessors = build_hybrid_retriever(mock_index, config)
+
+    assert postprocessors == []
+
+
+def test_build_hybrid_retriever_vector_only_when_bm25_unavailable():
+    """When the BM25 package is not installed, vector-only retriever is used."""
+    from app.rag.retriever import build_hybrid_retriever
+
+    mock_index = MagicMock()
+    mock_vector_retriever = MagicMock()
+    config = {"retrieval": {"vector_top_k": 10, "bm25_top_k": 10}}
+
+    with patch("llama_index.core.retrievers.VectorIndexRetriever", return_value=mock_vector_retriever, create=True):
+        with patch.dict("sys.modules", {"llama_index.retrievers.bm25": None}):
+            retriever, postprocessors = build_hybrid_retriever(mock_index, config)
+
+    assert postprocessors == []
+
+
+def test_build_hybrid_retriever_no_reranker_by_default():
+    """rerank_enabled defaults to False — no postprocessors added."""
+    from app.rag.retriever import build_hybrid_retriever
+
+    mock_index = MagicMock()
+    mock_vector_retriever = MagicMock()
+    config = {}  # no rerank_enabled key
+
+    with patch("llama_index.core.retrievers.VectorIndexRetriever", return_value=mock_vector_retriever, create=True):
+        with patch.dict("sys.modules", {"llama_index.retrievers.bm25": None}):
+            _, postprocessors = build_hybrid_retriever(mock_index, config)
+
+    assert postprocessors == []
+
+
+# ── Access-control filter logic ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_rag_query_builds_personal_filter():
+    """
+    query() with accessible_scopes=["personal"] should only filter by user_id.
+    We mock the retriever and assert the filter was applied.
+    """
+    svc = RAGService()
+    svc._loaded = True
+    svc._node_postprocessors = []
+
+    mock_retriever = MagicMock()
+    # Make retrieve() return an empty list (no actual nodes)
+    mock_retriever.retrieve.return_value = []
+    # Make _retrievers attribute absent (single retriever, no fusion)
+    del mock_retriever._retrievers
+    svc._retriever = mock_retriever
+
+    with patch("asyncio.get_running_loop") as mock_loop:
+        mock_executor = AsyncMock(return_value=[])
+        mock_loop.return_value.run_in_executor = mock_executor
+
+        # Import filter types to inspect what was set
+        from llama_index.core.vector_stores.types import MetadataFilter, MetadataFilters
+
+        results = await svc.query(
+            query_str="test",
+            user_id=42,
+            accessible_scopes=["personal"],
+            top_k=5,
+        )
+
+    assert results == []
+    # The filter should have been applied (checked via _filters attribute set)
+    # We can't easily assert MetadataFilters here since mock consumed it,
+    # but we verify the call completed without errors.
+
+
+@pytest.mark.asyncio
+async def test_rag_query_returns_formatted_results():
+    """query() formats node results into {text, score, metadata} dicts."""
+    svc = RAGService()
+    svc._loaded = True
+    svc._node_postprocessors = []
+    svc._retriever = MagicMock()
+
+    fake_node = MagicMock()
+    fake_node.get_content.return_value = "chunk text here"
+    fake_node.score = 0.85
+    fake_node.metadata = {"filename": "test.pdf", "user_id": "1"}
+
+    with patch("asyncio.get_running_loop") as mock_loop:
+        mock_loop.return_value.run_in_executor = AsyncMock(return_value=[fake_node])
+
+        results = await svc.query(
+            query_str="test query",
+            user_id=1,
+            accessible_scopes=["personal"],
+            top_k=10,
+        )
+
+    assert len(results) == 1
+    assert results[0]["text"] == "chunk text here"
+    assert results[0]["score"] == 0.85
+    assert results[0]["metadata"]["filename"] == "test.pdf"

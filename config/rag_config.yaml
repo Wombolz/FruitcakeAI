@@ -1,0 +1,32 @@
+# FruitcakeAI v5 — RAG Pipeline Configuration
+# Ported from v4 config/library_manager.yaml
+
+vector_store:
+  type: postgres
+  table_name: document_chunks
+  embed_dim: 384
+
+embedding:
+  model_name: BAAI/bge-small-en-v1.5
+  batch_size: 32
+
+retrieval:
+  vector_top_k: 40
+  bm25_top_k: 40
+  fusion: rrf                         # Reciprocal Rank Fusion
+  similarity_cutoff: 0.28
+  rerank_top_n: 10
+  rerank_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  source_diversity: true
+  max_chunks_per_source: 3
+
+chunking:
+  chunk_size: 900                     # tokens
+  chunk_overlap: 120
+  strategy: semantic_then_fallback
+  max_chunks_per_doc: 500
+  min_chunk_tokens: 50
+
+context_builder:
+  max_tokens: 1500
+  include_citations: true

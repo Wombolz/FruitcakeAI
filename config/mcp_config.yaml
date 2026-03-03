@@ -1,0 +1,43 @@
+# FruitcakeAI v5 — MCP Server Definitions
+# Add a new server here to make its tools available to the agent — no code changes needed.
+
+mcp_servers:
+  # ── Internal Python servers ──────────────────────────────────────────────────
+
+  calendar:
+    type: internal_python
+    module: app.mcp.servers.calendar
+    enabled: true
+
+  web_research:
+    type: internal_python
+    module: app.mcp.servers.web_research
+    enabled: true
+
+  rss:
+    type: internal_python
+    module: app.mcp.servers.rss
+    enabled: true
+
+  # ── Docker stdio servers ─────────────────────────────────────────────────────
+  # These require Docker + the image to be available locally.
+  # Pull with: docker pull mcp/sequentialthinking
+
+  python_refactoring:
+    type: docker_stdio
+    image: mcp/mcp-python-refactoring
+    enabled: true
+    timeout: 60
+    priority: 10
+
+  sequential_thinking:
+    type: docker_stdio
+    image: mcp/sequentialthinking
+    enabled: true
+    timeout: 60
+    priority: 15
+
+  filesystem:
+    type: docker_stdio
+    image: mcp/mcp-filesystem
+    enabled: false  # Enable when needed
