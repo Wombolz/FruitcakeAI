@@ -118,11 +118,17 @@ def create_app() -> FastAPI:
     from app.api.admin import router as admin_router
     from app.api.library import router as library_router
     from app.api.chat import router as chat_router
+    from app.api.tasks import router as tasks_router
+    from app.api.devices import router as devices_router
+    from app.api.memories import router as memories_router
 
     app.include_router(auth_router, prefix="/auth", tags=["auth"])
     app.include_router(admin_router, prefix="/admin", tags=["admin"])
     app.include_router(library_router, prefix="/library", tags=["library"])
     app.include_router(chat_router, prefix="/chat", tags=["chat"])
+    app.include_router(tasks_router, tags=["tasks"])
+    app.include_router(devices_router, tags=["devices"])
+    app.include_router(memories_router, tags=["memories"])
 
     return app
 

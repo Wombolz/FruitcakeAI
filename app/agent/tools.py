@@ -27,6 +27,48 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "create_memory",
+            "description": (
+                "Store a piece of information about the user or their preferences for future sessions. "
+                "Use 'semantic' for persistent facts (e.g. 'The user has a daughter named Emma'). "
+                "Use 'procedural' for behavioral rules (e.g. 'Always remind the user about medication at 9am'). "
+                "Use 'episodic' for time-bound events (e.g. 'The family is visiting grandparents this weekend'). "
+                "Only call this when you have learned something meaningful that should persist across sessions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_type": {
+                        "type": "string",
+                        "enum": ["semantic", "procedural", "episodic"],
+                        "description": "semantic=persistent fact, procedural=behavioral rule, episodic=time-bound event",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The memory to store, written as a clear, self-contained statement.",
+                    },
+                    "importance": {
+                        "type": "number",
+                        "description": "Importance score from 0.0 to 1.0 (default 0.5). Use 0.8+ for critical facts.",
+                        "default": 0.5,
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tags for grouping (e.g. ['health', 'family'])",
+                    },
+                    "expires_at": {
+                        "type": "string",
+                        "description": "Optional ISO 8601 datetime after which this memory expires (useful for episodic events).",
+                    },
+                },
+                "required": ["memory_type", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "summarize_document",
             "description": (
                 "Produce a comprehensive summary of an entire document in the user's library. "
@@ -181,6 +223,9 @@ async def _call_tool(
     name: str, arguments: Dict[str, Any], user_context: UserContext
 ) -> str:
     """Route a tool call to its implementation."""
+    if name == "create_memory":
+        return await _create_memory(arguments, user_context)
+
     if name == "search_library":
         return await _search_library(arguments, user_context)
 
@@ -366,3 +411,50 @@ async def _summarize_document(
     if coverage_note:
         header += f"\n_{coverage_note}_"
     return f"{header}\n\n{summary}"
+
+
+async def _create_memory(
+    arguments: Dict[str, Any], user_context: UserContext
+) -> str:
+    """Persist a new memory for the user via MemoryService."""
+    from datetime import datetime, timezone
+    from app.db.session import AsyncSessionLocal
+    from app.memory.service import get_memory_service
+
+    memory_type = arguments.get("memory_type", "semantic")
+    content = arguments.get("content", "").strip()
+    importance = float(arguments.get("importance", 0.5))
+    tags = arguments.get("tags") or []
+    expires_at_str = arguments.get("expires_at")
+
+    if not content:
+        return "Memory content is required."
+
+    if memory_type not in ("semantic", "procedural", "episodic"):
+        return f"Invalid memory_type '{memory_type}'. Must be semantic, procedural, or episodic."
+
+    expires_at = None
+    if expires_at_str:
+        try:
+            expires_at = datetime.fromisoformat(expires_at_str).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return f"Invalid expires_at format: '{expires_at_str}'. Use ISO 8601."
+
+    svc = get_memory_service()
+    async with AsyncSessionLocal() as db:
+        result = await svc.create(
+            db=db,
+            user_id=user_context.user_id,
+            memory_type=memory_type,
+            content=content,
+            importance=importance,
+            tags=tags,
+            expires_at=expires_at,
+        )
+        await db.commit()
+
+    if isinstance(result, str):
+        # Dedup suppression message
+        return result
+
+    return f"Memory saved (id={result.id}, type={memory_type})."
