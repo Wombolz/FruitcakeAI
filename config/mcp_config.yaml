@@ -41,3 +41,10 @@ mcp_servers:
     type: docker_stdio
     image: mcp/mcp-filesystem
     enabled: false  # Enable when needed
+
+  playwright:
+    type: docker_stdio
+    image: mcp/playwright
+    enabled: true
+    timeout: 60
+    priority: 15    
