@@ -127,6 +127,7 @@ def create_app() -> FastAPI:
     from app.api.tasks import router as tasks_router
     from app.api.devices import router as devices_router
     from app.api.memories import router as memories_router
+    from app.api.webhooks import router as webhooks_router
 
     app.include_router(auth_router, prefix="/auth", tags=["auth"])
     app.include_router(admin_router, prefix="/admin", tags=["admin"])
@@ -135,6 +136,7 @@ def create_app() -> FastAPI:
     app.include_router(tasks_router, tags=["tasks"])
     app.include_router(devices_router, tags=["devices"])
     app.include_router(memories_router, tags=["memories"])
+    app.include_router(webhooks_router, tags=["webhooks"])
 
     return app
 

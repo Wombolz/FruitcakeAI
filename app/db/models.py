@@ -64,6 +64,7 @@ class User(Base):
     tasks = relationship("Task", back_populates="user", cascade="all, delete-orphan")
     device_tokens = relationship("DeviceToken", back_populates="user", cascade="all, delete-orphan")
     memories = relationship("Memory", back_populates="user", cascade="all, delete-orphan")
+    webhook_configs = relationship("WebhookConfig", back_populates="user", cascade="all, delete-orphan")
 
     @property
     def library_scopes(self) -> list[str]:
@@ -345,3 +346,27 @@ class DeviceToken(Base):
 
     def __repr__(self):
         return f"<DeviceToken(user_id={self.user_id}, env='{self.environment}')>"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 models
+# ---------------------------------------------------------------------------
+
+class WebhookConfig(Base):
+    """Inbound webhook configuration for external triggers (GitHub/Zapier/IFTTT)."""
+    __tablename__ = "webhook_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    name = Column(String(255), nullable=False)
+    webhook_key = Column(String(255), unique=True, nullable=False, index=True)
+    instruction = Column(Text, nullable=False)
+    active = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="webhook_configs")
+
+    def __repr__(self):
+        return f"<WebhookConfig(id={self.id}, user_id={self.user_id}, active={self.active})>"
