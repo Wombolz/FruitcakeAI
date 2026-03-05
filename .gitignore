@@ -40,6 +40,9 @@ logs/
 # Temp files
 tmp/
 
+# Generated artifacts
+output/
+
 # Test / coverage
 .pytest_cache/
 .coverage

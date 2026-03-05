@@ -110,7 +110,11 @@ async def list_sessions(
 ) -> List[ChatSession]:
     result = await db.execute(
         select(ChatSession)
-        .where(ChatSession.user_id == current_user.id, ChatSession.is_active == True)
+        .where(
+            ChatSession.user_id == current_user.id,
+            ChatSession.is_active == True,
+            ChatSession.is_task_session == False,
+        )
         .order_by(ChatSession.updated_at.desc())
     )
     return result.scalars().all()

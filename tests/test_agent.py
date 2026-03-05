@@ -166,3 +166,28 @@ async def test_dispatch_returns_tool_role_messages():
     assert results[0]["role"] == "tool"
     assert results[0]["tool_call_id"] == "call_xyz"
     assert results[0]["content"] == "mock result"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_propagates_approval_required():
+    """ApprovalRequired must bubble out of dispatch_tool_calls for TaskRunner to handle."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import app.agent.tools as tools_module
+    from app.autonomy.approval import ApprovalRequired
+
+    ctx = _make_context()
+
+    mock_call = MagicMock()
+    mock_call.function.name = "create_calendar_event"
+    mock_call.function.arguments = "{}"
+    mock_call.id = "call_approval"
+
+    with patch.object(
+        tools_module,
+        "_call_tool",
+        new_callable=AsyncMock,
+        side_effect=ApprovalRequired("create_calendar_event"),
+    ):
+        with patch.object(tools_module, "_write_audit_log", new_callable=AsyncMock):
+            with pytest.raises(ApprovalRequired):
+                await tools_module.dispatch_tool_calls([mock_call], ctx)

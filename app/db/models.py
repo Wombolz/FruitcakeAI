@@ -1,6 +1,7 @@
 """
 FruitcakeAI v5 — SQLAlchemy ORM models
 Ported from v4, simplified, + persona/scope fields for v5 agent context.
+Phase 4: Memory, Task, DeviceToken models added.
 """
 
 import json
@@ -10,6 +11,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -45,6 +47,12 @@ class User(Base):
     _library_scopes = Column("library_scopes", Text, default='["family_docs"]')
     _calendar_access = Column("calendar_access", Text, default='[]')
 
+    # Phase 4: active hours for task scheduling
+    # Resolution order: task fields → user fields → heartbeat.yaml defaults
+    active_hours_start = Column(String(5))   # "HH:MM" in user's local tz, e.g. "07:00"
+    active_hours_end = Column(String(5))     # "HH:MM"
+    active_hours_tz = Column(String(50))     # IANA tz string, e.g. "America/Chicago"
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     last_login = Column(DateTime(timezone=True))
@@ -53,6 +61,10 @@ class User(Base):
     documents = relationship("Document", back_populates="owner", cascade="all, delete-orphan")
     chat_sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
     audit_logs = relationship("AuditLog", back_populates="user", cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="user", cascade="all, delete-orphan")
+    device_tokens = relationship("DeviceToken", back_populates="user", cascade="all, delete-orphan")
+    memories = relationship("Memory", back_populates="user", cascade="all, delete-orphan")
+    webhook_configs = relationship("WebhookConfig", back_populates="user", cascade="all, delete-orphan")
 
     @property
     def library_scopes(self) -> list[str]:
@@ -145,6 +157,9 @@ class ChatSession(Base):
     persona = Column(String(100), default="family_assistant")
     llm_model = Column(String(100))
 
+    # Phase 4: task sessions are hidden from the chat UI session list
+    is_task_session = Column(Boolean, default=False, nullable=False)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -192,3 +207,170 @@ class AuditLog(Base):
 
     def __repr__(self):
         return f"<AuditLog(user_id={self.user_id}, tool='{self.tool}')>"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 models
+# ---------------------------------------------------------------------------
+
+class Memory(Base):
+    """
+    Per-user persistent memory. The agent writes memories via the
+    create_memory tool; MemoryService retrieves them in 3 tiers before
+    each task/heartbeat run.
+
+    Memory is immutable — never edited, only deactivated + replaced.
+    This preserves a full audit trail of what the agent has learned.
+    """
+    __tablename__ = "memories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # "episodic" | "semantic" | "procedural"
+    memory_type = Column(String(20), nullable=False)
+
+    content = Column(Text, nullable=False)
+
+    # pgvector embedding for Tier 3 semantic retrieval
+    if _USE_PGVECTOR:
+        embedding = Column(Vector(settings.embedding_dimension))
+
+    # Importance 0.0–1.0. Nudged up by _record_access() on each hit.
+    importance = Column(Float, default=0.5, nullable=False)
+
+    # Tracks how many times this memory has been retrieved.
+    # High access_count → higher importance; zero accesses for 30+ days → pruning candidate.
+    access_count = Column(Integer, default=0, nullable=False)
+
+    # Optional JSON array of string tags for filtering/grouping
+    tags = Column(Text, default="[]")
+
+    # Soft-delete: deactivate instead of DELETE to preserve audit trail
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    # For episodic memories that should expire (e.g. "family visiting this weekend")
+    expires_at = Column(DateTime(timezone=True))
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User", back_populates="memories")
+
+    @property
+    def tags_list(self) -> list[str]:
+        return json.loads(self.tags or "[]")
+
+    @tags_list.setter
+    def tags_list(self, value: list[str]):
+        self.tags = json.dumps(value)
+
+    def __repr__(self):
+        return f"<Memory(user_id={self.user_id}, type='{self.memory_type}', importance={self.importance})>"
+
+
+class Task(Base):
+    """
+    Scheduled autonomous task. The agent executes the instruction in an
+    isolated session at next_run_at, then pushes the result if deliver=True.
+    """
+    __tablename__ = "tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    title = Column(String(255), nullable=False)
+    instruction = Column(Text, nullable=False)  # natural language prompt for the agent
+
+    # "one_shot" | "recurring"
+    task_type = Column(String(20), nullable=False, default="one_shot")
+
+    # "pending" | "running" | "completed" | "failed" | "cancelled" | "waiting_approval"
+    status = Column(String(30), default="pending", nullable=False)
+
+    # Schedule expression. One of:
+    #   "every:30m"   — interval shorthand (supports s, m, h, d)
+    #   cron expr     — "0 7 * * *"
+    #   ISO timestamp — "2026-03-10T09:00:00"  (one_shot)
+    schedule = Column(String(100))
+
+    # Push notification when the agent finishes
+    deliver = Column(Boolean, default=True, nullable=False)
+
+    # If True, the runner pauses before APPROVAL_REQUIRED_TOOLS and pushes an
+    # approval request to the user's device before proceeding.
+    requires_approval = Column(Boolean, default=False, nullable=False)
+
+    # Set to True by PATCH /tasks/{id} {"approved": true} so the runner knows
+    # to skip the approval gate on the next execution without overloading error.
+    pre_approved = Column(Boolean, default=False, nullable=False)
+
+    # Captured last agent output text
+    result = Column(Text)
+    error = Column(Text)
+
+    # Per-task active hours (overrides user-level, which overrides heartbeat.yaml)
+    active_hours_start = Column(String(5))
+    active_hours_end = Column(String(5))
+    active_hours_tz = Column(String(50))
+
+    # Exponential retry tracking
+    retry_count = Column(Integer, default=0, nullable=False)
+    next_retry_at = Column(DateTime(timezone=True))
+
+    # FK to the isolated ChatSession created for the last run.
+    # Used by /admin/task-runs to join AuditLog entries.
+    last_session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="SET NULL"), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_run_at = Column(DateTime(timezone=True))
+    next_run_at = Column(DateTime(timezone=True))
+
+    user = relationship("User", back_populates="tasks")
+
+    def __repr__(self):
+        return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"
+
+
+class DeviceToken(Base):
+    """APNs device token for a user. Used by APNsPusher to deliver notifications."""
+    __tablename__ = "device_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    token = Column(String(255), unique=True, nullable=False, index=True)
+
+    # "sandbox" | "production"
+    environment = Column(String(20), default="sandbox", nullable=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="device_tokens")
+
+    def __repr__(self):
+        return f"<DeviceToken(user_id={self.user_id}, env='{self.environment}')>"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 models
+# ---------------------------------------------------------------------------
+
+class WebhookConfig(Base):
+    """Inbound webhook configuration for external triggers (GitHub/Zapier/IFTTT)."""
+    __tablename__ = "webhook_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    name = Column(String(255), nullable=False)
+    webhook_key = Column(String(255), unique=True, nullable=False, index=True)
+    instruction = Column(Text, nullable=False)
+    active = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="webhook_configs")
+
+    def __repr__(self):
+        return f"<WebhookConfig(id={self.id}, user_id={self.user_id}, active={self.active})>"

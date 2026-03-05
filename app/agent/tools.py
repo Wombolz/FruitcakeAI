@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 import structlog
 
 from app.agent.context import UserContext
+from app.autonomy.approval import ApprovalRequired
 
 log = structlog.get_logger(__name__)
 
@@ -24,6 +25,48 @@ log = structlog.get_logger(__name__)
 # These are sent to the LLM so it knows what tools it can call.
 
 TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_memory",
+            "description": (
+                "Store a piece of information about the user or their preferences for future sessions. "
+                "Use 'semantic' for persistent facts (e.g. 'The user has a daughter named Emma'). "
+                "Use 'procedural' for behavioral rules (e.g. 'Always remind the user about medication at 9am'). "
+                "Use 'episodic' for time-bound events (e.g. 'The family is visiting grandparents this weekend'). "
+                "Only call this when you have learned something meaningful that should persist across sessions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_type": {
+                        "type": "string",
+                        "enum": ["semantic", "procedural", "episodic"],
+                        "description": "semantic=persistent fact, procedural=behavioral rule, episodic=time-bound event",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The memory to store, written as a clear, self-contained statement.",
+                    },
+                    "importance": {
+                        "type": "number",
+                        "description": "Importance score from 0.0 to 1.0 (default 0.5). Use 0.8+ for critical facts.",
+                        "default": 0.5,
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tags for grouping (e.g. ['health', 'family'])",
+                    },
+                    "expires_at": {
+                        "type": "string",
+                        "description": "Optional ISO 8601 datetime after which this memory expires (useful for episodic events).",
+                    },
+                },
+                "required": ["memory_type", "content"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -125,6 +168,10 @@ async def dispatch_tool_calls(
 
         try:
             result_content = await _call_tool(tool_name, arguments, user_context)
+        except ApprovalRequired:
+            # Let the TaskRunner handle approval gating; do not downgrade this
+            # to a tool error string or append a tool result message.
+            raise
         except Exception as e:
             log.error("Tool call failed", tool=tool_name, error=str(e))
             result_content = f"Tool {tool_name} failed: {e}"
@@ -181,6 +228,15 @@ async def _call_tool(
     name: str, arguments: Dict[str, Any], user_context: UserContext
 ) -> str:
     """Route a tool call to its implementation."""
+    # Approval gate — armed by TaskRunner for tasks with requires_approval=True.
+    # Raises ApprovalRequired before executing; the runner catches it and pauses the task.
+    from app.autonomy.approval import _approval_armed, APPROVAL_REQUIRED_TOOLS, ApprovalRequired
+    if _approval_armed.get() and name in APPROVAL_REQUIRED_TOOLS:
+        raise ApprovalRequired(name)
+
+    if name == "create_memory":
+        return await _create_memory(arguments, user_context)
+
     if name == "search_library":
         return await _search_library(arguments, user_context)
 
@@ -366,3 +422,50 @@ async def _summarize_document(
     if coverage_note:
         header += f"\n_{coverage_note}_"
     return f"{header}\n\n{summary}"
+
+
+async def _create_memory(
+    arguments: Dict[str, Any], user_context: UserContext
+) -> str:
+    """Persist a new memory for the user via MemoryService."""
+    from datetime import datetime, timezone
+    from app.db.session import AsyncSessionLocal
+    from app.memory.service import get_memory_service
+
+    memory_type = arguments.get("memory_type", "semantic")
+    content = arguments.get("content", "").strip()
+    importance = float(arguments.get("importance", 0.5))
+    tags = arguments.get("tags") or []
+    expires_at_str = arguments.get("expires_at")
+
+    if not content:
+        return "Memory content is required."
+
+    if memory_type not in ("semantic", "procedural", "episodic"):
+        return f"Invalid memory_type '{memory_type}'. Must be semantic, procedural, or episodic."
+
+    expires_at = None
+    if expires_at_str:
+        try:
+            dt = datetime.fromisoformat(expires_at_str)
+            expires_at = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return f"Invalid expires_at format: '{expires_at_str}'. Use ISO 8601."
+
+    svc = get_memory_service()
+    async with AsyncSessionLocal() as db:
+        result = await svc.create(
+            db=db,
+            user_id=user_context.user_id,
+            memory_type=memory_type,
+            content=content,
+            importance=importance,
+            tags=tags,
+            expires_at=expires_at,
+        )
+        await db.commit()
+        if isinstance(result, str):
+            return result
+        memory_id = result.id  # capture before session closes to avoid DetachedInstanceError
+
+    return f"Memory saved (id={memory_id}, type={memory_type})."

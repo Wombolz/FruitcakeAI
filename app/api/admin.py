@@ -8,6 +8,7 @@ GET  /admin/users          — list all users
 POST /admin/users          — create a new user
 PATCH /admin/users/{id}    — update user role / persona / scopes / active flag
 GET  /admin/audit          — recent agent tool-call audit log
+GET  /admin/task-runs      — Phase 4 debug: task run history with tool calls
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import require_admin
 from app.auth.jwt import hash_password
 from app.config import settings
-from app.db.models import AuditLog, User
+from app.db.models import AuditLog, Task, User
 from app.db.session import get_db
 from app.metrics import metrics
 
@@ -296,3 +297,65 @@ async def get_audit_log(
     ]
 
     return {"count": len(entries), "entries": entries}
+
+
+@router.get("/admin/task-runs", tags=["admin"])
+async def task_runs(
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """
+    Phase 4 dev/debug endpoint — full task run history with tool calls.
+
+    Returns each task's details plus every AuditLog entry written during
+    its last run (matched via last_session_id). Gives you: what the task
+    was, what tools it called, what they returned, and the final output —
+    all in one call from /docs.
+    """
+    # Fetch recently-run tasks ordered by last_run_at
+    task_result = await db.execute(
+        select(Task)
+        .where(Task.last_run_at.isnot(None))
+        .order_by(desc(Task.last_run_at))
+        .limit(limit)
+    )
+    tasks = task_result.scalars().all()
+
+    output = []
+    for task in tasks:
+        # Fetch AuditLog entries for this task's last session
+        tool_calls: List[Dict[str, Any]] = []
+        if task.last_session_id is not None:
+            log_result = await db.execute(
+                select(AuditLog)
+                .where(AuditLog.session_id == task.last_session_id)
+                .order_by(AuditLog.created_at)
+            )
+            tool_calls = [
+                {
+                    "tool": entry.tool,
+                    "arguments": entry.arguments,
+                    "result_summary": entry.result_summary,
+                    "called_at": entry.created_at,
+                }
+                for entry in log_result.scalars().all()
+            ]
+
+        output.append(
+            {
+                "id": task.id,
+                "title": task.title,
+                "instruction": task.instruction,
+                "task_type": task.task_type,
+                "status": task.status,
+                "last_run_at": task.last_run_at,
+                "last_session_id": task.last_session_id,
+                "result": task.result,
+                "error": task.error,
+                "retry_count": task.retry_count,
+                "tool_calls": tool_calls,
+            }
+        )
+
+    return {"count": len(output), "runs": output}
