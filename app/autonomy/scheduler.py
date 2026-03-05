@@ -151,8 +151,14 @@ def _cron_match(value: int, field: str, min_val: int, max_val: int, sunday7: boo
                 step = int(step_str)
             except ValueError:
                 return False
-            start = min_val if base == "*" else int(base.split("-")[0])
-            if value >= start and (value - start) % step == 0:
+            if base == "*":
+                start, end = min_val, max_val
+            elif "-" in base:
+                parts = base.split("-", 1)
+                start, end = int(parts[0]), int(parts[1])
+            else:
+                start, end = int(base), max_val
+            if start <= value <= end and (value - start) % step == 0:
                 return True
         elif "-" in part:
             lo, hi = part.split("-", 1)
