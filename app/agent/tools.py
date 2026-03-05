@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 import structlog
 
 from app.agent.context import UserContext
+from app.autonomy.approval import ApprovalRequired
 
 log = structlog.get_logger(__name__)
 
@@ -167,6 +168,10 @@ async def dispatch_tool_calls(
 
         try:
             result_content = await _call_tool(tool_name, arguments, user_context)
+        except ApprovalRequired:
+            # Let the TaskRunner handle approval gating; do not downgrade this
+            # to a tool error string or append a tool result message.
+            raise
         except Exception as e:
             log.error("Tool call failed", tool=tool_name, error=str(e))
             result_content = f"Tool {tool_name} failed: {e}"
@@ -442,7 +447,8 @@ async def _create_memory(
     expires_at = None
     if expires_at_str:
         try:
-            expires_at = datetime.fromisoformat(expires_at_str).replace(tzinfo=timezone.utc)
+            dt = datetime.fromisoformat(expires_at_str)
+            expires_at = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except ValueError:
             return f"Invalid expires_at format: '{expires_at_str}'. Use ISO 8601."
 

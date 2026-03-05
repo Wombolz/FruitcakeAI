@@ -268,7 +268,7 @@ class TaskAuditOut(BaseModel):
     result: Optional[str]
     tool_calls: List[TaskAuditEntry]
 
-@router.get("/{task_id}/audit", response_model=TaskAuditOut)
+@router.get("/tasks/{task_id}/audit", response_model=TaskAuditOut)
 async def get_task_audit(
     task_id: int,
     db: AsyncSession = Depends(get_db),

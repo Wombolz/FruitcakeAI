@@ -166,6 +166,8 @@ def _cron_match(value: int, field: str, min_val: int, max_val: int) -> bool:
             except ValueError:
                 return False
 
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Sprint 4.2 — APScheduler wiring
