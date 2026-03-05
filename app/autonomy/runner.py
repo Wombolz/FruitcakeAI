@@ -24,7 +24,7 @@ import structlog
 
 from app.autonomy.approval import ApprovalRequired, _approval_armed
 from app.autonomy.scheduler import compute_next_run_at
-from app.db.models import Task
+from app.db.models import Task, TaskStep
 
 log = structlog.get_logger(__name__)
 
@@ -52,6 +52,7 @@ class TaskRunner:
     # ------------------------------------------------------------------
 
     async def _run(self, task_id: int) -> None:
+        from sqlalchemy import select
         from app.db.session import AsyncSessionLocal
 
         # Phase 1: Re-fetch and mark running
@@ -88,6 +89,7 @@ class TaskRunner:
                 task.retry_count = 0
 
                 if task.task_type == "recurring" and task.schedule:
+                    await self._reset_steps_for_new_run(db, task.id)
                     task.next_run_at = compute_next_run_at(task.schedule)
                     task.status = "pending"   # re-queue for next run
 
@@ -119,6 +121,17 @@ class TaskRunner:
                 task = await db.get(Task, task_id)
                 task.status = "waiting_approval"
                 task.last_run_at = datetime.now(timezone.utc)
+                if task.current_step_index is not None:
+                    rows = await db.execute(
+                        select(TaskStep).where(
+                            TaskStep.task_id == task.id,
+                            TaskStep.step_index == task.current_step_index,
+                        )
+                    )
+                    step = rows.scalar_one_or_none()
+                    if step is not None:
+                        step.status = "waiting_approval"
+                        step.waiting_approval_tool = str(exc)
                 await db.commit()
             log.info("task.waiting_approval", task_id=task_id, blocked_tool=str(exc))
 
@@ -130,9 +143,9 @@ class TaskRunner:
     # ------------------------------------------------------------------
 
     async def _execute_agent(self, task_id: int) -> str:
+        from sqlalchemy import select
         from app.db.session import AsyncSessionLocal
         from app.db.models import ChatSession, User
-        from app.agent.context import UserContext
         from app.agent.core import run_agent
         from app.memory.service import get_memory_service
 
@@ -143,6 +156,7 @@ class TaskRunner:
         task_instruction: Optional[str] = None
         task_title: Optional[str] = None
         task_requires_approval: bool = False
+        has_plan = False
         pre_approved = False
 
         async with AsyncSessionLocal() as db:
@@ -162,20 +176,24 @@ class TaskRunner:
             task_instruction = task.instruction
             task_title = task.title
             task_requires_approval = task.requires_approval
+            has_plan = bool(task.has_plan)
 
-            # Create isolated task session (excluded from chat UI session list)
-            session = ChatSession(
-                user_id=task.user_id,
-                title=f"[Task] {task_title}",
-                persona=persona_name,
-                is_task_session=True,
-            )
-            db.add(session)
-            await db.flush()
-            session_id = session.id
+            # Reuse existing task session when resuming from waiting_approval.
+            if task.last_session_id and task.status == "pending":
+                existing = await db.get(ChatSession, task.last_session_id)
+                session_id = existing.id if existing else None
 
-            # Link this session back to the task for /admin/task-runs join
-            task.last_session_id = session_id
+            if not session_id:
+                session = ChatSession(
+                    user_id=task.user_id,
+                    title=f"[Task] {task_title}",
+                    persona=persona_name,
+                    is_task_session=True,
+                )
+                db.add(session)
+                await db.flush()
+                session_id = session.id
+                task.last_session_id = session_id
             await db.commit()
 
         # Build UserContext (re-fetch user while session open so from_user can read attributes)
@@ -188,36 +206,197 @@ class TaskRunner:
             user_context = UserContext.from_user(user, persona_name=persona_name)
         user_context.session_id = session_id
 
-        # Retrieve memories for this user
+        # Planned mode: execute TaskStep graph.
+        if has_plan:
+            async with AsyncSessionLocal() as db:
+                count_rows = await db.execute(
+                    select(TaskStep.id).where(TaskStep.task_id == task_id).limit(1)
+                )
+                if count_rows.scalar_one_or_none() is not None:
+                    return await self._execute_planned_steps(
+                        task_id=task_id,
+                        user_id=task_user_id,
+                        task_title=task_title or "",
+                        task_instruction=task_instruction or "",
+                        session_id=session_id,
+                        user_context=user_context,
+                        task_requires_approval=task_requires_approval,
+                        pre_approved=pre_approved,
+                    )
+
+        # Back-compat mode: single instruction task behavior.
         async with AsyncSessionLocal() as db:
             svc = get_memory_service()
-            memories = await svc.retrieve_for_context(
-                db, task_user_id, query=task_instruction
-            )
+            memories = await svc.retrieve_for_context(db, task_user_id, query=task_instruction)
 
-        # Compose prompt: memory context → task header → instruction → timestamp
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         parts: list[str] = []
-
         if memories:
             parts.append(svc.format_for_prompt(memories))
-
         parts.append(f"[Task: {task_title}]")
-        parts.append(task_instruction)
+        parts.append(task_instruction or "")
         parts.append(f"\nCurrent time: {now_str}")
 
-        messages = [{"role": "user", "content": "\n\n".join(parts)}]
-
-        # Arm the approval gate if this task requires it (and isn't pre-approved)
         arm_approval = task_requires_approval and not pre_approved
         token = _approval_armed.set(arm_approval)
-
         try:
-            result = await run_agent(messages, user_context, mode="task")
+            return await run_agent([{"role": "user", "content": "\n\n".join(parts)}], user_context, mode="task")
         finally:
-            _approval_armed.reset(token)  # always disarm, even on exception
+            _approval_armed.reset(token)
 
-        return result
+    async def _execute_planned_steps(
+        self,
+        *,
+        task_id: int,
+        user_id: int,
+        task_title: str,
+        task_instruction: str,
+        session_id: int,
+        user_context,
+        task_requires_approval: bool,
+        pre_approved: bool,
+    ) -> str:
+        """Execute task steps sequentially from current_step_index."""
+        from sqlalchemy import select
+        from app.db.session import AsyncSessionLocal
+        from app.agent.core import run_agent
+        from app.memory.service import get_memory_service
+
+        final_result = ""
+
+        async with AsyncSessionLocal() as db:
+            task = await db.get(Task, task_id)
+            start_index = task.current_step_index or 1
+            rows = await db.execute(
+                select(TaskStep)
+                .where(TaskStep.task_id == task_id)
+                .order_by(TaskStep.step_index)
+            )
+            steps = rows.scalars().all()
+
+        for step in steps:
+            if step.step_index < start_index or step.status == "succeeded":
+                continue
+
+            # Mark running and clear stale error state.
+            async with AsyncSessionLocal() as db:
+                task = await db.get(Task, task_id)
+                step_row = await db.get(TaskStep, step.id)
+                task.current_step_index = step_row.step_index
+                step_row.status = "running"
+                step_row.error = None
+                step_row.waiting_approval_tool = None
+                await db.commit()
+
+            async with AsyncSessionLocal() as db:
+                svc = get_memory_service()
+                memories = await svc.retrieve_for_context(db, user_id, query=step.instruction)
+
+            # Summaries from previous succeeded steps keep context compact.
+            prior_summaries: list[str] = []
+            async with AsyncSessionLocal() as db:
+                prev_rows = await db.execute(
+                    select(TaskStep)
+                    .where(
+                        TaskStep.task_id == task_id,
+                        TaskStep.step_index < step.step_index,
+                        TaskStep.output_summary.isnot(None),
+                    )
+                    .order_by(TaskStep.step_index)
+                )
+                for prev in prev_rows.scalars().all():
+                    prior_summaries.append(f"Step {prev.step_index}: {prev.output_summary}")
+
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            prompt_parts: list[str] = [f"[Task: {task_title}]", task_instruction]
+            prompt_parts.append(f"Current Step ({step.step_index}): {step.title}")
+            prompt_parts.append(step.instruction)
+            if prior_summaries:
+                prompt_parts.append("Previous step summaries:\n" + "\n".join(prior_summaries))
+            if memories:
+                prompt_parts.insert(0, svc.format_for_prompt(memories))
+            prompt_parts.append(f"Current time: {now_str}")
+
+            arm_approval = (task_requires_approval or step.requires_approval) and not pre_approved
+            token = _approval_armed.set(arm_approval)
+            try:
+                result = await run_agent(
+                    [{"role": "user", "content": "\n\n".join(prompt_parts)}],
+                    user_context,
+                    mode="task",
+                )
+            except ApprovalRequired as exc:
+                _approval_armed.reset(token)
+                async with AsyncSessionLocal() as db:
+                    task = await db.get(Task, task_id)
+                    step_row = await db.get(TaskStep, step.id)
+                    task.status = "waiting_approval"
+                    task.current_step_index = step_row.step_index
+                    step_row.status = "waiting_approval"
+                    step_row.waiting_approval_tool = str(exc)
+                    await db.commit()
+                raise
+            except Exception as exc:
+                _approval_armed.reset(token)
+                async with AsyncSessionLocal() as db:
+                    task = await db.get(Task, task_id)
+                    step_row = await db.get(TaskStep, step.id)
+                    task.status = "failed"
+                    step_row.status = "failed"
+                    step_row.error = str(exc)
+                    await db.commit()
+                raise
+            else:
+                _approval_armed.reset(token)
+
+            summary = result[:240] if result else ""
+            final_result = result
+            async with AsyncSessionLocal() as db:
+                task = await db.get(Task, task_id)
+                step_row = await db.get(TaskStep, step.id)
+                step_row.status = "succeeded"
+                step_row.result = result
+                step_row.output_summary = summary
+                task.current_step_index = step.step_index + 1
+                await db.commit()
+
+        # Build final result from summaries to keep it compact.
+        async with AsyncSessionLocal() as db:
+            rows = await db.execute(
+                select(TaskStep)
+                .where(TaskStep.task_id == task_id)
+                .order_by(TaskStep.step_index)
+            )
+            finished = rows.scalars().all()
+            summaries = [s.output_summary for s in finished if s.output_summary]
+            if summaries:
+                final_result = "\n".join(summaries)
+            task = await db.get(Task, task_id)
+            task.current_step_index = None
+            await db.commit()
+
+        return final_result
+
+    async def _reset_steps_for_new_run(self, db, task_id: int) -> None:
+        """Recurring tasks start from a clean step state each run."""
+        from sqlalchemy import select
+
+        rows = await db.execute(
+            select(TaskStep).where(TaskStep.task_id == task_id)
+        )
+        steps = rows.scalars().all()
+        if not steps:
+            return
+
+        for step in steps:
+            step.status = "pending"
+            step.output_summary = None
+            step.result = None
+            step.error = None
+            step.waiting_approval_tool = None
+
+        task = await db.get(Task, task_id)
+        task.current_step_index = 1
 
     # ------------------------------------------------------------------
     # Error handling with exponential backoff

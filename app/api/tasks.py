@@ -7,6 +7,7 @@ GET    /tasks/{id}         Task detail + last result
 PATCH  /tasks/{id}         Update or approve/reject
 DELETE /tasks/{id}         Cancel task (status=cancelled)
 POST   /tasks/{id}/run     Manual trigger (dev/testing)
+POST   /tasks/{id}/reset   Recover a task stuck in 'running' after a restart
 """
 
 from __future__ import annotations
@@ -21,8 +22,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import json
 
+from app.autonomy.planner import create_task_plan_for_user
 from app.auth.dependencies import get_current_user
-from app.db.models import AuditLog, Task, User
+from app.db.models import AuditLog, Task, TaskStep, User
 from app.db.session import get_db
 
 router = APIRouter()
@@ -70,6 +72,9 @@ class TaskOut(BaseModel):
     active_hours_end: Optional[str]
     active_hours_tz: Optional[str]
     retry_count: int
+    current_step_index: Optional[int]
+    has_plan: bool
+    plan_version: int
     created_at: Optional[datetime]
     last_run_at: Optional[datetime]
     next_run_at: Optional[datetime]
@@ -253,6 +258,42 @@ async def manual_run(
     return {"queued": True, "task_id": task_id}
 
 
+# ── POST /tasks/{id}/reset ───────────────────────────────────────────────────
+
+class TaskResetRequest(BaseModel):
+    requeue: bool = True   # True → reset to pending; False → cancel
+
+
+@router.post("/tasks/{task_id}/reset", response_model=TaskOut)
+async def reset_task(
+    task_id: int,
+    body: TaskResetRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Recover a task that is stuck in 'running' after a server restart.
+
+    requeue=true  (default) — sets status back to 'pending' so the scheduler
+                               picks it up on the next tick.
+    requeue=false            — marks the task 'cancelled' to abandon it.
+
+    Returns 409 if the task is not currently in the 'running' state.
+    """
+    task = await _get_owned_task(task_id, current_user.id, db)
+    if task.status != "running":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Task is not stuck (status={task.status}). Only 'running' tasks can be reset.",
+        )
+    if body.requeue:
+        task.status = "pending"
+        task.next_run_at = datetime.now(timezone.utc)
+    else:
+        task.status = "cancelled"
+    return task
+
+
 # ── GET /tasks/{id}/audit ─────────────────────────────────────────────────────
 
 class TaskAuditEntry(BaseModel):
@@ -266,6 +307,42 @@ class TaskAuditOut(BaseModel):
     title: str
     result: Optional[str]
     tool_calls: List[TaskAuditEntry]
+
+
+class TaskStepOut(BaseModel):
+    id: int
+    step_index: int
+    title: str
+    instruction: str
+    status: str
+    requires_approval: bool
+    output_summary: Optional[str]
+    error: Optional[str]
+    waiting_approval_tool: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+
+class TaskStepPatch(BaseModel):
+    title: Optional[str] = None
+    instruction: Optional[str] = None
+    status: Optional[str] = None
+    requires_approval: Optional[bool] = None
+
+
+class TaskPlanRequest(BaseModel):
+    goal: str
+    max_steps: int = 6
+    notes: Optional[str] = ""
+    style: Optional[str] = "concise"
+
+
+class TaskPlanOut(BaseModel):
+    task_id: int
+    steps_created: int
+    titles: List[str]
+    plan_version: int
 
 @router.get("/tasks/{task_id}/audit", response_model=TaskAuditOut)
 async def get_task_audit(
@@ -297,6 +374,77 @@ async def get_task_audit(
         result=task.result,
         tool_calls=tool_calls,
     )
+
+
+@router.get("/tasks/{task_id}/steps", response_model=List[TaskStepOut])
+async def list_task_steps(
+    task_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> List[TaskStep]:
+    await _get_owned_task(task_id, current_user.id, db)
+    rows = await db.execute(
+        select(TaskStep)
+        .where(TaskStep.task_id == task_id)
+        .order_by(TaskStep.step_index)
+    )
+    return rows.scalars().all()
+
+
+@router.patch("/tasks/{task_id}/steps/{step_id}", response_model=TaskStepOut)
+async def update_task_step(
+    task_id: int,
+    step_id: int,
+    body: TaskStepPatch,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TaskStep:
+    await _get_owned_task(task_id, current_user.id, db)
+    rows = await db.execute(
+        select(TaskStep).where(TaskStep.id == step_id, TaskStep.task_id == task_id)
+    )
+    step = rows.scalar_one_or_none()
+    if step is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Step not found")
+
+    if body.title is not None:
+        step.title = body.title
+    if body.instruction is not None:
+        step.instruction = body.instruction
+    if body.requires_approval is not None:
+        step.requires_approval = body.requires_approval
+    if body.status is not None:
+        allowed = {"pending", "running", "waiting_approval", "succeeded", "failed", "skipped"}
+        if body.status not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"status must be one of: {', '.join(sorted(allowed))}",
+            )
+        step.status = body.status
+    await db.flush()
+    return step
+
+
+@router.post("/tasks/{task_id}/plan", response_model=TaskPlanOut)
+async def create_task_plan(
+    task_id: int,
+    body: TaskPlanRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TaskPlanOut:
+    try:
+        out = await create_task_plan_for_user(
+            db,
+            task_id=task_id,
+            user_id=current_user.id,
+            goal=body.goal,
+            max_steps=body.max_steps,
+            notes=body.notes or "",
+            style=body.style or "concise",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return TaskPlanOut(**out)
 
 
 # ── Internal helper ───────────────────────────────────────────────────────────

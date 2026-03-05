@@ -16,6 +16,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -304,6 +305,9 @@ class Task(Base):
     # Set to True by PATCH /tasks/{id} {"approved": true} so the runner knows
     # to skip the approval gate on the next execution without overloading error.
     pre_approved = Column(Boolean, default=False, nullable=False)
+    current_step_index = Column(Integer)
+    has_plan = Column(Boolean, default=False, nullable=False)
+    plan_version = Column(Integer, default=1, nullable=False)
 
     # Captured last agent output text
     result = Column(Text)
@@ -327,6 +331,12 @@ class Task(Base):
     next_run_at = Column(DateTime(timezone=True))
 
     user = relationship("User", back_populates="tasks")
+    steps = relationship(
+        "TaskStep",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TaskStep.step_index",
+    )
 
     def __repr__(self):
         return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"
@@ -350,6 +360,57 @@ class DeviceToken(Base):
 
     def __repr__(self):
         return f"<DeviceToken(user_id={self.user_id}, env='{self.environment}')>"
+
+
+class TaskStep(Base):
+    """Step in a planned task graph. Executed sequentially by TaskRunner."""
+    __tablename__ = "task_steps"
+    __table_args__ = (
+        UniqueConstraint("task_id", "step_index", name="uq_task_steps_task_id_step_index"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    step_index = Column(Integer, nullable=False, index=True)
+
+    title = Column(String(255), nullable=False)
+    instruction = Column(Text, nullable=False)
+
+    # "pending" | "running" | "waiting_approval" | "succeeded" | "failed" | "skipped"
+    status = Column(String(30), default="pending", nullable=False, index=True)
+    requires_approval = Column(Boolean, default=False, nullable=False)
+
+    tool_allowlist = Column(Text, default="[]", nullable=False)
+    tool_blocklist = Column(Text, default="[]", nullable=False)
+
+    output_summary = Column(Text)
+    result = Column(Text)
+    error = Column(Text)
+    waiting_approval_tool = Column(String(100))
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    task = relationship("Task", back_populates="steps")
+
+    @property
+    def tool_allowlist_items(self) -> list[str]:
+        return json.loads(self.tool_allowlist or "[]")
+
+    @tool_allowlist_items.setter
+    def tool_allowlist_items(self, value: list[str]):
+        self.tool_allowlist = json.dumps(value)
+
+    @property
+    def tool_blocklist_items(self) -> list[str]:
+        return json.loads(self.tool_blocklist or "[]")
+
+    @tool_blocklist_items.setter
+    def tool_blocklist_items(self, value: list[str]):
+        self.tool_blocklist = json.dumps(value)
+
+    def __repr__(self):
+        return f"<TaskStep(task_id={self.task_id}, idx={self.step_index}, status='{self.status}')>"
 
 
 # ---------------------------------------------------------------------------

@@ -70,6 +70,27 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "create_task_plan",
+            "description": (
+                "Create an ordered step-by-step plan for an existing task. "
+                "Use this before running complex tasks that need multiple stages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer", "description": "ID of an existing task owned by the user"},
+                    "goal": {"type": "string", "description": "High-level goal for the plan"},
+                    "max_steps": {"type": "integer", "description": "Maximum number of steps to generate", "default": 6},
+                    "notes": {"type": "string", "description": "Optional constraints or context"},
+                    "style": {"type": "string", "description": "Optional style hint: concise or thorough", "default": "concise"},
+                },
+                "required": ["task_id", "goal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "summarize_document",
             "description": (
                 "Produce a comprehensive summary of an entire document in the user's library. "
@@ -242,6 +263,9 @@ async def _call_tool(
 
     if name == "summarize_document":
         return await _summarize_document(arguments, user_context)
+
+    if name == "create_task_plan":
+        return await _create_task_plan(arguments, user_context)
 
     # Route all other tool calls through the MCP registry
     from app.mcp.registry import get_mcp_registry
@@ -469,3 +493,45 @@ async def _create_memory(
         memory_id = result.id  # capture before session closes to avoid DetachedInstanceError
 
     return f"Memory saved (id={memory_id}, type={memory_type})."
+
+
+async def _create_task_plan(
+    arguments: Dict[str, Any], user_context: UserContext
+) -> str:
+    """Create TaskStep rows for an existing task owned by this user."""
+    from app.autonomy.planner import create_task_plan_for_user
+    from app.db.session import AsyncSessionLocal
+
+    try:
+        task_id = int(arguments.get("task_id"))
+    except Exception:
+        return "Invalid task_id."
+
+    goal = str(arguments.get("goal", "")).strip()
+    if not goal:
+        return "goal is required."
+
+    try:
+        max_steps = int(arguments.get("max_steps", 6))
+    except Exception:
+        max_steps = 6
+    notes = str(arguments.get("notes", "") or "")
+    style = str(arguments.get("style", "concise") or "concise")
+
+    async with AsyncSessionLocal() as db:
+        try:
+            result = await create_task_plan_for_user(
+                db,
+                task_id=task_id,
+                user_id=user_context.user_id,
+                goal=goal,
+                max_steps=max_steps,
+                notes=notes,
+                style=style,
+            )
+            await db.commit()
+        except ValueError as exc:
+            await db.rollback()
+            return str(exc)
+
+    return json.dumps(result)

@@ -67,6 +67,16 @@ def test_summarize_document_has_document_name_parameter():
     assert "document_name" in required
 
 
+def test_create_task_plan_schema_has_required_fields():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_task_plan")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "task_id" in props
+    assert "goal" in props
+    assert "task_id" in required
+    assert "goal" in required
+
+
 # ── Persona / blocked-tools filtering ─────────────────────────────────────────
 
 def test_family_assistant_no_blocked_tools():

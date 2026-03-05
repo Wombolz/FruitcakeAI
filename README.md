@@ -181,6 +181,7 @@ FastAPI Backend (fruitcake_v5/)
 | PATCH | `/tasks/{id}` | user | Update / approve / reject |
 | DELETE | `/tasks/{id}` | user | Cancel task |
 | POST | `/tasks/{id}/run` | user | Manual trigger (dev) |
+| POST | `/tasks/{id}/reset` | user | Recover a task stuck in running after a restart |
 | GET | `/tasks/{id}/audit` | user | Tool-call log for last run |
 | GET | `/memories` | user | List memories |
 | POST | `/memories` | user | Create memory (admin/testing) |

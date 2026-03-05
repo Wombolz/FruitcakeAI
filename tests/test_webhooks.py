@@ -97,7 +97,7 @@ async def test_webhook_trigger_rejects_invalid_json(client):
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 400
-    assert "Invalid JSON payload" in resp.json()["detail"]
+    assert "Invalid JSON payload" in resp.json()["error"]
 
 
 @pytest.mark.asyncio
