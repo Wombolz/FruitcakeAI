@@ -112,7 +112,8 @@ def _simple_next_run(schedule: str) -> datetime | None:
                 pass
     # Try ISO timestamp
     try:
-        return datetime.fromisoformat(schedule).replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(schedule)
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
     except ValueError:
         pass
     return None
