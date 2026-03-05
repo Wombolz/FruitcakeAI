@@ -40,7 +40,10 @@ def get_tools() -> List[Dict[str, Any]]:
             "name": "list_events",
             "description": (
                 "List calendar events in a date range. "
-                "Use when the user asks about their schedule, upcoming events, or what's on the calendar."
+                "Use when the user asks about their schedule, upcoming events, or what's on the calendar. "
+                "Available calendars: Home (default), Work, Family, Calendar, 'Turkey Cookin'. "
+                "If the user doesn't specify a calendar, use the default (Home). "
+                "If the request sounds work-related use Work; family events use Family."
             ),
             "inputSchema": {
                 "type": "object",
@@ -55,7 +58,7 @@ def get_tools() -> List[Dict[str, Any]]:
                     },
                     "calendar_id": {
                         "type": "string",
-                        "description": "Specific calendar ID. Leave empty to use the default calendar.",
+                        "description": "Calendar name: 'Home', 'Work', 'Family', 'Calendar', or 'Turkey Cookin'. Defaults to Home.",
                     },
                     "max_results": {
                         "type": "integer",
@@ -67,7 +70,15 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "create_event",
-            "description": "Create a new calendar event.",
+            "description": (
+                "Create a new calendar event. "
+                "Available calendars: Home (default), Work, Family, Calendar, 'Turkey Cookin'. "
+                "Infer the best calendar from context if the user doesn't specify. "
+                "IMPORTANT: If the event date is described as a weekday pattern "
+                "(e.g. 'first Thursday', 'last Friday of the month', 'every second Monday'), "
+                "you MUST call compute_dates first to get the exact ISO dates. "
+                "Never calculate weekday-of-month dates yourself."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -82,7 +93,7 @@ def get_tools() -> List[Dict[str, Any]]:
                     },
                     "calendar_id": {
                         "type": "string",
-                        "description": "Calendar ID to add the event to. Defaults to primary.",
+                        "description": "Calendar name: 'Home', 'Work', 'Family', 'Calendar', or 'Turkey Cookin'. Defaults to Home.",
                     },
                     "description": {"type": "string", "description": "Optional event description"},
                     "location": {"type": "string", "description": "Optional location"},
@@ -92,7 +103,10 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "search_events",
-            "description": "Search calendar events by keyword across a date range.",
+            "description": (
+                "Search calendar events by keyword across a date range. "
+                "Searches the default calendar (Home). For targeted searches, use list_events with a specific calendar_id."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -111,6 +125,37 @@ def get_tools() -> List[Dict[str, Any]]:
                 "required": ["query"],
             },
         },
+        {
+            "name": "compute_dates",
+            "description": (
+                "Compute exact dates for a recurring pattern using Python — never guess dates yourself. "
+                "Use this BEFORE creating multiple events to get the correct dates. "
+                "Examples: 'first thursday of each month', 'every other monday', 'last friday of each month'."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": (
+                            "Day pattern. Format: '{ordinal} {weekday}' where ordinal is "
+                            "first/second/third/fourth/last and weekday is monday–sunday. "
+                            "E.g. 'first thursday', 'last friday', 'third wednesday'."
+                        ),
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of occurrences to compute. Default: 6.",
+                        "default": 6,
+                    },
+                    "start_from": {
+                        "type": "string",
+                        "description": "ISO date to start from (e.g. 2026-03-01). Defaults to today.",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
     ]
 
 
@@ -121,6 +166,8 @@ async def call_tool(tool_name: str, arguments: Dict[str, Any], user_context: Any
         return await _create_event(arguments, user_context)
     if tool_name == "search_events":
         return await _search_events(arguments, user_context)
+    if tool_name == "compute_dates":
+        return _compute_dates(arguments)
     return f"Unknown calendar tool: {tool_name}"
 
 
@@ -232,6 +279,61 @@ async def _search_events(args: Dict[str, Any], user_context: Any) -> str:
     for ev in matches:
         s = (ev.get("start") or "")[:16].replace("T", " ")
         lines.append(f"• {s}: {ev.get('summary') or 'Untitled'}")
+    return "\n".join(lines)
+
+
+def _compute_dates(args: Dict[str, Any]) -> str:
+    """
+    Compute exact dates for a recurring weekday pattern using Python.
+    Pattern: '{ordinal} {weekday}' e.g. 'first thursday', 'last friday'.
+    """
+    import calendar as cal_mod
+
+    pattern = (args.get("pattern") or "").strip().lower()
+    count = int(args.get("count") or 6)
+    start_str = args.get("start_from")
+
+    ordinal_map = {"first": 0, "second": 1, "third": 2, "fourth": 3, "last": -1}
+    weekday_map = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+    }
+
+    ordinal = next((v for k, v in ordinal_map.items() if k in pattern), None)
+    weekday = next((v for k, v in weekday_map.items() if k in pattern), None)
+
+    if ordinal is None or weekday is None:
+        return (
+            f"Could not parse pattern '{pattern}'. "
+            "Use format: 'first thursday', 'last friday', 'second monday', etc."
+        )
+
+    start = datetime.fromisoformat(start_str).date() if start_str else datetime.now(timezone.utc).date()
+    # Start from the 1st of start month
+    current = start.replace(day=1)
+    results = []
+
+    while len(results) < count:
+        # Find all matching weekdays in current month
+        _, days_in_month = cal_mod.monthrange(current.year, current.month)
+        matching = [
+            current.replace(day=d)
+            for d in range(1, days_in_month + 1)
+            if current.replace(day=d).weekday() == weekday
+        ]
+        if matching:
+            pick = matching[ordinal]  # ordinal=-1 gives last
+            if pick >= start:
+                results.append(pick)
+        # Advance to next month
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1, day=1)
+        else:
+            current = current.replace(month=current.month + 1, day=1)
+
+    lines = [f"Computed dates for '{pattern}' ({count} occurrences):\n"]
+    for i, d in enumerate(results, 1):
+        lines.append(f"{i}. {d.strftime('%A, %B %-d, %Y')} ({d.isoformat()})")
     return "\n".join(lines)
 
 

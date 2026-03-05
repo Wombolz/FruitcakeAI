@@ -313,6 +313,10 @@ class Task(Base):
     retry_count = Column(Integer, default=0, nullable=False)
     next_retry_at = Column(DateTime(timezone=True))
 
+    # FK to the isolated ChatSession created for the last run.
+    # Used by /admin/task-runs to join AuditLog entries.
+    last_session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="SET NULL"), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_run_at = Column(DateTime(timezone=True))
     next_run_at = Column(DateTime(timezone=True))

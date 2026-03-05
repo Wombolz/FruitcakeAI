@@ -223,6 +223,12 @@ async def _call_tool(
     name: str, arguments: Dict[str, Any], user_context: UserContext
 ) -> str:
     """Route a tool call to its implementation."""
+    # Approval gate — armed by TaskRunner for tasks with requires_approval=True.
+    # Raises ApprovalRequired before executing; the runner catches it and pauses the task.
+    from app.autonomy.approval import _approval_armed, APPROVAL_REQUIRED_TOOLS, ApprovalRequired
+    if _approval_armed.get() and name in APPROVAL_REQUIRED_TOOLS:
+        raise ApprovalRequired(name)
+
     if name == "create_memory":
         return await _create_memory(arguments, user_context)
 

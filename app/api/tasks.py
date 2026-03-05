@@ -19,8 +19,10 @@ from pydantic import BaseModel
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import json
+
 from app.auth.dependencies import get_current_user
-from app.db.models import Task, User
+from app.db.models import AuditLog, Task, User
 from app.db.session import get_db
 
 router = APIRouter()
@@ -250,6 +252,52 @@ async def manual_run(
         pass  # Runner not yet wired (Sprint 4.2) — next scheduler tick will pick it up
 
     return {"queued": True, "task_id": task_id}
+
+
+# ── GET /tasks/{id}/audit ─────────────────────────────────────────────────────
+
+class TaskAuditEntry(BaseModel):
+    tool: str
+    arguments: Dict[str, Any]
+    result_summary: str
+    created_at: datetime
+
+class TaskAuditOut(BaseModel):
+    task_id: int
+    title: str
+    result: Optional[str]
+    tool_calls: List[TaskAuditEntry]
+
+@router.get("/{task_id}/audit", response_model=TaskAuditOut)
+async def get_task_audit(
+    task_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TaskAuditOut:
+    """Return the task's result and all tool calls from its last execution session."""
+    task = await _get_owned_task(task_id, current_user.id, db)
+    tool_calls: List[TaskAuditEntry] = []
+    if task.last_session_id:
+        rows = await db.execute(
+            select(AuditLog)
+            .where(AuditLog.session_id == task.last_session_id)
+            .order_by(AuditLog.created_at)
+        )
+        tool_calls = [
+            TaskAuditEntry(
+                tool=r.tool,
+                arguments=json.loads(r.arguments or "{}"),
+                result_summary=r.result_summary or "",
+                created_at=r.created_at,
+            )
+            for r in rows.scalars().all()
+        ]
+    return TaskAuditOut(
+        task_id=task.id,
+        title=task.title,
+        result=task.result,
+        tool_calls=tool_calls,
+    )
 
 
 # ── Internal helper ───────────────────────────────────────────────────────────

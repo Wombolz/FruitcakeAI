@@ -2,7 +2,7 @@
 FruitcakeAI v5 — Scheduler + Schedule Parser (Phase 4)
 
 Sprint 4.1: compute_next_run_at() — parses schedule expressions.
-Sprint 4.2: APScheduler wiring (start_scheduler, tick) added here.
+Sprint 4.2: APScheduler wiring (start_scheduler, shutdown_scheduler, tick).
 
 Schedule expression formats:
     "every:30m"           — interval (supports s, m, h, d)
@@ -12,6 +12,7 @@ Schedule expression formats:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -164,4 +165,96 @@ def _cron_match(value: int, field: str, min_val: int, max_val: int) -> bool:
                     return True
             except ValueError:
                 return False
+
+
+# ---------------------------------------------------------------------------
+# Sprint 4.2 — APScheduler wiring
+# ---------------------------------------------------------------------------
+
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+    _APSCHEDULER_AVAILABLE = True
+except ImportError:
+    _APSCHEDULER_AVAILABLE = False
+
+import structlog
+_log = structlog.get_logger(__name__)
+
+_scheduler: "AsyncIOScheduler | None" = None
+
+
+async def start_scheduler() -> None:
+    """
+    Initialize and start the APScheduler in-process scheduler.
+
+    The task_dispatcher job fires every minute and calls tick() to find
+    and launch any tasks whose next_run_at has passed.
+
+    Uses SQLAlchemyJobStore backed by the existing PostgreSQL database so
+    job definitions survive restarts without a separate broker.
+    """
+    global _scheduler
+    if not _APSCHEDULER_AVAILABLE:
+        _log.warning("scheduler.apscheduler_not_installed", hint="pip install apscheduler>=3.10,<4")
+        return
+
+    from app.config import settings
+
+    jobstore = SQLAlchemyJobStore(url=settings.database_url_sync)
+    _scheduler = AsyncIOScheduler(
+        jobstores={"default": jobstore},
+        job_defaults={"coalesce": True, "max_instances": 1},
+    )
+    _scheduler.add_job(
+        tick,
+        "interval",
+        minutes=1,
+        id="task_dispatcher",
+        replace_existing=True,
+    )
+    _scheduler.start()
+    _log.info("scheduler.started")
+
+
+def shutdown_scheduler() -> None:
+    """Stop the scheduler gracefully on app shutdown."""
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        _scheduler.shutdown(wait=False)
+        _log.info("scheduler.stopped")
+
+
+async def tick() -> None:
+    """
+    Dispatcher: query tasks due for execution and fire them concurrently.
+
+    Runs every minute via APScheduler. Tasks are SELECT'd in a short-lived
+    session; execution happens in independent asyncio tasks so the DB
+    connection is not held across multi-turn LLM loops.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import select, and_
+    from app.db.session import AsyncSessionLocal
+    from app.db.models import Task
+    from app.autonomy.runner import get_task_runner
+
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Task).where(
+                and_(
+                    Task.status == "pending",
+                    Task.next_run_at <= now,
+                )
+            )
+        )
+        due = result.scalars().all()
+
+    if due:
+        _log.info("scheduler.tick", due_count=len(due))
+
+    runner = get_task_runner()
+    for task in due:
+        asyncio.create_task(runner.execute(task))
     return False

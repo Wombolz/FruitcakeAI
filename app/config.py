@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     apple_caldav_app_password: str = "" # App-specific password from appleid.apple.com
     apple_caldav_default_calendar: str = "home"
 
+    # ── APNs Push (Phase 4 Sprint 4.3) ────────────────────────────────────────
+    # Leave empty to disable push (tasks still run, results not pushed to device)
+    apns_key_id: str = ""           # 10-char Key ID from developer.apple.com
+    apns_team_id: str = ""          # 10-char Team ID
+    apns_auth_key_path: str = ""    # Absolute path to AuthKey_<key_id>.p8
+    apns_bundle_id: str = "none.FruitcakeAi"
+    apns_environment: str = "sandbox"  # "sandbox" | "production"
+
 
 @lru_cache
 def get_settings() -> Settings:

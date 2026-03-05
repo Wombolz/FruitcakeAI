@@ -39,9 +39,15 @@ async def lifespan(app: FastAPI):
     from app.mcp.registry import get_mcp_registry
     await get_mcp_registry().startup()
 
+    # Start task scheduler (fires every minute, picks up due tasks)
+    from app.autonomy.scheduler import start_scheduler
+    await start_scheduler()
+
     yield
 
     log.info("FruitcakeAI v5 shutting down")
+    from app.autonomy.scheduler import shutdown_scheduler
+    shutdown_scheduler()
     await get_mcp_registry().shutdown()
     await engine.dispose()
 

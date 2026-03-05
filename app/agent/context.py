@@ -4,11 +4,14 @@ Builds the agent system prompt from the current user's role, persona, and scopes
 
 The LLM sees this context on every request — it's the primary access control mechanism.
 Persona config (blocked_tools, tone, scopes) is loaded from config/personas.yaml.
+Current date/time is injected on every call so the LLM can answer date-dependent
+questions (age calculations, scheduling) correctly without a tool round-trip.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone as _tz
 from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
@@ -28,6 +31,7 @@ class UserContext:
     blocked_tools: List[str] = field(default_factory=list)
     content_filter: str = ""           # "" | "strict"
     session_id: Optional[int] = None   # set by chat.py for audit logging
+    timezone: Optional[str] = None     # IANA tz string, e.g. "America/Chicago"
 
     @classmethod
     def from_user(
@@ -61,12 +65,26 @@ class UserContext:
             calendar_access=calendar_access,
             blocked_tools=pc.get("blocked_tools", []),
             content_filter=pc.get("content_filter", ""),
+            timezone=getattr(user, "active_hours_tz", None) or None,
         )
+
+    def _current_time_str(self) -> str:
+        """Return a human-readable current date/time string, localized if a timezone is set."""
+        now_utc = datetime.now(_tz.utc)
+        if self.timezone:
+            try:
+                from zoneinfo import ZoneInfo
+                now_local = now_utc.astimezone(ZoneInfo(self.timezone))
+                return now_local.strftime("%A, %B %d, %Y %I:%M %p %Z")
+            except Exception:
+                pass
+        return now_utc.strftime("%A, %B %d, %Y %H:%M UTC")
 
     def to_system_prompt(self) -> str:
         lines = [
             "You are FruitcakeAI, a private, local-first AI assistant for a family household.",
             "",
+            f"Current date and time: {self._current_time_str()}",
             f"Current user: {self.username} (role: {self.role})",
             f"Active persona: {self.persona}",
         ]

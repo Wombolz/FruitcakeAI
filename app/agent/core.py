@@ -22,6 +22,12 @@ log = structlog.get_logger(__name__)
 # Silence LiteLLM's verbose request logging in production
 litellm.suppress_debug_info = True
 
+# Phase 4: task sessions get more turns for multi-step autonomous work
+TURN_LIMITS: Dict[str, int] = {
+    "chat": 8,
+    "task": 16,
+}
+
 
 def _build_messages(
     history: List[Dict[str, Any]],
@@ -64,6 +70,7 @@ def _litellm_kwargs() -> Dict[str, Any]:
 async def run_agent(
     messages: List[Dict[str, Any]],
     user_context: UserContext,
+    mode: str = "chat",
 ) -> str:
     """
     Run the agent loop (non-streaming).
@@ -71,11 +78,16 @@ async def run_agent(
     Continues calling the LLM until it produces a final text response
     with no pending tool calls.
 
+    Args:
+        messages: Conversation history (user/assistant turns, no system message).
+        user_context: User identity, persona, and access controls.
+        mode: "chat" (default, 8 turns) or "task" (16 turns for autonomous work).
+
     Returns the assistant's final response as a plain string.
     """
     tools = get_tools_for_user(user_context)
     history = list(messages)
-    max_turns = 8  # Guard against infinite tool-call loops
+    max_turns = TURN_LIMITS.get(mode, 8)
     extra = _litellm_kwargs()
 
     for turn in range(max_turns):

@@ -156,9 +156,12 @@ class MemoryService:
                 except Exception:
                     log.warning("memory.tier3_failed", exc_info=True)
 
-        # Record access for all returned memories (fire-and-forget)
+        # Record access for all returned memories (fire-and-forget).
+        # Pass IDs only — _record_accesses opens its own session so the
+        # caller's session can close without racing the background task.
         import asyncio
-        asyncio.create_task(self._record_accesses(db, results))
+        if results:
+            asyncio.create_task(self._record_accesses([m.id for m in results]))
 
         return results
 
@@ -240,21 +243,26 @@ class MemoryService:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _record_accesses(self, db: AsyncSession, memories: list[Memory]) -> None:
+    async def _record_accesses(self, memory_ids: list[int]) -> None:
         """
         Nudge importance up for each accessed memory and increment access_count.
-        Runs as a background task so retrieval latency is unaffected.
+        Runs as a fire-and-forget background task (never blocks retrieval).
 
-        Importance calibration: high access_count keeps score meaningful.
-        Memories never retrieved over 30 days become pruning candidates.
+        Opens its own session so the caller's session can close independently
+        without causing a state-change race on the shared connection.
         """
-        if not memories:
+        if not memory_ids:
             return
         try:
-            async with db.begin_nested():
-                for m in memories:
+            from app.db.session import AsyncSessionLocal
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(Memory).where(Memory.id.in_(memory_ids))
+                )
+                for m in result.scalars().all():
                     m.access_count = (m.access_count or 0) + 1
                     m.importance = min(1.0, (m.importance or 0.5) + IMPORTANCE_NUDGE)
+                await db.commit()
         except Exception:
             log.warning("memory.record_access_failed", exc_info=True)
 
