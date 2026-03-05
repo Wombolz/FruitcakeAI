@@ -299,7 +299,7 @@ async def get_audit_log(
     return {"count": len(entries), "entries": entries}
 
 
-@router.get("/admin/task-runs", tags=["admin"])
+@router.get("/task-runs", tags=["admin"])
 async def task_runs(
     limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
