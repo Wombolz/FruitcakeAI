@@ -75,7 +75,7 @@ async def test_webhook_trigger_accepts_and_enqueues(client):
     cfg = create.json()
 
     with patch("app.api.webhooks._execute_webhook", new=AsyncMock()) as execute_mock:
-        resp = await client.post(f"/webhooks/{cfg['webhook_key']}", json={"event": "push"})
+        resp = await client.post(f"/webhooks/trigger/{cfg['webhook_key']}", json={"event": "push"})
         assert resp.status_code == 202
         assert resp.json()["accepted"] is True
         execute_mock.assert_awaited_once_with(cfg["id"], {"event": "push"})
@@ -92,7 +92,7 @@ async def test_webhook_trigger_rejects_invalid_json(client):
     cfg = create.json()
 
     resp = await client.post(
-        f"/webhooks/{cfg['webhook_key']}",
+        f"/webhooks/trigger/{cfg['webhook_key']}",
         content="{not-json",
         headers={"Content-Type": "application/json"},
     )
@@ -110,7 +110,7 @@ async def test_webhook_trigger_inactive_key_not_found(client):
     )
     cfg = create.json()
 
-    resp = await client.post(f"/webhooks/{cfg['webhook_key']}", json={"event": "x"})
+    resp = await client.post(f"/webhooks/trigger/{cfg['webhook_key']}", json={"event": "x"})
     assert resp.status_code == 404
 
 

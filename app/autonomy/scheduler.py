@@ -121,7 +121,7 @@ def _parse_cron(expr: str, after: datetime) -> Optional[datetime]:
             and _cron_match(candidate.hour, hour_f, 0, 23)
             and _cron_match(candidate.day, dom_f, 1, 31)
             and _cron_match(candidate.month, month_f, 1, 12)
-            and _cron_match(cron_dow, dow_f, 0, 7)
+            and _cron_match(cron_dow, dow_f, 0, 7, sunday7=True)
         ):
             return candidate
         # When minute/hour already matched, skip ahead to avoid minute-by-minute crawl
@@ -135,7 +135,7 @@ def _parse_cron(expr: str, after: datetime) -> Optional[datetime]:
     return None
 
 
-def _cron_match(value: int, field: str, min_val: int, max_val: int) -> bool:
+def _cron_match(value: int, field: str, min_val: int, max_val: int, sunday7: bool = False) -> bool:
     """
     Return True if `value` satisfies the cron field expression.
 
@@ -156,11 +156,19 @@ def _cron_match(value: int, field: str, min_val: int, max_val: int) -> bool:
                 return True
         elif "-" in part:
             lo, hi = part.split("-", 1)
-            if int(lo) <= value <= int(hi):
+            lo_i, hi_i = int(lo), int(hi)
+            # Normalise Sunday alias in range bounds before comparing
+            if sunday7 and value == 0:
+                if lo_i <= 7 <= hi_i or lo_i <= 0 <= hi_i:
+                    return True
+            elif int(lo) <= value <= int(hi):
                 return True
         else:
             try:
                 n = int(part)
+                # Treat 7 as Sunday (0) when sunday7 is set
+                if sunday7 and n == 7:
+                    n = 0
                 if n == value:
                     return True
             except ValueError:

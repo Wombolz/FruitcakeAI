@@ -1,10 +1,10 @@
 """
 FruitcakeAI v5 — Webhooks API (Phase 5.1)
 
-POST   /webhooks/{key}    Inbound trigger (external, no auth)
-GET    /webhooks          List current user's webhook configs
-POST   /webhooks          Create webhook config
-DELETE /webhooks/{id}     Delete webhook config
+POST   /webhooks/trigger/{key}   Inbound trigger (external, no auth)
+GET    /webhooks                 List current user's webhook configs
+POST   /webhooks                 Create webhook config
+DELETE /webhooks/{id}            Delete webhook config
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ class WebhookTriggerOut(BaseModel):
 
 # ── Public trigger endpoint (no auth) ────────────────────────────────────────
 
-@router.post("/webhooks/{webhook_key}", response_model=WebhookTriggerOut, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/webhooks/trigger/{webhook_key}", response_model=WebhookTriggerOut, status_code=status.HTTP_202_ACCEPTED)
 async def trigger_webhook(
     webhook_key: str,
     request: Request,
@@ -171,6 +171,13 @@ async def _parse_payload(request: Request) -> Dict[str, Any]:
 async def _execute_webhook(webhook_id: int, payload: Dict[str, Any]) -> None:
     """Execute webhook instruction in an isolated agent session."""
     # Load webhook + owner and create hidden task-style session
+    # Extract needed values before session closes to avoid DetachedInstanceError
+    session_id: Optional[int] = None
+    user_id: Optional[int] = None
+    persona: Optional[str] = None
+    cfg_name: Optional[str] = None
+    cfg_instruction: Optional[str] = None
+
     async with AsyncSessionLocal() as db:
         cfg = await db.get(WebhookConfig, webhook_id)
         if cfg is None or not cfg.active:
@@ -181,25 +188,36 @@ async def _execute_webhook(webhook_id: int, payload: Dict[str, Any]) -> None:
             log.warning("webhook.user_not_found", webhook_id=webhook_id, user_id=cfg.user_id)
             return
 
+        persona = user.persona or "family_assistant"
+        cfg_name = cfg.name
+        cfg_instruction = cfg.instruction
+
         session = ChatSession(
             user_id=user.id,
-            title=f"[Webhook] {cfg.name}",
-            persona=user.persona or "family_assistant",
+            title=f"[Webhook] {cfg_name}",
+            persona=persona,
             is_task_session=True,
         )
         db.add(session)
         await db.flush()
         session_id = session.id
+        user_id = user.id
         await db.commit()
 
-    user_context = UserContext.from_user(user, persona_name=user.persona or "family_assistant")
+    # Re-fetch user and build context while session is open; user becomes detached after
+    async with AsyncSessionLocal() as db:
+        user = await db.get(User, user_id)
+        if user is None:
+            log.warning("webhook.user_not_found", webhook_id=webhook_id, user_id=user_id)
+            return
+        user_context = UserContext.from_user(user, persona_name=persona)
     user_context.session_id = session_id
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload_json = json.dumps(payload, ensure_ascii=True, sort_keys=True)
     prompt = (
-        f"[Webhook: {cfg.name}]\n"
-        f"{cfg.instruction}\n\n"
+        f"[Webhook: {cfg_name}]\n"
+        f"{cfg_instruction}\n\n"
         f"Current time: {now}\n"
         f"Webhook payload JSON: {payload_json}"
     )

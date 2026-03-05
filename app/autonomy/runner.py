@@ -55,6 +55,10 @@ class TaskRunner:
         from app.db.session import AsyncSessionLocal
 
         # Phase 1: Re-fetch and mark running
+        # Extract title and deliver before session closes to avoid DetachedInstanceError
+        task_title: Optional[str] = None
+        task_deliver: bool = False
+
         async with AsyncSessionLocal() as db:
             task = await db.get(Task, task_id)
             if task is None:
@@ -63,10 +67,12 @@ class TaskRunner:
             if task.status not in ("pending",):
                 log.info("task.skip_non_pending", task_id=task_id, status=task.status)
                 return
+            task_title = task.title
+            task_deliver = task.deliver
             task.status = "running"
             await db.commit()
 
-        log.info("task.started", task_id=task_id, title=task.title)
+        log.info("task.started", task_id=task_id, title=task_title)
 
         try:
             result = await self._execute_agent(task_id)
@@ -104,7 +110,7 @@ class TaskRunner:
             log.info("task.completed", task_id=task_id, result_len=len(result or ""))
 
             # Phase 7: Deliver result (APNs stub — real push wired in Sprint 4.3)
-            if task.deliver and result:
+            if task_deliver and result:
                 await self._push(task_id, result)
 
         except ApprovalRequired as exc:
@@ -130,7 +136,15 @@ class TaskRunner:
         from app.agent.core import run_agent
         from app.memory.service import get_memory_service
 
-        # Load task + user
+        # Load task + user; extract values before session closes to avoid DetachedInstanceError
+        persona_name: Optional[str] = None
+        session_id: Optional[int] = None
+        task_user_id: Optional[int] = None
+        task_instruction: Optional[str] = None
+        task_title: Optional[str] = None
+        task_requires_approval: bool = False
+        pre_approved = False
+
         async with AsyncSessionLocal() as db:
             task = await db.get(Task, task_id)
             user = await db.get(User, task.user_id)
@@ -143,11 +157,17 @@ class TaskRunner:
                 task.error = None  # clear the sentinel
                 await db.commit()
 
+            persona_name = user.persona or "family_assistant"
+            task_user_id = task.user_id
+            task_instruction = task.instruction
+            task_title = task.title
+            task_requires_approval = task.requires_approval
+
             # Create isolated task session (excluded from chat UI session list)
             session = ChatSession(
                 user_id=task.user_id,
-                title=f"[Task] {task.title}",
-                persona=user.persona or "family_assistant",
+                title=f"[Task] {task_title}",
+                persona=persona_name,
                 is_task_session=True,
             )
             db.add(session)
@@ -158,19 +178,21 @@ class TaskRunner:
             task.last_session_id = session_id
             await db.commit()
 
-        # Build UserContext
+        # Build UserContext (re-fetch user while session open so from_user can read attributes)
         from app.agent.context import UserContext
-        from app.agent.persona_loader import get_persona
 
-        persona_name = user.persona or "family_assistant"
-        user_context = UserContext.from_user(user, persona_name=persona_name)
+        async with AsyncSessionLocal() as db:
+            user = await db.get(User, task_user_id)
+            if user is None:
+                raise ValueError(f"User {task_user_id} not found for task {task_id}")
+            user_context = UserContext.from_user(user, persona_name=persona_name)
         user_context.session_id = session_id
 
         # Retrieve memories for this user
         async with AsyncSessionLocal() as db:
             svc = get_memory_service()
             memories = await svc.retrieve_for_context(
-                db, task.user_id, query=task.instruction
+                db, task_user_id, query=task_instruction
             )
 
         # Compose prompt: memory context → task header → instruction → timestamp
@@ -180,14 +202,14 @@ class TaskRunner:
         if memories:
             parts.append(svc.format_for_prompt(memories))
 
-        parts.append(f"[Task: {task.title}]")
-        parts.append(task.instruction)
+        parts.append(f"[Task: {task_title}]")
+        parts.append(task_instruction)
         parts.append(f"\nCurrent time: {now_str}")
 
         messages = [{"role": "user", "content": "\n\n".join(parts)}]
 
         # Arm the approval gate if this task requires it (and isn't pre-approved)
-        arm_approval = task.requires_approval and not pre_approved
+        arm_approval = task_requires_approval and not pre_approved
         token = _approval_armed.set(arm_approval)
 
         try:

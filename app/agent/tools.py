@@ -464,9 +464,8 @@ async def _create_memory(
             expires_at=expires_at,
         )
         await db.commit()
+        if isinstance(result, str):
+            return result
+        memory_id = result.id  # capture before session closes to avoid DetachedInstanceError
 
-    if isinstance(result, str):
-        # Dedup suppression message
-        return result
-
-    return f"Memory saved (id={result.id}, type={memory_type})."
+    return f"Memory saved (id={memory_id}, type={memory_type})."
