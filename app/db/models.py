@@ -301,6 +301,10 @@ class Task(Base):
     # approval request to the user's device before proceeding.
     requires_approval = Column(Boolean, default=False, nullable=False)
 
+    # Set to True by PATCH /tasks/{id} {"approved": true} so the runner knows
+    # to skip the approval gate on the next execution without overloading error.
+    pre_approved = Column(Boolean, default=False, nullable=False)
+
     # Captured last agent output text
     result = Column(Text)
     error = Column(Text)

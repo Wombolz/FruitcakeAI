@@ -91,6 +91,7 @@ def upgrade() -> None:
             sa.Column("schedule", sa.String(100), nullable=True),
             sa.Column("deliver", sa.Boolean(), nullable=False, server_default="true"),
             sa.Column("requires_approval", sa.Boolean(), nullable=False, server_default="false"),
+            sa.Column("pre_approved", sa.Boolean(), nullable=False, server_default="false"),
             sa.Column("result", sa.Text(), nullable=True),
             sa.Column("error", sa.Text(), nullable=True),
             sa.Column("active_hours_start", sa.String(5), nullable=True),
@@ -109,6 +110,23 @@ def upgrade() -> None:
         op.create_index("ix_tasks_status", "tasks", ["status"])
     if not _has_index(inspector, "tasks", "ix_tasks_next_run_at"):
         op.create_index("ix_tasks_next_run_at", "tasks", ["next_run_at"])
+
+    # Idempotent column adds for databases created before this column existed
+    if not _has_column(inspector, "tasks", "pre_approved"):
+        op.add_column(
+            "tasks",
+            sa.Column("pre_approved", sa.Boolean(), nullable=False, server_default="false"),
+        )
+    if not _has_column(inspector, "tasks", "last_session_id"):
+        op.add_column(
+            "tasks",
+            sa.Column(
+                "last_session_id",
+                sa.Integer(),
+                sa.ForeignKey("chat_sessions.id", ondelete="SET NULL"),
+                nullable=True,
+            ),
+        )
 
     # ── device_tokens ─────────────────────────────────────────────────────────
     if "device_tokens" not in existing_tables:

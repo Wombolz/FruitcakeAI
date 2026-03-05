@@ -25,7 +25,7 @@ class ApprovalRequired(Exception):
 # Tools that must pause for user approval before executing.
 # Phase 5 will add "send_email" when the email MCP server is wired.
 APPROVAL_REQUIRED_TOOLS: frozenset[str] = frozenset({
-    "create_calendar_event",
+    "create_event",
 })
 
 # ContextVar: set to True by TaskRunner before calling run_agent() when

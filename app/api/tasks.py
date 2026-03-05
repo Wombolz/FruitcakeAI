@@ -186,11 +186,9 @@ async def update_task(
                 detail=f"Task is not waiting for approval (status={task.status})",
             )
         if body.approved:
-            # Re-schedule for immediate re-run with pre_approved flag
             task.status = "pending"
             task.next_run_at = datetime.now(timezone.utc)
-            # The runner checks a task-level flag; signal via error field temporarily
-            task.error = "__pre_approved__"
+            task.pre_approved = True
         else:
             task.status = "cancelled"
         return task

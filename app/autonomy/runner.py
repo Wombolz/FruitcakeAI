@@ -152,9 +152,9 @@ class TaskRunner:
                 raise ValueError(f"User {task.user_id} not found for task {task_id}")
 
             # Check pre-approval flag (set by PATCH /tasks/{id} {"approved": true})
-            pre_approved = task.error == "__pre_approved__"
+            pre_approved = bool(task.pre_approved)
             if pre_approved:
-                task.error = None  # clear the sentinel
+                task.pre_approved = False
                 await db.commit()
 
             persona_name = user.persona or "family_assistant"

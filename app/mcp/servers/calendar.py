@@ -333,7 +333,7 @@ def _compute_dates(args: Dict[str, Any]) -> str:
 
     lines = [f"Computed dates for '{pattern}' ({count} occurrences):\n"]
     for i, d in enumerate(results, 1):
-        lines.append(f"{i}. {d.strftime('%A, %B %-d, %Y')} ({d.isoformat()})")
+        lines.append(f"{i}. {d.strftime('%A, %B')} {d.day}, {d.year} ({d.isoformat()})")
     return "\n".join(lines)
 
 
