@@ -34,6 +34,18 @@ else
   done
 fi
 
+echo "▶ Activating Python environment..."
+if [ ! -d ".venv" ]; then
+  echo "  .venv not found — creating it once..."
+  python3 -m venv .venv
+  source .venv/bin/activate
+  echo "  Installing dependencies (first-time setup)..."
+  pip install -q -r requirements.txt
+else
+  source .venv/bin/activate
+  echo "  Using existing .venv (dependency install skipped)."
+fi
+
 echo "▶ Running Alembic migrations..."
 alembic upgrade head
 

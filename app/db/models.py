@@ -282,6 +282,8 @@ class Task(Base):
 
     title = Column(String(255), nullable=False)
     instruction = Column(Text, nullable=False)  # natural language prompt for the agent
+    # Optional per-task persona override/resolution target.
+    persona = Column(String(100), nullable=True)
 
     # "one_shot" | "recurring"
     task_type = Column(String(20), nullable=False, default="one_shot")
@@ -336,6 +338,12 @@ class Task(Base):
         back_populates="task",
         cascade="all, delete-orphan",
         order_by="TaskStep.step_index",
+    )
+    runs = relationship(
+        "TaskRun",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TaskRun.started_at.desc()",
     )
 
     def __repr__(self):
@@ -411,6 +419,28 @@ class TaskStep(Base):
 
     def __repr__(self):
         return f"<TaskStep(task_id={self.task_id}, idx={self.step_index}, status='{self.status}')>"
+
+
+class TaskRun(Base):
+    """Execution record for one task run attempt."""
+    __tablename__ = "task_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="SET NULL"))
+
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    finished_at = Column(DateTime(timezone=True))
+
+    # "running" | "completed" | "failed" | "waiting_approval" | "cancelled"
+    status = Column(String(30), nullable=False, default="running")
+    error = Column(Text)
+    summary = Column(Text)
+
+    task = relationship("Task", back_populates="runs")
+
+    def __repr__(self):
+        return f"<TaskRun(task_id={self.task_id}, status='{self.status}')>"
 
 
 # ---------------------------------------------------------------------------

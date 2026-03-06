@@ -24,6 +24,7 @@ import pytest
 import yaml
 
 from app.mcp.registry import MCPRegistry, _extract_text, _to_litellm_schema
+from app.mcp.client import MCPClient
 
 
 # ── _to_litellm_schema ─────────────────────────────────────────────────────────
@@ -218,3 +219,18 @@ async def test_registry_get_status(fake_config: Path):
     assert status["tool_count"] == 1
     tool_names = [t["name"] for t in status["tools"]]
     assert "status_tool" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_stdio_reader_waits_for_matching_response_id():
+    client = MCPClient(server_name="test", command="docker", args=["run", "fake"])
+    client._read = AsyncMock(side_effect=[
+        {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"message": "working"}},
+        {"jsonrpc": "2.0", "id": 999, "result": {"ignored": True}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}},
+    ])
+
+    msg = await client._read_response(request_id=2, timeout=1.0)
+    assert msg is not None
+    assert msg.get("id") == 2
+    assert msg["result"]["ok"] is True

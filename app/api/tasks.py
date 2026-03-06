@@ -17,14 +17,16 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import json
 
+from app.agent.persona_loader import list_personas, persona_exists
+from app.agent.persona_router import infer_persona_for_task
 from app.autonomy.planner import create_task_plan_for_user
 from app.auth.dependencies import get_current_user
-from app.db.models import AuditLog, Task, TaskStep, User
+from app.db.models import AuditLog, Task, TaskRun, TaskStep, User
 from app.db.session import get_db
 
 router = APIRouter()
@@ -35,6 +37,7 @@ router = APIRouter()
 class TaskCreate(BaseModel):
     title: str
     instruction: str
+    persona: Optional[str] = None
     task_type: str = "one_shot"          # "one_shot" | "recurring"
     schedule: Optional[str] = None       # "every:30m" | cron | ISO timestamp
     deliver: bool = True
@@ -47,6 +50,7 @@ class TaskCreate(BaseModel):
 class TaskPatch(BaseModel):
     title: Optional[str] = None
     instruction: Optional[str] = None
+    persona: Optional[str] = None
     schedule: Optional[str] = None
     deliver: Optional[bool] = None
     requires_approval: Optional[bool] = None
@@ -61,6 +65,7 @@ class TaskOut(BaseModel):
     id: int
     title: str
     instruction: str
+    persona: Optional[str]
     task_type: str
     status: str
     schedule: Optional[str]
@@ -73,6 +78,8 @@ class TaskOut(BaseModel):
     active_hours_tz: Optional[str]
     retry_count: int
     current_step_index: Optional[int]
+    current_step_title: Optional[str]
+    waiting_approval_tool: Optional[str]
     has_plan: bool
     plan_version: int
     created_at: Optional[datetime]
@@ -132,10 +139,16 @@ async def create_task(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    resolved_persona = _resolve_task_persona(
+        title=body.title,
+        instruction=body.instruction,
+        requested_persona=body.persona,
+    )
     task = Task(
         user_id=current_user.id,
         title=body.title,
         instruction=body.instruction,
+        persona=resolved_persona,
         task_type=body.task_type,
         status="pending",
         schedule=body.schedule,
@@ -148,7 +161,7 @@ async def create_task(
     )
     db.add(task)
     await db.flush()
-    return task
+    return _to_task_out(task, None)
 
 
 @router.get("/tasks", response_model=List[TaskOut])
@@ -161,7 +174,9 @@ async def list_tasks(
         .where(Task.user_id == current_user.id)
         .order_by(desc(Task.created_at))
     )
-    return result.scalars().all()
+    tasks = result.scalars().all()
+    step_lookup = await _load_current_steps(db, tasks)
+    return [_to_task_out(task, step_lookup.get((task.id, task.current_step_index))) for task in tasks]
 
 
 @router.get("/tasks/{task_id}", response_model=TaskOut)
@@ -171,7 +186,8 @@ async def get_task(
     db: AsyncSession = Depends(get_db),
 ):
     task = await _get_owned_task(task_id, current_user.id, db)
-    return task
+    step_lookup = await _load_current_steps(db, [task])
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
 
 
 @router.patch("/tasks/{task_id}", response_model=TaskOut)
@@ -182,6 +198,8 @@ async def update_task(
     db: AsyncSession = Depends(get_db),
 ):
     task = await _get_owned_task(task_id, current_user.id, db)
+    title_changed = False
+    instruction_changed = False
 
     # Approval flow
     if body.approved is not None:
@@ -196,13 +214,22 @@ async def update_task(
             task.pre_approved = True
         else:
             task.status = "cancelled"
-        return task
+        step_lookup = await _load_current_steps(db, [task])
+        return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
 
     # Field updates
     if body.title is not None:
         task.title = body.title
+        title_changed = True
     if body.instruction is not None:
         task.instruction = body.instruction
+        instruction_changed = True
+    if body.persona is not None:
+        task.persona = _resolve_task_persona(
+            title=task.title,
+            instruction=task.instruction,
+            requested_persona=body.persona,
+        )
     if body.deliver is not None:
         task.deliver = body.deliver
     if body.requires_approval is not None:
@@ -216,8 +243,12 @@ async def update_task(
     if body.schedule is not None:
         task.schedule = body.schedule
         task.next_run_at = _compute_next_run_at(body.schedule)
+    if body.persona is None and (title_changed or instruction_changed) and not task.persona:
+        inferred, _, _ = infer_persona_for_task(task.title, task.instruction)
+        task.persona = inferred
 
-    return task
+    step_lookup = await _load_current_steps(db, [task])
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
 
 
 @router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -227,7 +258,67 @@ async def cancel_task(
     db: AsyncSession = Depends(get_db),
 ):
     task = await _get_owned_task(task_id, current_user.id, db)
+    if task.status == "running":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Task is running. Stop it before deleting.",
+        )
+    await db.delete(task)
+
+
+@router.post("/tasks/{task_id}/stop", response_model=TaskOut)
+async def stop_task(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    task = await _get_owned_task(task_id, current_user.id, db)
+
+    if task.status in {"completed", "failed", "cancelled"}:
+        step_lookup = await _load_current_steps(db, [task])
+        return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
+
+    from app.autonomy.runner import get_task_runner
+
+    await get_task_runner().request_stop(task.id)
+
+    now = datetime.now(timezone.utc)
     task.status = "cancelled"
+    task.next_run_at = None
+    task.next_retry_at = None
+    task.pre_approved = False
+    task.last_run_at = now
+    task.error = "Stopped by user"
+
+    if task.current_step_index is not None:
+        rows = await db.execute(
+            select(TaskStep).where(
+                TaskStep.task_id == task.id,
+                TaskStep.step_index == task.current_step_index,
+            )
+        )
+        step = rows.scalar_one_or_none()
+        if step is not None and step.status in {"pending", "running", "waiting_approval"}:
+            step.status = "skipped"
+            step.error = "Stopped by user"
+            step.waiting_approval_tool = None
+
+    run_rows = await db.execute(
+        select(TaskRun)
+        .where(
+            TaskRun.task_id == task.id,
+            TaskRun.status.in_(["running", "waiting_approval"]),
+        )
+        .order_by(desc(TaskRun.started_at))
+    )
+    run = run_rows.scalars().first()
+    if run is not None:
+        run.status = "cancelled"
+        run.finished_at = now
+        run.error = "Stopped by user"
+
+    step_lookup = await _load_current_steps(db, [task])
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
 
 
 @router.post("/tasks/{task_id}/run", response_model=Dict[str, Any])
@@ -291,7 +382,8 @@ async def reset_task(
         task.next_run_at = datetime.now(timezone.utc)
     else:
         task.status = "cancelled"
-    return task
+    step_lookup = await _load_current_steps(db, [task])
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
 
 
 # ── GET /tasks/{id}/audit ─────────────────────────────────────────────────────
@@ -457,3 +549,66 @@ async def _get_owned_task(task_id: int, user_id: int, db: AsyncSession) -> Task:
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
     return task
+
+
+def _to_task_out(task: Task, current_step: Optional[TaskStep]) -> TaskOut:
+    waiting_tool: Optional[str] = None
+    if task.status == "waiting_approval" and current_step is not None:
+        waiting_tool = current_step.waiting_approval_tool
+
+    return TaskOut(
+        id=task.id,
+        title=task.title,
+        instruction=task.instruction,
+        persona=task.persona,
+        task_type=task.task_type,
+        status=task.status,
+        schedule=task.schedule,
+        deliver=task.deliver,
+        requires_approval=task.requires_approval,
+        result=task.result,
+        error=task.error,
+        active_hours_start=task.active_hours_start,
+        active_hours_end=task.active_hours_end,
+        active_hours_tz=task.active_hours_tz,
+        retry_count=task.retry_count,
+        current_step_index=task.current_step_index,
+        current_step_title=current_step.title if current_step is not None else None,
+        waiting_approval_tool=waiting_tool,
+        has_plan=task.has_plan,
+        plan_version=task.plan_version,
+        created_at=task.created_at,
+        last_run_at=task.last_run_at,
+        next_run_at=task.next_run_at,
+    )
+
+
+def _resolve_task_persona(*, title: str, instruction: str, requested_persona: Optional[str]) -> str:
+    explicit = (requested_persona or "").strip()
+    if explicit:
+        if not persona_exists(explicit):
+            available = ", ".join(list_personas().keys())
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown persona '{explicit}'. Available: {available}",
+            )
+        return explicit
+
+    inferred, _, _ = infer_persona_for_task(title, instruction)
+    return inferred
+
+
+async def _load_current_steps(db: AsyncSession, tasks: List[Task]) -> Dict[tuple[int, int], TaskStep]:
+    keys = [
+        (task.id, task.current_step_index)
+        for task in tasks
+        if task.current_step_index is not None
+    ]
+    if not keys:
+        return {}
+
+    rows = await db.execute(
+        select(TaskStep).where(tuple_(TaskStep.task_id, TaskStep.step_index).in_(keys))
+    )
+    steps = rows.scalars().all()
+    return {(step.task_id, step.step_index): step for step in steps}

@@ -24,7 +24,7 @@ import structlog
 
 from app.autonomy.approval import ApprovalRequired, _approval_armed
 from app.autonomy.scheduler import compute_next_run_at
-from app.db.models import Task, TaskStep
+from app.db.models import Task, TaskRun, TaskStep
 
 log = structlog.get_logger(__name__)
 
@@ -43,9 +43,26 @@ class TaskRunner:
     API endpoint. The semaphore ensures at most 2 tasks run concurrently.
     """
 
+    def __init__(self) -> None:
+        self._active_runs: dict[int, asyncio.Task] = {}
+        self._active_lock = asyncio.Lock()
+
     async def execute(self, task: Task) -> None:
         async with _semaphore:
             await self._run(task.id)
+
+    async def request_stop(self, task_id: int) -> bool:
+        """
+        Request cancellation of an actively running task coroutine.
+
+        Returns True when a live run was found and cancellation was signaled.
+        """
+        async with self._active_lock:
+            run_task = self._active_runs.get(task_id)
+        if run_task is None or run_task.done():
+            return False
+        run_task.cancel()
+        return True
 
     # ------------------------------------------------------------------
     # Core execution pipeline
@@ -59,24 +76,34 @@ class TaskRunner:
         # Extract title and deliver before session closes to avoid DetachedInstanceError
         task_title: Optional[str] = None
         task_deliver: bool = False
+        task_run_id: Optional[int] = None
 
-        async with AsyncSessionLocal() as db:
-            task = await db.get(Task, task_id)
-            if task is None:
-                log.warning("task.not_found", task_id=task_id)
-                return
-            if task.status not in ("pending",):
-                log.info("task.skip_non_pending", task_id=task_id, status=task.status)
-                return
-            task_title = task.title
-            task_deliver = task.deliver
-            task.status = "running"
-            await db.commit()
-
-        log.info("task.started", task_id=task_id, title=task_title)
+        current = asyncio.current_task()
+        async with self._active_lock:
+            if current is not None:
+                self._active_runs[task_id] = current
 
         try:
-            result = await self._execute_agent(task_id)
+            async with AsyncSessionLocal() as db:
+                task = await db.get(Task, task_id)
+                if task is None:
+                    log.warning("task.not_found", task_id=task_id)
+                    return
+                if task.status not in ("pending",):
+                    log.info("task.skip_non_pending", task_id=task_id, status=task.status)
+                    return
+                task_title = task.title
+                task_deliver = task.deliver
+                task.status = "running"
+                run = TaskRun(task_id=task.id, status="running")
+                db.add(run)
+                await db.flush()
+                task_run_id = run.id
+                await db.commit()
+
+            log.info("task.started", task_id=task_id, title=task_title)
+
+            result = await self._execute_agent(task_id, task_run_id=task_run_id)
 
             # Phase 6a: Success — update task record
             async with AsyncSessionLocal() as db:
@@ -88,10 +115,23 @@ class TaskRunner:
                 task.last_run_at = datetime.now(timezone.utc)
                 task.retry_count = 0
 
+                recurring_snapshot = ""
                 if task.task_type == "recurring" and task.schedule:
-                    await self._reset_steps_for_new_run(db, task.id)
+                    recurring_snapshot = await self._reset_steps_for_new_run(db, task.id)
                     task.next_run_at = compute_next_run_at(task.schedule)
                     task.status = "pending"   # re-queue for next run
+
+                if task_run_id:
+                    run = await db.get(TaskRun, task_run_id)
+                    if run is not None:
+                        run.status = "completed"
+                        run.finished_at = datetime.now(timezone.utc)
+                        run.error = None
+                        if recurring_snapshot:
+                            merged = f"{(result or '').strip()}\n\n{recurring_snapshot}".strip()
+                            run.summary = merged[:4000]
+                        else:
+                            run.summary = (result or "")[:1000]
 
                 # Save instruction + result as messages so the session is browsable
                 # and "Reply in Chat" can load real context.
@@ -115,6 +155,9 @@ class TaskRunner:
             if task_deliver and result:
                 await self._push(task_id, result)
 
+        except asyncio.CancelledError:
+            await self._handle_cancelled(task_id, task_run_id=task_run_id)
+
         except ApprovalRequired as exc:
             # The approval gate was triggered — persist waiting_approval state
             async with AsyncSessionLocal() as db:
@@ -132,21 +175,32 @@ class TaskRunner:
                     if step is not None:
                         step.status = "waiting_approval"
                         step.waiting_approval_tool = str(exc)
+                if task_run_id:
+                    run = await db.get(TaskRun, task_run_id)
+                    if run is not None:
+                        run.status = "waiting_approval"
+                        run.finished_at = datetime.now(timezone.utc)
+                        run.error = str(exc)
                 await db.commit()
             log.info("task.waiting_approval", task_id=task_id, blocked_tool=str(exc))
 
         except Exception as exc:
-            await self._handle_error(task_id, exc)
+            await self._handle_error(task_id, exc, task_run_id=task_run_id)
+        finally:
+            async with self._active_lock:
+                if self._active_runs.get(task_id) is current:
+                    self._active_runs.pop(task_id, None)
 
     # ------------------------------------------------------------------
     # Agent execution in isolated session
     # ------------------------------------------------------------------
 
-    async def _execute_agent(self, task_id: int) -> str:
+    async def _execute_agent(self, task_id: int, task_run_id: Optional[int] = None) -> str:
         from sqlalchemy import select
         from app.db.session import AsyncSessionLocal
         from app.db.models import ChatSession, User
         from app.agent.core import run_agent
+        from app.autonomy.planner import create_task_plan_for_user
         from app.memory.service import get_memory_service
 
         # Load task + user; extract values before session closes to avoid DetachedInstanceError
@@ -171,12 +225,40 @@ class TaskRunner:
                 task.pre_approved = False
                 await db.commit()
 
-            persona_name = user.persona or "family_assistant"
+            from app.autonomy.execution_profile import resolve_execution_profile
+            resolved = resolve_execution_profile(task, user)
+            persona_name = resolved.persona
             task_user_id = task.user_id
             task_instruction = task.instruction
             task_title = task.title
             task_requires_approval = task.requires_approval
             has_plan = bool(task.has_plan)
+            # Lazy backfill: persist inferred/defaulted persona for legacy tasks.
+            if not task.persona:
+                task.persona = persona_name
+                await db.flush()
+            log.info(
+                "task.execution_profile",
+                task_id=task.id,
+                persona=persona_name,
+                allowed_tools_count=len(resolved.allowed_tools),
+                blocked_tools_count=len(resolved.blocked_tools),
+            )
+
+            # Scheduled/autonomous tasks without a plan get an explicit plan once.
+            if not has_plan and self._should_auto_plan(task):
+                plan_goal = (task.title or task.instruction or "").strip() or "Scheduled task"
+                await create_task_plan_for_user(
+                    db,
+                    task_id=task.id,
+                    user_id=task.user_id,
+                    goal=plan_goal,
+                    max_steps=6,
+                    notes=task.instruction or "",
+                    style="concise",
+                )
+                has_plan = bool(task.has_plan)
+                log.info("task.auto_planned", task_id=task.id, has_plan=has_plan)
 
             # Reuse existing task session when resuming from waiting_approval.
             if task.last_session_id and task.status == "pending":
@@ -194,6 +276,10 @@ class TaskRunner:
                 await db.flush()
                 session_id = session.id
                 task.last_session_id = session_id
+            if task_run_id:
+                run = await db.get(TaskRun, task_run_id)
+                if run is not None:
+                    run.session_id = session_id
             await db.commit()
 
         # Build UserContext (re-fetch user while session open so from_user can read attributes)
@@ -243,6 +329,10 @@ class TaskRunner:
             return await run_agent([{"role": "user", "content": "\n\n".join(parts)}], user_context, mode="task")
         finally:
             _approval_armed.reset(token)
+
+    @staticmethod
+    def _should_auto_plan(task: Task) -> bool:
+        return bool(task.schedule) or task.task_type == "recurring"
 
     async def _execute_planned_steps(
         self,
@@ -360,24 +450,26 @@ class TaskRunner:
                 task.current_step_index = step.step_index + 1
                 await db.commit()
 
-        # Build final result from summaries to keep it compact.
+        # Final output should be the final synthesis step output, not joined
+        # truncated summaries from intermediate steps.
         async with AsyncSessionLocal() as db:
-            rows = await db.execute(
-                select(TaskStep)
-                .where(TaskStep.task_id == task_id)
-                .order_by(TaskStep.step_index)
-            )
-            finished = rows.scalars().all()
-            summaries = [s.output_summary for s in finished if s.output_summary]
-            if summaries:
-                final_result = "\n".join(summaries)
+            if not final_result:
+                rows = await db.execute(
+                    select(TaskStep)
+                    .where(TaskStep.task_id == task_id, TaskStep.result.isnot(None))
+                    .order_by(TaskStep.step_index.desc())
+                    .limit(1)
+                )
+                last_with_result = rows.scalar_one_or_none()
+                if last_with_result is not None:
+                    final_result = last_with_result.result or ""
             task = await db.get(Task, task_id)
             task.current_step_index = None
             await db.commit()
 
         return final_result
 
-    async def _reset_steps_for_new_run(self, db, task_id: int) -> None:
+    async def _reset_steps_for_new_run(self, db, task_id: int) -> str:
         """Recurring tasks start from a clean step state each run."""
         from sqlalchemy import select
 
@@ -386,7 +478,19 @@ class TaskRunner:
         )
         steps = rows.scalars().all()
         if not steps:
-            return
+            return ""
+
+        snapshot_lines = ["Step snapshot from previous run:"]
+        for step in steps:
+            snapshot_lines.append(f"- Step {step.step_index}: {step.title} [{step.status}]")
+            if step.output_summary:
+                snapshot_lines.append(f"  Summary: {step.output_summary}")
+            elif step.result:
+                trimmed = (step.result[:220] + "...") if len(step.result) > 220 else step.result
+                snapshot_lines.append(f"  Result: {trimmed}")
+            if step.error:
+                snapshot_lines.append(f"  Error: {step.error}")
+        snapshot = "\n".join(snapshot_lines)
 
         for step in steps:
             step.status = "pending"
@@ -397,12 +501,35 @@ class TaskRunner:
 
         task = await db.get(Task, task_id)
         task.current_step_index = 1
+        return snapshot
 
     # ------------------------------------------------------------------
     # Error handling with exponential backoff
     # ------------------------------------------------------------------
 
-    async def _handle_error(self, task_id: int, exc: Exception) -> None:
+    async def _handle_cancelled(self, task_id: int, task_run_id: Optional[int] = None) -> None:
+        from app.db.session import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            task = await db.get(Task, task_id)
+            if task is not None:
+                task.status = "cancelled"
+                task.last_run_at = datetime.now(timezone.utc)
+                task.next_run_at = None
+                task.next_retry_at = None
+                task.error = "Stopped by user"
+
+            if task_run_id:
+                run = await db.get(TaskRun, task_run_id)
+                if run is not None:
+                    run.status = "cancelled"
+                    run.finished_at = datetime.now(timezone.utc)
+                    run.error = "Stopped by user"
+            await db.commit()
+
+        log.info("task.cancelled", task_id=task_id)
+
+    async def _handle_error(self, task_id: int, exc: Exception, task_run_id: Optional[int] = None) -> None:
         from app.db.session import AsyncSessionLocal
 
         log.error("task.failed", task_id=task_id, error=str(exc), exc_info=True)
@@ -429,6 +556,13 @@ class TaskRunner:
                 task.error = str(exc)
                 task.last_run_at = datetime.now(timezone.utc)
                 log.warning("task.exhausted_retries", task_id=task_id)
+
+            if task_run_id:
+                run = await db.get(TaskRun, task_run_id)
+                if run is not None:
+                    run.status = "failed"
+                    run.finished_at = datetime.now(timezone.utc)
+                    run.error = str(exc)
 
             await db.commit()
 

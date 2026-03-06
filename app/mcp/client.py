@@ -102,9 +102,10 @@ class MCPClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            request_id = self._next_id()
             await self._write({
                 "jsonrpc": "2.0",
-                "id": self._next_id(),
+                "id": request_id,
                 "method": "initialize",
                 "params": {
                     "protocolVersion": "2024-11-05",
@@ -112,7 +113,7 @@ class MCPClient:
                     "clientInfo": {"name": "FruitcakeAI", "version": "5.0"},
                 },
             })
-            response = await self._read()
+            response = await self._read_response(request_id=request_id, timeout=float(self.timeout))
             if response and "result" in response:
                 self._server_info = response["result"]
                 # Required MCP protocol handshake
@@ -146,23 +147,93 @@ class MCPClient:
         line = await self._process.stdout.readline()
         if not line:
             return None
-        try:
-            return json.loads(line.decode().strip())
-        except json.JSONDecodeError:
+
+        first = line.decode(errors="replace").strip()
+        if not first:
             return None
+
+        # MCP stdio commonly uses Content-Length framing.
+        if first.lower().startswith("content-length:"):
+            try:
+                length = int(first.split(":", 1)[1].strip())
+            except Exception:
+                return None
+
+            # Consume remaining headers until blank line.
+            while True:
+                header_line = await self._process.stdout.readline()
+                if not header_line:
+                    return None
+                if header_line in (b"\n", b"\r\n"):
+                    break
+
+            try:
+                payload = await self._process.stdout.readexactly(length)
+                return json.loads(payload.decode(errors="replace"))
+            except Exception:
+                return None
+
+        # Line-delimited JSON (legacy/simple servers).
+        try:
+            return json.loads(first)
+        except json.JSONDecodeError:
+            pass
+
+        # Some servers pretty-print JSON over multiple lines.
+        buffer = first
+        for _ in range(64):
+            next_line = await self._process.stdout.readline()
+            if not next_line:
+                break
+            buffer += "\n" + next_line.decode(errors="replace").rstrip("\r\n")
+            try:
+                return json.loads(buffer)
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    async def _read_response(
+        self,
+        *,
+        request_id: Optional[int],
+        timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Read stdio frames until the matching JSON-RPC response id arrives.
+
+        Notifications/out-of-band frames are ignored.
+        """
+        deadline: Optional[float] = None
+        if timeout is not None:
+            deadline = asyncio.get_running_loop().time() + timeout
+
+        while True:
+            remaining: Optional[float] = None
+            if deadline is not None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+
+            msg = await asyncio.wait_for(self._read(), timeout=remaining)
+            if msg is None:
+                return None
+            if request_id is not None and msg.get("id") != request_id:
+                continue
+            return msg
 
     # ── Tool discovery ────────────────────────────────────────────────────────
 
     async def _discover_tools(self) -> None:
         try:
             if self.transport_type == "stdio":
+                request_id = self._next_id()
                 await self._write({
                     "jsonrpc": "2.0",
-                    "id": self._next_id(),
+                    "id": request_id,
                     "method": "tools/list",
                     "params": {},
                 })
-                response = await self._read()
+                response = await self._read_response(request_id=request_id, timeout=float(self.timeout))
                 if response and "result" in response:
                     self._tools = response["result"].get("tools", [])
             else:
@@ -207,18 +278,21 @@ class MCPClient:
         try:
             if not self._connected or not self._process:
                 raise RuntimeError(f"Not connected to {self.server_name}")
+            request_id = self._next_id()
             await self._write({
                 "jsonrpc": "2.0",
-                "id": self._next_id(),
+                "id": request_id,
                 "method": "tools/call",
                 "params": {"name": tool_name, "arguments": arguments},
             })
-            response = await self._read()
+            response = await self._read_response(request_id=request_id, timeout=float(self.timeout))
             if response and "result" in response:
                 return {"success": True, "result": response["result"]}
             if response and "error" in response:
                 return {"success": False, "error": response["error"].get("message", "Unknown error")}
             return {"success": False, "error": "No response from server"}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"Timed out waiting for server response ({self.timeout}s)"}
         except Exception as e:
             log.error("MCP stdio tool call failed", server=self.server_name, tool=tool_name, error=str(e))
             return {"success": False, "error": str(e)}

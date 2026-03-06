@@ -84,7 +84,28 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "notes": {"type": "string", "description": "Optional constraints or context"},
                     "style": {"type": "string", "description": "Optional style hint: concise or thorough", "default": "concise"},
                 },
-                "required": ["task_id", "goal"],
+                "required": ["goal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_and_run_task_plan",
+            "description": (
+                "Create an ordered task plan and immediately enqueue execution. "
+                "Use this when the user asks you to both plan and run."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer", "description": "Optional existing task ID owned by the user"},
+                    "goal": {"type": "string", "description": "High-level goal for the plan"},
+                    "max_steps": {"type": "integer", "description": "Maximum number of steps to generate", "default": 6},
+                    "notes": {"type": "string", "description": "Optional constraints or context"},
+                    "style": {"type": "string", "description": "Optional style hint: concise or thorough", "default": "concise"},
+                },
+                "required": ["goal"],
             },
         },
     },
@@ -159,9 +180,17 @@ def get_tools_for_user(user_context: UserContext) -> List[Dict[str, Any]]:
 
     registry = get_mcp_registry()
     if registry._is_ready:
-        for tool in registry.get_tools_for_agent():
-            if tool["function"]["name"] not in blocked:
-                tools.append(tool)
+        mcp_tools = registry.get_tools_for_agent()
+        has_web_search = any(t["function"]["name"] == "web_search" for t in mcp_tools)
+        for tool in mcp_tools:
+            tool_name = tool["function"]["name"]
+            if tool_name in blocked:
+                continue
+            # Prefer internal web_search when available to avoid flaky generic
+            # docker search tools hijacking normal web lookup prompts.
+            if has_web_search and tool_name == "search":
+                continue
+            tools.append(tool)
 
     return tools
 
@@ -267,9 +296,24 @@ async def _call_tool(
     if name == "create_task_plan":
         return await _create_task_plan(arguments, user_context)
 
+    if name == "create_and_run_task_plan":
+        return await _create_and_run_task_plan(arguments, user_context)
+
     # Route all other tool calls through the MCP registry
     from app.mcp.registry import get_mcp_registry
     registry = get_mcp_registry()
+
+    # Compatibility bridge: if a model still emits generic "search", route it
+    # through internal web_search when available.
+    if name == "search" and registry.knows_tool("web_search"):
+        mapped_args: Dict[str, Any] = {
+            "query": arguments.get("query", ""),
+            "max_results": arguments.get("max_results", arguments.get("limit", 5)),
+        }
+        if "region" in arguments:
+            mapped_args["region"] = arguments.get("region")
+        return await registry.call_tool("web_search", mapped_args, user_context)
+
     if registry.knows_tool(name):
         return await registry.call_tool(name, arguments, user_context)
 
@@ -498,14 +542,35 @@ async def _create_memory(
 async def _create_task_plan(
     arguments: Dict[str, Any], user_context: UserContext
 ) -> str:
-    """Create TaskStep rows for an existing task owned by this user."""
-    from app.autonomy.planner import create_task_plan_for_user
-    from app.db.session import AsyncSessionLocal
+    return await _plan_task_common(arguments, user_context, run_after=False)
 
-    try:
-        task_id = int(arguments.get("task_id"))
-    except Exception:
-        return "Invalid task_id."
+
+async def _create_and_run_task_plan(
+    arguments: Dict[str, Any], user_context: UserContext
+) -> str:
+    return await _plan_task_common(arguments, user_context, run_after=True)
+
+
+async def _plan_task_common(
+    arguments: Dict[str, Any],
+    user_context: UserContext,
+    run_after: bool,
+) -> str:
+    """Create TaskStep rows for a task; optionally enqueue immediate execution."""
+    from app.agent.persona_router import infer_persona_for_task
+    from app.autonomy.planner import create_task_plan_for_user
+    from app.autonomy.runner import get_task_runner
+    from app.db.models import Task
+    from app.db.session import AsyncSessionLocal
+    from datetime import datetime, timezone
+
+    task_id_raw = arguments.get("task_id")
+    task_id: Optional[int] = None
+    if task_id_raw is not None:
+        try:
+            task_id = int(task_id_raw)
+        except Exception:
+            return "Invalid task_id."
 
     goal = str(arguments.get("goal", "")).strip()
     if not goal:
@@ -519,6 +584,25 @@ async def _create_task_plan(
     style = str(arguments.get("style", "concise") or "concise")
 
     async with AsyncSessionLocal() as db:
+        created_new_task = False
+        if task_id is None:
+            # Chat-first ergonomics: allow planning from goal alone.
+            inferred_persona, _, _ = infer_persona_for_task(goal, notes.strip() or goal)
+            task = Task(
+                user_id=user_context.user_id,
+                title=(goal[:255] or "Planned task"),
+                instruction=notes.strip() or goal,
+                persona=inferred_persona,
+                task_type="one_shot",
+                status="pending",
+                deliver=True,
+                requires_approval=False,
+            )
+            db.add(task)
+            await db.flush()
+            task_id = task.id
+            created_new_task = True
+
         try:
             result = await create_task_plan_for_user(
                 db,
@@ -534,4 +618,19 @@ async def _create_task_plan(
             await db.rollback()
             return str(exc)
 
+    if run_after:
+        async with AsyncSessionLocal() as db:
+            task = await db.get(Task, task_id)
+            if task is not None and task.status != "running":
+                task.status = "pending"
+                task.next_run_at = datetime.now(timezone.utc)
+                await db.commit()
+                asyncio.create_task(get_task_runner().execute(task))
+                result["run_enqueued"] = True
+            else:
+                result["run_enqueued"] = False
+    else:
+        result["run_enqueued"] = False
+
+    result["created_task"] = created_new_task
     return json.dumps(result)

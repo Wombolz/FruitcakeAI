@@ -11,7 +11,7 @@ mcp_servers:
 
   web_research:
     type: internal_python
-    module: app.mcp.servers.web_research
+    module: app.mcp.servers.web_research_v2
     enabled: true
 
   rss:
@@ -40,7 +40,23 @@ mcp_servers:
   filesystem:
     type: docker_stdio
     image: mcp/mcp-filesystem
-    enabled: false  # Enable when needed
+    enabled: true
+    timeout: 60
+    priority: 12
+
+  duckduckgo:
+    type: docker_stdio
+    image: mcp/duckduckgo
+    enabled: true
+    timeout: 60
+    priority: 14
+
+  markitdown:
+    type: docker_stdio
+    image: mcp/markitdown
+    enabled: true
+    timeout: 60
+    priority: 13
 
   playwright:
     type: docker_stdio

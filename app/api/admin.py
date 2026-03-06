@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import require_admin
 from app.auth.jwt import hash_password
 from app.config import settings
-from app.db.models import AuditLog, Task, User
+from app.db.models import AuditLog, Task, TaskRun, User
 from app.db.session import get_db
 from app.metrics import metrics
 
@@ -306,30 +306,25 @@ async def task_runs(
     _: User = Depends(require_admin),
 ):
     """
-    Phase 4 dev/debug endpoint — full task run history with tool calls.
+    Debug endpoint — task run history with tool calls.
 
-    Returns each task's details plus every AuditLog entry written during
-    its last run (matched via last_session_id). Gives you: what the task
-    was, what tools it called, what they returned, and the final output —
-    all in one call from /docs.
+    Uses task_runs records so each execution attempt is tracked separately.
     """
-    # Fetch recently-run tasks ordered by last_run_at
-    task_result = await db.execute(
-        select(Task)
-        .where(Task.last_run_at.isnot(None))
-        .order_by(desc(Task.last_run_at))
+    run_result = await db.execute(
+        select(TaskRun, Task)
+        .join(Task, TaskRun.task_id == Task.id)
+        .order_by(desc(TaskRun.started_at))
         .limit(limit)
     )
-    tasks = task_result.scalars().all()
+    runs = run_result.all()
 
     output = []
-    for task in tasks:
-        # Fetch AuditLog entries for this task's last session
+    for run, task in runs:
         tool_calls: List[Dict[str, Any]] = []
-        if task.last_session_id is not None:
+        if run.session_id is not None:
             log_result = await db.execute(
                 select(AuditLog)
-                .where(AuditLog.session_id == task.last_session_id)
+                .where(AuditLog.session_id == run.session_id)
                 .order_by(AuditLog.created_at)
             )
             tool_calls = [
@@ -344,15 +339,17 @@ async def task_runs(
 
         output.append(
             {
+                "run_id": run.id,
                 "id": task.id,
                 "title": task.title,
                 "instruction": task.instruction,
                 "task_type": task.task_type,
-                "status": task.status,
-                "last_run_at": task.last_run_at,
-                "last_session_id": task.last_session_id,
-                "result": task.result,
-                "error": task.error,
+                "status": run.status,
+                "started_at": run.started_at,
+                "finished_at": run.finished_at,
+                "session_id": run.session_id,
+                "result": run.summary,
+                "error": run.error,
                 "retry_count": task.retry_count,
                 "tool_calls": tool_calls,
             }
