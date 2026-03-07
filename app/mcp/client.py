@@ -15,6 +15,8 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
+_STDIO_STREAM_LIMIT_BYTES = 8 * 1024 * 1024
+
 
 class MCPClient:
     """
@@ -101,6 +103,7 @@ class MCPClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=_STDIO_STREAM_LIMIT_BYTES,
             )
             request_id = self._next_id()
             await self._write({
