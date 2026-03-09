@@ -249,11 +249,11 @@ class Memory(Base):
     if _USE_PGVECTOR:
         embedding = Column(Vector(settings.embedding_dimension))
 
-    # Importance 0.0–1.0. Nudged up by _record_access() on each hit.
+    # Importance 0.0–1.0. Set at write-time or by explicit update flows.
     importance = Column(Float, default=0.5, nullable=False)
 
     # Tracks how many times this memory has been retrieved.
-    # High access_count → higher importance; zero accesses for 30+ days → pruning candidate.
+    # Used for usage analytics and optional pruning heuristics.
     access_count = Column(Integer, default=0, nullable=False)
 
     # Optional JSON array of string tags for filtering/grouping
