@@ -172,6 +172,15 @@ class APNsPusher:
             )
             return False
 
+        except ImportError as exc:
+            # httpx with HTTP/2 support requires the optional "h2" dependency.
+            # APNs requires HTTP/2, so surface a concrete fix path.
+            log.error(
+                "apns.http2_dependency_missing",
+                error=str(exc),
+                hint="Install requirements (httpx[http2]) so h2 is available in this venv",
+            )
+            return False
         except Exception as exc:
             log.error("apns.send_error", error=str(exc), prefix=device_token[:8])
             return False

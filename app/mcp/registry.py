@@ -81,7 +81,32 @@ class MCPRegistry:
         self._litellm_schemas: List[Dict[str, Any]] = []
         # Raw YAML config (used for status reporting)
         self._raw_config: Dict[str, Any] = {}
+        # Duplicate tool name conflicts (deterministic first-wins policy)
+        self._duplicate_tools: List[Dict[str, Any]] = []
         self._is_ready = False
+
+    def _register_tool(self, tool: Dict[str, Any], server_name: str, server_type: str) -> None:
+        """
+        Register one tool by name using deterministic first-wins behavior.
+        Duplicate names are retained in diagnostics and never silently override.
+        """
+        name = tool["name"]
+        if name in self._tool_map:
+            existing_server, existing_type = self._tool_map[name]
+            conflict = {
+                "tool": name,
+                "existing_server": existing_server,
+                "existing_type": existing_type,
+                "ignored_server": server_name,
+                "ignored_type": server_type,
+                "policy": "first_wins",
+            }
+            self._duplicate_tools.append(conflict)
+            log.error("Duplicate MCP tool name (ignored by first-wins policy)", **conflict)
+            return
+
+        self._tool_map[name] = (server_name, server_type)
+        self._litellm_schemas.append(_to_litellm_schema(tool))
 
     async def startup(self, config_path: Optional[Path] = None) -> None:
         """Load config/mcp_config.yaml and initialize all enabled servers."""
@@ -126,9 +151,7 @@ class MCPRegistry:
             tools = module.get_tools()  # expected: List[MCP tool schema dicts]
             self._modules[server_name] = module
             for tool in tools:
-                name = tool["name"]
-                self._tool_map[name] = (server_name, "internal_python")
-                self._litellm_schemas.append(_to_litellm_schema(tool))
+                self._register_tool(tool, server_name, "internal_python")
             log.info(
                 "Internal MCP server loaded",
                 server=server_name,
@@ -157,9 +180,7 @@ class MCPRegistry:
         if ok:
             self._clients[server_name] = client
             for tool in client.get_tools():
-                name = tool["name"]
-                self._tool_map[name] = (server_name, "docker_stdio")
-                self._litellm_schemas.append(_to_litellm_schema(tool))
+                self._register_tool(tool, server_name, "docker_stdio")
             log.info(
                 "Docker MCP server connected",
                 server=server_name,
@@ -260,6 +281,57 @@ class MCPRegistry:
             "tool_count": len(tools),
             "tools": tools,
             "disabled_servers": disabled,
+            "duplicate_tools": list(self._duplicate_tools),
+        }
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        """Expanded MCP diagnostics for targeted admin troubleshooting."""
+        servers: List[Dict[str, Any]] = []
+        configured = self._raw_config.get("mcp_servers", {})
+        for server_name, config in configured.items():
+            enabled = config.get("enabled", True)
+            server_type = config.get("type", "unknown")
+            entry: Dict[str, Any] = {
+                "server": server_name,
+                "type": server_type,
+                "enabled": enabled,
+                "declared_tools": config.get("tools", []),
+            }
+
+            if not enabled:
+                entry["status"] = "disabled"
+                servers.append(entry)
+                continue
+
+            if server_type == "docker_stdio":
+                client = self._clients.get(server_name)
+                if client is None:
+                    entry["status"] = "not_connected"
+                else:
+                    status = client.get_status()
+                    entry["status"] = "connected" if status.get("connected") else "error"
+                    entry["connection_state"] = status.get("connection_state")
+                    entry["last_error"] = status.get("last_error")
+                    entry["stderr_tail"] = status.get("stderr_tail", [])
+                    entry["registered_tools"] = status.get("tools", [])
+            elif server_type == "internal_python":
+                loaded = server_name in self._modules
+                entry["status"] = "loaded" if loaded else "error"
+                entry["registered_tools"] = [
+                    tool_name
+                    for tool_name, (owner, _) in self._tool_map.items()
+                    if owner == server_name
+                ]
+            else:
+                entry["status"] = "unknown_type"
+
+            servers.append(entry)
+
+        return {
+            "ready": self._is_ready,
+            "tool_count": len(self._litellm_schemas),
+            "duplicate_tools": list(self._duplicate_tools),
+            "servers": servers,
         }
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────

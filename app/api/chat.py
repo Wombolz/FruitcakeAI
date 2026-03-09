@@ -13,9 +13,9 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -42,6 +42,16 @@ class CreateSessionRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: str
+    allowed_tools: Optional[List[str]] = None
+    blocked_tools: Optional[List[str]] = None
+
+
+class RenameSessionRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=255)
+
+
+class UpdateSessionPersonaRequest(BaseModel):
+    persona: str = Field(min_length=1, max_length=100)
 
 
 class MessageOut(BaseModel):
@@ -78,6 +88,25 @@ async def list_personas() -> Dict[str, Any]:
             "content_filter": cfg.get("content_filter", ""),
         }
         for name, cfg in personas.items()
+    }
+
+
+# ── GET /chat/tools ───────────────────────────────────────────────────────────
+
+@router.get("/tools")
+async def list_tools(
+    persona: Optional[str] = Query(None, description="Optional persona override"),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return available tool names for the current user/persona."""
+    from app.agent.tools import get_tools_for_user
+    user_context = UserContext.from_user(current_user, persona_name=persona)
+    tools = get_tools_for_user(user_context)
+    names = sorted({tool["function"]["name"] for tool in tools})
+    return {
+        "persona": user_context.persona,
+        "tools": names,
+        "blocked_tools": sorted(set(user_context.blocked_tools)),
     }
 
 
@@ -146,6 +175,52 @@ async def get_session(
     }
 
 
+# ── PATCH /chat/sessions/{id} ────────────────────────────────────────────────
+
+@router.patch("/sessions/{session_id}", response_model=SessionOut)
+async def rename_session(
+    session_id: int,
+    body: RenameSessionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChatSession:
+    """Rename a chat session (owner only)."""
+    session = await _get_session_or_404(session_id, current_user.id, db)
+    new_title = body.title.strip()
+    if not new_title:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="title must not be blank",
+        )
+    session.title = new_title
+    await db.flush()
+    await db.refresh(session)
+    return session
+
+
+# ── PATCH /chat/sessions/{id}/persona ────────────────────────────────────────
+
+@router.patch("/sessions/{session_id}/persona", response_model=SessionOut)
+async def update_session_persona(
+    session_id: int,
+    body: UpdateSessionPersonaRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChatSession:
+    """Update the active persona for a session (owner only)."""
+    from app.agent.persona_loader import persona_exists
+
+    persona_name = body.persona.strip().lower().replace(" ", "_")
+    if not persona_exists(persona_name):
+        raise HTTPException(status_code=400, detail=f"Unknown persona '{persona_name}'")
+
+    session = await _get_session_or_404(session_id, current_user.id, db)
+    session.persona = persona_name
+    await db.flush()
+    await db.refresh(session)
+    return session
+
+
 # ── DELETE /chat/sessions/{id} ───────────────────────────────────────────────
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
@@ -190,6 +265,11 @@ async def send_message(
 
     # Build context from the session's current persona (may differ from user default)
     user_context = UserContext.from_user(current_user, persona_name=session.persona)
+    _apply_tool_overrides(
+        user_context,
+        allowed_tools=body.allowed_tools,
+        blocked_tools=body.blocked_tools,
+    )
     user_context.session_id = session_id
 
     try:
@@ -258,6 +338,8 @@ async def chat_websocket(
         raw = await websocket.receive_text()
         data = json.loads(raw)
         user_message = data.get("content", "").strip()
+        allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
+        blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
 
         # ── Auth path 2: token in first message body (backward compat) ──
         if current_user is None:
@@ -318,6 +400,11 @@ async def chat_websocket(
 
                     # Build context from session's current persona
                     user_context = UserContext.from_user(current_user, persona_name=session.persona)
+                    _apply_tool_overrides(
+                        user_context,
+                        allowed_tools=allowed_tools,
+                        blocked_tools=blocked_tools,
+                    )
                     user_context.session_id = session_id
                     full_response = []
 
@@ -340,6 +427,8 @@ async def chat_websocket(
             raw = await websocket.receive_text()
             data = json.loads(raw)
             user_message = data.get("content", "").strip()
+            allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
+            blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
 
     except WebSocketDisconnect:
         pass
@@ -435,3 +524,44 @@ async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any
     )
     messages = result.scalars().all()
     return [{"role": m.role, "content": m.content} for m in messages]
+
+
+def _apply_tool_overrides(
+    user_context: UserContext,
+    *,
+    allowed_tools: Optional[List[str]],
+    blocked_tools: Optional[List[str]],
+) -> None:
+    """
+    Testing override hook for chat sessions.
+    Merges persona-level blocked tools with optional per-message allow/block lists.
+    """
+    from app.agent.tools import TOOL_SCHEMAS
+    from app.mcp.registry import get_mcp_registry
+
+    base_blocked = set(user_context.blocked_tools or [])
+    all_tools = {tool["function"]["name"] for tool in TOOL_SCHEMAS}
+
+    registry = get_mcp_registry()
+    if registry._is_ready:
+        all_tools.update(
+            tool["function"]["name"]
+            for tool in registry.get_tools_for_agent()
+        )
+
+    normalized_allowed = {
+        str(name).strip() for name in (allowed_tools or [])
+        if str(name).strip()
+    }
+    normalized_blocked = {
+        str(name).strip() for name in (blocked_tools or [])
+        if str(name).strip()
+    }
+
+    if normalized_allowed:
+        valid_allowed = normalized_allowed.intersection(all_tools)
+        if valid_allowed:
+            base_blocked.update(all_tools - valid_allowed)
+    base_blocked.update(normalized_blocked.intersection(all_tools))
+
+    user_context.blocked_tools = sorted(base_blocked)

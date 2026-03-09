@@ -66,6 +66,18 @@ class User(Base):
     device_tokens = relationship("DeviceToken", back_populates="user", cascade="all, delete-orphan")
     memories = relationship("Memory", back_populates="user", cascade="all, delete-orphan")
     webhook_configs = relationship("WebhookConfig", back_populates="user", cascade="all, delete-orphan")
+    rss_sources = relationship("RSSSource", back_populates="user", cascade="all, delete-orphan")
+    rss_source_candidates = relationship(
+        "RSSSourceCandidate",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="RSSSourceCandidate.user_id",
+    )
+    reviewed_rss_source_candidates = relationship(
+        "RSSSourceCandidate",
+        back_populates="reviewer",
+        foreign_keys="RSSSourceCandidate.reviewed_by",
+    )
 
     @property
     def library_scopes(self) -> list[str]:
@@ -465,3 +477,88 @@ class WebhookConfig(Base):
 
     def __repr__(self):
         return f"<WebhookConfig(id={self.id}, user_id={self.user_id}, active={self.active})>"
+
+
+class RSSSource(Base):
+    """Curated RSS/Atom feed source. Global when user_id is null."""
+    __tablename__ = "rss_sources"
+    __table_args__ = (
+        UniqueConstraint("user_id", "url_canonical", name="uq_rss_sources_user_url"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+
+    name = Column(String(255), nullable=False)
+    url = Column(Text, nullable=False)
+    url_canonical = Column(Text, nullable=False, index=True)
+    category = Column(String(100), default="news", nullable=False)
+    active = Column(Boolean, default=True, nullable=False, index=True)
+    trust_level = Column(String(30), default="manual", nullable=False)
+    update_interval_minutes = Column(Integer, default=60, nullable=False)
+    last_ok_at = Column(DateTime(timezone=True))
+    last_error = Column(Text)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User", back_populates="rss_sources")
+    items = relationship("RSSItem", back_populates="source", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<RSSSource(id={self.id}, user_id={self.user_id}, name='{self.name}')>"
+
+
+class RSSSourceCandidate(Base):
+    """Discovered candidate feed awaiting moderation."""
+    __tablename__ = "rss_source_candidates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    seed_url = Column(Text, nullable=False)
+    url = Column(Text, nullable=False)
+    url_canonical = Column(Text, nullable=False, index=True)
+    title_hint = Column(String(255))
+    domain = Column(String(255), nullable=False, index=True)
+    discovered_via = Column(String(100), default="discover_rss_sources", nullable=False)
+    status = Column(String(30), default="pending", nullable=False, index=True)
+    reason = Column(Text)
+    reviewed_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
+    reviewed_at = Column(DateTime(timezone=True))
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id], back_populates="rss_source_candidates")
+    reviewer = relationship(
+        "User",
+        foreign_keys=[reviewed_by],
+        back_populates="reviewed_rss_source_candidates",
+    )
+
+    def __repr__(self):
+        return f"<RSSSourceCandidate(id={self.id}, user_id={self.user_id}, status='{self.status}')>"
+
+
+class RSSItem(Base):
+    """Cached RSS/Atom item for fast recall/search and headline history."""
+    __tablename__ = "rss_items"
+    __table_args__ = (
+        UniqueConstraint("source_id", "item_uid", name="uq_rss_items_source_uid"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_id = Column(Integer, ForeignKey("rss_sources.id", ondelete="CASCADE"), nullable=False, index=True)
+    item_uid = Column(String(128), nullable=False, index=True)
+
+    title = Column(String(1000), nullable=False)
+    link = Column(Text)
+    summary = Column(Text)
+    published_at = Column(DateTime(timezone=True), index=True)
+    first_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    fetched_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    source = relationship("RSSSource", back_populates="items")
+
+    def __repr__(self):
+        return f"<RSSItem(source_id={self.source_id}, title='{self.title[:40]}')>"

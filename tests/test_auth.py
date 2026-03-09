@@ -7,6 +7,7 @@ import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
+from unittest.mock import AsyncMock, patch
 
 from app.db.session import Base, get_db
 from app.main import app
@@ -221,6 +222,160 @@ async def test_delete_session_not_owned_returns_404(client):
         headers={"Authorization": f"Bearer {other_token}"},
     )
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_rename_session_updates_title(client):
+    await client.post("/auth/register", json={
+        "username": "renameuser",
+        "email": "rename@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "renameuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Before"}, headers=headers)
+    session_id = create.json()["id"]
+
+    rename = await client.patch(
+        f"/chat/sessions/{session_id}",
+        json={"title": "After"},
+        headers=headers,
+    )
+    assert rename.status_code == 200
+    assert rename.json()["title"] == "After"
+
+    sessions = await client.get("/chat/sessions", headers=headers)
+    titles = {row["id"]: row["title"] for row in sessions.json()}
+    assert titles[session_id] == "After"
+
+
+@pytest.mark.asyncio
+async def test_rename_session_not_owned_returns_404(client):
+    for username in ("rename_owner", "rename_other"):
+        await client.post("/auth/register", json={
+            "username": username,
+            "email": f"{username}@example.com",
+            "password": "pass123",
+        })
+
+    owner_login = await client.post("/auth/login", json={"username": "rename_owner", "password": "pass123"})
+    owner_token = owner_login.json()["access_token"]
+    other_login = await client.post("/auth/login", json={"username": "rename_other", "password": "pass123"})
+    other_token = other_login.json()["access_token"]
+
+    create = await client.post(
+        "/chat/sessions",
+        json={"title": "Owner title"},
+        headers={"Authorization": f"Bearer {owner_token}"},
+    )
+    session_id = create.json()["id"]
+
+    rename = await client.patch(
+        f"/chat/sessions/{session_id}",
+        json={"title": "Hacked"},
+        headers={"Authorization": f"Bearer {other_token}"},
+    )
+    assert rename.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_session_persona(client):
+    await client.post("/auth/register", json={
+        "username": "personauser",
+        "email": "persona@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "personauser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Persona Test"}, headers=headers)
+    session_id = create.json()["id"]
+
+    patch_resp = await client.patch(
+        f"/chat/sessions/{session_id}/persona",
+        json={"persona": "work_assistant"},
+        headers=headers,
+    )
+    assert patch_resp.status_code == 200
+    assert patch_resp.json()["persona"] == "work_assistant"
+
+
+@pytest.mark.asyncio
+async def test_chat_tools_endpoint_returns_tools(client):
+    await client.post("/auth/register", json={
+        "username": "tooluser",
+        "email": "tooluser@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "tooluser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.get("/chat/tools", headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "tools" in data
+    assert "search_library" in data["tools"]
+
+
+@pytest.mark.asyncio
+async def test_send_message_applies_tool_overrides(client):
+    await client.post("/auth/register", json={
+        "username": "overrideuser",
+        "email": "override@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "overrideuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Override Test"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with patch("app.api.chat.run_agent", new_callable=AsyncMock, return_value="ok") as mock_run:
+        send = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "hello", "allowed_tools": ["search_library"]},
+            headers=headers,
+        )
+
+    assert send.status_code == 200
+    user_context = mock_run.await_args.args[1]
+    assert "create_memory" in user_context.blocked_tools
+    assert "search_library" not in user_context.blocked_tools
+
+
+@pytest.mark.asyncio
+async def test_admin_push_test_endpoint(client):
+    await client.post("/auth/register", json={
+        "username": "adminpush",
+        "email": "adminpush@example.com",
+        "password": "pass123",
+        "role": "admin",
+    })
+    login = await client.post("/auth/login", json={"username": "adminpush", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Register one device token for this admin user
+    reg = await client.post(
+        "/devices/register",
+        json={"token": "deadbeef-token", "environment": "sandbox"},
+        headers=headers,
+    )
+    assert reg.status_code == 200
+
+    fake_pusher = type("FakePusher", (), {"send": AsyncMock(return_value=True)})()
+    with patch("app.api.admin.get_apns_pusher", return_value=fake_pusher):
+        resp = await client.post("/admin/push/test", headers=headers, json={})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["attempted"] == 1
+    assert data["delivered"] == 1
 
 
 # ── Token validation ───────────────────────────────────────────────────────────
