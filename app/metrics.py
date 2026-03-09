@@ -24,6 +24,12 @@ class _Metrics:
     error_count: int = 0
     total_tool_calls: int = 0
     active_ws_sessions: int = 0
+    task_model_planning_large_calls: int = 0
+    task_model_execution_small_calls: int = 0
+    task_model_final_large_calls: int = 0
+    task_model_fallback_to_large_count: int = 0
+    task_model_fallback_success_count: int = 0
+    task_model_fallback_failure_count: int = 0
 
     def inc_requests(self) -> None:
         with self._lock:
@@ -45,6 +51,30 @@ class _Metrics:
         with self._lock:
             self.active_ws_sessions = max(0, self.active_ws_sessions - 1)
 
+    def inc_task_model_planning_large_calls(self, n: int = 1) -> None:
+        with self._lock:
+            self.task_model_planning_large_calls += n
+
+    def inc_task_model_execution_small_calls(self, n: int = 1) -> None:
+        with self._lock:
+            self.task_model_execution_small_calls += n
+
+    def inc_task_model_final_large_calls(self, n: int = 1) -> None:
+        with self._lock:
+            self.task_model_final_large_calls += n
+
+    def inc_task_model_fallback_to_large_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.task_model_fallback_to_large_count += n
+
+    def inc_task_model_fallback_success_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.task_model_fallback_success_count += n
+
+    def inc_task_model_fallback_failure_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.task_model_fallback_failure_count += n
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -52,6 +82,12 @@ class _Metrics:
                 "error_count": self.error_count,
                 "total_tool_calls": self.total_tool_calls,
                 "active_ws_sessions": self.active_ws_sessions,
+                "task_model_planning_large_calls": self.task_model_planning_large_calls,
+                "task_model_execution_small_calls": self.task_model_execution_small_calls,
+                "task_model_final_large_calls": self.task_model_final_large_calls,
+                "task_model_fallback_to_large_count": self.task_model_fallback_to_large_count,
+                "task_model_fallback_success_count": self.task_model_fallback_success_count,
+                "task_model_fallback_failure_count": self.task_model_fallback_failure_count,
             }
 
 

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.core import _litellm_kwargs
 from app.config import settings
 from app.db.models import Task, TaskStep
+from app.metrics import metrics
 
 
 async def create_task_plan_for_user(
@@ -27,6 +28,7 @@ async def create_task_plan_for_user(
     max_steps: int = 6,
     notes: str = "",
     style: str = "concise",
+    model_override: str | None = None,
 ) -> Dict[str, Any]:
     """Generate and persist TaskStep rows for a task owned by the user."""
     result = await db.execute(select(Task).where(Task.id == task_id, Task.user_id == user_id))
@@ -41,6 +43,7 @@ async def create_task_plan_for_user(
         max_steps=bounded_steps,
         notes=notes.strip(),
         style=style.strip() or "concise",
+        model_override=model_override,
     )
 
     had_plan = bool(task.has_plan)
@@ -82,6 +85,7 @@ async def _generate_plan_steps(
     max_steps: int,
     notes: str,
     style: str,
+    model_override: str | None,
 ) -> List[Dict[str, Any]]:
     """Generate a strict JSON step list with an LLM-first + deterministic fallback."""
     prompt = (
@@ -95,9 +99,16 @@ async def _generate_plan_steps(
         "Keep steps actionable and ordered."
     )
 
+    selected_model = model_override or (
+        settings.task_large_model if settings.task_model_routing_enabled and settings.task_force_large_for_planning
+        else settings.llm_model
+    )
+
     try:
+        if settings.task_model_routing_enabled and selected_model == settings.task_large_model:
+            metrics.inc_task_model_planning_large_calls()
         resp = await litellm.acompletion(
-            model=settings.llm_model,
+            model=selected_model,
             messages=[{"role": "user", "content": prompt}],
             tools=None,
             tool_choice=None,

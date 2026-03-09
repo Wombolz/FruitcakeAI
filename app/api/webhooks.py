@@ -23,9 +23,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.context import UserContext
 from app.agent.core import run_agent
+from app.autonomy.model_routing import resolve_task_model_profile
 from app.auth.dependencies import get_current_user
 from app.db.models import ChatMessage, ChatSession, User, WebhookConfig
 from app.db.session import AsyncSessionLocal, get_db
+from app.metrics import metrics
 
 router = APIRouter()
 log = structlog.get_logger(__name__)
@@ -210,6 +212,7 @@ async def _execute_webhook(webhook_id: int, payload: Dict[str, Any]) -> None:
         if user is None:
             log.warning("webhook.user_not_found", webhook_id=webhook_id, user_id=user_id)
             return
+        model_profile = resolve_task_model_profile(task=None, user=user)
         user_context = UserContext.from_user(user, persona_name=persona)
     user_context.session_id = session_id
 
@@ -222,9 +225,35 @@ async def _execute_webhook(webhook_id: int, payload: Dict[str, Any]) -> None:
         f"Webhook payload JSON: {payload_json}"
     )
 
+    fallback_used = False
     try:
-        result = await run_agent([{"role": "user", "content": prompt}], user_context, mode="task")
+        try:
+            metrics.inc_task_model_execution_small_calls()
+            result = await run_agent(
+                [{"role": "user", "content": prompt}],
+                user_context,
+                mode="task",
+                model_override=model_profile.execution_model,
+                stage="webhook_execution",
+            )
+            if not (result or "").strip():
+                raise ValueError("Empty model output")
+        except Exception:
+            if not model_profile.large_retry_enabled or model_profile.large_retry_max_attempts < 1:
+                raise
+            fallback_used = True
+            metrics.inc_task_model_fallback_to_large_count()
+            result = await run_agent(
+                [{"role": "user", "content": prompt}],
+                user_context,
+                mode="task",
+                model_override=model_profile.final_synthesis_model,
+                stage="webhook_execution_fallback",
+            )
+            metrics.inc_task_model_fallback_success_count()
     except Exception as exc:
+        if fallback_used:
+            metrics.inc_task_model_fallback_failure_count()
         log.error("webhook.execution_failed", webhook_id=webhook_id, error=str(exc), exc_info=True)
         result = f"Webhook execution failed: {exc}"
 

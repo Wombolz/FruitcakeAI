@@ -16,6 +16,7 @@ Design:
 from __future__ import annotations
 
 import asyncio
+import re
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -23,8 +24,10 @@ from typing import Optional
 import structlog
 
 from app.autonomy.approval import ApprovalRequired, _approval_armed
+from app.autonomy.model_routing import TaskModelProfile, resolve_task_model_profile
 from app.autonomy.scheduler import compute_next_run_at
 from app.db.models import Task, TaskRun, TaskStep
+from app.metrics import metrics
 
 log = structlog.get_logger(__name__)
 
@@ -104,6 +107,7 @@ class TaskRunner:
             log.info("task.started", task_id=task_id, title=task_title)
 
             result = await self._execute_agent(task_id, task_run_id=task_run_id)
+            result = _format_result_for_inbox(result)
 
             # Phase 6a: Success — update task record
             async with AsyncSessionLocal() as db:
@@ -212,6 +216,7 @@ class TaskRunner:
         task_requires_approval: bool = False
         has_plan = False
         pre_approved = False
+        model_profile: TaskModelProfile | None = None
 
         async with AsyncSessionLocal() as db:
             task = await db.get(Task, task_id)
@@ -227,6 +232,7 @@ class TaskRunner:
 
             from app.autonomy.execution_profile import resolve_execution_profile
             resolved = resolve_execution_profile(task, user)
+            model_profile = resolve_task_model_profile(task, user)
             persona_name = resolved.persona
             task_user_id = task.user_id
             task_instruction = task.instruction
@@ -256,6 +262,7 @@ class TaskRunner:
                     max_steps=6,
                     notes=task.instruction or "",
                     style="concise",
+                    model_override=model_profile.planning_model,
                 )
                 has_plan = bool(task.has_plan)
                 log.info("task.auto_planned", task_id=task.id, has_plan=has_plan)
@@ -308,6 +315,7 @@ class TaskRunner:
                         user_context=user_context,
                         task_requires_approval=task_requires_approval,
                         pre_approved=pre_approved,
+                        model_profile=model_profile,
                     )
 
         # Back-compat mode: single instruction task behavior.
@@ -326,7 +334,13 @@ class TaskRunner:
         arm_approval = task_requires_approval and not pre_approved
         token = _approval_armed.set(arm_approval)
         try:
-            return await run_agent([{"role": "user", "content": "\n\n".join(parts)}], user_context, mode="task")
+            return await run_agent(
+                [{"role": "user", "content": "\n\n".join(parts)}],
+                user_context,
+                mode="task",
+                model_override=model_profile.final_synthesis_model if model_profile else None,
+                stage="task_single_stage",
+            )
         finally:
             _approval_armed.reset(token)
 
@@ -345,6 +359,7 @@ class TaskRunner:
         user_context,
         task_requires_approval: bool,
         pre_approved: bool,
+        model_profile: TaskModelProfile,
     ) -> str:
         """Execute task steps sequentially from current_step_index."""
         from sqlalchemy import select
@@ -408,12 +423,23 @@ class TaskRunner:
             prompt_parts.append(f"Current time: {now_str}")
 
             arm_approval = (task_requires_approval or step.requires_approval) and not pre_approved
+            is_final_step = self._is_final_synthesis_step(step, steps)
+            stage = "task_final_synthesis" if is_final_step else "task_execution_step"
+            primary_model = (
+                model_profile.final_synthesis_model if is_final_step else model_profile.execution_model
+            )
             token = _approval_armed.set(arm_approval)
             try:
-                result = await run_agent(
-                    [{"role": "user", "content": "\n\n".join(prompt_parts)}],
-                    user_context,
-                    mode="task",
+                result = await self._run_step_with_model_policy(
+                    prompt="\n\n".join(prompt_parts),
+                    user_context=user_context,
+                    primary_model=primary_model,
+                    final_model=model_profile.final_synthesis_model,
+                    stage=stage,
+                    allow_large_fallback=(not is_final_step and model_profile.large_retry_enabled),
+                    fallback_attempts=model_profile.large_retry_max_attempts,
+                    count_small_metric=(not is_final_step),
+                    count_final_large_metric=is_final_step,
                 )
             except ApprovalRequired as exc:
                 _approval_armed.reset(token)
@@ -468,6 +494,69 @@ class TaskRunner:
             await db.commit()
 
         return final_result
+
+    async def _run_step_with_model_policy(
+        self,
+        *,
+        prompt: str,
+        user_context,
+        primary_model: str,
+        final_model: str,
+        stage: str,
+        allow_large_fallback: bool,
+        fallback_attempts: int,
+        count_small_metric: bool,
+        count_final_large_metric: bool,
+    ) -> str:
+        from app.agent.core import run_agent
+
+        attempts = 0
+        max_attempts = max(0, fallback_attempts)
+        used_fallback = False
+
+        while True:
+            using_fallback_model = attempts > 0
+            model = final_model if using_fallback_model else primary_model
+            if count_small_metric and not using_fallback_model:
+                metrics.inc_task_model_execution_small_calls()
+            if count_final_large_metric and not using_fallback_model:
+                metrics.inc_task_model_final_large_calls()
+            if using_fallback_model:
+                metrics.inc_task_model_fallback_to_large_count()
+                used_fallback = True
+
+            try:
+                result = await run_agent(
+                    [{"role": "user", "content": prompt}],
+                    user_context,
+                    mode="task",
+                    model_override=model,
+                    stage=stage,
+                )
+                if not (result or "").strip():
+                    raise ValueError("Empty model output")
+                if used_fallback:
+                    metrics.inc_task_model_fallback_success_count()
+                return result
+            except ApprovalRequired:
+                raise
+            except Exception:
+                if allow_large_fallback and attempts < max_attempts:
+                    attempts += 1
+                    continue
+                if used_fallback:
+                    metrics.inc_task_model_fallback_failure_count()
+                raise
+
+    @staticmethod
+    def _is_final_synthesis_step(step: TaskStep, all_steps: list[TaskStep]) -> bool:
+        if not all_steps:
+            return True
+        if step.step_index == max(s.step_index for s in all_steps):
+            return True
+        text = f"{step.title} {step.instruction}".lower()
+        markers = ("final", "synthesis", "summarize", "summary", "final output")
+        return any(marker in text for marker in markers)
 
     async def _reset_steps_for_new_run(self, db, task_id: int) -> str:
         """Recurring tasks start from a clean step state each run."""
@@ -612,3 +701,26 @@ def get_task_runner() -> TaskRunner:
     if _runner is None:
         _runner = TaskRunner()
     return _runner
+
+
+def _format_result_for_inbox(result: str) -> str:
+    """
+    Improve readability when the model returns one very long line.
+    Preserve already formatted markdown/newline-heavy outputs.
+    """
+    text = (result or "").strip()
+    if not text:
+        return text
+    if "\n" in text:
+        return text
+
+    # Keep obvious list-style outputs untouched.
+    if re.search(r"\b\d+\.\s", text):
+        return text
+
+    # Split long single-line prose into paragraphs at sentence boundaries.
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) < 2:
+        return text
+    return "\n\n".join(parts)

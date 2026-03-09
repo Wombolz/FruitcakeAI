@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tests.conftest import TestSessionLocal
+
 async def _auth_headers(client, username: str) -> dict[str, str]:
     password = "pass123"
     await client.post(
@@ -124,3 +126,38 @@ async def test_webhook_crud_requires_auth(client):
         json={"name": "No auth", "instruction": "Fail"},
     )
     assert create_resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_execute_webhook_uses_small_then_large_fallback(monkeypatch, client):
+    from app.api import webhooks as webhooks_module
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "task_model_routing_enabled", True)
+    monkeypatch.setattr(settings, "task_small_model", "ollama_chat/qwen2.5:7b")
+    monkeypatch.setattr(settings, "task_large_model", "ollama_chat/qwen2.5:14b")
+    monkeypatch.setattr(settings, "task_large_retry_enabled", True)
+    monkeypatch.setattr(settings, "task_large_retry_max_attempts", 1)
+
+    headers = await _auth_headers(client, "webhookmodelowner")
+    create = await client.post(
+        "/webhooks",
+        json={"name": "Model route hook", "instruction": "Execute task mode"},
+        headers=headers,
+    )
+    webhook_id = create.json()["id"]
+
+    calls = []
+
+    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None):
+        calls.append((model_override, stage))
+        if len(calls) == 1:
+            raise RuntimeError("small model failed")
+        return "fallback succeeded"
+
+    with patch.object(webhooks_module, "AsyncSessionLocal", new=TestSessionLocal):
+        with patch.object(webhooks_module, "run_agent", new=AsyncMock(side_effect=_fake_run_agent)):
+            await webhooks_module._execute_webhook(webhook_id, {"event": "push"})
+
+    assert calls[0] == ("ollama_chat/qwen2.5:7b", "webhook_execution")
+    assert calls[1] == ("ollama_chat/qwen2.5:14b", "webhook_execution_fallback")

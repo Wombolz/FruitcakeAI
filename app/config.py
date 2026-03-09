@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     local_api_base: str = "http://localhost:11434/v1"
     local_api_key: str = "sk-local"
     local_model: str = "qwen2.5:14b"
+    # Task-stage routing (Phase 5.4.x)
+    task_small_model: str = "ollama_chat/qwen2.5:7b"
+    task_large_model: str = "ollama_chat/qwen2.5:14b"
+    task_model_routing_enabled: bool = True
+    task_large_retry_enabled: bool = True
+    task_large_retry_max_attempts: int = 1
+    task_force_large_for_planning: bool = True
+    task_force_large_for_final_synthesis: bool = True
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"

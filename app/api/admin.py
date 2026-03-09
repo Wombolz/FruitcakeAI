@@ -19,13 +19,14 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import select, desc
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import require_admin
 from app.auth.jwt import hash_password
+from app.autonomy.push import get_apns_pusher
 from app.config import settings
-from app.db.models import AuditLog, Task, TaskRun, User
+from app.db.models import AuditLog, DeviceToken, RSSSource, RSSSourceCandidate, Task, TaskRun, User
 from app.db.session import get_db
 from app.metrics import metrics
 
@@ -67,6 +68,11 @@ class UpdateUserRequest(BaseModel):
     library_scopes: Optional[List[str]] = None
     calendar_access: Optional[List[str]] = None
     is_active: Optional[bool] = None
+
+
+class TestPushRequest(BaseModel):
+    title: str = "Fruitcake Test Push"
+    body: str = "This is a test notification from FruitcakeAI."
 
 
 # ── GET /admin/metrics ────────────────────────────────────────────────────────
@@ -157,6 +163,82 @@ async def list_tools(
     """
     from app.mcp.registry import get_mcp_registry
     return get_mcp_registry().get_status()
+
+
+@router.get("/mcp/diagnostics")
+async def mcp_diagnostics(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Detailed MCP diagnostics: server-level connection state, last error,
+    stderr tail (docker stdio), registered tools, and duplicate-name conflicts.
+    """
+    from app.mcp.registry import get_mcp_registry
+    diagnostics = get_mcp_registry().get_diagnostics()
+
+    pending_count = (
+        await db.execute(
+            select(func.count()).select_from(RSSSourceCandidate).where(RSSSourceCandidate.status == "pending")
+        )
+    ).scalar_one()
+    approved_count = (
+        await db.execute(
+            select(func.count()).select_from(RSSSourceCandidate).where(RSSSourceCandidate.status == "approved")
+        )
+    ).scalar_one()
+    source_count = (await db.execute(select(func.count()).select_from(RSSSource))).scalar_one()
+    diagnostics["rss"] = {
+        "source_count": int(source_count or 0),
+        "candidate_counts": {
+            "pending": int(pending_count or 0),
+            "approved": int(approved_count or 0),
+        },
+    }
+    return diagnostics
+
+
+@router.post("/push/test")
+async def send_test_push(
+    body: TestPushRequest = TestPushRequest(),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Send a test APNs notification to the current admin user's registered devices.
+    Useful for validating push delivery without running a task.
+    """
+    result = await db.execute(
+        select(DeviceToken).where(DeviceToken.user_id == current_user.id)
+    )
+    tokens = result.scalars().all()
+    if not tokens:
+        return {
+            "ok": False,
+            "attempted": 0,
+            "delivered": 0,
+            "message": "No registered device tokens for current user.",
+        }
+
+    pusher = get_apns_pusher()
+
+    delivered = 0
+    for device in tokens:
+        ok = await pusher.send(
+            device_token=device.token,
+            environment=device.environment,
+            title=body.title,
+            body=body.body,
+        )
+        if ok:
+            delivered += 1
+
+    return {
+        "ok": delivered > 0,
+        "attempted": len(tokens),
+        "delivered": delivered,
+        "message": f"Delivered to {delivered}/{len(tokens)} device(s).",
+    }
 
 
 # ── GET /admin/users ──────────────────────────────────────────────────────────

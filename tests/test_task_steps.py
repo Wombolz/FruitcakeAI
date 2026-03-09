@@ -9,7 +9,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import select
 
+from app.config import settings
 from app.db.models import ChatSession, Task, TaskRun, TaskStep
+from app.autonomy.runner import _format_result_for_inbox
 from tests.conftest import TestSessionLocal
 
 
@@ -245,6 +247,21 @@ async def test_stop_task_marks_task_and_run_cancelled(client):
         assert latest.status == "cancelled"
 
 
+def test_format_result_for_inbox_splits_single_line_prose():
+    text = (
+        "Here are the highlights. Markets rose on policy news. "
+        "Analysts expect volatility tomorrow."
+    )
+    formatted = _format_result_for_inbox(text)
+    assert "\n\n" in formatted
+    assert formatted.startswith("Here are the highlights.")
+
+
+def test_format_result_for_inbox_preserves_existing_newlines():
+    text = "Line one.\n\nLine two."
+    assert _format_result_for_inbox(text) == text
+
+
 @pytest.mark.asyncio
 async def test_planned_task_uses_last_step_result_as_final_output(client):
     from app.autonomy.runner import TaskRunner
@@ -413,3 +430,114 @@ async def test_runner_lazy_backfills_task_persona_and_uses_it_for_session(client
         session = await db.get(ChatSession, task.last_session_id)
         assert session is not None
         assert session.persona == "news_researcher"
+
+
+@pytest.mark.asyncio
+async def test_runner_uses_small_for_intermediate_and_large_for_final_step(client, monkeypatch):
+    from app.autonomy.runner import TaskRunner
+
+    monkeypatch.setattr(settings, "task_model_routing_enabled", True)
+    monkeypatch.setattr(settings, "task_small_model", "ollama_chat/qwen2.5:7b")
+    monkeypatch.setattr(settings, "task_large_model", "ollama_chat/qwen2.5:14b")
+    monkeypatch.setattr(settings, "task_force_large_for_final_synthesis", True)
+    monkeypatch.setattr(settings, "task_large_retry_enabled", True)
+    monkeypatch.setattr(settings, "task_large_retry_max_attempts", 1)
+
+    headers = await _headers(client, "routingowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Two step route",
+            "instruction": "Run two steps",
+            "task_type": "one_shot",
+            "deliver": False,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    fake_steps = [
+        {"title": "Collect", "instruction": "Collect details", "requires_approval": False},
+        {"title": "Final synthesis", "instruction": "Produce final output", "requires_approval": False},
+    ]
+    with patch("app.autonomy.planner._generate_plan_steps", new=AsyncMock(return_value=fake_steps)):
+        await client.post(
+            f"/tasks/{task_id}/plan",
+            json={"goal": "Route test", "max_steps": 4},
+            headers=headers,
+        )
+
+    calls = []
+
+    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None):
+        calls.append((model_override, stage))
+        if stage == "task_execution_step":
+            return "INTERMEDIATE"
+        return "FINAL OUTPUT"
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_fake_run_agent)):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    assert len(calls) >= 2
+    assert calls[0][0] == "ollama_chat/qwen2.5:7b"
+    assert calls[0][1] == "task_execution_step"
+    assert calls[-1][0] == "ollama_chat/qwen2.5:14b"
+    assert calls[-1][1] == "task_final_synthesis"
+
+
+@pytest.mark.asyncio
+async def test_runner_retries_non_final_step_once_with_large_model(client, monkeypatch):
+    from app.autonomy.runner import TaskRunner
+
+    monkeypatch.setattr(settings, "task_model_routing_enabled", True)
+    monkeypatch.setattr(settings, "task_small_model", "ollama_chat/qwen2.5:7b")
+    monkeypatch.setattr(settings, "task_large_model", "ollama_chat/qwen2.5:14b")
+    monkeypatch.setattr(settings, "task_force_large_for_final_synthesis", True)
+    monkeypatch.setattr(settings, "task_large_retry_enabled", True)
+    monkeypatch.setattr(settings, "task_large_retry_max_attempts", 1)
+
+    headers = await _headers(client, "retryrouteowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Retry route",
+            "instruction": "Run with fallback",
+            "task_type": "one_shot",
+            "deliver": False,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    fake_steps = [
+        {"title": "Fetch data", "instruction": "Call tools", "requires_approval": False},
+        {"title": "Final synthesis", "instruction": "Summarize", "requires_approval": False},
+    ]
+    with patch("app.autonomy.planner._generate_plan_steps", new=AsyncMock(return_value=fake_steps)):
+        await client.post(
+            f"/tasks/{task_id}/plan",
+            json={"goal": "Retry test", "max_steps": 4},
+            headers=headers,
+        )
+
+    calls = []
+
+    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None):
+        calls.append((model_override, stage))
+        if len(calls) == 1:
+            raise RuntimeError("tool-call failed")
+        if stage == "task_execution_step":
+            return "RECOVERED STEP"
+        return "FINAL RESULT"
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_fake_run_agent)):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    # first step: small -> fallback large; final step: large
+    assert calls[0] == ("ollama_chat/qwen2.5:7b", "task_execution_step")
+    assert calls[1] == ("ollama_chat/qwen2.5:14b", "task_execution_step")
+    assert calls[-1] == ("ollama_chat/qwen2.5:14b", "task_final_synthesis")
