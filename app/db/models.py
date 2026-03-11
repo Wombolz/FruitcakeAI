@@ -67,6 +67,7 @@ class User(Base):
     memories = relationship("Memory", back_populates="user", cascade="all, delete-orphan")
     webhook_configs = relationship("WebhookConfig", back_populates="user", cascade="all, delete-orphan")
     rss_sources = relationship("RSSSource", back_populates="user", cascade="all, delete-orphan")
+    rss_user_state = relationship("RSSUserState", back_populates="user", uselist=False, cascade="all, delete-orphan")
     rss_source_candidates = relationship(
         "RSSSourceCandidate",
         back_populates="user",
@@ -562,3 +563,18 @@ class RSSItem(Base):
 
     def __repr__(self):
         return f"<RSSItem(source_id={self.source_id}, title='{self.title[:40]}')>"
+
+
+class RSSUserState(Base):
+    """Per-user RSS cursor state for incremental listing flows."""
+    __tablename__ = "rss_user_state"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    last_list_recent_cursor_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="rss_user_state")
+
+    def __repr__(self):
+        return f"<RSSUserState(user_id={self.user_id}, cursor={self.last_list_recent_cursor_at})>"

@@ -399,6 +399,7 @@ class TaskRunner:
 
             # Summaries from previous succeeded steps keep context compact.
             prior_summaries: list[str] = []
+            prior_full_outputs: list[str] = []
             async with AsyncSessionLocal() as db:
                 prev_rows = await db.execute(
                     select(TaskStep)
@@ -409,21 +410,35 @@ class TaskRunner:
                     )
                     .order_by(TaskStep.step_index)
                 )
-                for prev in prev_rows.scalars().all():
+                prev_steps = prev_rows.scalars().all()
+                for prev in prev_steps:
                     prior_summaries.append(f"Step {prev.step_index}: {prev.output_summary}")
+                    if prev.result:
+                        prior_full_outputs.append(
+                            f"Step {prev.step_index} full output:\n{prev.result[:2200]}"
+                        )
 
+            is_final_step = self._is_final_synthesis_step(step, steps)
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             prompt_parts: list[str] = [f"[Task: {task_title}]", task_instruction]
             prompt_parts.append(f"Current Step ({step.step_index}): {step.title}")
             prompt_parts.append(step.instruction)
             if prior_summaries:
                 prompt_parts.append("Previous step summaries:\n" + "\n".join(prior_summaries))
+            if is_final_step and prior_full_outputs:
+                prompt_parts.append(
+                    "Previous step outputs (use exact details for final synthesis):\n"
+                    + "\n\n".join(prior_full_outputs)
+                )
+                prompt_parts.append(
+                    "If you include links in the final output, copy exact URLs from prior step outputs. "
+                    "Do not invent, rewrite, or simplify URLs."
+                )
             if memories:
                 prompt_parts.insert(0, svc.format_for_prompt(memories))
             prompt_parts.append(f"Current time: {now_str}")
 
             arm_approval = (task_requires_approval or step.requires_approval) and not pre_approved
-            is_final_step = self._is_final_synthesis_step(step, steps)
             stage = "task_final_synthesis" if is_final_step else "task_execution_step"
             primary_model = (
                 model_profile.final_synthesis_model if is_final_step else model_profile.execution_model

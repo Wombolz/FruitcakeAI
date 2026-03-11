@@ -11,6 +11,7 @@ Tools exposed to the agent:
   list_rss_source_candidates    — List candidate feeds pending/approved/rejected
   approve_rss_source_candidate  — Approve candidate and create active source
   reject_rss_source_candidate   — Reject candidate with reason
+  list_recent_feed_items        — List recent articles with configurable window/source filters
   search_my_feeds               — Search user active feed catalog
 """
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 from urllib.parse import urlsplit
 
@@ -217,6 +219,47 @@ _SEARCH_MY_FEEDS_SCHEMA: Dict[str, Any] = {
     },
 }
 
+_LIST_RECENT_FEED_ITEMS_SCHEMA: Dict[str, Any] = {
+    "name": "list_recent_feed_items",
+    "description": (
+        "List recent RSS articles with title, published time, source, summary, and full URL. "
+        "Use this for latest/since-last-refresh article lists. "
+        "Prefer search_my_feeds for keyword/topic search."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "max_results": {"type": "integer", "default": 5},
+            "window": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["hours", "days", "weeks", "since_last_refresh", "all"],
+                        "default": "days",
+                    },
+                    "value": {"type": "integer", "description": "Required for hours/days/weeks."},
+                },
+            },
+            "sources": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["all", "category", "include", "exclude"],
+                        "default": "all",
+                    },
+                    "category": {"type": "string"},
+                    "include_source_ids": {"type": "array", "items": {"type": "integer"}},
+                    "exclude_source_ids": {"type": "array", "items": {"type": "integer"}},
+                },
+            },
+            "refresh": {"type": "boolean", "default": False},
+            "mark_cursor": {"type": "boolean", "default": True},
+        },
+    },
+}
+
 
 # ── Public MCP interface ──────────────────────────────────────────────────────
 
@@ -231,6 +274,7 @@ def get_tools() -> List[Dict[str, Any]]:
         _LIST_RSS_CANDIDATES_SCHEMA,
         _APPROVE_RSS_CANDIDATE_SCHEMA,
         _REJECT_RSS_CANDIDATE_SCHEMA,
+        _LIST_RECENT_FEED_ITEMS_SCHEMA,
         _SEARCH_MY_FEEDS_SCHEMA,
     ]
 
@@ -258,6 +302,8 @@ async def call_tool(
         return await _approve_rss_source_candidate(arguments, user_context)
     if tool_name == "reject_rss_source_candidate":
         return await _reject_rss_source_candidate(arguments, user_context)
+    if tool_name == "list_recent_feed_items":
+        return await _list_recent_feed_items(arguments, user_context)
     if tool_name == "search_my_feeds":
         return await _search_my_feeds(arguments, user_context)
     return f"Unknown tool: {tool_name}"
@@ -660,6 +706,86 @@ async def _search_my_feeds(arguments: Dict[str, Any], user_context: Any) -> str:
         )
 
 
+async def _list_recent_feed_items(arguments: Dict[str, Any], user_context: Any) -> str:
+    user_id = _get_user_id(user_context)
+    if not user_id:
+        return "list_recent_feed_items requires an authenticated user context."
+
+    max_results = max(1, min(int(arguments.get("max_results", 5)), 50))
+    refresh = bool(arguments.get("refresh", False))
+    mark_cursor = bool(arguments.get("mark_cursor", True))
+
+    window = arguments.get("window") or {}
+    window_mode = str(window.get("mode", "days")).strip().lower() or "days"
+    window_value_raw = window.get("value")
+    window_value = int(window_value_raw) if window_value_raw is not None else None
+
+    sources = arguments.get("sources") or {}
+    source_mode = str(sources.get("mode", "all")).strip().lower() or "all"
+    source_category = (sources.get("category") or "").strip() or None
+    include_source_ids = [int(x) for x in (sources.get("include_source_ids") or []) if int(x) > 0]
+    exclude_source_ids = [int(x) for x in (sources.get("exclude_source_ids") or []) if int(x) > 0]
+
+    if window_mode in {"hours", "days", "weeks"} and (window_value is None or window_value <= 0):
+        return "window.value must be a positive integer when window.mode is hours/days/weeks."
+    if window_mode not in {"hours", "days", "weeks", "since_last_refresh", "all"}:
+        return "window.mode must be one of: hours, days, weeks, since_last_refresh, all."
+    if source_mode not in {"all", "category", "include", "exclude"}:
+        return "sources.mode must be one of: all, category, include, exclude."
+
+    async with AsyncSessionLocal() as db:
+        if refresh:
+            refreshed = await rss_sources.refresh_active_sources_cache(
+                db,
+                user_id=user_id,
+                category=source_category if source_mode == "category" else None,
+                max_items_per_source=20,
+            )
+            await db.commit()
+        else:
+            refreshed = None
+
+        cursor_at = None
+        effective_mode = window_mode
+        effective_value = window_value
+        if window_mode == "since_last_refresh":
+            cursor_at = await rss_sources.get_recent_list_cursor(db, user_id=user_id)
+            if cursor_at is None:
+                # First-run fallback for predictable output.
+                effective_mode = "days"
+                effective_value = 7
+
+        rows = await rss_sources.list_recent_items(
+            db,
+            user_id=user_id,
+            max_results=max_results,
+            window_mode=effective_mode,
+            window_value=effective_value,
+            source_mode=source_mode,
+            source_category=source_category,
+            include_source_ids=include_source_ids,
+            exclude_source_ids=exclude_source_ids,
+            since_cursor_at=cursor_at,
+        )
+
+        if not rows:
+            if window_mode == "since_last_refresh":
+                return "No new items since last refresh."
+            return "No recent feed items found for the selected filters."
+
+        if mark_cursor:
+            newest = max((_recent_item_timestamp(r) for r in rows), default=None)
+            if newest is not None:
+                await rss_sources.set_recent_list_cursor(db, user_id=user_id, cursor_at=newest)
+                await db.commit()
+
+    return _format_recent_items_results(
+        rows,
+        mode=window_mode,
+        refreshed_sources=(refreshed or {}).get("sources"),
+    )
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_summary(entry: Any) -> str:
@@ -766,5 +892,50 @@ def _format_cached_results(
         summary = row.get("summary") or ""
         if summary:
             lines.append(f"    {summary}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _recent_item_timestamp(row: Dict[str, str]) -> datetime | None:
+    text = (row.get("published") or "").strip() or (row.get("fetched_at") or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _format_recent_items_results(
+    rows: List[Dict[str, str]],
+    *,
+    mode: str,
+    refreshed_sources: int | None = None,
+) -> str:
+    if mode == "since_last_refresh":
+        title = f"Recent feed items since last refresh ({len(rows)}):"
+    else:
+        title = f"Recent feed items ({len(rows)}):"
+    if refreshed_sources is not None:
+        title += f" [refreshed {refreshed_sources} source(s)]"
+
+    lines = [title, ""]
+    for i, row in enumerate(rows, 1):
+        lines.append(f"[{i}] {row.get('title') or '(no title)'}")
+        feed = row.get("feed") or ""
+        if feed:
+            lines.append(f"    Source: {feed}")
+        published = row.get("published") or ""
+        if published:
+            lines.append(f"    Published: {published}")
+        summary = row.get("summary") or ""
+        if summary:
+            lines.append(f"    Summary: {summary}")
+        url = row.get("url") or ""
+        if url:
+            lines.append(f"    URL: {url}")
         lines.append("")
     return "\n".join(lines)

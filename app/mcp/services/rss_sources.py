@@ -9,10 +9,10 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import RSSItem, RSSSource, RSSSourceCandidate
+from app.db.models import RSSItem, RSSSource, RSSSourceCandidate, RSSUserState
 from app.mcp.services.rss_seed import DEFAULT_GLOBAL_RSS_SOURCES
 
 _TRACKING_QUERY_KEYS = {
@@ -343,6 +343,111 @@ async def search_cached_items(
             "fetched_at": item.fetched_at.isoformat() if item.fetched_at else "",
         }
         for item, source_name in rows
+    ]
+
+
+async def get_recent_list_cursor(
+    db: AsyncSession,
+    *,
+    user_id: int,
+) -> Optional[datetime]:
+    row = (
+        await db.execute(
+            select(RSSUserState).where(RSSUserState.user_id == user_id).limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    return row.last_list_recent_cursor_at
+
+
+async def set_recent_list_cursor(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    cursor_at: datetime,
+) -> RSSUserState:
+    row = (
+        await db.execute(
+            select(RSSUserState).where(RSSUserState.user_id == user_id).limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = RSSUserState(user_id=user_id, last_list_recent_cursor_at=cursor_at)
+        db.add(row)
+    else:
+        row.last_list_recent_cursor_at = cursor_at
+    await db.flush()
+    return row
+
+
+async def list_recent_items(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    max_results: int = 5,
+    window_mode: str = "days",
+    window_value: Optional[int] = 7,
+    source_mode: str = "all",
+    source_category: Optional[str] = None,
+    include_source_ids: Optional[list[int]] = None,
+    exclude_source_ids: Optional[list[int]] = None,
+    since_cursor_at: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
+    """
+    Return recent cached RSS items with configurable window/source filtering.
+    Ordered by published_at desc, then fetched_at desc.
+    """
+    effective_category = source_category if source_mode == "category" else None
+    sources = await resolve_active_sources(db, user_id=user_id, category=effective_category)
+    source_ids = [s.id for s in sources]
+    if not source_ids:
+        return []
+
+    include_set = {int(x) for x in (include_source_ids or []) if int(x) > 0}
+    exclude_set = {int(x) for x in (exclude_source_ids or []) if int(x) > 0}
+    if source_mode == "include":
+        source_ids = [sid for sid in source_ids if sid in include_set]
+    elif source_mode == "exclude":
+        source_ids = [sid for sid in source_ids if sid not in exclude_set]
+    if not source_ids:
+        return []
+
+    q = (
+        select(RSSItem, RSSSource.name, RSSSource.id)
+        .join(RSSSource, RSSSource.id == RSSItem.source_id)
+        .where(RSSItem.source_id.in_(source_ids))
+    )
+
+    now = datetime.now(timezone.utc)
+    mode = (window_mode or "days").strip().lower()
+    if mode in {"hours", "days", "weeks"}:
+        value = int(window_value or 0)
+        if value > 0:
+            if mode == "hours":
+                cutoff = now - timedelta(hours=value)
+            elif mode == "weeks":
+                cutoff = now - timedelta(weeks=value)
+            else:
+                cutoff = now - timedelta(days=value)
+            q = q.where(or_(RSSItem.published_at >= cutoff, and_(RSSItem.published_at.is_(None), RSSItem.fetched_at >= cutoff)))
+    elif mode == "since_last_refresh" and since_cursor_at is not None:
+        q = q.where(or_(RSSItem.published_at > since_cursor_at, and_(RSSItem.published_at.is_(None), RSSItem.fetched_at > since_cursor_at)))
+    # mode=all applies no additional time filter.
+
+    q = q.order_by(RSSItem.published_at.desc().nullslast(), RSSItem.fetched_at.desc()).limit(max(1, min(max_results, 100)))
+    rows = (await db.execute(q)).all()
+    return [
+        {
+            "source_id": source_id,
+            "title": item.title,
+            "url": item.link or "",
+            "summary": item.summary or "",
+            "published": item.published_at.isoformat() if item.published_at else "",
+            "feed": source_name,
+            "fetched_at": item.fetched_at.isoformat() if item.fetched_at else "",
+        }
+        for item, source_name, source_id in rows
     ]
 
 

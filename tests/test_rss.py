@@ -1,13 +1,18 @@
 import pytest
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from unittest.mock import AsyncMock
 
 from app.db.models import RSSItem, RSSSource
 from app.db.session import Base
 from app.mcp.servers.rss import _looks_like_placeholder_feed, _normalize_feed_url, call_tool, get_tools
-from app.mcp.services.rss_sources import search_cached_items
+from app.mcp.services.rss_sources import (
+    get_recent_list_cursor,
+    list_recent_items,
+    search_cached_items,
+    set_recent_list_cursor,
+)
 from tests.conftest import TestSessionLocal
 
 
@@ -36,6 +41,7 @@ def test_rss_models_registered_in_metadata():
     assert "rss_sources" in table_names
     assert "rss_source_candidates" in table_names
     assert "rss_items" in table_names
+    assert "rss_user_state" in table_names
 
 
 def test_rss_server_exposes_new_tool_schemas():
@@ -46,6 +52,7 @@ def test_rss_server_exposes_new_tool_schemas():
     assert "add_rss_source" in names
     assert "discover_rss_sources" in names
     assert "search_my_feeds" in names
+    assert "list_recent_feed_items" in names
 
 
 def test_search_my_feeds_schema_requires_non_empty_query():
@@ -172,3 +179,163 @@ async def test_search_cached_items_temporal_query_returns_latest_items():
 
     assert len(rows) >= 1
     assert rows[0]["title"] == "Breaking market move"
+
+
+@pytest.mark.asyncio
+async def test_list_recent_feed_items_tool_outputs_full_urls():
+    async with TestSessionLocal() as db:
+        source = RSSSource(
+            user_id=1,
+            name="Example",
+            url="https://example.com/feed.xml",
+            url_canonical="https://example.com/feed.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(source)
+        await db.flush()
+        db.add(
+            RSSItem(
+                source_id=source.id,
+                item_uid="recent-url-1",
+                title="Article One",
+                link="https://example.com/article-1",
+                summary="Summary one",
+                published_at=datetime.now(timezone.utc),
+            )
+        )
+        await db.commit()
+
+    with patch("app.mcp.servers.rss.AsyncSessionLocal", new=TestSessionLocal):
+        result = await call_tool(
+            "list_recent_feed_items",
+            {"max_results": 5, "window": {"mode": "all"}},
+            user_context={"user_id": 1},
+        )
+    assert "Recent feed items" in result
+    assert "URL: https://example.com/article-1" in result
+
+
+@pytest.mark.asyncio
+async def test_recent_items_since_last_refresh_cursor_updates_and_filters():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    older = now
+    newer = now + timedelta(seconds=1)
+
+    async with TestSessionLocal() as db:
+        source = RSSSource(
+            user_id=2,
+            name="Cursor Feed",
+            url="https://cursor.example/feed.xml",
+            url_canonical="https://cursor.example/feed.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(source)
+        await db.flush()
+        db.add(
+            RSSItem(
+                source_id=source.id,
+                item_uid="c1",
+                title="Old Item",
+                link="https://cursor.example/old",
+                summary="old",
+                published_at=older,
+                fetched_at=older,
+                first_seen_at=older,
+                last_seen_at=older,
+            )
+        )
+        await db.flush()
+        await set_recent_list_cursor(db, user_id=2, cursor_at=older)
+        db.add(
+            RSSItem(
+                source_id=source.id,
+                item_uid="c2",
+                title="New Item",
+                link="https://cursor.example/new",
+                summary="new",
+                published_at=newer,
+                fetched_at=newer,
+                first_seen_at=newer,
+                last_seen_at=newer,
+            )
+        )
+        await db.commit()
+
+    async with TestSessionLocal() as db:
+        cursor = await get_recent_list_cursor(db, user_id=2)
+        rows = await list_recent_items(
+            db,
+            user_id=2,
+            max_results=5,
+            window_mode="since_last_refresh",
+            since_cursor_at=cursor,
+        )
+        assert len(rows) == 1
+        assert rows[0]["title"] == "New Item"
+
+
+@pytest.mark.asyncio
+async def test_list_recent_items_source_include_filter():
+    now = datetime.now(timezone.utc)
+    async with TestSessionLocal() as db:
+        s1 = RSSSource(
+            user_id=3,
+            name="Feed A",
+            url="https://a.example/feed.xml",
+            url_canonical="https://a.example/feed.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        s2 = RSSSource(
+            user_id=3,
+            name="Feed B",
+            url="https://b.example/feed.xml",
+            url_canonical="https://b.example/feed.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add_all([s1, s2])
+        await db.flush()
+        db.add_all(
+            [
+                RSSItem(
+                    source_id=s1.id,
+                    item_uid="a1",
+                    title="From A",
+                    link="https://a.example/1",
+                    summary="A",
+                    published_at=now,
+                ),
+                RSSItem(
+                    source_id=s2.id,
+                    item_uid="b1",
+                    title="From B",
+                    link="https://b.example/1",
+                    summary="B",
+                    published_at=now,
+                ),
+            ]
+        )
+        await db.commit()
+
+    async with TestSessionLocal() as db:
+        rows = await list_recent_items(
+            db,
+            user_id=3,
+            max_results=10,
+            window_mode="all",
+            source_mode="include",
+            include_source_ids=[s1.id],
+        )
+        assert len(rows) == 1
+        assert rows[0]["title"] == "From A"
