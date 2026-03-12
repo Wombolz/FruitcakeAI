@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     task_large_retry_max_attempts: int = 1
     task_force_large_for_planning: bool = True
     task_force_large_for_final_synthesis: bool = True
+    task_plan_default_steps: int = 8
+    task_plan_max_steps: int = 20
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"

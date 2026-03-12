@@ -4,13 +4,15 @@ FruitcakeAI v5 — Task step planning endpoints.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
 
 from app.config import settings
-from app.db.models import ChatSession, Task, TaskRun, TaskStep
+from app.db.models import ChatSession, RSSItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
+from app.autonomy.profiles.news_magazine import _ground_output
 from app.autonomy.runner import _format_result_for_inbox
 from tests.conftest import TestSessionLocal
 
@@ -54,6 +56,35 @@ async def test_create_plan_and_list_steps(client):
     rows = steps.json()
     assert [r["step_index"] for r in rows] == [1, 2]
     assert rows[1]["requires_approval"] is True
+
+
+@pytest.mark.asyncio
+async def test_magazine_plan_uses_deterministic_steps_without_approval(client):
+    headers = await _headers(client, "magplanowner")
+    task = await client.post(
+        "/tasks",
+        json={
+            "title": "Daily News Magazine",
+            "instruction": "Create a daily magazine from prepared data",
+            "profile": "news_magazine",
+        },
+        headers=headers,
+    )
+    task_id = task.json()["id"]
+
+    planned = await client.post(
+        f"/tasks/{task_id}/plan",
+        json={"goal": "Publish hourly news magazine", "max_steps": 8},
+        headers=headers,
+    )
+    assert planned.status_code == 200
+    assert planned.json()["steps_created"] == 2
+
+    steps = await client.get(f"/tasks/{task_id}/steps", headers=headers)
+    rows = steps.json()
+    assert rows[0]["title"] == "Draft Magazine from Dataset"
+    assert rows[-1]["title"] == "Final Dedupe and Publish"
+    assert all(row["requires_approval"] is False for row in rows)
 
 
 @pytest.mark.asyncio
@@ -262,6 +293,33 @@ def test_format_result_for_inbox_preserves_existing_newlines():
     assert _format_result_for_inbox(text) == text
 
 
+def test_ground_magazine_output_removes_unverified_links():
+    source_text = (
+        "1. Story One\n"
+        "URL: https://news.example.org/one\n"
+        "2. Story Two\n"
+        "URL: https://bad.example.org/two\n"
+    )
+    cleaned, report = _ground_output(
+        source_text,
+        allowed_urls={"https://news.example.org/one"},
+    )
+    assert report["fatal"] is False
+    assert "https://news.example.org/one" in cleaned
+    assert "https://bad.example.org/two" not in cleaned
+
+
+def test_ground_magazine_output_fails_when_all_links_ungrounded():
+    source_text = "URL: https://fake.example.org/a\nURL: https://fake.example.org/b"
+    cleaned, report = _ground_output(
+        source_text,
+        allowed_urls={"https://real.example.org/a"},
+    )
+    assert cleaned == ""
+    assert report["fatal"] is True
+    assert "fatal_reason" in report
+
+
 @pytest.mark.asyncio
 async def test_planned_task_uses_last_step_result_as_final_output(client):
     from app.autonomy.runner import TaskRunner
@@ -389,6 +447,38 @@ async def test_create_task_infers_persona_and_validates_explicit_persona(client)
             "instruction": "Test invalid persona",
             "persona": "does_not_exist",
         },
+        headers=headers,
+    )
+    assert invalid.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_and_patch_task_profile_validation(client):
+    headers = await _headers(client, "profileowner")
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Magazine",
+            "instruction": "Build periodic magazine",
+            "profile": "news_magazine",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["profile"] == "news_magazine"
+
+    patch = await client.patch(
+        f"/tasks/{created.json()['id']}",
+        json={"profile": "default"},
+        headers=headers,
+    )
+    assert patch.status_code == 200
+    assert patch.json()["profile"] == "default"
+
+    invalid = await client.patch(
+        f"/tasks/{created.json()['id']}",
+        json={"profile": "not_real"},
         headers=headers,
     )
     assert invalid.status_code == 400
@@ -541,3 +631,143 @@ async def test_runner_retries_non_final_step_once_with_large_model(client, monke
     assert calls[0] == ("ollama_chat/qwen2.5:7b", "task_execution_step")
     assert calls[1] == ("ollama_chat/qwen2.5:14b", "task_execution_step")
     assert calls[-1] == ("ollama_chat/qwen2.5:14b", "task_final_synthesis")
+
+
+@pytest.mark.asyncio
+async def test_runner_suppresses_repeated_identical_tool_failures(client, monkeypatch):
+    from app.autonomy.runner import TaskRunner
+
+    monkeypatch.setattr(settings, "task_model_routing_enabled", True)
+    monkeypatch.setattr(settings, "task_small_model", "ollama_chat/qwen2.5:7b")
+    monkeypatch.setattr(settings, "task_large_model", "ollama_chat/qwen2.5:14b")
+    monkeypatch.setattr(settings, "task_force_large_for_final_synthesis", True)
+    monkeypatch.setattr(settings, "task_large_retry_enabled", True)
+    monkeypatch.setattr(settings, "task_large_retry_max_attempts", 3)
+
+    headers = await _headers(client, "suppressionowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Data gather task",
+            "instruction": "Run tool workflow",
+            "task_type": "one_shot",
+            "deliver": False,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    fake_steps = [
+        {"title": "Fetch data", "instruction": "Call tools", "requires_approval": False},
+        {"title": "Final synthesis", "instruction": "Summarize", "requires_approval": False},
+    ]
+    with patch("app.autonomy.planner._generate_plan_steps", new=AsyncMock(return_value=fake_steps)):
+        await client.post(
+            f"/tasks/{task_id}/plan",
+            json={"goal": "Suppression test", "max_steps": 4},
+            headers=headers,
+        )
+
+    async def _always_fail(*_args, **_kwargs):
+        raise RuntimeError("Tool search failed: timeout")
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_always_fail)):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status in {"pending", "failed"}
+        rows = await db.execute(
+            select(TaskStep)
+            .where(TaskStep.task_id == task_id, TaskStep.step_index == 1)
+            .limit(1)
+        )
+        first_step = rows.scalar_one_or_none()
+        assert first_step is not None
+        assert (first_step.error or "").startswith("Suppressed repeated tool failure:")
+
+
+@pytest.mark.asyncio
+async def test_magazine_run_persists_dataset_and_grounding_artifacts(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "magazineowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Daily News Magazine",
+            "instruction": "Build a daily news magazine from prepared sources",
+            "profile": "news_magazine",
+            "task_type": "one_shot",
+            "deliver": False,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    async with TestSessionLocal() as db:
+        task_row = await db.get(Task, task_id)
+        src = RSSSource(
+            user_id=task_row.user_id,
+            name="Magazine Feed",
+            url="https://mag.example/feed.xml",
+            url_canonical="https://mag.example/feed.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(src)
+        await db.flush()
+        db.add(
+            RSSItem(
+                source_id=src.id,
+                item_uid="m1",
+                title="Test story",
+                link="https://mag.example/story-1",
+                summary="Summary",
+                published_at=datetime.now(timezone.utc),
+            )
+        )
+        await db.commit()
+
+    await client.post(
+        f"/tasks/{task_id}/plan",
+        json={"goal": "Magazine output", "max_steps": 2},
+        headers=headers,
+    )
+
+    with patch(
+        "app.autonomy.magazine_pipeline.rss_sources.refresh_active_sources_cache",
+        new=AsyncMock(return_value={"sources": 1, "items": 1}),
+    ):
+        with patch(
+            "app.agent.core.run_agent",
+            new=AsyncMock(
+                side_effect=[
+                    "Draft created from dataset.",
+                    "## Daily News Magazine\\n\\n- [Story](https://mag.example/story-1)",
+                ]
+            ),
+        ):
+            runner = TaskRunner()
+            with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+                await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    async with TestSessionLocal() as db:
+        runs = await db.execute(
+            select(TaskRun).where(TaskRun.task_id == task_id).order_by(TaskRun.started_at.desc())
+        )
+        latest = runs.scalars().first()
+        assert latest is not None
+        artifacts = await db.execute(
+            select(TaskRunArtifact).where(TaskRunArtifact.task_run_id == latest.id)
+        )
+        by_type = {a.artifact_type: a for a in artifacts.scalars().all()}
+        assert "prepared_dataset" in by_type
+        assert "final_output" in by_type
+        assert "validation_report" in by_type
+        assert "run_diagnostics" in by_type

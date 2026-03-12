@@ -17,6 +17,7 @@ from app.agent.core import _litellm_kwargs
 from app.config import settings
 from app.db.models import Task, TaskStep
 from app.metrics import metrics
+from app.autonomy.profiles import resolve_task_profile
 
 
 async def create_task_plan_for_user(
@@ -25,7 +26,7 @@ async def create_task_plan_for_user(
     task_id: int,
     user_id: int,
     goal: str,
-    max_steps: int = 6,
+    max_steps: int = 8,
     notes: str = "",
     style: str = "concise",
     model_override: str | None = None,
@@ -36,14 +37,17 @@ async def create_task_plan_for_user(
     if task is None:
         raise ValueError("Task not found")
 
-    bounded_steps = min(max(max_steps, 1), 12)
-    steps = await _generate_plan_steps(
-        goal=goal.strip() or task.title,
+    bounded_steps = min(max(max_steps, 1), max(1, int(settings.task_plan_max_steps)))
+    resolved_goal = goal.strip() or task.title
+    profile = resolve_task_profile(task)
+    steps = await profile.plan_steps(
+        goal=resolved_goal,
         task_instruction=task.instruction,
         max_steps=bounded_steps,
         notes=notes.strip(),
         style=style.strip() or "concise",
         model_override=model_override,
+        default_planner=_generate_plan_steps,
     )
 
     had_plan = bool(task.has_plan)
@@ -155,3 +159,4 @@ def _fallback_steps(goal: str, task_instruction: str, max_steps: int) -> List[Di
         {"title": "Summarize result", "instruction": "Provide a concise final summary and next actions.", "requires_approval": False},
     ]
     return steps[:max_steps]
+

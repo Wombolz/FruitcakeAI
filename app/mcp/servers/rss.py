@@ -11,6 +11,7 @@ Tools exposed to the agent:
   list_rss_source_candidates    — List candidate feeds pending/approved/rejected
   approve_rss_source_candidate  — Approve candidate and create active source
   reject_rss_source_candidate   — Reject candidate with reason
+  refresh_rss_cache             — Refresh active RSS cache and return stats only
   list_recent_feed_items        — List recent articles with configurable window/source filters
   search_my_feeds               — Search user active feed catalog
 """
@@ -236,7 +237,7 @@ _LIST_RECENT_FEED_ITEMS_SCHEMA: Dict[str, Any] = {
                     "mode": {
                         "type": "string",
                         "enum": ["hours", "days", "weeks", "since_last_refresh", "all"],
-                        "default": "days",
+                        "default": "all",
                     },
                     "value": {"type": "integer", "description": "Required for hours/days/weeks."},
                 },
@@ -260,6 +261,21 @@ _LIST_RECENT_FEED_ITEMS_SCHEMA: Dict[str, Any] = {
     },
 }
 
+_REFRESH_RSS_CACHE_SCHEMA: Dict[str, Any] = {
+    "name": "refresh_rss_cache",
+    "description": (
+        "Refresh active RSS sources for the current user and return compact maintenance stats only. "
+        "Use this for maintenance tasks that should avoid article content output."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string"},
+            "max_items_per_source": {"type": "integer", "default": 20},
+        },
+    },
+}
+
 
 # ── Public MCP interface ──────────────────────────────────────────────────────
 
@@ -274,6 +290,7 @@ def get_tools() -> List[Dict[str, Any]]:
         _LIST_RSS_CANDIDATES_SCHEMA,
         _APPROVE_RSS_CANDIDATE_SCHEMA,
         _REJECT_RSS_CANDIDATE_SCHEMA,
+        _REFRESH_RSS_CACHE_SCHEMA,
         _LIST_RECENT_FEED_ITEMS_SCHEMA,
         _SEARCH_MY_FEEDS_SCHEMA,
     ]
@@ -302,6 +319,8 @@ async def call_tool(
         return await _approve_rss_source_candidate(arguments, user_context)
     if tool_name == "reject_rss_source_candidate":
         return await _reject_rss_source_candidate(arguments, user_context)
+    if tool_name == "refresh_rss_cache":
+        return await _refresh_rss_cache(arguments, user_context)
     if tool_name == "list_recent_feed_items":
         return await _list_recent_feed_items(arguments, user_context)
     if tool_name == "search_my_feeds":
@@ -706,6 +725,35 @@ async def _search_my_feeds(arguments: Dict[str, Any], user_context: Any) -> str:
         )
 
 
+async def _refresh_rss_cache(arguments: Dict[str, Any], user_context: Any) -> str:
+    user_id = _get_user_id(user_context)
+    if not user_id:
+        return "refresh_rss_cache requires an authenticated user context."
+
+    category = (arguments.get("category") or "").strip() or None
+    try:
+        max_items_per_source = max(1, min(int(arguments.get("max_items_per_source", 20)), 50))
+    except Exception:
+        max_items_per_source = 20
+
+    async with AsyncSessionLocal() as db:
+        refreshed = await rss_sources.refresh_active_sources_cache(
+            db,
+            user_id=user_id,
+            category=category,
+            max_items_per_source=max_items_per_source,
+        )
+        await db.commit()
+
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return (
+        "RSS_REFRESH_OK\n"
+        f"sources_refreshed: {int(refreshed.get('sources') or 0)}\n"
+        f"items_seen: {int(refreshed.get('items') or 0)}\n"
+        f"timestamp_utc: {now}"
+    )
+
+
 async def _list_recent_feed_items(arguments: Dict[str, Any], user_context: Any) -> str:
     user_id = _get_user_id(user_context)
     if not user_id:
@@ -715,8 +763,9 @@ async def _list_recent_feed_items(arguments: Dict[str, Any], user_context: Any) 
     refresh = bool(arguments.get("refresh", False))
     mark_cursor = bool(arguments.get("mark_cursor", True))
 
-    window = arguments.get("window") or {}
-    window_mode = str(window.get("mode", "days")).strip().lower() or "days"
+    raw_window = arguments.get("window")
+    window = raw_window or {}
+    window_mode = str(window.get("mode", "all")).strip().lower() or "all"
     window_value_raw = window.get("value")
     window_value = int(window_value_raw) if window_value_raw is not None else None
 

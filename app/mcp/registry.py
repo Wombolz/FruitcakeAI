@@ -4,7 +4,7 @@ Auto-discovery from config/mcp_config.yaml.
 
 Supports two server types:
   internal_python  — Python modules that run in-process (calendar, web, rss)
-  docker_stdio     — Docker containers invoked via stdio (python_refactoring, sequential_thinking)
+  docker_stdio     — Docker containers invoked via stdio (python_refactoring, playwright, etc.)
 
 Tool schemas are converted from MCP format → LiteLLM function-calling format at startup.
 Adding a new server requires only a config entry — no code changes.

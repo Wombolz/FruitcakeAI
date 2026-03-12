@@ -44,7 +44,11 @@ def build_hybrid_retriever(
         from llama_index.retrievers.bm25 import BM25Retriever
 
         docstore = index.docstore
-        has_docs = bool(getattr(docstore, "_docs", None) or getattr(docstore, "_kvstore", None))
+        raw_docs = getattr(docstore, "_docs", None)
+        if isinstance(raw_docs, dict):
+            has_docs = len(raw_docs) > 0
+        else:
+            has_docs = bool(raw_docs)
 
         if not has_docs:
             log.info("BM25 skipped at startup (no documents yet) — will activate after first ingest")
@@ -57,6 +61,12 @@ def build_hybrid_retriever(
                     similarity_top_k=bm25_top_k,
                 )
             log.info("BM25 retriever initialized")
+    except ValueError as e:
+        # Seen when a docstore object exists but has zero effective corpus rows.
+        if "empty sequence" in str(e).lower():
+            log.info("BM25 skipped at startup (empty corpus) — using vector-only until ingest")
+        else:
+            log.warning("BM25 not available, using vector-only: %s", e)
     except Exception as e:
         log.warning("BM25 not available, using vector-only: %s", e)
 

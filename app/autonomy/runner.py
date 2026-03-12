@@ -16,23 +16,29 @@ Design:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import logging
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import structlog
+from sqlalchemy import select
 
 from app.autonomy.approval import ApprovalRequired, _approval_armed
 from app.autonomy.model_routing import TaskModelProfile, resolve_task_model_profile
+from app.autonomy.profiles import resolve_task_profile, resolve_task_profile_by_name
 from app.autonomy.scheduler import compute_next_run_at
-from app.db.models import Task, TaskRun, TaskStep
+from app.config import settings
+from app.db.models import Task, TaskRun, TaskRunArtifact, TaskStep
 from app.metrics import metrics
 
 log = structlog.get_logger(__name__)
 
 # Exponential retry delays (seconds) for transient errors
 RETRY_DELAYS = [30, 60, 300, 900, 3600]
+REPEATED_TOOL_ERROR_THRESHOLD = 2
 
 # Limit concurrent task-mode agent loops
 _semaphore = asyncio.Semaphore(2)
@@ -80,6 +86,7 @@ class TaskRunner:
         task_title: Optional[str] = None
         task_deliver: bool = False
         task_run_id: Optional[int] = None
+        run_debug: dict[str, object] = {}
 
         current = asyncio.current_task()
         async with self._active_lock:
@@ -106,7 +113,7 @@ class TaskRunner:
 
             log.info("task.started", task_id=task_id, title=task_title)
 
-            result = await self._execute_agent(task_id, task_run_id=task_run_id)
+            result, run_debug = await self._execute_agent(task_id, task_run_id=task_run_id)
             result = _format_result_for_inbox(result)
 
             # Phase 6a: Success — update task record
@@ -121,7 +128,11 @@ class TaskRunner:
 
                 recurring_snapshot = ""
                 if task.task_type == "recurring" and task.schedule:
-                    recurring_snapshot = await self._reset_steps_for_new_run(db, task.id)
+                    recurring_snapshot = await self._reset_steps_for_new_run(
+                        db,
+                        task.id,
+                        run_debug=run_debug,
+                    )
                     task.next_run_at = compute_next_run_at(task.schedule)
                     task.status = "pending"   # re-queue for next run
 
@@ -131,11 +142,23 @@ class TaskRunner:
                         run.status = "completed"
                         run.finished_at = datetime.now(timezone.utc)
                         run.error = None
+                        diagnostics = _format_run_diagnostics(run_debug)
                         if recurring_snapshot:
                             merged = f"{(result or '').strip()}\n\n{recurring_snapshot}".strip()
+                            if diagnostics:
+                                merged = f"{merged}\n\n{diagnostics}".strip()
                             run.summary = merged[:4000]
                         else:
-                            run.summary = (result or "")[:1000]
+                            merged = (result or "").strip()
+                            if diagnostics:
+                                merged = f"{merged}\n\n{diagnostics}".strip()
+                            run.summary = merged[:4000]
+                    await _persist_run_artifacts(
+                        db,
+                        task_run_id=task_run_id,
+                        final_markdown=result,
+                        run_debug=run_debug,
+                    )
 
                 # Save instruction + result as messages so the session is browsable
                 # and "Reply in Chat" can load real context.
@@ -199,7 +222,11 @@ class TaskRunner:
     # Agent execution in isolated session
     # ------------------------------------------------------------------
 
-    async def _execute_agent(self, task_id: int, task_run_id: Optional[int] = None) -> str:
+    async def _execute_agent(
+        self,
+        task_id: int,
+        task_run_id: Optional[int] = None,
+    ) -> tuple[str, dict[str, object]]:
         from sqlalchemy import select
         from app.db.session import AsyncSessionLocal
         from app.db.models import ChatSession, User
@@ -217,6 +244,7 @@ class TaskRunner:
         has_plan = False
         pre_approved = False
         model_profile: TaskModelProfile | None = None
+        task_profile = None
 
         async with AsyncSessionLocal() as db:
             task = await db.get(Task, task_id)
@@ -233,6 +261,7 @@ class TaskRunner:
             from app.autonomy.execution_profile import resolve_execution_profile
             resolved = resolve_execution_profile(task, user)
             model_profile = resolve_task_model_profile(task, user)
+            task_profile = resolve_task_profile(task, user)
             persona_name = resolved.persona
             task_user_id = task.user_id
             task_instruction = task.instruction
@@ -259,7 +288,7 @@ class TaskRunner:
                     task_id=task.id,
                     user_id=task.user_id,
                     goal=plan_goal,
-                    max_steps=6,
+                    max_steps=settings.task_plan_default_steps,
                     notes=task.instruction or "",
                     style="concise",
                     model_override=model_profile.planning_model,
@@ -316,6 +345,8 @@ class TaskRunner:
                         task_requires_approval=task_requires_approval,
                         pre_approved=pre_approved,
                         model_profile=model_profile,
+                        task_run_id=task_run_id,
+                        task_profile=task_profile,
                     )
 
         # Back-compat mode: single instruction task behavior.
@@ -334,13 +365,14 @@ class TaskRunner:
         arm_approval = task_requires_approval and not pre_approved
         token = _approval_armed.set(arm_approval)
         try:
-            return await run_agent(
+            result = await run_agent(
                 [{"role": "user", "content": "\n\n".join(parts)}],
                 user_context,
                 mode="task",
                 model_override=model_profile.final_synthesis_model if model_profile else None,
                 stage="task_single_stage",
             )
+            return result, {}
         finally:
             _approval_armed.reset(token)
 
@@ -360,7 +392,9 @@ class TaskRunner:
         task_requires_approval: bool,
         pre_approved: bool,
         model_profile: TaskModelProfile,
-    ) -> str:
+        task_run_id: Optional[int] = None,
+        task_profile=None,
+    ) -> tuple[str, dict[str, object]]:
         """Execute task steps sequentially from current_step_index."""
         from sqlalchemy import select
         from app.db.session import AsyncSessionLocal
@@ -368,6 +402,31 @@ class TaskRunner:
         from app.memory.service import get_memory_service
 
         final_result = ""
+        repeated_error_counts: dict[str, int] = {}
+        suppression_events: list[dict[str, str | int]] = []
+        step_user_context = user_context
+        run_context: dict[str, object] = {}
+        grounding_report: dict[str, object] | None = None
+        run_debug: dict[str, object] = {
+            "profile": getattr(task_profile, "name", "default"),
+            "tool_failure_suppressions": suppression_events,
+        }
+
+        if task_profile and task_run_id:
+            async with AsyncSessionLocal() as db:
+                run_context = await task_profile.prepare_run_context(
+                    db=db,
+                    user_id=user_id,
+                    task_run_id=task_run_id,
+                )
+                await db.commit()
+            if isinstance(run_context, dict):
+                for key in ("dataset", "dataset_stats", "refresh_stats"):
+                    if key in run_context:
+                        run_debug[key] = run_context[key]
+            blocked = set(step_user_context.blocked_tools or [])
+            blocked.update(task_profile.effective_blocked_tools(run_context=run_context))
+            step_user_context = replace(step_user_context, blocked_tools=sorted(blocked))
 
         async with AsyncSessionLocal() as db:
             task = await db.get(Task, task_id)
@@ -423,6 +482,12 @@ class TaskRunner:
             prompt_parts: list[str] = [f"[Task: {task_title}]", task_instruction]
             prompt_parts.append(f"Current Step ({step.step_index}): {step.title}")
             prompt_parts.append(step.instruction)
+            if task_profile:
+                task_profile.augment_prompt(
+                    prompt_parts=prompt_parts,
+                    run_context=run_context,
+                    is_final_step=is_final_step,
+                )
             if prior_summaries:
                 prompt_parts.append("Previous step summaries:\n" + "\n".join(prior_summaries))
             if is_final_step and prior_full_outputs:
@@ -447,7 +512,7 @@ class TaskRunner:
             try:
                 result = await self._run_step_with_model_policy(
                     prompt="\n\n".join(prompt_parts),
-                    user_context=user_context,
+                    user_context=step_user_context,
                     primary_model=primary_model,
                     final_model=model_profile.final_synthesis_model,
                     stage=stage,
@@ -455,6 +520,8 @@ class TaskRunner:
                     fallback_attempts=model_profile.large_retry_max_attempts,
                     count_small_metric=(not is_final_step),
                     count_final_large_metric=is_final_step,
+                    repeated_error_counts=repeated_error_counts,
+                    suppression_events=suppression_events,
                 )
             except ApprovalRequired as exc:
                 _approval_armed.reset(token)
@@ -469,6 +536,19 @@ class TaskRunner:
                 raise
             except Exception as exc:
                 _approval_armed.reset(token)
+                if (
+                    getattr(task_profile, "name", "default") == "news_magazine"
+                    and not is_final_step
+                    and _is_suppressed_tool_failure_error(exc)
+                ):
+                    async with AsyncSessionLocal() as db:
+                        task = await db.get(Task, task_id)
+                        step_row = await db.get(TaskStep, step.id)
+                        step_row.status = "skipped"
+                        step_row.error = str(exc)
+                        task.current_step_index = step.step_index + 1
+                        await db.commit()
+                    continue
                 async with AsyncSessionLocal() as db:
                     task = await db.get(Task, task_id)
                     step_row = await db.get(TaskStep, step.id)
@@ -479,6 +559,27 @@ class TaskRunner:
                 raise
             else:
                 _approval_armed.reset(token)
+
+            if task_profile:
+                cleaned, grounding_report = task_profile.validate_finalize(
+                    result=result,
+                    prior_full_outputs=prior_full_outputs,
+                    run_context=run_context,
+                    is_final_step=is_final_step,
+                )
+                result = cleaned
+                if grounding_report is not None:
+                    run_debug["grounding_report"] = grounding_report
+                if grounding_report and grounding_report.get("fatal"):
+                    message = str(grounding_report.get("fatal_reason") or "Ungrounded magazine output")
+                    async with AsyncSessionLocal() as db:
+                        task = await db.get(Task, task_id)
+                        step_row = await db.get(TaskStep, step.id)
+                        task.status = "failed"
+                        step_row.status = "failed"
+                        step_row.error = message
+                        await db.commit()
+                    raise RuntimeError(message)
 
             summary = result[:240] if result else ""
             final_result = result
@@ -508,7 +609,9 @@ class TaskRunner:
             task.current_step_index = None
             await db.commit()
 
-        return final_result
+        if grounding_report is not None:
+            run_debug["grounding_report"] = grounding_report
+        return final_result, run_debug
 
     async def _run_step_with_model_policy(
         self,
@@ -522,6 +625,8 @@ class TaskRunner:
         fallback_attempts: int,
         count_small_metric: bool,
         count_final_large_metric: bool,
+        repeated_error_counts: dict[str, int],
+        suppression_events: list[dict[str, str | int]],
     ) -> str:
         from app.agent.core import run_agent
 
@@ -555,7 +660,22 @@ class TaskRunner:
                 return result
             except ApprovalRequired:
                 raise
-            except Exception:
+            except Exception as exc:
+                signature = _build_tool_error_signature(exc, stage=stage, model=model)
+                if signature:
+                    count = repeated_error_counts.get(signature, 0) + 1
+                    repeated_error_counts[signature] = count
+                    if count >= REPEATED_TOOL_ERROR_THRESHOLD:
+                        suppression_events.append(
+                            {
+                                "signature": signature,
+                                "count": count,
+                                "stage": stage,
+                            }
+                        )
+                        raise RuntimeError(
+                            f"Suppressed repeated tool failure: {signature}"
+                        ) from exc
                 if allow_large_fallback and attempts < max_attempts:
                     attempts += 1
                     continue
@@ -573,7 +693,13 @@ class TaskRunner:
         markers = ("final", "synthesis", "summarize", "summary", "final output")
         return any(marker in text for marker in markers)
 
-    async def _reset_steps_for_new_run(self, db, task_id: int) -> str:
+    async def _reset_steps_for_new_run(
+        self,
+        db,
+        task_id: int,
+        *,
+        run_debug: Optional[dict[str, object]] = None,
+    ) -> str:
         """Recurring tasks start from a clean step state each run."""
         from sqlalchemy import select
 
@@ -589,11 +715,15 @@ class TaskRunner:
             snapshot_lines.append(f"- Step {step.step_index}: {step.title} [{step.status}]")
             if step.output_summary:
                 snapshot_lines.append(f"  Summary: {step.output_summary}")
-            elif step.result:
-                trimmed = (step.result[:220] + "...") if len(step.result) > 220 else step.result
-                snapshot_lines.append(f"  Result: {trimmed}")
+            if step.result:
+                trimmed = (step.result[:420] + "...") if len(step.result) > 420 else step.result
+                snapshot_lines.append(f"  Output: {trimmed}")
             if step.error:
                 snapshot_lines.append(f"  Error: {step.error}")
+        diagnostics = _format_run_diagnostics(run_debug or {})
+        if diagnostics:
+            snapshot_lines.append("")
+            snapshot_lines.append(diagnostics)
         snapshot = "\n".join(snapshot_lines)
 
         for step in steps:
@@ -739,3 +869,76 @@ def _format_result_for_inbox(result: str) -> str:
     if len(parts) < 2:
         return text
     return "\n\n".join(parts)
+
+
+def _build_tool_error_signature(exc: Exception, *, stage: str, model: str) -> str:
+    text = str(exc or "").strip()
+    if not text:
+        return ""
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    return f"{stage}|{model}|{normalized[:240]}"
+
+
+def _is_suppressed_tool_failure_error(exc: Exception) -> bool:
+    return "Suppressed repeated tool failure:" in str(exc)
+
+
+def _format_run_diagnostics(run_debug: dict[str, object]) -> str:
+    if not run_debug:
+        return ""
+
+    lines: list[str] = ["Run diagnostics:"]
+    suppressions = run_debug.get("tool_failure_suppressions") or []
+    if isinstance(suppressions, list) and suppressions:
+        lines.append(f"- Suppressed repeated failures: {len(suppressions)}")
+        for item in suppressions[:5]:
+            if isinstance(item, dict):
+                lines.append(f"  - {item.get('signature', 'unknown')} (count={item.get('count', '?')})")
+
+    grounding = run_debug.get("grounding_report")
+    if isinstance(grounding, dict):
+        lines.append(
+            "- Grounding: "
+            f"urls={grounding.get('detected_urls', 0)}, "
+            f"invalid={len(grounding.get('invalid_urls') or [])}, "
+            f"placeholders={grounding.get('placeholder_hits', 0)}, "
+            f"fatal={grounding.get('fatal', False)}"
+        )
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
+async def _persist_run_artifacts(
+    db,
+    *,
+    task_run_id: int,
+    final_markdown: str,
+    run_debug: dict[str, object],
+) -> None:
+    profile = resolve_task_profile_by_name(str(run_debug.get("profile") or "default"))
+    payloads = profile.artifact_payloads(final_markdown=final_markdown, run_debug=run_debug)
+
+    # Replace previous artifacts for this run/type to keep data deterministic.
+    existing_rows = (
+        await db.execute(
+            select(TaskRunArtifact).where(TaskRunArtifact.task_run_id == task_run_id)
+        )
+    ).scalars().all()
+    for row in existing_rows:
+        await db.delete(row)
+
+    for payload in payloads:
+        content_json = payload.get("content_json")
+        if isinstance(content_json, dict):
+            content_json = json.dumps(content_json, ensure_ascii=True, sort_keys=True)
+        elif content_json is not None and not isinstance(content_json, str):
+            content_json = json.dumps(content_json, ensure_ascii=True, sort_keys=True)
+        db.add(
+            TaskRunArtifact(
+                task_run_id=task_run_id,
+                artifact_type=str(payload.get("artifact_type") or "run_diagnostics"),
+                content_json=content_json,
+                content_text=payload.get("content_text"),
+            )
+        )

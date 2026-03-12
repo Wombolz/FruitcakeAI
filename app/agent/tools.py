@@ -80,7 +80,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "properties": {
                     "task_id": {"type": "integer", "description": "ID of an existing task owned by the user"},
                     "goal": {"type": "string", "description": "High-level goal for the plan"},
-                    "max_steps": {"type": "integer", "description": "Maximum number of steps to generate", "default": 6},
+                    "max_steps": {"type": "integer", "description": "Maximum number of steps to generate", "default": 8},
                     "notes": {"type": "string", "description": "Optional constraints or context"},
                     "style": {"type": "string", "description": "Optional style hint: concise or thorough", "default": "concise"},
                 },
@@ -101,7 +101,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "properties": {
                     "task_id": {"type": "integer", "description": "Optional existing task ID owned by the user"},
                     "goal": {"type": "string", "description": "High-level goal for the plan"},
-                    "max_steps": {"type": "integer", "description": "Maximum number of steps to generate", "default": 6},
+                    "max_steps": {"type": "integer", "description": "Maximum number of steps to generate", "default": 8},
                     "notes": {"type": "string", "description": "Optional constraints or context"},
                     "style": {"type": "string", "description": "Optional style hint: concise or thorough", "default": "concise"},
                 },
@@ -558,6 +558,7 @@ async def _plan_task_common(
 ) -> str:
     """Create TaskStep rows for a task; optionally enqueue immediate execution."""
     from app.agent.persona_router import infer_persona_for_task
+    from app.config import settings
     from app.autonomy.planner import create_task_plan_for_user
     from app.autonomy.runner import get_task_runner
     from app.db.models import Task
@@ -577,9 +578,9 @@ async def _plan_task_common(
         return "goal is required."
 
     try:
-        max_steps = int(arguments.get("max_steps", 6))
+        max_steps = int(arguments.get("max_steps", settings.task_plan_default_steps))
     except Exception:
-        max_steps = 6
+        max_steps = settings.task_plan_default_steps
     notes = str(arguments.get("notes", "") or "")
     style = str(arguments.get("style", "concise") or "concise")
 

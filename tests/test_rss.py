@@ -51,6 +51,7 @@ def test_rss_server_exposes_new_tool_schemas():
     assert "list_rss_sources" in names
     assert "add_rss_source" in names
     assert "discover_rss_sources" in names
+    assert "refresh_rss_cache" in names
     assert "search_my_feeds" in names
     assert "list_recent_feed_items" in names
 
@@ -216,6 +217,79 @@ async def test_list_recent_feed_items_tool_outputs_full_urls():
         )
     assert "Recent feed items" in result
     assert "URL: https://example.com/article-1" in result
+
+
+@pytest.mark.asyncio
+async def test_list_recent_feed_items_defaults_window_to_all_when_omitted():
+    async with TestSessionLocal() as db:
+        source = RSSSource(
+            user_id=11,
+            name="Default Window Feed",
+            url="https://default-window.example/feed.xml",
+            url_canonical="https://default-window.example/feed.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(source)
+        await db.flush()
+        db.add(
+            RSSItem(
+                source_id=source.id,
+                item_uid="dw-1",
+                title="Default Window Item",
+                link="https://default-window.example/a1",
+                summary="summary",
+                published_at=datetime.now(timezone.utc),
+            )
+        )
+        await db.commit()
+
+    with patch("app.mcp.servers.rss.AsyncSessionLocal", new=TestSessionLocal):
+        result = await call_tool(
+            "list_recent_feed_items",
+            {"max_results": 5},
+            user_context={"user_id": 11},
+        )
+    assert "Recent feed items" in result
+    assert "Default Window Item" in result
+
+
+@pytest.mark.asyncio
+async def test_list_recent_feed_items_requires_value_for_explicit_days_mode():
+    with patch("app.mcp.servers.rss.AsyncSessionLocal", new=TestSessionLocal):
+        result = await call_tool(
+            "list_recent_feed_items",
+            {"window": {"mode": "days"}},
+            user_context={"user_id": 11},
+        )
+    assert "window.value must be a positive integer" in result
+
+
+@pytest.mark.asyncio
+async def test_refresh_rss_cache_returns_compact_stats():
+    with patch(
+        "app.mcp.servers.rss.rss_sources.refresh_active_sources_cache",
+        new=AsyncMock(return_value={"sources": 5, "items": 42}),
+    ):
+        with patch("app.mcp.servers.rss.AsyncSessionLocal", new=TestSessionLocal):
+            result = await call_tool(
+                "refresh_rss_cache",
+                {"max_items_per_source": 10},
+                user_context={"user_id": 1},
+            )
+
+    assert result.startswith("RSS_REFRESH_OK")
+    assert "sources_refreshed: 5" in result
+    assert "items_seen: 42" in result
+    assert "timestamp_utc:" in result
+
+
+@pytest.mark.asyncio
+async def test_refresh_rss_cache_requires_user_context():
+    result = await call_tool("refresh_rss_cache", {}, user_context=None)
+    assert "requires an authenticated user context" in result
 
 
 @pytest.mark.asyncio

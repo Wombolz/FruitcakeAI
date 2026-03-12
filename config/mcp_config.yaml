@@ -21,7 +21,6 @@ mcp_servers:
 
   # ── Docker stdio servers ─────────────────────────────────────────────────────
   # These require Docker + the image to be available locally.
-  # Pull with: docker pull mcp/sequentialthinking
 
   python_refactoring:
     type: docker_stdio
@@ -30,24 +29,10 @@ mcp_servers:
     timeout: 60
     priority: 10
 
-  sequential_thinking:
-    type: docker_stdio
-    image: mcp/sequentialthinking
-    enabled: true
-    timeout: 60
-    priority: 15
-
-  filesystem:
-    type: docker_stdio
-    image: mcp/mcp-filesystem
-    enabled: true
-    timeout: 60
-    priority: 12
-
   duckduckgo:
     type: docker_stdio
     image: mcp/duckduckgo
-    enabled: true
+    enabled: false
     timeout: 60
     priority: 14
 

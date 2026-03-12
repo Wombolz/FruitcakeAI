@@ -297,6 +297,8 @@ class Task(Base):
     instruction = Column(Text, nullable=False)  # natural language prompt for the agent
     # Optional per-task persona override/resolution target.
     persona = Column(String(100), nullable=True)
+    # Optional task execution profile (default, news_magazine)
+    profile = Column(String(50), nullable=True)
 
     # "one_shot" | "recurring"
     task_type = Column(String(20), nullable=False, default="one_shot")
@@ -451,9 +453,32 @@ class TaskRun(Base):
     summary = Column(Text)
 
     task = relationship("Task", back_populates="runs")
+    artifacts = relationship(
+        "TaskRunArtifact",
+        back_populates="task_run",
+        cascade="all, delete-orphan",
+        order_by="TaskRunArtifact.created_at.desc()",
+    )
 
     def __repr__(self):
         return f"<TaskRun(task_id={self.task_id}, status='{self.status}')>"
+
+
+class TaskRunArtifact(Base):
+    """Structured artifacts emitted by a task run (dataset, reports, outputs)."""
+    __tablename__ = "task_run_artifacts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_run_id = Column(Integer, ForeignKey("task_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    artifact_type = Column(String(50), nullable=False, index=True)
+    content_json = Column(Text)
+    content_text = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    task_run = relationship("TaskRun", back_populates="artifacts")
+
+    def __repr__(self):
+        return f"<TaskRunArtifact(task_run_id={self.task_run_id}, type='{self.artifact_type}')>"
 
 
 # ---------------------------------------------------------------------------

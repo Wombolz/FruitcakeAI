@@ -25,7 +25,9 @@ import json
 from app.agent.persona_loader import list_personas, persona_exists
 from app.agent.persona_router import infer_persona_for_task
 from app.autonomy.planner import create_task_plan_for_user
+from app.autonomy.profiles import normalize_task_profile
 from app.auth.dependencies import get_current_user
+from app.config import settings
 from app.db.models import AuditLog, Task, TaskRun, TaskStep, User
 from app.db.session import get_db
 
@@ -38,6 +40,7 @@ class TaskCreate(BaseModel):
     title: str
     instruction: str
     persona: Optional[str] = None
+    profile: Optional[str] = None
     task_type: str = "one_shot"          # "one_shot" | "recurring"
     schedule: Optional[str] = None       # "every:30m" | cron | ISO timestamp
     deliver: bool = True
@@ -51,6 +54,7 @@ class TaskPatch(BaseModel):
     title: Optional[str] = None
     instruction: Optional[str] = None
     persona: Optional[str] = None
+    profile: Optional[str] = None
     schedule: Optional[str] = None
     deliver: Optional[bool] = None
     requires_approval: Optional[bool] = None
@@ -66,6 +70,7 @@ class TaskOut(BaseModel):
     title: str
     instruction: str
     persona: Optional[str]
+    profile: Optional[str]
     task_type: str
     status: str
     schedule: Optional[str]
@@ -149,6 +154,7 @@ async def create_task(
         title=body.title,
         instruction=body.instruction,
         persona=resolved_persona,
+        profile=_resolve_task_profile(body.profile),
         task_type=body.task_type,
         status="pending",
         schedule=body.schedule,
@@ -230,6 +236,8 @@ async def update_task(
             instruction=task.instruction,
             requested_persona=body.persona,
         )
+    if body.profile is not None:
+        task.profile = _resolve_task_profile(body.profile)
     if body.deliver is not None:
         task.deliver = body.deliver
     if body.requires_approval is not None:
@@ -425,7 +433,7 @@ class TaskStepPatch(BaseModel):
 
 class TaskPlanRequest(BaseModel):
     goal: str
-    max_steps: int = 6
+    max_steps: int = settings.task_plan_default_steps
     notes: Optional[str] = ""
     style: Optional[str] = "concise"
 
@@ -561,6 +569,7 @@ def _to_task_out(task: Task, current_step: Optional[TaskStep]) -> TaskOut:
         title=task.title,
         instruction=task.instruction,
         persona=task.persona,
+        profile=task.profile,
         task_type=task.task_type,
         status=task.status,
         schedule=task.schedule,
@@ -596,6 +605,13 @@ def _resolve_task_persona(*, title: str, instruction: str, requested_persona: Op
 
     inferred, _, _ = infer_persona_for_task(title, instruction)
     return inferred
+
+
+def _resolve_task_profile(requested_profile: Optional[str]) -> Optional[str]:
+    try:
+        return normalize_task_profile(requested_profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
 async def _load_current_steps(db: AsyncSession, tasks: List[Task]) -> Dict[tuple[int, int], TaskStep]:
