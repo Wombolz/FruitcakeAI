@@ -11,7 +11,7 @@ websockets==13.1
 litellm>=1.82.0
 
 # ── RAG ──────────────────────────────────────────────────────────────────────
-llama-index==0.12.5
+llama-index==0.12.28
 llama-index-vector-stores-postgres==0.3.3
 llama-index-embeddings-huggingface==0.4.0
 llama-index-retrievers-bm25==0.5.0
@@ -27,7 +27,7 @@ pgvector==0.3.6
 alembic==1.14.0
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-python-jose[cryptography]==3.3.0
+python-jose[cryptography]==3.4.0
 passlib[bcrypt]==1.7.4
 bcrypt>=3.1,<4.1   # passlib 1.7.4 incompatible with bcrypt 4.1+
 
@@ -65,7 +65,7 @@ structlog==24.4.0
 
 # ── ML / Embeddings ──────────────────────────────────────────────────────────
 sentence-transformers==3.3.1
-torch==2.5.1
+torch==2.6.0
 transformers==4.48.0
 
 # ── Testing ───────────────────────────────────────────────────────────────────
