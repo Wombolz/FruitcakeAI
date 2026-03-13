@@ -36,8 +36,13 @@ fi
 
 echo "▶ Activating Python environment..."
 if [ ! -d ".venv" ]; then
+  if ! command -v python3.11 >/dev/null 2>&1; then
+    echo "  ERROR: python3.11 is required but not found on PATH."
+    echo "  Install Python 3.11 and rerun ./scripts/start.sh"
+    exit 1
+  fi
   echo "  .venv not found — creating it once..."
-  python3 -m venv .venv
+  python3.11 -m venv .venv
   source .venv/bin/activate
   echo "  Installing dependencies (first-time setup)..."
   pip install -q -r requirements.txt

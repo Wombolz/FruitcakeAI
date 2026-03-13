@@ -46,7 +46,7 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - [Ollama](https://ollama.ai) — `brew install ollama`
 - [Xcode 26+](https://developer.apple.com/xcode/) — for the iOS/macOS app
-- Python 3.9+
+- Python 3.11+
 
 ### 1. Clone and configure
 
@@ -128,7 +128,7 @@ curl -X POST http://localhost:8000/auth/login \
 ```bash
 source .venv/bin/activate
 pytest tests/
-# 55 passed in ~6s — no running PostgreSQL required
+# 139 passed in ~31s — no running PostgreSQL required
 ```
 
 ---
