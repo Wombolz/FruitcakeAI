@@ -4,19 +4,21 @@
 # ── Web framework ─────────────────────────────────────────────────────────────
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
-python-multipart==0.0.18
+python-multipart==0.0.20
 websockets==13.1
 
 # ── LLM / Agent ──────────────────────────────────────────────────────────────
 litellm>=1.82.0
 
 # ── RAG ──────────────────────────────────────────────────────────────────────
-llama-index==0.12.28
-llama-index-vector-stores-postgres==0.3.3
-llama-index-embeddings-huggingface==0.4.0
-llama-index-retrievers-bm25==0.5.0
+# Keep llama-index-core explicit to avoid pulling llama-index-llms-openai
+# (which requires openai<2 and conflicts with litellm/openai>=2).
+llama-index-core==0.13.6
+llama-index-vector-stores-postgres==0.7.3
+llama-index-embeddings-huggingface==0.6.1
+llama-index-retrievers-bm25==0.6.5
 # NOTE: llama-index-llms-openai is intentionally NOT listed here.
-# It requires openai<2, which conflicts with litellm>=1.82.0 (needs openai>=2.24.0).
+# It requires openai<2, which conflicts with litellm/openai>=2.
 # We set Settings.llm = None so LlamaIndex's LLM layer is never invoked.
 
 # ── Database ──────────────────────────────────────────────────────────────────
