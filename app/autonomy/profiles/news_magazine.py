@@ -71,6 +71,8 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
             "search_my_feeds",
             "list_recent_feed_items",
             "search_library",
+            "summarize_document",
+            "create_memory",
             "web_search",
             "fetch_page",
         }
@@ -84,6 +86,10 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
     ) -> None:
         prompt_parts.append(
             "News magazine profile policy: use only prepared dataset content; do not call retrieval tools."
+        )
+        prompt_parts.append(
+            "Never call any library/memory tools for this task "
+            "(search_library, summarize_document, create_memory)."
         )
         prompt_parts.append(
             "Formatting contract: every article entry MUST include a direct markdown link line "

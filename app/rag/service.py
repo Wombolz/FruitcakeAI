@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 import structlog
+from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
 log = structlog.get_logger(__name__)
@@ -43,6 +45,8 @@ class RAGService:
         self._embed_model = None
         self._node_postprocessors: List[Any] = []
         self._config: Dict[str, Any] = {}
+        self._bm25_node_count: int = 0
+        self._bm25_source_table: Optional[str] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -55,6 +59,7 @@ class RAGService:
             self._load_config()
             # Heavy model loading runs in a thread so it doesn't block the event loop
             await asyncio.get_running_loop().run_in_executor(None, self._init_sync)
+            await self._rebuild_retriever_async()
             self._loaded = True
             log.info("RAG service ready")
         except Exception as e:
@@ -109,9 +114,9 @@ class RAGService:
         self._index = VectorStoreIndex.from_vector_store(
             vector_store, storage_context=storage_ctx
         )
-        self._retriever, self._node_postprocessors = build_hybrid_retriever(
-            self._index, self._config
-        )
+        # Hybrid retriever is finalized asynchronously in startup()
+        # so BM25 can be built from persisted chunk rows.
+        self._retriever, self._node_postprocessors = build_hybrid_retriever(self._index, self._config)
 
     @property
     def is_ready(self) -> bool:
@@ -214,17 +219,100 @@ class RAGService:
         log.info("Document ingested", document_id=document_id, nodes=len(nodes))
 
         # Rebuild the retriever so BM25 now picks up the newly indexed documents
-        await asyncio.get_running_loop().run_in_executor(None, self._rebuild_retriever)
+        await self._rebuild_retriever_async()
 
         return len(nodes)
 
-    def _rebuild_retriever(self) -> None:
-        """Rebuild hybrid retriever — called after each ingest so BM25 corpus stays current."""
+    async def _rebuild_retriever_async(self) -> None:
+        """Rebuild hybrid retriever using persisted chunk rows for BM25 corpus."""
         from app.rag.retriever import build_hybrid_retriever
 
-        self._retriever, self._node_postprocessors = build_hybrid_retriever(
-            self._index, self._config
+        bm25_nodes = await self._load_bm25_nodes()
+        loop = asyncio.get_running_loop()
+        self._retriever, self._node_postprocessors = await loop.run_in_executor(
+            None,
+            lambda: build_hybrid_retriever(
+                self._index,
+                self._config,
+                bm25_nodes=bm25_nodes,
+            ),
         )
+        self._bm25_node_count = len(bm25_nodes)
+
+    async def _load_bm25_nodes(self, limit: int = 8000) -> List[Any]:
+        """
+        Build BM25 corpus nodes from persisted chunk rows in Postgres.
+        This avoids dependence on index.docstore internals.
+        """
+        from llama_index.core.schema import TextNode
+        from app.db.session import AsyncSessionLocal
+
+        table = await self._resolve_chunk_table()
+        if not table:
+            self._bm25_source_table = None
+            return []
+
+        rows: List[Any] = []
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                text(
+                    f"""
+                    SELECT node_id, text, metadata_
+                    FROM {table}
+                    WHERE text IS NOT NULL
+                      AND LENGTH(TRIM(text)) > 0
+                    ORDER BY id DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": int(limit)},
+            )
+            rows = result.all()
+
+        nodes: List[Any] = []
+        for idx, row in enumerate(rows, start=1):
+            node_id = row[0] or f"bm25-node-{idx}"
+            content = row[1] or ""
+            metadata = row[2] if isinstance(row[2], dict) else {}
+            nodes.append(TextNode(id_=str(node_id), text=content, extra_info=metadata))
+
+        self._bm25_source_table = table
+        return nodes
+
+    async def _resolve_chunk_table(self) -> Optional[str]:
+        """
+        Resolve the active vector chunk table name.
+        Supports both configured table and PGVector's data_ prefixed table.
+        """
+        from app.db.session import AsyncSessionLocal
+
+        configured = str(self._config.get("vector_store", {}).get("table_name", "document_chunks"))
+        candidates = [configured, f"data_{configured}"]
+
+        safe_candidates = []
+        for name in candidates:
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                safe_candidates.append(name)
+        if not safe_candidates:
+            return None
+
+        best_name: Optional[str] = None
+        best_count = -1
+        async with AsyncSessionLocal() as db:
+            for name in safe_candidates:
+                try:
+                    count = (
+                        await db.execute(text(f"SELECT COUNT(*) FROM {name}"))
+                    ).scalar_one()
+                except Exception:
+                    continue
+                if int(count) > best_count:
+                    best_count = int(count)
+                    best_name = name
+
+        if best_count <= 0:
+            return None
+        return best_name
 
     # ── Delete ────────────────────────────────────────────────────────────────
 
@@ -246,4 +334,6 @@ class RAGService:
             "status": "ready" if self._loaded else "not_initialized",
             "retriever": type(self._retriever).__name__ if self._retriever else None,
             "postprocessors": len(self._node_postprocessors),
+            "bm25_nodes": self._bm25_node_count,
+            "bm25_source_table": self._bm25_source_table,
         }
