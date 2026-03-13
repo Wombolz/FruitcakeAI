@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -96,6 +97,9 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
             "in this exact form: [Read More](FULL_URL). "
             "If an item lacks a valid URL from dataset, omit that item."
         )
+        prompt_parts.append(
+            "If you cannot provide a valid dataset URL for an item, omit that item."
+        )
         prepared = (run_context.get("dataset_prompt") or "").strip()
         if prepared:
             prompt_parts.append(f"Prepared dataset (authoritative source list):\n{prepared[:18000]}")
@@ -115,11 +119,12 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
         if not isinstance(dataset, dict):
             return result, None
 
-        # Repair missing article links when the heading title matches a dataset item.
-        repaired = _inject_missing_links_from_dataset(result, dataset=dataset)
+        # Repair missing article links from dataset titles before strict validation.
+        repaired, inject_meta = _inject_missing_links_from_dataset_with_report(result, dataset=dataset)
         allowed_urls = _extract_urls(run_context.get("dataset_prompt") or "")
         cleaned, report = _ground_output(repaired, allowed_urls=allowed_urls)
         cleaned = _dedupe_output_by_url(cleaned)
+        cleaned, dropped_missing = _drop_unlinked_item_blocks(cleaned)
 
         strict_report = validate_magazine_markdown(cleaned, dataset=dataset)
         report.update(
@@ -127,6 +132,9 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
                 "invalid_urls_strict": strict_report.get("invalid_urls", []),
                 "duplicate_urls_strict": strict_report.get("duplicate_urls", []),
                 "placeholder_hits_strict": strict_report.get("placeholder_hits", 0),
+                "auto_link_injected_count": inject_meta.get("injected_count", 0),
+                "auto_link_ambiguous_count": inject_meta.get("ambiguous_count", 0),
+                "dropped_missing_link_items": dropped_missing,
             }
         )
         if strict_report.get("invalid_urls"):
@@ -134,12 +142,12 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
             report["fatal_reason"] = "Final output contains URL(s) not present in prepared dataset."
         if strict_report.get("duplicate_urls"):
             report["duplicate_urls_warning"] = strict_report.get("duplicate_urls")
-        if strict_report.get("missing_link_items", 0) > 0:
+        if strict_report.get("detected_urls", 0) == 0:
             report["fatal"] = True
             report["fatal_reason"] = (
-                "Final output is missing direct links for one or more article items. "
-                "Each article must include [Read More](FULL_URL)."
+                "Final output has no publishable linked items after grounding/repair."
             )
+        report["publish_mode"] = "partial" if dropped_missing > 0 else "full"
         return cleaned, report
 
     def artifact_payloads(
@@ -272,14 +280,20 @@ def _dedupe_output_by_url(text: str) -> str:
 
 
 def _inject_missing_links_from_dataset(text: str, *, dataset: Dict[str, Any]) -> str:
+    repaired, _ = _inject_missing_links_from_dataset_with_report(text, dataset=dataset)
+    return repaired
+
+
+def _inject_missing_links_from_dataset_with_report(text: str, *, dataset: Dict[str, Any]) -> Tuple[str, Dict[str, int]]:
     if not text:
-        return text
+        return text, {"injected_count": 0, "ambiguous_count": 0}
 
     items = dataset.get("items") or []
     if not isinstance(items, list):
-        return text
+        return text, {"injected_count": 0, "ambiguous_count": 0}
 
-    title_to_url: dict[str, str] = {}
+    title_to_url: dict[str, list[str]] = {}
+    normalized_titles: list[str] = []
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -288,13 +302,20 @@ def _inject_missing_links_from_dataset(text: str, *, dataset: Dict[str, Any]) ->
         if not title or not url:
             continue
         key = _normalize_title(title)
-        if key and key not in title_to_url:
-            title_to_url[key] = url
+        if not key:
+            continue
+        if key not in title_to_url:
+            title_to_url[key] = []
+            normalized_titles.append(key)
+        if url not in title_to_url[key]:
+            title_to_url[key].append(url)
     if not title_to_url:
-        return text
+        return text, {"injected_count": 0, "ambiguous_count": 0}
 
     lines = text.splitlines()
     out: list[str] = []
+    injected_count = 0
+    ambiguous_count = 0
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -314,13 +335,20 @@ def _inject_missing_links_from_dataset(text: str, *, dataset: Dict[str, Any]) ->
             j += 1
 
         if not _extract_urls("\n".join(block)):
-            url = title_to_url.get(_normalize_title(title))
+            url, ambiguous = _best_url_for_title(
+                title,
+                title_to_url=title_to_url,
+                normalized_titles=normalized_titles,
+            )
             if url:
                 block.append(f"[Read More]({url})")
+                injected_count += 1
+            elif ambiguous:
+                ambiguous_count += 1
         out.extend(block)
         i = j
 
-    return "\n".join(out)
+    return "\n".join(out), {"injected_count": injected_count, "ambiguous_count": ambiguous_count}
 
 
 def _extract_item_title(line: str) -> Optional[str]:
@@ -335,3 +363,76 @@ def _extract_item_title(line: str) -> Optional[str]:
 def _normalize_title(value: str) -> str:
     lowered = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
     return re.sub(r"\s+", " ", lowered)
+
+
+def _best_url_for_title(
+    raw_title: str,
+    *,
+    title_to_url: Dict[str, list[str]],
+    normalized_titles: list[str],
+) -> Tuple[Optional[str], bool]:
+    normalized = _normalize_title(raw_title)
+    if not normalized:
+        return None, False
+
+    exact = title_to_url.get(normalized)
+    if exact:
+        if len(exact) == 1:
+            return exact[0], False
+        return None, True
+
+    best_key: Optional[str] = None
+    best_score = 0.0
+    second_score = 0.0
+    for candidate in normalized_titles:
+        score = difflib.SequenceMatcher(None, normalized, candidate).ratio()
+        if score > best_score:
+            second_score = best_score
+            best_score = score
+            best_key = candidate
+        elif score > second_score:
+            second_score = score
+
+    if best_key is None or best_score < 0.80:
+        return None, False
+    if (best_score - second_score) < 0.03:
+        return None, True
+
+    urls = title_to_url.get(best_key) or []
+    if len(urls) != 1:
+        return None, True
+    return urls[0], False
+
+
+def _drop_unlinked_item_blocks(text: str) -> Tuple[str, int]:
+    if not text:
+        return text, 0
+
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    dropped = 0
+    while i < len(lines):
+        line = lines[i]
+        title = _extract_item_title(line)
+        if title is None:
+            out.append(line)
+            i += 1
+            continue
+
+        block = [line]
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            if _extract_item_title(nxt) is not None or nxt.strip().startswith("## "):
+                break
+            block.append(nxt)
+            j += 1
+
+        if _extract_urls("\n".join(block)):
+            out.extend(block)
+        else:
+            dropped += 1
+        i = j
+
+    return "\n".join(out).strip(), dropped

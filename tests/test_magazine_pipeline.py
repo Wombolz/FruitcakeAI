@@ -9,8 +9,11 @@ from app.autonomy.magazine_pipeline import (
     validate_magazine_markdown,
 )
 from app.autonomy.profiles.news_magazine import (
+    NewsMagazineExecutionProfile,
     _dedupe_output_by_url,
+    _drop_unlinked_item_blocks,
     _inject_missing_links_from_dataset,
+    _inject_missing_links_from_dataset_with_report,
 )
 from app.db.models import RSSItem, RSSSource
 from tests.conftest import TestSessionLocal
@@ -200,3 +203,96 @@ def test_inject_missing_links_from_dataset_by_title():
     repaired = _inject_missing_links_from_dataset(text, dataset=dataset)
     assert "[Read More](https://example.com/one)" in repaired
     assert "[Read More](https://example.com/two)" in repaired
+
+
+def test_inject_missing_links_from_dataset_fuzzy_title_match():
+    dataset = {"items": [{"title": "Federal Reserve signals rate pause", "url": "https://example.com/rates"}]}
+    text = "### Federal Reserve signals pause on rates\nSummary text\n"
+    repaired, meta = _inject_missing_links_from_dataset_with_report(text, dataset=dataset)
+    assert "[Read More](https://example.com/rates)" in repaired
+    assert meta["injected_count"] == 1
+
+
+def test_inject_missing_links_from_dataset_ambiguous_title_skips_injection():
+    dataset = {
+        "items": [
+            {"title": "Market update live", "url": "https://example.com/one"},
+            {"title": "Markets update live", "url": "https://example.com/two"},
+        ]
+    }
+    text = "### Market updates live\nSummary text\n"
+    repaired, meta = _inject_missing_links_from_dataset_with_report(text, dataset=dataset)
+    assert "[Read More](" not in repaired
+    assert meta["ambiguous_count"] >= 1
+
+
+def test_drop_unlinked_item_blocks_keeps_linked_items_only():
+    text = (
+        "## Top Stories\n"
+        "### Keep me\n"
+        "[Read More](https://example.com/keep)\n"
+        "### Drop me\n"
+        "No link here\n"
+    )
+    cleaned, dropped = _drop_unlinked_item_blocks(text)
+    assert "### Keep me" in cleaned
+    assert "### Drop me" not in cleaned
+    assert dropped == 1
+
+
+def test_news_magazine_validate_finalize_publishes_partial_when_some_items_missing_links():
+    profile = NewsMagazineExecutionProfile()
+    dataset = {
+        "run_id": 101,
+        "items": [
+            {"title": "Story One", "url": "https://example.com/one"},
+            {"title": "Story Two", "url": "https://example.com/two"},
+        ],
+    }
+    run_context = {
+        "dataset": dataset,
+        "dataset_prompt": "URL: https://example.com/one\nURL: https://example.com/two\n",
+    }
+    source = (
+        "## Top Stories\n"
+        "### Story One\n"
+        "Summary one\n"
+        "### Story Two\n"
+        "Summary two\n"
+        "[Read More](https://example.com/two)\n"
+    )
+    cleaned, report = profile.validate_finalize(
+        result=source,
+        prior_full_outputs=[],
+        run_context=run_context,
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report.get("fatal") is False
+    assert report.get("publish_mode") == "full"
+    assert report.get("auto_link_injected_count") == 1
+    assert "https://example.com/one" in cleaned
+    assert "https://example.com/two" in cleaned
+
+
+def test_news_magazine_validate_finalize_fails_when_no_publishable_linked_items():
+    profile = NewsMagazineExecutionProfile()
+    dataset = {
+        "run_id": 102,
+        "items": [{"title": "Known Story", "url": "https://example.com/known"}],
+    }
+    run_context = {
+        "dataset": dataset,
+        "dataset_prompt": "URL: https://example.com/known\n",
+    }
+    source = "## Top Stories\n### Unmatched Headline\nNo valid link\n"
+    cleaned, report = profile.validate_finalize(
+        result=source,
+        prior_full_outputs=[],
+        run_context=run_context,
+        is_final_step=True,
+    )
+    assert "https://example.com/" not in cleaned
+    assert report is not None
+    assert report.get("fatal") is True
+    assert "no publishable linked items" in str(report.get("fatal_reason", "")).lower()
