@@ -115,8 +115,10 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
         if not isinstance(dataset, dict):
             return result, None
 
+        # Repair missing article links when the heading title matches a dataset item.
+        repaired = _inject_missing_links_from_dataset(result, dataset=dataset)
         allowed_urls = _extract_urls(run_context.get("dataset_prompt") or "")
-        cleaned, report = _ground_output(result, allowed_urls=allowed_urls)
+        cleaned, report = _ground_output(repaired, allowed_urls=allowed_urls)
         cleaned = _dedupe_output_by_url(cleaned)
 
         strict_report = validate_magazine_markdown(cleaned, dataset=dataset)
@@ -267,3 +269,69 @@ def _dedupe_output_by_url(text: str) -> str:
 
     _flush_block()
     return "\n".join(out).strip()
+
+
+def _inject_missing_links_from_dataset(text: str, *, dataset: Dict[str, Any]) -> str:
+    if not text:
+        return text
+
+    items = dataset.get("items") or []
+    if not isinstance(items, list):
+        return text
+
+    title_to_url: dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not title or not url:
+            continue
+        key = _normalize_title(title)
+        if key and key not in title_to_url:
+            title_to_url[key] = url
+    if not title_to_url:
+        return text
+
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        title = _extract_item_title(line)
+        if title is None:
+            out.append(line)
+            i += 1
+            continue
+
+        j = i + 1
+        block: list[str] = [line]
+        while j < len(lines):
+            nxt = lines[j]
+            if _extract_item_title(nxt) is not None or nxt.strip().startswith("## "):
+                break
+            block.append(nxt)
+            j += 1
+
+        if not _extract_urls("\n".join(block)):
+            url = title_to_url.get(_normalize_title(title))
+            if url:
+                block.append(f"[Read More]({url})")
+        out.extend(block)
+        i = j
+
+    return "\n".join(out)
+
+
+def _extract_item_title(line: str) -> Optional[str]:
+    stripped = line.strip()
+    if stripped.startswith("- **Headline:**"):
+        return stripped.split(":", 1)[1].strip()
+    if stripped.startswith("### "):
+        return stripped[4:].strip()
+    return None
+
+
+def _normalize_title(value: str) -> str:
+    lowered = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    return re.sub(r"\s+", " ", lowered)

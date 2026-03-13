@@ -8,7 +8,10 @@ from app.autonomy.magazine_pipeline import (
     build_magazine_dataset,
     validate_magazine_markdown,
 )
-from app.autonomy.profiles.news_magazine import _dedupe_output_by_url
+from app.autonomy.profiles.news_magazine import (
+    _dedupe_output_by_url,
+    _inject_missing_links_from_dataset,
+)
 from app.db.models import RSSItem, RSSSource
 from tests.conftest import TestSessionLocal
 
@@ -177,3 +180,23 @@ def test_dedupe_output_by_url_keeps_first_item_per_url():
     deduped = _dedupe_output_by_url(text)
     assert deduped.count("https://example.com/a") == 1
     assert deduped.count("https://example.com/b") == 1
+
+
+def test_inject_missing_links_from_dataset_by_title():
+    dataset = {
+        "items": [
+            {"title": "Story One", "url": "https://example.com/one"},
+            {"title": "Story Two", "url": "https://example.com/two"},
+        ]
+    }
+    text = (
+        "## Top Stories\n"
+        "- **Headline:** Story One\n"
+        "  **Source:** Example\n"
+        "  **Summary:** First story summary\n"
+        "### Story Two\n"
+        "Second story summary\n"
+    )
+    repaired = _inject_missing_links_from_dataset(text, dataset=dataset)
+    assert "[Read More](https://example.com/one)" in repaired
+    assert "[Read More](https://example.com/two)" in repaired
