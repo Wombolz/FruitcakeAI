@@ -2,21 +2,24 @@
 # Install: pip install -r requirements.txt
 
 # ── Web framework ─────────────────────────────────────────────────────────────
-fastapi==0.115.6
+fastapi==0.128.8
+starlette==0.49.1
 uvicorn[standard]==0.32.1
-python-multipart==0.0.18
+python-multipart==0.0.20
 websockets==13.1
 
 # ── LLM / Agent ──────────────────────────────────────────────────────────────
 litellm>=1.82.0
 
 # ── RAG ──────────────────────────────────────────────────────────────────────
-llama-index==0.12.5
-llama-index-vector-stores-postgres==0.3.3
-llama-index-embeddings-huggingface==0.4.0
-llama-index-retrievers-bm25==0.5.0
+# Keep llama-index-core explicit to avoid pulling llama-index-llms-openai
+# (which requires openai<2 and conflicts with litellm/openai>=2).
+llama-index-core==0.13.6
+llama-index-vector-stores-postgres==0.7.3
+llama-index-embeddings-huggingface==0.6.1
+llama-index-retrievers-bm25==0.6.5
 # NOTE: llama-index-llms-openai is intentionally NOT listed here.
-# It requires openai<2, which conflicts with litellm>=1.82.0 (needs openai>=2.24.0).
+# It requires openai<2, which conflicts with litellm/openai>=2.
 # We set Settings.llm = None so LlamaIndex's LLM layer is never invoked.
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -27,7 +30,7 @@ pgvector==0.3.6
 alembic==1.14.0
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-python-jose[cryptography]==3.3.0
+python-jose[cryptography]==3.4.0
 passlib[bcrypt]==1.7.4
 bcrypt>=3.1,<4.1   # passlib 1.7.4 incompatible with bcrypt 4.1+
 
@@ -65,8 +68,8 @@ structlog==24.4.0
 
 # ── ML / Embeddings ──────────────────────────────────────────────────────────
 sentence-transformers==3.3.1
-torch==2.5.1
-transformers==4.47.1
+torch==2.8.0
+transformers==4.53.0
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 pytest==8.3.4
