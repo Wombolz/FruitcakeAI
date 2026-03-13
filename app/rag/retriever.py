@@ -6,7 +6,7 @@ Ported from v4 LlamaIndexService, extracted into its own module.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -14,6 +14,8 @@ log = logging.getLogger(__name__)
 def build_hybrid_retriever(
     index: Any,
     config: Dict[str, Any],
+    *,
+    bm25_nodes: Optional[List[Any]] = None,
 ) -> Tuple[Any, List[Any]]:
     """
     Build the retrieval pipeline from a LlamaIndex VectorStoreIndex.
@@ -43,20 +45,37 @@ def build_hybrid_retriever(
     try:
         from llama_index.retrievers.bm25 import BM25Retriever
 
-        docstore = index.docstore
-        has_docs = bool(getattr(docstore, "_docs", None) or getattr(docstore, "_kvstore", None))
-
-        if not has_docs:
-            log.info("BM25 skipped at startup (no documents yet) — will activate after first ingest")
+        if bm25_nodes:
+            bm25_retriever = BM25Retriever.from_defaults(
+                nodes=bm25_nodes,
+                similarity_top_k=bm25_top_k,
+            )
+            log.info("BM25 retriever initialized from persisted chunk nodes", node_count=len(bm25_nodes))
         else:
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                bm25_retriever = BM25Retriever.from_defaults(
-                    docstore=docstore,
-                    similarity_top_k=bm25_top_k,
-                )
-            log.info("BM25 retriever initialized")
+            docstore = index.docstore
+            raw_docs = getattr(docstore, "_docs", None)
+            if isinstance(raw_docs, dict):
+                has_docs = len(raw_docs) > 0
+            else:
+                has_docs = bool(raw_docs)
+
+            if not has_docs:
+                log.info("BM25 skipped at startup (no documents yet) — will activate after first ingest")
+            else:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    bm25_retriever = BM25Retriever.from_defaults(
+                        docstore=docstore,
+                        similarity_top_k=bm25_top_k,
+                    )
+                log.info("BM25 retriever initialized from index docstore")
+    except ValueError as e:
+        # Seen when a docstore object exists but has zero effective corpus rows.
+        if "empty sequence" in str(e).lower():
+            log.info("BM25 skipped at startup (empty corpus) — using vector-only until ingest")
+        else:
+            log.warning("BM25 not available, using vector-only: %s", e)
     except Exception as e:
         log.warning("BM25 not available, using vector-only: %s", e)
 

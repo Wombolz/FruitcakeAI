@@ -9,6 +9,7 @@ personas:
     library_scopes: [family_docs, recipes, household]
     calendar_access: [family, personal]
     blocked_tools: []
+    intent_keywords: [family, home, household, chores, groceries, recipe]
 
   kids_assistant:
     description: Safe, age-appropriate assistant for children
@@ -18,6 +19,7 @@ personas:
     content_filter: strict
     # Block all open-web tools by their exact function names
     blocked_tools: [web_search, fetch_page, get_feed_items, search_feeds]
+    intent_keywords: [homework, school, kids, child, spelling, reading]
 
   work_assistant:
     description: Focused on professional tasks and productivity
@@ -25,3 +27,13 @@ personas:
     library_scopes: [work_docs, projects]
     calendar_access: [work, personal]
     blocked_tools: []
+    intent_keywords: [project, work, meeting, report, client, proposal]
+
+  news_researcher:
+    description: Focused on gathering and summarizing current events with source grounding
+    tone: concise and factual
+    library_scopes: [work_docs, projects, household]
+    calendar_access: [personal]
+    blocked_tools: []
+    intent_keywords: [news, headline, headlines, breaking, top stories, current events]
+    intent_phrases: [ap headlines, latest headlines, todays headlines, today's headlines]

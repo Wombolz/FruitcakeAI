@@ -71,6 +71,8 @@ async def run_agent(
     messages: List[Dict[str, Any]],
     user_context: UserContext,
     mode: str = "chat",
+    model_override: str | None = None,
+    stage: str | None = None,
 ) -> str:
     """
     Run the agent loop (non-streaming).
@@ -89,18 +91,19 @@ async def run_agent(
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
     extra = _litellm_kwargs()
+    selected_model = model_override or settings.llm_model
 
     for turn in range(max_turns):
         try:
             response = await litellm.acompletion(
-                model=settings.llm_model,
+                model=selected_model,
                 messages=_build_messages(history, user_context),
                 tools=tools or None,
                 tool_choice="auto" if tools else None,
                 **extra,
             )
         except Exception as e:
-            log.error("LLM call failed", error=str(e), model=settings.llm_model)
+            log.error("LLM call failed", error=str(e), model=selected_model, mode=mode, stage=stage)
             raise
 
         message = response.choices[0].message
@@ -120,6 +123,9 @@ async def run_agent(
                 "Tool calls executed",
                 turn=turn + 1,
                 tools=[tc.function.name for tc in message.tool_calls],
+                model=selected_model,
+                mode=mode,
+                stage=stage,
             )
         else:
             # Final text response
@@ -132,6 +138,8 @@ async def run_agent(
 async def stream_agent(
     messages: List[Dict[str, Any]],
     user_context: UserContext,
+    model_override: str | None = None,
+    stage: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Run the agent loop with streaming.
@@ -143,13 +151,14 @@ async def stream_agent(
     history = list(messages)
     max_turns = 8
     extra = _litellm_kwargs()
+    selected_model = model_override or settings.llm_model
 
     for turn in range(max_turns):
         # Non-streaming for intermediate turns that involve tool calls —
         # we only stream the final text response turn.
         try:
             response = await litellm.acompletion(
-                model=settings.llm_model,
+                model=selected_model,
                 messages=_build_messages(history, user_context),
                 tools=tools or None,
                 tool_choice="auto" if tools else None,
@@ -157,7 +166,13 @@ async def stream_agent(
                 **extra,
             )
         except Exception as e:
-            log.error("LLM call failed (streaming turn)", error=str(e), model=settings.llm_model)
+            log.error(
+                "LLM call failed (streaming turn)",
+                error=str(e),
+                model=selected_model,
+                mode="chat",
+                stage=stage,
+            )
             raise
 
         message = response.choices[0].message
@@ -173,6 +188,9 @@ async def stream_agent(
                 "Tool calls executed (streaming turn)",
                 turn=turn + 1,
                 tools=[tc.function.name for tc in message.tool_calls],
+                model=selected_model,
+                mode="chat",
+                stage=stage,
             )
         else:
             # Final turn — yield the already-computed response directly.

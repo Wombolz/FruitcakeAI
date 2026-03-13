@@ -54,7 +54,7 @@ def get_tools() -> List[Dict[str, Any]]:
                     },
                     "end_date": {
                         "type": "string",
-                        "description": "End date in ISO format. Defaults to 7 days from start_date.",
+                        "description": "End date in ISO format. Defaults to 30 days from start_date.",
                     },
                     "calendar_id": {
                         "type": "string",
@@ -175,9 +175,31 @@ async def call_tool(tool_name: str, arguments: Dict[str, Any], user_context: Any
 
 async def _list_events(args: Dict[str, Any], user_context: Any) -> str:
     now = datetime.now(timezone.utc)
-    start_dt = _parse_dt(args.get("start_date") or now.date().isoformat(), default=now)
+    start_raw = args.get("start_date")
+    if start_raw:
+        start_dt = _parse_dt(start_raw, default=now)
+        if start_dt is None:
+            return (
+                f"Invalid start_date '{start_raw}'. Use ISO date/time, e.g. "
+                "2026-03-06 or 2026-03-06T09:00:00."
+            )
+    else:
+        start_dt = now
     end_str = args.get("end_date")
-    end_dt = _parse_dt(end_str, default=start_dt + timedelta(days=7)) if end_str else start_dt + timedelta(days=7)
+    if end_str:
+        end_dt = _parse_dt(end_str, default=start_dt + timedelta(days=30))
+        if end_dt is None:
+            return (
+                f"Invalid end_date '{end_str}'. Use ISO date/time, e.g. "
+                "2026-03-20 or 2026-03-20T18:00:00."
+            )
+    else:
+        end_dt = start_dt + timedelta(days=30)
+    if end_dt <= start_dt:
+        return (
+            f"Invalid date range: end_date ({end_dt.isoformat()}) must be after "
+            f"start_date ({start_dt.isoformat()})."
+        )
     max_results = min(int(args.get("max_results", 20)), 100)
     calendar_id = args.get("calendar_id")
 
@@ -187,11 +209,12 @@ async def _list_events(args: Dict[str, Any], user_context: Any) -> str:
 
     try:
         events = await provider.list_events(
-            calendar_id=calendar_id or provider.default_calendar_id(),
+            calendar_id=calendar_id,
             start=start_dt.isoformat(),
             end=end_dt.isoformat(),
             max_results=max_results,
         )
+        events = _dedupe_events(events)
     except Exception as e:
         log.error("list_events failed", error=str(e))
         return f"Calendar error: {e}"
@@ -257,11 +280,12 @@ async def _search_events(args: Dict[str, Any], user_context: Any) -> str:
 
     try:
         events = await provider.list_events(
-            calendar_id=provider.default_calendar_id(),
+            calendar_id=None,
             start=start_dt.isoformat(),
             end=end_dt.isoformat(),
             max_results=200,
         )
+        events = _dedupe_events(events)
     except Exception as e:
         return f"Calendar error: {e}"
 
@@ -361,7 +385,9 @@ def _not_configured() -> str:
     )
 
 
-def _parse_dt(s: str, default: datetime) -> datetime:
+def _parse_dt(s: str, default: datetime) -> Optional[datetime]:
+    if not s:
+        return default
     for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(s, fmt)
@@ -370,7 +396,35 @@ def _parse_dt(s: str, default: datetime) -> datetime:
             return dt
         except ValueError:
             continue
-    return default
+    return None
+
+
+def _calendar_matches(requested_calendar_id: str, provider_calendar_name: str, provider_calendar_url: str) -> bool:
+    requested = (requested_calendar_id or "").strip()
+    if not requested:
+        return False
+    req = requested.lower()
+    name = (provider_calendar_name or "").strip().lower()
+    url = (provider_calendar_url or "").strip().lower()
+    return req == name or req == url
+
+
+def _dedupe_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop duplicate events while preserving order."""
+    deduped: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for ev in events or []:
+        key = (
+            str(ev.get("id") or ""),
+            str(ev.get("start") or ""),
+            str(ev.get("end") or ""),
+            str(ev.get("summary") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ev)
+    return deduped
 
 
 @dataclass
@@ -428,16 +482,17 @@ class _GoogleProvider:
             return self._service
 
     async def list_events(
-        self, calendar_id: str, start: str, end: str, max_results: int
+        self, calendar_id: Optional[str], start: str, end: str, max_results: int
     ) -> List[Dict[str, Any]]:
         service = await self._get_service()
         loop = asyncio.get_running_loop()
+        effective_calendar_id = calendar_id or self.default_calendar_id()
 
         def _fetch():
             resp = (
                 service.events()
                 .list(
-                    calendarId=calendar_id,
+                    calendarId=effective_calendar_id,
                     timeMin=start,
                     timeMax=end,
                     maxResults=max_results,
@@ -520,35 +575,55 @@ class _AppleProvider:
             return self._principal
 
     async def list_events(
-        self, calendar_id: str, start: str, end: str, max_results: int
+        self, calendar_id: Optional[str], start: str, end: str, max_results: int
     ) -> List[Dict[str, Any]]:
         principal = await self._get_principal()
         start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
         end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
         loop = asyncio.get_running_loop()
+        requested_calendar = (calendar_id or "").strip()
 
         def _fetch():
-            for cal in principal.calendars():
-                name = getattr(cal, "name", None) or str(cal.url)
-                if calendar_id in (str(cal.url), name):
-                    items = []
-                    for ev in cal.date_search(start_dt, end_dt)[:max_results]:
-                        comp = ev.icalendar_component
-                        for sub in getattr(comp, "subcomponents", []):
-                            if sub.name != "VEVENT":
-                                continue
-                            s = sub.get("dtstart")
-                            e = sub.get("dtend")
-                            items.append({
-                                "id": str(sub.get("uid", "")),
-                                "summary": str(sub.get("summary", "")),
-                                "description": str(sub.get("description", "")) if sub.get("description") else None,
-                                "location": str(sub.get("location", "")) if sub.get("location") else None,
-                                "start": s.dt.isoformat() if s else None,
-                                "end": e.dt.isoformat() if e else None,
-                            })
-                    return items
-            return []
+            calendars = list(principal.calendars())
+            available_names = [
+                (getattr(cal, "name", None) or str(cal.url))
+                for cal in calendars
+            ]
+
+            selected = []
+            if requested_calendar:
+                for cal in calendars:
+                    name = getattr(cal, "name", None) or str(cal.url)
+                    if _calendar_matches(requested_calendar, name, str(cal.url)):
+                        selected.append(cal)
+                if not selected:
+                    raise RuntimeError(
+                        f"Calendar '{requested_calendar}' not found. Available calendars: {', '.join(available_names)}"
+                    )
+            else:
+                selected = calendars
+
+            items = []
+            for cal in selected:
+                for ev in cal.date_search(start_dt, end_dt):
+                    comp = ev.icalendar_component
+                    for vevent in _collect_vevent_components(comp):
+                        s = vevent.get("dtstart")
+                        e = vevent.get("dtend")
+                        items.append({
+                            "id": str(vevent.get("uid", "")),
+                            "summary": str(vevent.get("summary", "")),
+                            "description": str(vevent.get("description", "")) if vevent.get("description") else None,
+                            "location": str(vevent.get("location", "")) if vevent.get("location") else None,
+                            "start": s.dt.isoformat() if s and getattr(s, "dt", None) else None,
+                            "end": e.dt.isoformat() if e and getattr(e, "dt", None) else None,
+                        })
+
+            def _sort_key(item: Dict[str, Any]) -> str:
+                return str(item.get("start") or "")
+
+            items.sort(key=_sort_key)
+            return items[:max_results]
 
         return await loop.run_in_executor(None, _fetch)
 
@@ -564,7 +639,7 @@ class _AppleProvider:
         def _create():
             for cal in principal.calendars():
                 name = getattr(cal, "name", None) or str(cal.url)
-                if calendar_id in (str(cal.url), name):
+                if _calendar_matches(calendar_id, name, str(cal.url)):
                     cal_obj = ICalendar()
                     cal_obj.add("prodid", "-//FruitcakeAI//")
                     cal_obj.add("version", "2.0")
@@ -584,3 +659,18 @@ class _AppleProvider:
             return {"id": "", "status": "calendar_not_found"}
 
         return await loop.run_in_executor(None, _create)
+
+
+def _collect_vevent_components(component: Any) -> List[Any]:
+    """Return VEVENT objects whether the source is VEVENT or VCALENDAR."""
+    if component is None:
+        return []
+
+    if getattr(component, "name", None) == "VEVENT":
+        return [component]
+
+    vevents: List[Any] = []
+    for sub in getattr(component, "subcomponents", []) or []:
+        if getattr(sub, "name", None) == "VEVENT":
+            vevents.append(sub)
+    return vevents

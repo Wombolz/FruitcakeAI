@@ -11,7 +11,7 @@ mcp_servers:
 
   web_research:
     type: internal_python
-    module: app.mcp.servers.web_research
+    module: app.mcp.servers.web_research_v2
     enabled: true
 
   rss:
@@ -21,7 +21,6 @@ mcp_servers:
 
   # ── Docker stdio servers ─────────────────────────────────────────────────────
   # These require Docker + the image to be available locally.
-  # Pull with: docker pull mcp/sequentialthinking
 
   python_refactoring:
     type: docker_stdio
@@ -30,17 +29,19 @@ mcp_servers:
     timeout: 60
     priority: 10
 
-  sequential_thinking:
+  duckduckgo:
     type: docker_stdio
-    image: mcp/sequentialthinking
+    image: mcp/duckduckgo
+    enabled: false
+    timeout: 60
+    priority: 14
+
+  markitdown:
+    type: docker_stdio
+    image: mcp/markitdown
     enabled: true
     timeout: 60
-    priority: 15
-
-  filesystem:
-    type: docker_stdio
-    image: mcp/mcp-filesystem
-    enabled: false  # Enable when needed
+    priority: 13
 
   playwright:
     type: docker_stdio

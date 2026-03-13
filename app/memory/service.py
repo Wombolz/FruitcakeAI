@@ -41,9 +41,6 @@ TIER2_DAYS = 7
 # Tier 3: how many similar episodic memories to include
 TIER3_TOP_K = 5
 
-# Importance nudge per access — keeps scores calibrated over time
-IMPORTANCE_NUDGE = 0.02
-
 _USE_PGVECTOR = settings.database_url.startswith("postgresql")
 
 
@@ -245,7 +242,7 @@ class MemoryService:
 
     async def _record_accesses(self, memory_ids: list[int]) -> None:
         """
-        Nudge importance up for each accessed memory and increment access_count.
+        Increment access_count for each accessed memory.
         Runs as a fire-and-forget background task (never blocks retrieval).
 
         Opens its own session so the caller's session can close independently
@@ -261,7 +258,6 @@ class MemoryService:
                 )
                 for m in result.scalars().all():
                     m.access_count = (m.access_count or 0) + 1
-                    m.importance = min(1.0, (m.importance or 0.5) + IMPORTANCE_NUDGE)
                 await db.commit()
         except Exception:
             log.warning("memory.record_access_failed", exc_info=True)

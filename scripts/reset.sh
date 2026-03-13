@@ -24,6 +24,7 @@ until docker compose exec postgres pg_isready -U fruitcake -d fruitcake_v5 &>/de
 done
 
 echo "▶ Running migrations..."
+source .venv/bin/activate
 alembic upgrade head
 
 echo "▶ Seeding default users..."

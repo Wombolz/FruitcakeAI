@@ -16,6 +16,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -65,6 +66,19 @@ class User(Base):
     device_tokens = relationship("DeviceToken", back_populates="user", cascade="all, delete-orphan")
     memories = relationship("Memory", back_populates="user", cascade="all, delete-orphan")
     webhook_configs = relationship("WebhookConfig", back_populates="user", cascade="all, delete-orphan")
+    rss_sources = relationship("RSSSource", back_populates="user", cascade="all, delete-orphan")
+    rss_user_state = relationship("RSSUserState", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    rss_source_candidates = relationship(
+        "RSSSourceCandidate",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="RSSSourceCandidate.user_id",
+    )
+    reviewed_rss_source_candidates = relationship(
+        "RSSSourceCandidate",
+        back_populates="reviewer",
+        foreign_keys="RSSSourceCandidate.reviewed_by",
+    )
 
     @property
     def library_scopes(self) -> list[str]:
@@ -236,11 +250,11 @@ class Memory(Base):
     if _USE_PGVECTOR:
         embedding = Column(Vector(settings.embedding_dimension))
 
-    # Importance 0.0–1.0. Nudged up by _record_access() on each hit.
+    # Importance 0.0–1.0. Set at write-time or by explicit update flows.
     importance = Column(Float, default=0.5, nullable=False)
 
     # Tracks how many times this memory has been retrieved.
-    # High access_count → higher importance; zero accesses for 30+ days → pruning candidate.
+    # Used for usage analytics and optional pruning heuristics.
     access_count = Column(Integer, default=0, nullable=False)
 
     # Optional JSON array of string tags for filtering/grouping
@@ -281,6 +295,10 @@ class Task(Base):
 
     title = Column(String(255), nullable=False)
     instruction = Column(Text, nullable=False)  # natural language prompt for the agent
+    # Optional per-task persona override/resolution target.
+    persona = Column(String(100), nullable=True)
+    # Optional task execution profile (default, news_magazine)
+    profile = Column(String(50), nullable=True)
 
     # "one_shot" | "recurring"
     task_type = Column(String(20), nullable=False, default="one_shot")
@@ -304,6 +322,9 @@ class Task(Base):
     # Set to True by PATCH /tasks/{id} {"approved": true} so the runner knows
     # to skip the approval gate on the next execution without overloading error.
     pre_approved = Column(Boolean, default=False, nullable=False)
+    current_step_index = Column(Integer)
+    has_plan = Column(Boolean, default=False, nullable=False)
+    plan_version = Column(Integer, default=1, nullable=False)
 
     # Captured last agent output text
     result = Column(Text)
@@ -327,6 +348,18 @@ class Task(Base):
     next_run_at = Column(DateTime(timezone=True))
 
     user = relationship("User", back_populates="tasks")
+    steps = relationship(
+        "TaskStep",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TaskStep.step_index",
+    )
+    runs = relationship(
+        "TaskRun",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TaskRun.started_at.desc()",
+    )
 
     def __repr__(self):
         return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"
@@ -352,6 +385,102 @@ class DeviceToken(Base):
         return f"<DeviceToken(user_id={self.user_id}, env='{self.environment}')>"
 
 
+class TaskStep(Base):
+    """Step in a planned task graph. Executed sequentially by TaskRunner."""
+    __tablename__ = "task_steps"
+    __table_args__ = (
+        UniqueConstraint("task_id", "step_index", name="uq_task_steps_task_id_step_index"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    step_index = Column(Integer, nullable=False, index=True)
+
+    title = Column(String(255), nullable=False)
+    instruction = Column(Text, nullable=False)
+
+    # "pending" | "running" | "waiting_approval" | "succeeded" | "failed" | "skipped"
+    status = Column(String(30), default="pending", nullable=False, index=True)
+    requires_approval = Column(Boolean, default=False, nullable=False)
+
+    tool_allowlist = Column(Text, default="[]", nullable=False)
+    tool_blocklist = Column(Text, default="[]", nullable=False)
+
+    output_summary = Column(Text)
+    result = Column(Text)
+    error = Column(Text)
+    waiting_approval_tool = Column(String(100))
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    task = relationship("Task", back_populates="steps")
+
+    @property
+    def tool_allowlist_items(self) -> list[str]:
+        return json.loads(self.tool_allowlist or "[]")
+
+    @tool_allowlist_items.setter
+    def tool_allowlist_items(self, value: list[str]):
+        self.tool_allowlist = json.dumps(value)
+
+    @property
+    def tool_blocklist_items(self) -> list[str]:
+        return json.loads(self.tool_blocklist or "[]")
+
+    @tool_blocklist_items.setter
+    def tool_blocklist_items(self, value: list[str]):
+        self.tool_blocklist = json.dumps(value)
+
+    def __repr__(self):
+        return f"<TaskStep(task_id={self.task_id}, idx={self.step_index}, status='{self.status}')>"
+
+
+class TaskRun(Base):
+    """Execution record for one task run attempt."""
+    __tablename__ = "task_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="SET NULL"))
+
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    finished_at = Column(DateTime(timezone=True))
+
+    # "running" | "completed" | "failed" | "waiting_approval" | "cancelled"
+    status = Column(String(30), nullable=False, default="running")
+    error = Column(Text)
+    summary = Column(Text)
+
+    task = relationship("Task", back_populates="runs")
+    artifacts = relationship(
+        "TaskRunArtifact",
+        back_populates="task_run",
+        cascade="all, delete-orphan",
+        order_by="TaskRunArtifact.created_at.desc()",
+    )
+
+    def __repr__(self):
+        return f"<TaskRun(task_id={self.task_id}, status='{self.status}')>"
+
+
+class TaskRunArtifact(Base):
+    """Structured artifacts emitted by a task run (dataset, reports, outputs)."""
+    __tablename__ = "task_run_artifacts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_run_id = Column(Integer, ForeignKey("task_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    artifact_type = Column(String(50), nullable=False, index=True)
+    content_json = Column(Text)
+    content_text = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    task_run = relationship("TaskRun", back_populates="artifacts")
+
+    def __repr__(self):
+        return f"<TaskRunArtifact(task_run_id={self.task_run_id}, type='{self.artifact_type}')>"
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 models
 # ---------------------------------------------------------------------------
@@ -374,3 +503,103 @@ class WebhookConfig(Base):
 
     def __repr__(self):
         return f"<WebhookConfig(id={self.id}, user_id={self.user_id}, active={self.active})>"
+
+
+class RSSSource(Base):
+    """Curated RSS/Atom feed source. Global when user_id is null."""
+    __tablename__ = "rss_sources"
+    __table_args__ = (
+        UniqueConstraint("user_id", "url_canonical", name="uq_rss_sources_user_url"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+
+    name = Column(String(255), nullable=False)
+    url = Column(Text, nullable=False)
+    url_canonical = Column(Text, nullable=False, index=True)
+    category = Column(String(100), default="news", nullable=False)
+    active = Column(Boolean, default=True, nullable=False, index=True)
+    trust_level = Column(String(30), default="manual", nullable=False)
+    update_interval_minutes = Column(Integer, default=60, nullable=False)
+    last_ok_at = Column(DateTime(timezone=True))
+    last_error = Column(Text)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User", back_populates="rss_sources")
+    items = relationship("RSSItem", back_populates="source", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<RSSSource(id={self.id}, user_id={self.user_id}, name='{self.name}')>"
+
+
+class RSSSourceCandidate(Base):
+    """Discovered candidate feed awaiting moderation."""
+    __tablename__ = "rss_source_candidates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    seed_url = Column(Text, nullable=False)
+    url = Column(Text, nullable=False)
+    url_canonical = Column(Text, nullable=False, index=True)
+    title_hint = Column(String(255))
+    domain = Column(String(255), nullable=False, index=True)
+    discovered_via = Column(String(100), default="discover_rss_sources", nullable=False)
+    status = Column(String(30), default="pending", nullable=False, index=True)
+    reason = Column(Text)
+    reviewed_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
+    reviewed_at = Column(DateTime(timezone=True))
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id], back_populates="rss_source_candidates")
+    reviewer = relationship(
+        "User",
+        foreign_keys=[reviewed_by],
+        back_populates="reviewed_rss_source_candidates",
+    )
+
+    def __repr__(self):
+        return f"<RSSSourceCandidate(id={self.id}, user_id={self.user_id}, status='{self.status}')>"
+
+
+class RSSItem(Base):
+    """Cached RSS/Atom item for fast recall/search and headline history."""
+    __tablename__ = "rss_items"
+    __table_args__ = (
+        UniqueConstraint("source_id", "item_uid", name="uq_rss_items_source_uid"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_id = Column(Integer, ForeignKey("rss_sources.id", ondelete="CASCADE"), nullable=False, index=True)
+    item_uid = Column(String(128), nullable=False, index=True)
+
+    title = Column(String(1000), nullable=False)
+    link = Column(Text)
+    summary = Column(Text)
+    published_at = Column(DateTime(timezone=True), index=True)
+    first_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    fetched_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    source = relationship("RSSSource", back_populates="items")
+
+    def __repr__(self):
+        return f"<RSSItem(source_id={self.source_id}, title='{self.title[:40]}')>"
+
+
+class RSSUserState(Base):
+    """Per-user RSS cursor state for incremental listing flows."""
+    __tablename__ = "rss_user_state"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    last_list_recent_cursor_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="rss_user_state")
+
+    def __repr__(self):
+        return f"<RSSUserState(user_id={self.user_id}, cursor={self.last_list_recent_cursor_at})>"

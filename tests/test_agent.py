@@ -67,6 +67,24 @@ def test_summarize_document_has_document_name_parameter():
     assert "document_name" in required
 
 
+def test_create_task_plan_schema_has_required_fields():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_task_plan")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "task_id" in props
+    assert "goal" in props
+    assert "goal" in required
+
+
+def test_create_and_run_task_plan_schema_has_required_fields():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_and_run_task_plan")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "task_id" in props
+    assert "goal" in props
+    assert "goal" in required
+
+
 # ── Persona / blocked-tools filtering ─────────────────────────────────────────
 
 def test_family_assistant_no_blocked_tools():
@@ -117,6 +135,27 @@ def test_blocked_tools_list_exact_match():
     names = [t["function"]["name"] for t in tools]
     assert "search_library" not in names
     assert "summarize_document" in names
+
+
+def test_prefers_web_search_over_generic_search_tool():
+    """Hide generic 'search' when internal 'web_search' is available."""
+    from unittest.mock import patch, MagicMock
+
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    fake_mcp_tools = [
+        {"type": "function", "function": {"name": "web_search", "description": "", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "search", "description": "", "parameters": {"type": "object", "properties": {}}}},
+    ]
+    mock_registry = MagicMock()
+    mock_registry._is_ready = True
+    mock_registry.get_tools_for_agent.return_value = fake_mcp_tools
+
+    with patch("app.mcp.registry.get_mcp_registry", return_value=mock_registry):
+        tools = get_tools_for_user(ctx)
+
+    names = [t["function"]["name"] for t in tools]
+    assert "web_search" in names
+    assert "search" not in names
 
 
 # ── Dispatch tests ─────────────────────────────────────────────────────────────
@@ -191,3 +230,25 @@ async def test_dispatch_propagates_approval_required():
         with patch.object(tools_module, "_write_audit_log", new_callable=AsyncMock):
             with pytest.raises(ApprovalRequired):
                 await tools_module.dispatch_tool_calls([mock_call], ctx)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_routes_generic_search_to_web_search():
+    """Generic MCP 'search' calls should flow through internal web_search when present."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import app.agent.tools as tools_module
+
+    ctx = _make_context()
+    mock_registry = MagicMock()
+    mock_registry.knows_tool.side_effect = lambda n: n == "web_search"
+    mock_registry.call_tool = AsyncMock(return_value="ok")
+
+    with patch("app.mcp.registry.get_mcp_registry", return_value=mock_registry):
+        result = await tools_module._call_tool("search", {"query": "ap headlines", "limit": 3}, ctx)
+
+    assert result == "ok"
+    mock_registry.call_tool.assert_awaited_once_with(
+        "web_search",
+        {"query": "ap headlines", "max_results": 3},
+        ctx,
+    )

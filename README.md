@@ -84,7 +84,7 @@ ollama serve   # runs in background on port 11434
 This script:
 1. Starts the Docker postgres container (`pgvector/pgvector:pg16`)
 2. Waits for Ollama health check
-3. Creates the Python virtual environment and installs dependencies
+3. Activates existing `.venv` (or creates/installs only on first run)
 4. Runs database migrations and seeds default users
 5. Starts the FastAPI server on `http://localhost:8000`
 
@@ -181,6 +181,7 @@ FastAPI Backend (fruitcake_v5/)
 | PATCH | `/tasks/{id}` | user | Update / approve / reject |
 | DELETE | `/tasks/{id}` | user | Cancel task |
 | POST | `/tasks/{id}/run` | user | Manual trigger (dev) |
+| POST | `/tasks/{id}/reset` | user | Recover a task stuck in running after a restart |
 | GET | `/tasks/{id}/audit` | user | Tool-call log for last run |
 | GET | `/memories` | user | List memories |
 | POST | `/memories` | user | Create memory (admin/testing) |
@@ -241,6 +242,13 @@ git push -u origin main
 ./scripts/reset.sh   # drops DB, recreates tables, reseeds users
 ```
 
+## Stop local services
+
+```bash
+./scripts/stop.sh        # stop API + postgres
+./scripts/stop.sh --all  # also stop Ollama
+```
+
 ---
 
 ## Project Structure
@@ -280,6 +288,7 @@ fruitcake_v5/
 ├── tests/              55 tests, SQLite in-memory (no DB required)
 ├── scripts/
 │   ├── start.sh        One-command startup
+│   ├── stop.sh         Stop local API/services
 │   └── reset.sh        Wipe and reseed
 └── docker-compose.yml  PostgreSQL + pgvector
 ```
