@@ -1,40 +1,47 @@
-# FruitcakeAI v5
+# FruitcakeAI
 
-A private, local-first AI assistant for families. Runs entirely on your hardware — no data leaves your home.
+**Local-first AI with persistent memory, autonomous tasks, and role-based access — for individuals, households, and small teams.**
+
+FruitcakeAI is a self-hosted AI assistant that remembers its users across conversations, runs recurring tasks autonomously, and keeps every byte of data on your hardware. Unlike cloud assistants, it gets to know the people it serves over time — and it never phones home.
 
 ```
-iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
-                              ↓
-                    LlamaIndex RAG (pgvector)
-                    MCP tool servers (calendar, web, RSS)
-                    Autonomous task engine (scheduler + runner)
-                    Persistent memory (3-tier retrieval)
-                    Inbound webhooks (external triggers)
+FruitcakeAI_iOS (iPhone / Mac)  →  FruitcakeAI backend  →  Ollama (local LLM)
+                                              ↓
+                                Hybrid RAG (pgvector + BM25 + RRF)
+                                MCP tools (calendar, web, RSS)
+                                Autonomous task engine (scheduler + runner)
+                                Persistent memory (3-tier retrieval)
+                                Inbound webhooks (external triggers)
 ```
+
+> **Who this is for**: Technical users comfortable with Docker, Python, and Xcode. If you can run `docker compose up` and build a Swift app, you can run FruitcakeAI. Self-hosted homelabs, households, and small teams are the primary audience.
+
+**iOS/macOS client**: [github.com/fruitcakeai/fruitcake-ios](https://github.com/fruitcakeai/fruitcake-ios) — requires Xcode 16+.
 
 ---
 
-## What's Included
+## Why FruitcakeAI?
 
-### Phase 3 — Core assistant
-- Multi-user JWT auth with role-based personas (`admin`, `parent`, `child`, `guest`)
-- LiteLLM agent loop with tool dispatch — works with Ollama, Claude, or OpenAI
-- LlamaIndex RAG + pgvector hybrid retrieval over uploaded documents
-- MCP tool servers: calendar, web search, RSS
-- Streaming chat via WebSocket; REST fallback
-- Persona system — per-user `blocked_tools`, tone, and content filters
+Most AI assistants are episodic — each conversation starts from scratch, and your data lives on someone else's servers. FruitcakeAI is different:
 
-### Phase 4 — Autonomous tasks and memory
-- **Tasks** — create one-shot or recurring tasks with `every:Xm/h/d` or cron schedules; active-hours windows prevent off-hours runs; exponential retry on failure
-- **Approval gate** — tasks with `requires_approval=True` pause before executing calendar-mutating tools; user approves via `PATCH /tasks/{id}`
-- **Persistent memory** — agent writes memories via the `create_memory` tool; `MemoryService` retrieves them in 3 tiers (procedural rules → importance-ranked facts → pgvector semantic search) and injects them into every task prompt
-- **Device tokens** — APNs token registration for push notifications (delivery stub, full pusher in Sprint 4.3)
-- **Timezone-aware prompts** — current date/time injected into every system prompt, localized to the user's IANA timezone
+- **It remembers.** The agent writes memories as it learns about you — preferences, facts, recurring situations — and retrieves them semantically in every future conversation and task run.
+- **It acts without being prompted.** Schedule recurring tasks ("summarize my RSS feeds every morning"), set active hours so it stays quiet at night, and get push notifications when something needs attention.
+- **It stays on your hardware.** Ollama runs the LLM locally. Embeddings use a local HuggingFace model. No data leaves your machine unless you explicitly opt in to a cloud model.
+- **It knows who it's talking to.** Role-based personas give different users different tool access and content filters — useful for households with kids, teams with varying access levels, or anyone who wants a guest mode.
 
-### Phase 5.1 — Webhooks
-- Inbound webhook triggers via a secret key — POST any JSON payload to `/webhooks/trigger/{key}` and the agent runs your instruction with the payload injected
-- Authenticated CRUD for managing webhook configs
-- Compatible with GitHub, Zapier, IFTTT, and any HTTP client
+---
+
+## Features
+
+- **Persistent memory** — agent writes memories via tool call; 3-tier retrieval (procedural rules → importance-ranked facts → pgvector semantic search) injects relevant context into every prompt
+- **Autonomous tasks** — one-shot or recurring (`every:30m`, cron, or ISO timestamp); active-hours windows; exponential retry on failure; push notification on completion
+- **Approval gates** — tasks flag irreversible actions (calendar mutations, email) for user sign-off before executing; approval via `PATCH /tasks/{id}` or the Inbox tab
+- **Role-based personas** — `admin`, `parent`, `child`, `guest` roles with per-user `blocked_tools`, tone, and content filters; designed for multi-user environments
+- **Hybrid RAG** — pgvector + BM25 + RRF fusion over uploaded documents; vector-only fallback if BM25 corpus unavailable; per-user library scoping (personal / shared)
+- **MCP tool servers** — calendar, web search, RSS; add new tools via config, no code required
+- **Inbound webhooks** — POST any JSON payload to `/webhooks/trigger/{key}` and the agent runs your instruction; compatible with GitHub, Zapier, IFTTT, or any HTTP client
+- **On-device fallback** — offline mode uses Apple FoundationModels for calendar, reminders, and contacts
+- **Model-agnostic** — swap between Ollama, Claude, or OpenAI via a single env var; no code changes
 
 ---
 
@@ -45,18 +52,18 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - macOS with [Homebrew](https://brew.sh)
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - [Ollama](https://ollama.ai) — `brew install ollama`
-- [Xcode 26+](https://developer.apple.com/xcode/) — for the iOS/macOS app
 - Python 3.9+
+- Xcode 16+ — for the iOS/macOS client
 
 ### 1. Clone and configure
 
 ```bash
-git clone <repo-url> fruitcake_v5
-cd fruitcake_v5
+git clone <repo-url> FruitcakeAI
+cd FruitcakeAI
 cp .env.example .env
 ```
 
-Edit `.env` — the only required change for a local setup:
+Edit `.env` — the only required changes for a local setup:
 
 ```env
 SECRET_KEY=change-me-to-a-random-string
@@ -73,7 +80,7 @@ ollama pull qwen2.5:14b
 ollama serve   # runs in background on port 11434
 ```
 
-> **M1 Max 64GB note**: `qwen2.5:14b` is the verified default. `qwen2.5:32b` (~20GB) is a step up if you close other apps. `llama3.3:70b` (~43GB) crashes at runtime — avoid it.
+> **M1 Max 64GB**: `qwen2.5:14b` is the verified default. `qwen2.5:32b` (~20GB) is a capable step-up if you close other apps first. `llama3.3:70b` (~43GB) crashes at runtime on this hardware — avoid it.
 
 ### 3. Start the backend
 
@@ -84,11 +91,11 @@ ollama serve   # runs in background on port 11434
 This script:
 1. Starts the Docker postgres container (`pgvector/pgvector:pg16`)
 2. Waits for Ollama health check
-3. Activates existing `.venv` (or creates/installs only on first run)
+3. Activates existing `.venv` (or creates and installs on first run)
 4. Runs database migrations and seeds default users
 5. Starts the FastAPI server on `http://localhost:8000`
 
-Default users:
+Default users — **change these passwords before using on a shared network:**
 
 | Username | Password | Role |
 |----------|----------|------|
@@ -96,8 +103,6 @@ Default users:
 | parent | changeme123 | parent |
 | kid | changeme123 | child |
 | guest | changeme123 | guest |
-
-> **Change these passwords before using on a shared network.**
 
 ### 4. Verify the backend
 
@@ -111,15 +116,11 @@ curl -X POST http://localhost:8000/auth/login \
 # → {"access_token": "eyJ...", "token_type": "bearer"}
 ```
 
-### 5. Open the Swift app
+### 5. Connect the client
 
-1. Open `../FruitcakeAi/FruitcakeAi.xcodeproj` in Xcode
-2. Select your target device (iPhone simulator or Mac)
-3. Build and run (`⌘R`)
-4. In the app: **Settings → Server URL** → enter `http://localhost:8000`
-5. Log in with any seed user
+Open `FruitcakeAI_iOS` in Xcode, set **Settings → Server URL** to `http://localhost:8000`, and log in with any seed user.
 
-**First chat**: type anything — the assistant responds from the local LLM. Upload a PDF via the Library tab, then ask about it.
+**Try it**: send any message — the assistant responds from the local LLM. Upload a PDF via the Library tab, then ask about its contents. Create a task via the Inbox tab and watch it run on schedule.
 
 ---
 
@@ -127,8 +128,8 @@ curl -X POST http://localhost:8000/auth/login \
 
 ```bash
 source .venv/bin/activate
-pytest tests/
-# 55 passed in ~6s — no running PostgreSQL required
+pytest -q
+# 133 passed in ~30s — no running PostgreSQL required
 ```
 
 ---
@@ -136,26 +137,26 @@ pytest tests/
 ## Architecture
 
 ```
-Swift App (iOS/macOS)
+FruitcakeAI_iOS (iPhone / macOS)
   ├── AuthManager       JWT auth, Keychain storage
   ├── APIClient         REST calls, multipart upload
   ├── WebSocketManager  Streaming chat tokens
   ├── OnDeviceAgent     FoundationModels fallback (offline mode)
   └── SwiftData         Local message cache
 
-FastAPI Backend (fruitcake_v5/)
+FruitcakeAI backend
   ├── app/api/          HTTP + WebSocket endpoints
   ├── app/agent/        LiteLLM agent loop, tool dispatch, persona system
-  ├── app/autonomy/     TaskRunner, Scheduler, ApprovalGate, APNs push stub
+  ├── app/autonomy/     TaskRunner, Scheduler, ApprovalGate, APNs push
   ├── app/memory/       MemoryService — 3-tier retrieval, dedup, pgvector
-  ├── app/rag/          LlamaIndex + pgvector hybrid retrieval
+  ├── app/rag/          pgvector + BM25 hybrid retrieval
   ├── app/mcp/          MCP tool registry (calendar, web, RSS, Docker servers)
   └── app/db/           PostgreSQL models, async sessions, Alembic migrations
 ```
 
-**Agent-first**: The LLM orchestrates tools — no hand-written routing rules.
-**Local by default**: Ollama + HuggingFace embeddings. No API keys required.
-**On-device fallback**: Offline mode uses Apple FoundationModels for calendar/reminders/contacts.
+**Agent-first**: the LLM orchestrates tools — no hand-written routing rules.  
+**Local by default**: Ollama + HuggingFace embeddings. No API keys required to get started.  
+**Model-agnostic**: swap LLM backends via a single env var. Ollama, Claude, and OpenAI are all supported.
 
 ---
 
@@ -181,7 +182,7 @@ FastAPI Backend (fruitcake_v5/)
 | PATCH | `/tasks/{id}` | user | Update / approve / reject |
 | DELETE | `/tasks/{id}` | user | Cancel task |
 | POST | `/tasks/{id}/run` | user | Manual trigger (dev) |
-| POST | `/tasks/{id}/reset` | user | Recover a task stuck in running after a restart |
+| POST | `/tasks/{id}/reset` | user | Recover a task stuck in running after restart |
 | GET | `/tasks/{id}/audit` | user | Tool-call log for last run |
 | GET | `/memories` | user | List memories |
 | POST | `/memories` | user | Create memory (admin/testing) |
@@ -208,45 +209,38 @@ FastAPI Backend (fruitcake_v5/)
 
 | Topic | Guide |
 |-------|-------|
-| Switch LLM (Ollama → Claude → OpenAI) | [docs/LLM_BACKENDS.md](docs/LLM_BACKENDS.md) |
-| Add MCP tools (config-only, no code) | [docs/ADDING_MCP_TOOLS.md](docs/ADDING_MCP_TOOLS.md) |
-| Customize personas per user | [docs/PERSONA_SYSTEM.md](docs/PERSONA_SYSTEM.md) |
-| Full roadmap | [docs/FruitcakeAI_v5_Roadmap_2.md](docs/FruitcakeAI_v5_Roadmap_2.md) |
+| Switch LLM (Ollama → Claude → OpenAI) | [Docs/LLM_BACKENDS.md](Docs/LLM_BACKENDS.md) |
+| Add MCP tools (config-only, no code) | [Docs/ADDING_MCP_TOOLS.md](Docs/ADDING_MCP_TOOLS.md) |
+| Customize personas per user | [Docs/PERSONA_SYSTEM.md](Docs/PERSONA_SYSTEM.md) |
+| Full roadmap | [Docs/FruitcakeAi Roadmap.md](Docs/FruitcakeAi Roadmap.md) |
 
 ---
 
-## GitHub / Repository Setup
+## Security Notes
 
-- **Secrets**: Real API keys and private configuration should only live in `.env` (and any `*.env.*` files). These files are **git-ignored** and are not committed.
-- **Data**: Uploaded documents and derived chunks are stored under `storage/`, which is also **git-ignored** so your personal data never ends up in the repository.
-- **Local-only files**: Virtual environments (`.venv/`), caches (`.pytest_cache/`), logs (`logs/`, `*.log`), IDE settings (`.vscode/`, `.idea/`), and local databases/backups (`*.sqlite*`, `*.db`, `*.bak`, `*.backup`) are all ignored by `.gitignore`.
+FruitcakeAI is designed to run on a trusted local network. Before sharing access:
 
-To publish this project to GitHub from a clean clone:
-
-```bash
-git init
-git add .
-git status   # verify .env, storage/, .venv/, logs/, etc. are NOT staged
-git commit -m "Initialize FruitcakeAI v5"
-
-# After creating a repo on GitHub:
-git remote add origin git@github.com:<your-username>/fruitcake_v5.git
-git push -u origin main
-```
+- **Change default passwords** — seed users use `changeme123`; update them before any shared use
+- **Network exposure** — `start.sh` runs Uvicorn on `0.0.0.0:8000`; restrict host firewall rules or put a reverse proxy in front before exposing beyond your local network
+- **Secrets stay in `.env`** — API keys and config live only in `.env`, which is git-ignored and never committed
+- **Uploaded data stays local** — documents and derived chunks are stored under `storage/`, also git-ignored
 
 ---
 
-## Reset to clean state
+## Contributing
+
+FruitcakeAI is in active development. Issues and pull requests are welcome. If you find a bug or have a feature suggestion, open an issue — include your hardware, OS, Ollama version, and LLM model.
+
+See [Docs/FruitcakeAi Roadmap.md](Docs/FruitcakeAi Roadmap.md) for what's planned and what's in progress.
+
+---
+
+## Utility Scripts
 
 ```bash
-./scripts/reset.sh   # drops DB, recreates tables, reseeds users
-```
-
-## Stop local services
-
-```bash
-./scripts/stop.sh        # stop API + postgres
-./scripts/stop.sh --all  # also stop Ollama
+./scripts/reset.sh        # drop DB, recreate tables, reseed users
+./scripts/stop.sh         # stop API + postgres
+./scripts/stop.sh --all   # also stop Ollama
 ```
 
 ---
@@ -254,7 +248,7 @@ git push -u origin main
 ## Project Structure
 
 ```
-fruitcake_v5/
+FruitcakeAI/
 ├── app/
 │   ├── agent/          Agent loop, tools, personas, context builder
 │   ├── api/
@@ -268,27 +262,24 @@ fruitcake_v5/
 │   ├── auth/           JWT auth, user registration
 │   ├── autonomy/
 │   │   ├── approval.py ApprovalRequired gate (ContextVar-scoped)
-│   │   ├── push.py     APNs push stub
+│   │   ├── push.py     APNs push
 │   │   ├── runner.py   TaskRunner — isolated agent sessions, retry logic
 │   │   └── scheduler.py cron/interval/ISO parser, next-run calculator
 │   ├── db/
 │   │   ├── models.py   User, Task, Memory, DeviceToken, WebhookConfig, …
 │   │   └── migrations/
-│   │       ├── 001_phase4_tasks_memory_devices.py
-│   │       ├── 002_task_last_session_id.py
-│   │       ├── 003_phase5_webhook_configs.py
-│   │       └── 004_task_pre_approved.py
 │   ├── memory/         MemoryService — 3-tier retrieval, dedup, access tracking
 │   ├── mcp/            MCP registry + internal servers
-│   └── rag/            LlamaIndex RAG service + hybrid retriever
+│   └── rag/            pgvector RAG service + hybrid retriever
 ├── config/
 │   ├── mcp_config.yaml     MCP server definitions
 │   ├── personas.yaml       Persona definitions
 │   └── users.yaml          Seed users
-├── tests/              55 tests, SQLite in-memory (no DB required)
+├── Docs/               Guides and roadmap
+├── tests/              133 tests, SQLite in-memory (no DB required)
 ├── scripts/
 │   ├── start.sh        One-command startup
-│   ├── stop.sh         Stop local API/services
+│   ├── stop.sh         Stop local services
 │   └── reset.sh        Wipe and reseed
 └── docker-compose.yml  PostgreSQL + pgvector
 ```
