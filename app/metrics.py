@@ -37,6 +37,9 @@ class _Metrics:
     chat_complexity_simple_count: int = 0
     chat_complexity_complex_count: int = 0
     chat_complexity_routed_complex_count: int = 0
+    chat_validation_retry_count: int = 0
+    chat_validation_invalid_link_count: int = 0
+    chat_validation_empty_retry_count: int = 0
 
     def inc_requests(self) -> None:
         with self._lock:
@@ -110,6 +113,18 @@ class _Metrics:
         with self._lock:
             self.chat_complexity_routed_complex_count += n
 
+    def inc_chat_validation_retry_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_validation_retry_count += n
+
+    def inc_chat_validation_invalid_link_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_validation_invalid_link_count += n
+
+    def inc_chat_validation_empty_retry_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_validation_empty_retry_count += n
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -130,6 +145,9 @@ class _Metrics:
                 "chat_complexity_simple_count": self.chat_complexity_simple_count,
                 "chat_complexity_complex_count": self.chat_complexity_complex_count,
                 "chat_complexity_routed_complex_count": self.chat_complexity_routed_complex_count,
+                "chat_validation_retry_count": self.chat_validation_retry_count,
+                "chat_validation_invalid_link_count": self.chat_validation_invalid_link_count,
+                "chat_validation_empty_retry_count": self.chat_validation_empty_retry_count,
             }
 
 

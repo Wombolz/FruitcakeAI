@@ -24,6 +24,10 @@ import structlog
 from app.agent.context import UserContext
 from app.agent.chat_orchestration import build_orchestrated_chat_history
 from app.agent.chat_routing import classify_chat_complexity
+from app.agent.chat_validation import (
+    build_chat_retry_instruction,
+    validate_chat_response,
+)
 from app.agent.core import run_agent, stream_agent
 from app.auth.dependencies import get_current_user
 from app.config import settings
@@ -292,11 +296,13 @@ async def send_message(
         metrics.inc_chat_complexity_simple_count()
 
     try:
-        reply = await run_agent(
+        reply = await _execute_chat_turn(
             execution_history,
             user_context,
+            user_prompt=body.content,
             mode=execution_mode,
             stage="chat_complex" if decision.is_complex else "chat_simple",
+            enable_validation=decision.is_complex,
         )
     except Exception as e:
         log.exception("Agent error in REST handler", session_id=session_id)
@@ -447,17 +453,29 @@ async def chat_websocket(
                         metrics.inc_chat_complexity_routed_complex_count()
                     else:
                         metrics.inc_chat_complexity_simple_count()
-
-                    async for token_chunk in stream_agent(
-                        execution_history,
-                        user_context,
-                        mode=execution_mode,
-                        stage="chat_complex" if decision.is_complex else "chat_simple",
-                    ):
-                        full_response.append(token_chunk)
-                        await websocket.send_json({"type": "token", "content": token_chunk})
-
-                    complete = "".join(full_response)
+                    if decision.is_complex:
+                        complete = await _execute_chat_turn(
+                            execution_history,
+                            user_context,
+                            user_prompt=user_message,
+                            mode=execution_mode,
+                            stage="chat_complex",
+                            enable_validation=True,
+                        )
+                        for token_chunk in _chunk_text(complete):
+                            full_response.append(token_chunk)
+                            await websocket.send_json({"type": "token", "content": token_chunk})
+                        complete = "".join(full_response)
+                    else:
+                        async for token_chunk in stream_agent(
+                            execution_history,
+                            user_context,
+                            mode=execution_mode,
+                            stage="chat_simple",
+                        ):
+                            full_response.append(token_chunk)
+                            await websocket.send_json({"type": "token", "content": token_chunk})
+                        complete = "".join(full_response)
 
                     # Store assistant reply
                     assistant_msg = ChatMessage(
@@ -545,6 +563,67 @@ async def _switch_persona(
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _chunk_text(content: str, chunk_size: int = 64):
+    for i in range(0, len(content), chunk_size):
+        yield content[i : i + chunk_size]
+
+
+async def _execute_chat_turn(
+    history: List[Dict[str, Any]],
+    user_context: UserContext,
+    *,
+    user_prompt: str,
+    mode: str,
+    stage: str,
+    enable_validation: bool,
+) -> str:
+    reply = await run_agent(
+        history,
+        user_context,
+        mode=mode,
+        stage=stage,
+    )
+    if not (enable_validation and settings.chat_validation_enabled):
+        return reply
+
+    max_attempts = max(0, int(settings.chat_validation_retry_max_attempts))
+    attempts = 0
+    current = reply
+
+    while True:
+        validation = validate_chat_response(user_prompt, current)
+        if validation.invalid_urls:
+            metrics.inc_chat_validation_invalid_link_count(len(validation.invalid_urls))
+
+        should_retry = (
+            settings.chat_validation_retry_enabled
+            and validation.should_retry
+            and attempts < max_attempts
+        )
+        if not should_retry:
+            return validation.cleaned_content if validation.invalid_urls else current
+
+        if validation.retry_reason == "empty_result":
+            metrics.inc_chat_validation_empty_retry_count()
+        metrics.inc_chat_validation_retry_count()
+        attempts += 1
+
+        retry_instruction = build_chat_retry_instruction(validation.retry_reason)
+        corrective = {"role": "system", "content": retry_instruction}
+        retry_history = list(history)
+        if retry_history and retry_history[-1].get("role") == "user":
+            retry_history = retry_history[:-1] + [corrective, retry_history[-1]]
+        else:
+            retry_history.append(corrective)
+
+        current = await run_agent(
+            retry_history,
+            user_context,
+            mode=mode,
+            stage=f"{stage}_retry",
+        )
+
 
 async def _get_session_or_404(
     session_id: int, user_id: int, db: AsyncSession

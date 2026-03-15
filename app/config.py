@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # Phase 5.5.2 orchestrated chat path
     chat_orchestration_enabled: bool = True
     chat_orchestration_max_steps: int = 3
+    # Phase 5.5.3 chat grounding checks
+    chat_validation_enabled: bool = True
+    chat_validation_retry_enabled: bool = True
+    chat_validation_retry_max_attempts: int = 1
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"
