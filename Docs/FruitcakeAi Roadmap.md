@@ -1079,6 +1079,7 @@ Verification highlights:
 ## Phase 5.5 — Adaptive Chat Orchestration (Quality Parity)
 
 **Goal**: close the quality gap between single-turn chat and task-mode execution on local models by adding optional task-like scaffolding to chat only when complexity warrants it.
+**Status**: 5.5.1-5.5.4 implemented in branch `codex/phase5.5.2-chat-orchestrated` (soak pending before merge).
 
 **Why now**:
 - Current task runs outperform chat on reliability because tasks use explicit planning, tool-grounding, and final synthesis.
@@ -1088,11 +1089,17 @@ Verification highlights:
 - Add lightweight complexity scoring for chat turns (multi-part asks, high-stakes asks, tool-heavy asks).
 - Route low-complexity requests through existing fast single-pass chat path.
 - Route high-complexity requests to orchestrated chat path.
+- Completed:
+  - `classify_chat_complexity(...)` added with deterministic scoring and route decision.
+  - Complex chat turns routed to chat orchestration mode; simple turns remain single-pass.
 
 **Sprint 5.5.2 — Orchestrated chat path (non-task UX)**
 - Add internal micro-plan for complex chat turns (2-3 steps max).
 - Reuse existing tool + grounding patterns from task runner where safe.
 - Keep response as a single chat answer (no task creation required).
+- Completed:
+  - Internal orchestration overlay added for complex chat turns (micro-plan + grounded synthesis rules).
+  - Dedicated `chat_orchestrated` mode added (higher turn budget) while preserving normal chat UX.
 
 **Sprint 5.5.3 — Grounding and output checks for chat**
 - Add optional validation for news/research style answers:
@@ -1100,6 +1107,10 @@ Verification highlights:
   - invalid link rejection
   - empty-result retry policy
 - Add “deep mode” switch in API/UI later (optional), defaulting to auto-routing.
+- Completed:
+  - Chat validation module added for research/news responses.
+  - One-shot retry for missing links / invalid links / empty responses.
+  - Invalid/placeholder links are stripped from final output when retry is not taken.
 
 **Sprint 5.5.4 — Observability and controls**
 - Add counters for:
@@ -1107,6 +1118,10 @@ Verification highlights:
   - fallback/retry rates
   - latency delta vs single-pass path
 - Add kill switch env flag to disable orchestrated chat instantly.
+- Completed:
+  - Kill switch `chat_orchestration_kill_switch` added; complex prompts immediately degrade to simple chat mode when enabled.
+  - Chat metrics expanded with retry counters, invalid-link counters, and simple vs orchestrated latency delta.
+  - REST and WebSocket chat paths aligned to shared orchestration/validation behavior.
 
 **Memory relevance follow-up (carryover)**
 - Keep general retrieval/search from automatically raising memory relevance.
@@ -1120,6 +1135,9 @@ Verification highlights:
 1. Complex chat prompts show measurable quality improvement without forcing heavy orchestration on simple chat.
 2. Median chat latency for simple prompts stays near current baseline.
 3. No API-breaking changes; feature is additive and flag-gated.
+4. Implemented branch validation:
+   - Chat-focused suites passed (`tests/test_chat_routing.py`, `tests/test_chat_orchestration.py`, `tests/test_chat_validation.py`, `tests/test_auth.py`).
+   - Core regression subsets passed (`tests/test_agent.py`, `tests/test_task_steps.py`, `tests/test_webhooks.py`).
 
 ---
 
