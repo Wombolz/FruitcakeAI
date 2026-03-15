@@ -22,6 +22,7 @@ from sqlalchemy import select
 import structlog
 
 from app.agent.context import UserContext
+from app.agent.chat_orchestration import build_orchestrated_chat_history
 from app.agent.chat_routing import classify_chat_complexity
 from app.agent.core import run_agent, stream_agent
 from app.auth.dependencies import get_current_user
@@ -278,6 +279,12 @@ async def send_message(
         threshold=settings.chat_complexity_threshold,
         routing_enabled=settings.chat_complexity_routing_enabled,
     )
+    execution_mode = "chat_orchestrated" if decision.is_complex else "chat"
+    execution_history = build_orchestrated_chat_history(
+        history,
+        enabled=decision.is_complex and settings.chat_orchestration_enabled,
+        max_steps=settings.chat_orchestration_max_steps,
+    )
     if decision.is_complex:
         metrics.inc_chat_complexity_complex_count()
         metrics.inc_chat_complexity_routed_complex_count()
@@ -286,9 +293,9 @@ async def send_message(
 
     try:
         reply = await run_agent(
-            history,
+            execution_history,
             user_context,
-            mode=decision.mode,
+            mode=execution_mode,
             stage="chat_complex" if decision.is_complex else "chat_simple",
         )
     except Exception as e:
@@ -429,6 +436,12 @@ async def chat_websocket(
                         threshold=settings.chat_complexity_threshold,
                         routing_enabled=settings.chat_complexity_routing_enabled,
                     )
+                    execution_mode = "chat_orchestrated" if decision.is_complex else "chat"
+                    execution_history = build_orchestrated_chat_history(
+                        history,
+                        enabled=decision.is_complex and settings.chat_orchestration_enabled,
+                        max_steps=settings.chat_orchestration_max_steps,
+                    )
                     if decision.is_complex:
                         metrics.inc_chat_complexity_complex_count()
                         metrics.inc_chat_complexity_routed_complex_count()
@@ -436,9 +449,9 @@ async def chat_websocket(
                         metrics.inc_chat_complexity_simple_count()
 
                     async for token_chunk in stream_agent(
-                        history,
+                        execution_history,
                         user_context,
-                        mode=decision.mode,
+                        mode=execution_mode,
                         stage="chat_complex" if decision.is_complex else "chat_simple",
                     ):
                         full_response.append(token_chunk)

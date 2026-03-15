@@ -26,6 +26,7 @@ litellm.suppress_debug_info = True
 TURN_LIMITS: Dict[str, int] = {
     "chat": 8,
     "task": 16,
+    "chat_orchestrated": 12,
 }
 
 

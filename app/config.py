@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     # Phase 5.5.1 chat complexity routing
     chat_complexity_routing_enabled: bool = True
     chat_complexity_threshold: int = 3
+    # Phase 5.5.2 orchestrated chat path
+    chat_orchestration_enabled: bool = True
+    chat_orchestration_max_steps: int = 3
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"
