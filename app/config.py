@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     # ── Application ──────────────────────────────────────────────────────────
     app_name: str = "FruitcakeAI"
-    app_version: str = "0.6.2"
+    app_version: str = "0.6.3"
     debug: bool = False
     log_level: str = "INFO"
 

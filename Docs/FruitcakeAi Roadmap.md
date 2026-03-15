@@ -1,17 +1,23 @@
-# 🍰 FruitcakeAI v5 — Rebuild Roadmap
+# 🍰 FruitcakeAI Roadmap
 
 **Version**: 5.5  
 **Status**: Phase 1 ✅ · Phase 2 ✅ · Phase 3 ✅ · Phase 4 ✅ · Phase 5.1 ✅ · Phase 5.2 ✅ · Phase 5.3 ✅ · Phase 5.4 Hardening (In Progress)  
-**Philosophy**: Agent-first. Air-gapped by default. Knows its people.  
-**Build Location**: `/Users/jwomble/Development/fruitcake_v5/`  
-**Last Updated**: March 9, 2026  
-**Checkpoint Note**: Phase 5.4 is a pre-Phase-6 reliability gate (MCP + execution profile hardening).
+**Philosophy**: Trust · Privacy · Continuity. Local-first, cloud-optional, resilient by construction.  
+**Build Location**: `fruitcake_v5/`  
+**Last Updated**: March 15, 2026  
+**Checkpoint Note**: North Star direction is now the decision filter; Phase 5.4 remains the pre-Phase-6 reliability gate.
 
 ---
 
 ## Executive Summary
 
-FruitcakeAI v5 is a clean rebuild that preserves the best ideas from v3/v4 — hybrid RAG retrieval, multi-user/persona support, MCP tool integration — while discarding the complexity that made v3/v4 cumbersome.
+FruitcakeAI is built around three outcomes: **Trust**, **Privacy**, and **Continuity**.
+
+- **Trust**: multi-user, role-aware, safe-by-default operation with approval gates for irreversible actions.
+- **Privacy**: local-first baseline where cloud use is opt-in, not assumed.
+- **Continuity**: resilient operation under degraded conditions with graceful fallback and freshness-aware behavior.
+
+The current rebuild preserves the best ideas from v3/v4 — hybrid RAG retrieval, multi-user/persona support, MCP tool integration — while discarding orchestration complexity that made earlier versions cumbersome.
 
 The core mental model evolution:
 
@@ -35,6 +41,29 @@ OpenClaw is optimized for a single power user who wants maximum connectivity and
 | Mobile | Telegram dependency | Native Swift, APNs, on-device FoundationModels fallback |
 
 The memory system is the core differentiator. OpenClaw's heartbeat knows what's in your checklist. FruitcakeAI's heartbeat knows *you*.
+
+---
+
+## Guiding Direction
+
+- **Privacy-first, cloud-optional**: local inference is the default operating mode.
+- **Resilience by construction**: degraded connectivity should reduce freshness before it breaks functionality.
+- **Memory-first intelligence**: per-user memory context is core behavior, not an add-on.
+- **Role-aware safety**: persona-scoped tools and approval gates are design constraints.
+- **Modular MCP expansion**: integrations are additive and replaceable.
+
+Boundary rule:
+- FruitcakeAI core must function fully without optional providers.
+- Optional integrations may extend capability, but are never load-bearing.
+
+What FruitcakeAI is / is not:
+- **Is**: a local-first assistant for individuals, households, and small teams.
+- **Is not**: a cloud-first assistant with a local mode.
+- **Is not**: a prescribed single configuration; deployments can remain minimal or extend via MCP.
+
+### Design References
+- `Docs/FruitcakeAI_NorthStar.md`
+- `Docs/DesignPhilosophy.md`
 
 ---
 
@@ -1041,9 +1070,9 @@ Verification highlights:
 - Dream-cycle consolidation (deferred).
 
 #### Reference Inputs
-- `/Users/jwomble/Development/fruitcake_v5/Docs/phase_5_3_persona_routing_rollback_plan.md`
-- `/Users/jwomble/Development/fruitcake_v5/Docs/MCP_Modernization_Plan.md`
-- `/Users/jwomble/Development/fruitcake_v5/Docs/FruitcakeAI – Future Architecture Update.md`
+- `Docs/phase_5_3_persona_routing_rollback_plan.md`
+- `Docs/MCP_Modernization_Plan.md`
+- `Docs/FruitcakeAI – Future Architecture Update.md`
 
 ---
 
@@ -1163,6 +1192,8 @@ Acceptance additions for Sprint 5.6.5:
 ---
 
 ## Phase 6 Entry Criteria
+
+North Star governance note: this direction filters decisions and prioritization; it does not by itself expand implementation scope before phase gates are met.
 
 Phase 6 starts only when all are true:
 1. MCP error rate is below agreed threshold in daily use.
@@ -1391,5 +1422,5 @@ If a fact changes, the agent creates a new memory and marks the old one `is_acti
 
 ---
 
-*FruitcakeAI v5 — Simpler. Smarter. Knows its people.* 🍰  
+*FruitcakeAI — Simpler. Smarter. Knows its people.* 🍰  
 *Phases 1–3 + Sprint 3.7 complete March 2026 · 

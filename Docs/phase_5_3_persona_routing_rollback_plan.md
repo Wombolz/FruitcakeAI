@@ -55,8 +55,8 @@ This keeps orchestration generic while preserving flexibility and improving pred
 
 ### 1) Roll Back News-Specific Runner Logic
 Files:
-- `/Users/jwomble/Development/fruitcake_v5/app/autonomy/runner.py`
-- `/Users/jwomble/Development/fruitcake_v5/tests/test_task_steps.py`
+- `app/autonomy/runner.py`
+- `tests/test_task_steps.py`
 
 Remove:
 - `_is_news_headlines_task(...)`
@@ -78,8 +78,8 @@ Test updates:
 
 ### 2) Add `persona` to Task Model + Migration
 Files:
-- `/Users/jwomble/Development/fruitcake_v5/app/db/models.py`
-- `/Users/jwomble/Development/fruitcake_v5/app/db/migrations/versions/<new_revision>.py`
+- `app/db/models.py`
+- `app/db/migrations/versions/<new_revision>.py`
 
 Changes:
 - Add nullable column on `Task`:
@@ -95,7 +95,7 @@ Compatibility:
 
 ### 3) Extend Task API Contract for Persona
 Files:
-- `/Users/jwomble/Development/fruitcake_v5/app/api/tasks.py`
+- `app/api/tasks.py`
 
 Schema changes:
 - `TaskCreate`: add `persona: Optional[str] = None`
@@ -117,14 +117,14 @@ Validation:
 
 ### 4) Add Intent Router (Config-Driven)
 New file:
-- `/Users/jwomble/Development/fruitcake_v5/app/agent/persona_router.py`
+- `app/agent/persona_router.py`
 
 Responsibilities:
 - `infer_persona_for_task(title: str, instruction: str) -> tuple[str, float, str]` (persona, score, reason)
 - Deterministic keyword scoring (no LLM call).
 
 Rule source:
-- Extend `/Users/jwomble/Development/fruitcake_v5/config/personas.yaml` with optional routing metadata per persona, e.g.:
+- Extend `config/personas.yaml` with optional routing metadata per persona, e.g.:
   - `intent_keywords: [flight, hotel, itinerary, headline, stocks, ...]`
   - `intent_phrases: [...]` (optional)
 - Matching strategy:
@@ -146,7 +146,7 @@ Note:
 
 ### 5) Use `task.persona` in Runner + Lazy Backfill
 Files:
-- `/Users/jwomble/Development/fruitcake_v5/app/autonomy/runner.py`
+- `app/autonomy/runner.py`
 
 Behavior:
 1. Load task and user.
@@ -164,7 +164,7 @@ No domain-specific prompt policy injection in runner.
 
 ### 6) Optional API Ergonomics (within backend scope)
 File:
-- `/Users/jwomble/Development/fruitcake_v5/app/chat` or task service (if needed)
+- `app/chat` or task service (if needed)
 
 Add non-breaking behavior:
 - If chat/tool-created task creation path exists, ensure it can pass `persona` or receive inferred one consistently with `/tasks` API.
