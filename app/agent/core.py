@@ -138,6 +138,7 @@ async def run_agent(
 async def stream_agent(
     messages: List[Dict[str, Any]],
     user_context: UserContext,
+    mode: str = "chat",
     model_override: str | None = None,
     stage: str | None = None,
 ) -> AsyncGenerator[str, None]:
@@ -149,7 +150,7 @@ async def stream_agent(
     """
     tools = get_tools_for_user(user_context)
     history = list(messages)
-    max_turns = 8
+    max_turns = TURN_LIMITS.get(mode, 8)
     extra = _litellm_kwargs()
     selected_model = model_override or settings.llm_model
 
@@ -170,7 +171,7 @@ async def stream_agent(
                 "LLM call failed (streaming turn)",
                 error=str(e),
                 model=selected_model,
-                mode="chat",
+                mode=mode,
                 stage=stage,
             )
             raise
@@ -189,7 +190,7 @@ async def stream_agent(
                 turn=turn + 1,
                 tools=[tc.function.name for tc in message.tool_calls],
                 model=selected_model,
-                mode="chat",
+                mode=mode,
                 stage=stage,
             )
         else:

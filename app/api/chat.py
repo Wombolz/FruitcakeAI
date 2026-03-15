@@ -22,6 +22,7 @@ from sqlalchemy import select
 import structlog
 
 from app.agent.context import UserContext
+from app.agent.chat_routing import classify_chat_complexity
 from app.agent.core import run_agent, stream_agent
 from app.auth.dependencies import get_current_user
 from app.config import settings
@@ -272,8 +273,24 @@ async def send_message(
     )
     user_context.session_id = session_id
 
+    decision = classify_chat_complexity(
+        body.content,
+        threshold=settings.chat_complexity_threshold,
+        routing_enabled=settings.chat_complexity_routing_enabled,
+    )
+    if decision.is_complex:
+        metrics.inc_chat_complexity_complex_count()
+        metrics.inc_chat_complexity_routed_complex_count()
+    else:
+        metrics.inc_chat_complexity_simple_count()
+
     try:
-        reply = await run_agent(history, user_context)
+        reply = await run_agent(
+            history,
+            user_context,
+            mode=decision.mode,
+            stage="chat_complex" if decision.is_complex else "chat_simple",
+        )
     except Exception as e:
         log.exception("Agent error in REST handler", session_id=session_id)
         raise HTTPException(status_code=500, detail="Agent error — check server logs for details")
@@ -407,8 +424,23 @@ async def chat_websocket(
                     )
                     user_context.session_id = session_id
                     full_response = []
+                    decision = classify_chat_complexity(
+                        user_message,
+                        threshold=settings.chat_complexity_threshold,
+                        routing_enabled=settings.chat_complexity_routing_enabled,
+                    )
+                    if decision.is_complex:
+                        metrics.inc_chat_complexity_complex_count()
+                        metrics.inc_chat_complexity_routed_complex_count()
+                    else:
+                        metrics.inc_chat_complexity_simple_count()
 
-                    async for token_chunk in stream_agent(history, user_context):
+                    async for token_chunk in stream_agent(
+                        history,
+                        user_context,
+                        mode=decision.mode,
+                        stage="chat_complex" if decision.is_complex else "chat_simple",
+                    ):
                         full_response.append(token_chunk)
                         await websocket.send_json({"type": "token", "content": token_chunk})
 

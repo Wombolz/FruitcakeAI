@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     scheduler_llm_health_gate_enabled: bool = True
     scheduler_unhealthy_cooldown_seconds: int = 300
     scheduler_stale_running_recovery_minutes: int = 20
+    # Phase 5.5.1 chat complexity routing
+    chat_complexity_routing_enabled: bool = True
+    chat_complexity_threshold: int = 3
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"

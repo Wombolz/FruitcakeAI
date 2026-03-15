@@ -34,6 +34,9 @@ class _Metrics:
     scheduler_dispatch_suppressed_count: int = 0
     scheduler_recurring_backlog_skipped_count: int = 0
     scheduler_stale_running_recovered_count: int = 0
+    chat_complexity_simple_count: int = 0
+    chat_complexity_complex_count: int = 0
+    chat_complexity_routed_complex_count: int = 0
 
     def inc_requests(self) -> None:
         with self._lock:
@@ -95,6 +98,18 @@ class _Metrics:
         with self._lock:
             self.scheduler_stale_running_recovered_count += n
 
+    def inc_chat_complexity_simple_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_complexity_simple_count += n
+
+    def inc_chat_complexity_complex_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_complexity_complex_count += n
+
+    def inc_chat_complexity_routed_complex_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_complexity_routed_complex_count += n
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -112,6 +127,9 @@ class _Metrics:
                 "scheduler_dispatch_suppressed_count": self.scheduler_dispatch_suppressed_count,
                 "scheduler_recurring_backlog_skipped_count": self.scheduler_recurring_backlog_skipped_count,
                 "scheduler_stale_running_recovered_count": self.scheduler_stale_running_recovered_count,
+                "chat_complexity_simple_count": self.chat_complexity_simple_count,
+                "chat_complexity_complex_count": self.chat_complexity_complex_count,
+                "chat_complexity_routed_complex_count": self.chat_complexity_routed_complex_count,
             }
 
 
