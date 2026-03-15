@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     task_force_large_for_final_synthesis: bool = True
     task_plan_default_steps: int = 8
     task_plan_max_steps: int = 20
+    # Scheduler guardrails (laptop sleep / transient local LLM outages)
+    scheduler_llm_health_gate_enabled: bool = True
+    scheduler_unhealthy_cooldown_seconds: int = 300
+    scheduler_stale_running_recovery_minutes: int = 20
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"

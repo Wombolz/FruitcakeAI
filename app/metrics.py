@@ -30,6 +30,10 @@ class _Metrics:
     task_model_fallback_to_large_count: int = 0
     task_model_fallback_success_count: int = 0
     task_model_fallback_failure_count: int = 0
+    scheduler_llm_unavailable_ticks: int = 0
+    scheduler_dispatch_suppressed_count: int = 0
+    scheduler_recurring_backlog_skipped_count: int = 0
+    scheduler_stale_running_recovered_count: int = 0
 
     def inc_requests(self) -> None:
         with self._lock:
@@ -75,6 +79,22 @@ class _Metrics:
         with self._lock:
             self.task_model_fallback_failure_count += n
 
+    def inc_scheduler_llm_unavailable_ticks(self, n: int = 1) -> None:
+        with self._lock:
+            self.scheduler_llm_unavailable_ticks += n
+
+    def inc_scheduler_dispatch_suppressed_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.scheduler_dispatch_suppressed_count += n
+
+    def inc_scheduler_recurring_backlog_skipped_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.scheduler_recurring_backlog_skipped_count += n
+
+    def inc_scheduler_stale_running_recovered_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.scheduler_stale_running_recovered_count += n
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -88,6 +108,10 @@ class _Metrics:
                 "task_model_fallback_to_large_count": self.task_model_fallback_to_large_count,
                 "task_model_fallback_success_count": self.task_model_fallback_success_count,
                 "task_model_fallback_failure_count": self.task_model_fallback_failure_count,
+                "scheduler_llm_unavailable_ticks": self.scheduler_llm_unavailable_ticks,
+                "scheduler_dispatch_suppressed_count": self.scheduler_dispatch_suppressed_count,
+                "scheduler_recurring_backlog_skipped_count": self.scheduler_recurring_backlog_skipped_count,
+                "scheduler_stale_running_recovered_count": self.scheduler_stale_running_recovered_count,
             }
 
 
