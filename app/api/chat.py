@@ -11,6 +11,7 @@ GET  /chat/personas               — list available personas
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -283,15 +284,17 @@ async def send_message(
         threshold=settings.chat_complexity_threshold,
         routing_enabled=settings.chat_complexity_routing_enabled,
     )
-    execution_mode = "chat_orchestrated" if decision.is_complex else "chat"
+    execution_mode = _resolve_chat_mode(decision.is_complex)
     execution_history = build_orchestrated_chat_history(
         history,
-        enabled=decision.is_complex and settings.chat_orchestration_enabled,
+        enabled=(execution_mode == "chat_orchestrated" and settings.chat_orchestration_enabled),
         max_steps=settings.chat_orchestration_max_steps,
     )
+    effective_complex = decision.is_complex and execution_mode == "chat_orchestrated"
     if decision.is_complex:
         metrics.inc_chat_complexity_complex_count()
-        metrics.inc_chat_complexity_routed_complex_count()
+        if effective_complex:
+            metrics.inc_chat_complexity_routed_complex_count()
     else:
         metrics.inc_chat_complexity_simple_count()
 
@@ -302,7 +305,7 @@ async def send_message(
             user_prompt=body.content,
             mode=execution_mode,
             stage="chat_complex" if decision.is_complex else "chat_simple",
-            enable_validation=decision.is_complex,
+            enable_validation=effective_complex,
         )
     except Exception as e:
         log.exception("Agent error in REST handler", session_id=session_id)
@@ -442,31 +445,34 @@ async def chat_websocket(
                         threshold=settings.chat_complexity_threshold,
                         routing_enabled=settings.chat_complexity_routing_enabled,
                     )
-                    execution_mode = "chat_orchestrated" if decision.is_complex else "chat"
+                    execution_mode = _resolve_chat_mode(decision.is_complex)
                     execution_history = build_orchestrated_chat_history(
                         history,
-                        enabled=decision.is_complex and settings.chat_orchestration_enabled,
+                        enabled=(execution_mode == "chat_orchestrated" and settings.chat_orchestration_enabled),
                         max_steps=settings.chat_orchestration_max_steps,
                     )
+                    effective_complex = decision.is_complex and execution_mode == "chat_orchestrated"
                     if decision.is_complex:
                         metrics.inc_chat_complexity_complex_count()
-                        metrics.inc_chat_complexity_routed_complex_count()
+                        if effective_complex:
+                            metrics.inc_chat_complexity_routed_complex_count()
                     else:
                         metrics.inc_chat_complexity_simple_count()
-                    if decision.is_complex:
+                    if effective_complex:
                         complete = await _execute_chat_turn(
                             execution_history,
                             user_context,
                             user_prompt=user_message,
                             mode=execution_mode,
                             stage="chat_complex",
-                            enable_validation=True,
+                            enable_validation=effective_complex,
                         )
                         for token_chunk in _chunk_text(complete):
                             full_response.append(token_chunk)
                             await websocket.send_json({"type": "token", "content": token_chunk})
                         complete = "".join(full_response)
                     else:
+                        started = time.perf_counter()
                         async for token_chunk in stream_agent(
                             execution_history,
                             user_context,
@@ -475,6 +481,10 @@ async def chat_websocket(
                         ):
                             full_response.append(token_chunk)
                             await websocket.send_json({"type": "token", "content": token_chunk})
+                        metrics.record_chat_latency(
+                            mode="chat",
+                            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                        )
                         complete = "".join(full_response)
 
                     # Store assistant reply
@@ -569,6 +579,13 @@ def _chunk_text(content: str, chunk_size: int = 64):
         yield content[i : i + chunk_size]
 
 
+def _resolve_chat_mode(is_complex: bool) -> str:
+    if is_complex and settings.chat_orchestration_kill_switch:
+        metrics.inc_chat_orchestration_kill_switch_suppressed_count()
+        return "chat"
+    return "chat_orchestrated" if is_complex else "chat"
+
+
 async def _execute_chat_turn(
     history: List[Dict[str, Any]],
     user_context: UserContext,
@@ -578,6 +595,7 @@ async def _execute_chat_turn(
     stage: str,
     enable_validation: bool,
 ) -> str:
+    started = time.perf_counter()
     reply = await run_agent(
         history,
         user_context,
@@ -585,6 +603,10 @@ async def _execute_chat_turn(
         stage=stage,
     )
     if not (enable_validation and settings.chat_validation_enabled):
+        metrics.record_chat_latency(
+            mode=mode,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        )
         return reply
 
     max_attempts = max(0, int(settings.chat_validation_retry_max_attempts))
@@ -602,6 +624,10 @@ async def _execute_chat_turn(
             and attempts < max_attempts
         )
         if not should_retry:
+            metrics.record_chat_latency(
+                mode=mode,
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            )
             return validation.cleaned_content if validation.invalid_urls else current
 
         if validation.retry_reason == "empty_result":

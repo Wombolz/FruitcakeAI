@@ -7,6 +7,7 @@ from app.agent.chat_validation import (
     validate_chat_response,
 )
 from app.config import settings
+from app.metrics import metrics
 
 
 def test_validate_chat_response_requires_links_for_research_prompt():
@@ -89,6 +90,7 @@ async def test_send_message_retries_once_for_missing_links_on_complex_prompt(cli
     assert resp.status_code == 200
     assert "https://apnews.com/" in resp.json()["content"]
     assert mock_run.await_count == 2
+    assert mock_run.await_args_list[0].kwargs["mode"] == "chat_orchestrated"
 
 
 @pytest.mark.asyncio
@@ -131,3 +133,47 @@ async def test_send_message_strips_invalid_links_when_retry_disabled(client):
     assert resp.status_code == 200
     content = resp.json()["content"]
     assert "example.com/fake" not in content
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_forces_complex_chat_back_to_simple_mode(client):
+    token = await _login_token(client, "chatkillswitch", "chatkillswitch@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    create = await client.post("/chat/sessions", json={"title": "Kill Switch"}, headers=headers)
+    session_id = create.json()["id"]
+
+    baseline = metrics.snapshot().get("chat_orchestration_kill_switch_suppressed_count", 0)
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", True),
+        patch.object(settings, "chat_complexity_threshold", 1),
+        patch.object(settings, "chat_orchestration_kill_switch", True),
+        patch("app.api.chat.run_agent", new_callable=AsyncMock, return_value="ok") as mock_run,
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "Research latest headlines and compare sources"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert mock_run.await_count == 1
+    assert mock_run.await_args.kwargs["mode"] == "chat"
+    now = metrics.snapshot().get("chat_orchestration_kill_switch_suppressed_count", 0)
+    assert now >= baseline + 1
+
+
+async def _login_token(client, username: str, email: str) -> str:
+    await client.post(
+        "/auth/register",
+        json={
+            "username": username,
+            "email": email,
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": username, "password": "pass123"},
+    )
+    return login.json()["access_token"]
