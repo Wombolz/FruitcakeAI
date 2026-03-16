@@ -163,6 +163,77 @@ async def test_kill_switch_forces_complex_chat_back_to_simple_mode(client):
     assert now >= baseline + 1
 
 
+@pytest.mark.asyncio
+async def test_library_lookup_intent_forces_grounded_search(client):
+    token = await _login_token(client, "chatlibraryintent", "chatlibraryintent@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    create = await client.post("/chat/sessions", json={"title": "Library Grounding"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", False),
+        patch.object(settings, "chat_orchestration_kill_switch", False),
+        patch(
+            "app.agent.tools._list_library_documents",
+            new_callable=AsyncMock,
+            return_value='{"count":1,"documents":[{"id":1,"filename":"Family Calendar.pdf"}]}',
+        ),
+        patch("app.agent.tools._write_audit_log", new_callable=AsyncMock),
+        patch(
+            "app.api.chat.run_agent",
+            new_callable=AsyncMock,
+            return_value="Grounded response with concrete document evidence and details.",
+        ) as mock_run,
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "Can you list the documents in my library?"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert mock_run.await_count >= 1
+    kwargs = mock_run.await_args_list[0].kwargs
+    assert kwargs["mode"] == "chat_orchestrated"
+    injected_history = mock_run.await_args_list[0].args[0]
+    assert any(
+        m.get("role") == "system" and "Required grounding for this turn" in m.get("content", "")
+        for m in injected_history
+    )
+
+
+@pytest.mark.asyncio
+async def test_library_excerpt_intent_uses_search_library_grounding(client):
+    token = await _login_token(client, "chatlibraryexcerpt", "chatlibraryexcerpt@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    create = await client.post("/chat/sessions", json={"title": "Library Excerpt Grounding"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", False),
+        patch.object(settings, "chat_orchestration_kill_switch", False),
+        patch("app.agent.tools._search_library", new_callable=AsyncMock, return_value="Search results for: excerpt"),
+        patch("app.agent.tools._write_audit_log", new_callable=AsyncMock),
+        patch(
+            "app.api.chat.run_agent",
+            new_callable=AsyncMock,
+            return_value="Grounded excerpt response with source.",
+        ) as mock_run,
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "show me excerpt details from that document in my library"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    injected_history = mock_run.await_args_list[0].args[0]
+    assert any(
+        m.get("role") == "system" and "search_library result" in m.get("content", "")
+        for m in injected_history
+    )
+
+
 async def _login_token(client, username: str, email: str) -> str:
     await client.post(
         "/auth/register",

@@ -23,6 +23,10 @@ from sqlalchemy import select
 import structlog
 
 from app.agent.context import UserContext
+from app.agent.chat_intents import (
+    is_library_detail_or_excerpt_intent,
+    is_library_lookup_intent,
+)
 from app.agent.chat_orchestration import build_orchestrated_chat_history
 from app.agent.chat_routing import classify_chat_complexity
 from app.agent.chat_validation import (
@@ -278,19 +282,32 @@ async def send_message(
         blocked_tools=body.blocked_tools,
     )
     user_context.session_id = session_id
+    library_list_intent = is_library_lookup_intent(body.content)
+    library_detail_intent = is_library_detail_or_excerpt_intent(body.content)
+    library_intent = library_list_intent or library_detail_intent
+    history = await _apply_required_library_grounding(
+        history,
+        user_context,
+        user_prompt=body.content,
+        intent_type=(
+            "detail_or_excerpt"
+            if library_detail_intent
+            else ("list_documents" if library_list_intent else None)
+        ),
+    )
 
     decision = classify_chat_complexity(
         body.content,
         threshold=settings.chat_complexity_threshold,
         routing_enabled=settings.chat_complexity_routing_enabled,
     )
-    execution_mode = _resolve_chat_mode(decision.is_complex)
+    execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
     execution_history = build_orchestrated_chat_history(
         history,
         enabled=(execution_mode == "chat_orchestrated" and settings.chat_orchestration_enabled),
         max_steps=settings.chat_orchestration_max_steps,
     )
-    effective_complex = decision.is_complex and execution_mode == "chat_orchestrated"
+    effective_complex = (decision.is_complex or library_intent) and execution_mode == "chat_orchestrated"
     if decision.is_complex:
         metrics.inc_chat_complexity_complex_count()
         if effective_complex:
@@ -304,7 +321,7 @@ async def send_message(
             user_context,
             user_prompt=body.content,
             mode=execution_mode,
-            stage="chat_complex" if decision.is_complex else "chat_simple",
+            stage="chat_complex" if effective_complex else "chat_simple",
             enable_validation=effective_complex,
         )
     except Exception as e:
@@ -439,19 +456,32 @@ async def chat_websocket(
                         blocked_tools=blocked_tools,
                     )
                     user_context.session_id = session_id
+                    library_list_intent = is_library_lookup_intent(user_message)
+                    library_detail_intent = is_library_detail_or_excerpt_intent(user_message)
+                    library_intent = library_list_intent or library_detail_intent
+                    history = await _apply_required_library_grounding(
+                        history,
+                        user_context,
+                        user_prompt=user_message,
+                        intent_type=(
+                            "detail_or_excerpt"
+                            if library_detail_intent
+                            else ("list_documents" if library_list_intent else None)
+                        ),
+                    )
                     full_response = []
                     decision = classify_chat_complexity(
                         user_message,
                         threshold=settings.chat_complexity_threshold,
                         routing_enabled=settings.chat_complexity_routing_enabled,
                     )
-                    execution_mode = _resolve_chat_mode(decision.is_complex)
+                    execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
                     execution_history = build_orchestrated_chat_history(
                         history,
                         enabled=(execution_mode == "chat_orchestrated" and settings.chat_orchestration_enabled),
                         max_steps=settings.chat_orchestration_max_steps,
                     )
-                    effective_complex = decision.is_complex and execution_mode == "chat_orchestrated"
+                    effective_complex = (decision.is_complex or library_intent) and execution_mode == "chat_orchestrated"
                     if decision.is_complex:
                         metrics.inc_chat_complexity_complex_count()
                         if effective_complex:
@@ -649,6 +679,59 @@ async def _execute_chat_turn(
             mode=mode,
             stage=f"{stage}_retry",
         )
+
+
+async def _apply_required_library_grounding(
+    history: List[Dict[str, Any]],
+    user_context: UserContext,
+    *,
+    user_prompt: str,
+    intent_type: str | None,
+) -> List[Dict[str, Any]]:
+    """
+    For explicit library lookup intents, fetch grounded library evidence before
+    the assistant turn so chat does not invent document names.
+    """
+    if not intent_type:
+        return history
+
+    blocked = {str(name).strip() for name in (user_context.blocked_tools or [])}
+    from app.agent.tools import _list_library_documents, _search_library, _write_audit_log
+
+    if intent_type == "list_documents":
+        tool_name = "list_library_documents"
+        args = {"limit": 50}
+        if tool_name in blocked:
+            result = "list_library_documents is unavailable for this persona."
+        else:
+            result = await _list_library_documents(args, user_context)
+    else:
+        tool_name = "search_library"
+        args = {"query": user_prompt, "top_k": 20}
+        if tool_name in blocked:
+            result = "search_library is unavailable for this persona."
+        else:
+            result = await _search_library(args, user_context)
+
+    await _write_audit_log(
+        user_id=user_context.user_id,
+        session_id=user_context.session_id,
+        tool_name=tool_name,
+        arguments=args,
+        result_summary=str(result)[:500],
+    )
+    grounding_note = (
+        "Required grounding for this turn: this is a library intent. "
+        "Prioritize the newest user message over prior context. "
+        "Use only the tool output below as source of truth for document names/metadata. "
+        "If output is empty, explicitly say no documents/excerpts were found.\n\n"
+        f"{tool_name} result:\n{result}"
+    )
+
+    grounded = list(history)
+    if grounded and grounded[-1].get("role") == "user":
+        return grounded[:-1] + [{"role": "system", "content": grounding_note}, grounded[-1]]
+    return grounded + [{"role": "system", "content": grounding_note}]
 
 
 async def _get_session_or_404(

@@ -1079,7 +1079,7 @@ Verification highlights:
 ## Phase 5.5 — Adaptive Chat Orchestration (Quality Parity)
 
 **Goal**: close the quality gap between single-turn chat and task-mode execution on local models by adding optional task-like scaffolding to chat only when complexity warrants it.
-**Status**: 5.5.1-5.5.4 implemented in branch `codex/phase5.5.2-chat-orchestrated` (soak pending before merge).
+**Status**: 5.5.1-5.5.4 implemented in branch `codex/phase5.5.2-chat-orchestrated`; 5.5.5 active in `codex/phase5.5.5-library-grounding`.
 
 **Why now**:
 - Current task runs outperform chat on reliability because tasks use explicit planning, tool-grounding, and final synthesis.
@@ -1122,6 +1122,22 @@ Verification highlights:
   - Kill switch `chat_orchestration_kill_switch` added; complex prompts immediately degrade to simple chat mode when enabled.
   - Chat metrics expanded with retry counters, invalid-link counters, and simple vs orchestrated latency delta.
   - REST and WebSocket chat paths aligned to shared orchestration/validation behavior.
+
+**Sprint 5.5.5 — Library grounding and RAG runtime reliability**
+- Goal:
+  - stop library-chat drift/hallucinated filenames,
+  - prevent runtime `Invalid fusion mode: rrf` errors from breaking chat/task flows.
+- Implementation:
+  - add explicit `list_library_documents` tool for deterministic doc listings,
+  - add `GET /library/documents/{id}` and `GET /library/documents/{id}/excerpts`,
+  - enforce tool-required grounding for library list/detail/excerpt intents,
+  - finalize runtime fusion fallback (auto-switch to vector-only + same-request retry),
+  - expose `fusion_runtime_disabled` in health for soak diagnostics.
+- Acceptance:
+  - weather -> library-list sequence does not drift,
+  - library list/detail answers are tool-grounded with no invented docs,
+  - runtime fusion mode failures degrade gracefully (no user-facing hard failure),
+  - chat/rag/library regression suites pass.
 
 **Memory relevance follow-up (carryover)**
 - Keep general retrieval/search from automatically raising memory relevance.

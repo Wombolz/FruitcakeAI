@@ -10,6 +10,29 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
+_FUSION_MODE_ALIASES: Dict[str, List[str]] = {
+    # Legacy label first for backward-compat, then newer llama-index label.
+    "rrf": ["rrf", "reciprocal_rerank"],
+    "reciprocal_rerank": ["reciprocal_rerank", "rrf"],
+}
+
+
+def _candidate_fusion_modes(configured_mode: str | None) -> List[str]:
+    base = (configured_mode or "rrf").strip().lower()
+    candidates = list(_FUSION_MODE_ALIASES.get(base, [base]))
+    if "reciprocal_rerank" not in candidates:
+        candidates.append("reciprocal_rerank")
+    if "rrf" not in candidates:
+        candidates.append("rrf")
+    # Deduplicate while preserving order
+    out: List[str] = []
+    seen = set()
+    for mode in candidates:
+        if mode and mode not in seen:
+            seen.add(mode)
+            out.append(mode)
+    return out
+
 
 def build_hybrid_retriever(
     index: Any,
@@ -32,6 +55,7 @@ def build_hybrid_retriever(
     ret_cfg = config.get("retrieval", {})
     vector_top_k = int(ret_cfg.get("vector_top_k", 40))
     bm25_top_k = int(ret_cfg.get("bm25_top_k", 40))
+    configured_fusion_mode = str(ret_cfg.get("fusion", "rrf"))
 
     vector_retriever = VectorIndexRetriever(
         index=index, similarity_top_k=vector_top_k
@@ -85,13 +109,31 @@ def build_hybrid_retriever(
         try:
             from llama_index.core.retrievers import QueryFusionRetriever
 
-            retriever = QueryFusionRetriever(
-                retrievers=[vector_retriever, bm25_retriever],
-                similarity_top_k=vector_top_k,
-                num_queries=1,      # No query expansion — we just want RRF
-                mode="rrf",         # Reciprocal Rank Fusion
-            )
-            log.info("Hybrid retriever (vector + BM25 + RRF) initialized")
+            fusion_retriever = None
+            mode_candidates = _candidate_fusion_modes(configured_fusion_mode)
+            for mode in mode_candidates:
+                try:
+                    fusion_retriever = QueryFusionRetriever(
+                        retrievers=[vector_retriever, bm25_retriever],
+                        similarity_top_k=vector_top_k,
+                        num_queries=1,
+                        mode=mode,
+                    )
+                    log.info("Hybrid retriever initialized", fusion_mode=mode)
+                    break
+                except ValueError as e:
+                    # LlamaIndex mode naming has changed across versions.
+                    if "invalid fusion mode" in str(e).lower():
+                        continue
+                    raise
+            if fusion_retriever is None:
+                log.warning(
+                    "No supported fusion mode accepted by QueryFusionRetriever; using vector-only",
+                    configured_mode=configured_fusion_mode,
+                    tried_modes=mode_candidates,
+                )
+            else:
+                retriever = fusion_retriever
         except Exception as e:
             log.warning("QueryFusionRetriever not available, falling back to vector: %s", e)
 

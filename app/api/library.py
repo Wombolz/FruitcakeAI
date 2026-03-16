@@ -189,6 +189,84 @@ async def list_documents(
     ]
 
 
+@router.get("/documents/{doc_id}")
+async def get_document_details(
+    doc_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return metadata and processing state for one accessible document."""
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not _can_access_document(doc, current_user):
+        raise HTTPException(status_code=403, detail="Not authorized to access this document")
+
+    return {
+        "id": doc.id,
+        "filename": doc.original_filename or doc.filename,
+        "scope": doc.scope,
+        "processing_status": doc.processing_status,
+        "error_message": doc.error_message,
+        "mime_type": doc.mime_type,
+        "file_size_bytes": doc.file_size_bytes,
+        "created_at": doc.created_at.isoformat() if doc.created_at else "",
+        "updated_at": doc.updated_at.isoformat() if doc.updated_at else "",
+    }
+
+
+@router.get("/documents/{doc_id}/excerpts")
+async def get_document_excerpts(
+    doc_id: int,
+    q: str,
+    top_k: int = 8,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return targeted excerpts for one accessible document by query."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not _can_access_document(doc, current_user):
+        raise HTTPException(status_code=403, detail="Not authorized to access this document")
+
+    rag = get_rag_service()
+    if not rag.is_ready:
+        raise HTTPException(status_code=503, detail="RAG service not ready")
+
+    results = await rag.query(
+        query_str=q,
+        user_id=current_user.id,
+        accessible_scopes=["personal", "family", "shared"],
+        top_k=min(max(top_k, 1), 50),
+    )
+
+    filtered = []
+    for row in results:
+        md = row.get("metadata") or {}
+        if str(md.get("document_id", "")) == str(doc.id):
+            filtered.append(
+                {
+                    "text": row.get("text", ""),
+                    "score": row.get("score", 0.0),
+                    "metadata": md,
+                }
+            )
+
+    return {
+        "document_id": doc.id,
+        "filename": doc.original_filename or doc.filename,
+        "query": q,
+        "count": len(filtered),
+        "results": filtered,
+    }
+
+
 # ── DELETE /library/documents/{id} ───────────────────────────────────────────
 
 @router.delete("/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -253,3 +331,9 @@ async def update_document(
     doc.scope = body.scope
     await db.commit()
     return {"id": doc.id, "scope": doc.scope}
+
+
+def _can_access_document(doc: Document, user: User) -> bool:
+    if doc.owner_id == user.id:
+        return True
+    return doc.scope in {"family", "shared"}

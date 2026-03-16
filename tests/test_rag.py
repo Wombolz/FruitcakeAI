@@ -68,6 +68,7 @@ def test_rag_health_ready():
     svc._node_postprocessors = []
     h = svc.health()
     assert h["status"] == "ready"
+    assert "fusion_runtime_disabled" in h
 
 
 # ── RAGService — delete_document (best-effort, no error when not ready) ────────
@@ -131,6 +132,45 @@ def test_build_hybrid_retriever_no_reranker_by_default():
             _, postprocessors = build_hybrid_retriever(mock_index, config)
 
     assert postprocessors == []
+
+
+def test_build_hybrid_retriever_fusion_mode_alias_fallback_from_rrf():
+    """If llama-index rejects 'rrf', fallback should retry with reciprocal_rerank."""
+    from app.rag.retriever import build_hybrid_retriever
+
+    mock_index = MagicMock()
+    mock_vector_retriever = MagicMock(name="vector")
+    mock_bm25_retriever = MagicMock(name="bm25")
+    mock_fusion_retriever = MagicMock(name="fusion")
+    config = {"retrieval": {"vector_top_k": 10, "bm25_top_k": 10, "fusion": "rrf"}}
+
+    def _fusion_side_effect(*args, **kwargs):
+        mode = kwargs.get("mode")
+        if mode == "rrf":
+            raise ValueError("Invalid fusion mode: rrf")
+        if mode == "reciprocal_rerank":
+            return mock_fusion_retriever
+        raise AssertionError(f"unexpected mode {mode}")
+
+    with patch("llama_index.core.retrievers.VectorIndexRetriever", return_value=mock_vector_retriever, create=True):
+        with patch("llama_index.retrievers.bm25.BM25Retriever.from_defaults", return_value=mock_bm25_retriever, create=True):
+            with patch("llama_index.core.retrievers.QueryFusionRetriever", side_effect=_fusion_side_effect, create=True):
+                retriever, postprocessors = build_hybrid_retriever(
+                    mock_index,
+                    config,
+                    bm25_nodes=[MagicMock()],
+                )
+
+    assert retriever is mock_fusion_retriever
+    assert postprocessors == []
+
+
+def test_candidate_fusion_modes_supports_legacy_and_new_names():
+    from app.rag.retriever import _candidate_fusion_modes
+
+    assert _candidate_fusion_modes("rrf")[0] == "rrf"
+    assert "reciprocal_rerank" in _candidate_fusion_modes("rrf")
+    assert _candidate_fusion_modes("reciprocal_rerank")[0] == "reciprocal_rerank"
 
 
 # ── Access-control filter logic ────────────────────────────────────────────────
@@ -199,3 +239,37 @@ async def test_rag_query_returns_formatted_results():
     assert results[0]["text"] == "chunk text here"
     assert results[0]["score"] == 0.85
     assert results[0]["metadata"]["filename"] == "test.pdf"
+
+
+@pytest.mark.asyncio
+async def test_rag_query_runtime_invalid_fusion_mode_falls_back_to_vector():
+    svc = RAGService()
+    svc._loaded = True
+    svc._config = {"retrieval": {"vector_top_k": 12}}
+    svc._index = MagicMock()
+    svc._node_postprocessors = []
+
+    bad_retriever = MagicMock()
+    bad_retriever._retrievers = []
+    bad_retriever.retrieve.side_effect = ValueError("Invalid fusion mode: rrf")
+    svc._retriever = bad_retriever
+
+    good_node = MagicMock()
+    good_node.get_content.return_value = "grounded content"
+    good_node.score = 0.99
+    good_node.metadata = {"filename": "doc.txt"}
+    good_retriever = MagicMock()
+    good_retriever._retrievers = []
+    good_retriever.retrieve.return_value = [good_node]
+
+    with patch("llama_index.core.retrievers.VectorIndexRetriever", return_value=good_retriever, create=True):
+        results = await svc.query(
+            query_str="library docs",
+            user_id=1,
+            accessible_scopes=["personal"],
+            top_k=10,
+        )
+
+    assert len(results) == 1
+    assert results[0]["text"] == "grounded content"
+    assert svc._fusion_runtime_disabled is True

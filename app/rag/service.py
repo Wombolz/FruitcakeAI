@@ -47,6 +47,7 @@ class RAGService:
         self._config: Dict[str, Any] = {}
         self._bm25_node_count: int = 0
         self._bm25_source_table: Optional[str] = None
+        self._fusion_runtime_disabled: bool = False
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -156,21 +157,28 @@ class RAGService:
                 if scope in accessible_scopes:
                     filter_list.append(MetadataFilter(key="scope", value=scope))
 
+            meta_filters = None
             if filter_list:
                 meta_filters = MetadataFilters(
                     filters=filter_list, condition=FilterCondition.OR
                 )
-                # Apply to VectorIndexRetriever directly or via its inner retrievers
-                for r in [self._retriever] + list(
-                    getattr(self._retriever, "_retrievers", [])
-                ):
-                    if hasattr(r, "_filters"):
-                        r._filters = meta_filters
+                self._apply_metadata_filters(meta_filters)
 
             loop = asyncio.get_running_loop()
-            nodes = await loop.run_in_executor(
-                None, lambda: self._retriever.retrieve(query_str)
-            )
+            try:
+                nodes = await loop.run_in_executor(
+                    None, lambda: self._retriever.retrieve(query_str)
+                )
+            except ValueError as e:
+                if "invalid fusion mode" not in str(e).lower():
+                    raise
+                log.warning("RAG fusion mode failed at retrieve-time; switching to vector-only fallback", error=str(e))
+                self._swap_to_vector_only_retriever()
+                if meta_filters is not None:
+                    self._apply_metadata_filters(meta_filters)
+                nodes = await loop.run_in_executor(
+                    None, lambda: self._retriever.retrieve(query_str)
+                )
 
             for pp in self._node_postprocessors:
                 nodes = pp.postprocess_nodes(nodes, query_str=query_str)
@@ -187,6 +195,20 @@ class RAGService:
         except Exception as e:
             log.error("RAG query failed", query=query_str, error=str(e), exc_info=True)
             return []
+
+    def _apply_metadata_filters(self, meta_filters: Any) -> None:
+        for r in [self._retriever] + list(getattr(self._retriever, "_retrievers", [])):
+            if hasattr(r, "_filters"):
+                r._filters = meta_filters
+
+    def _swap_to_vector_only_retriever(self) -> None:
+        from llama_index.core.retrievers import VectorIndexRetriever
+
+        ret_cfg = self._config.get("retrieval", {})
+        vector_top_k = int(ret_cfg.get("vector_top_k", 40))
+        self._retriever = VectorIndexRetriever(index=self._index, similarity_top_k=vector_top_k)
+        self._fusion_runtime_disabled = True
+        log.info("RAG retriever switched to vector-only fallback", vector_top_k=vector_top_k)
 
     # ── Ingest ────────────────────────────────────────────────────────────────
 
@@ -336,4 +358,5 @@ class RAGService:
             "postprocessors": len(self._node_postprocessors),
             "bm25_nodes": self._bm25_node_count,
             "bm25_source_table": self._bm25_source_table,
+            "fusion_runtime_disabled": self._fusion_runtime_disabled,
         }
