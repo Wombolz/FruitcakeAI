@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.autonomy.approval import ApprovalRequired, _approval_armed
 from app.autonomy.model_routing import TaskModelProfile, resolve_task_model_profile
@@ -94,17 +94,40 @@ class TaskRunner:
                 self._active_runs[task_id] = current
 
         try:
+            preflight = await _preflight_llm_dispatch()
+            if preflight is not None:
+                cooldown_seconds, reason = preflight
+                await self._pause_for_llm_unavailable(
+                    task_id=task_id,
+                    cooldown_seconds=cooldown_seconds,
+                    reason=reason,
+                )
+                return
+
             async with AsyncSessionLocal() as db:
+                claim = await db.execute(
+                    update(Task)
+                    .where(Task.id == task_id, Task.status == "pending")
+                    .values(
+                        status="running",
+                        error=None,
+                        next_retry_at=None,
+                    )
+                )
+                if (claim.rowcount or 0) == 0:
+                    task = await db.get(Task, task_id)
+                    status = task.status if task is not None else "missing"
+                    log.info("task.skip_non_pending", task_id=task_id, status=status)
+                    await db.rollback()
+                    return
+
                 task = await db.get(Task, task_id)
                 if task is None:
                     log.warning("task.not_found", task_id=task_id)
-                    return
-                if task.status not in ("pending",):
-                    log.info("task.skip_non_pending", task_id=task_id, status=task.status)
+                    await db.rollback()
                     return
                 task_title = task.title
                 task_deliver = task.deliver
-                task.status = "running"
                 run = TaskRun(task_id=task.id, status="running")
                 db.add(run)
                 await db.flush()
@@ -771,6 +794,28 @@ class TaskRunner:
         async with AsyncSessionLocal() as db:
             task = await db.get(Task, task_id)
             retry = task.retry_count or 0
+            unavailable, reason = _classify_llm_unavailable_error(exc)
+            if unavailable:
+                cooldown = max(30, int(settings.scheduler_unhealthy_cooldown_seconds or 300))
+                next_time = datetime.now(timezone.utc) + timedelta(seconds=cooldown)
+                task.status = "pending"
+                task.error = f"paused_unavailable: {reason}"
+                task.next_retry_at = next_time
+                task.next_run_at = next_time
+                if task_run_id:
+                    run = await db.get(TaskRun, task_run_id)
+                    if run is not None:
+                        run.status = "cancelled"
+                        run.finished_at = datetime.now(timezone.utc)
+                        run.error = f"paused_unavailable: {reason}"
+                await db.commit()
+                log.warning(
+                    "task.paused_unavailable",
+                    task_id=task_id,
+                    cooldown_seconds=cooldown,
+                    reason=reason,
+                )
+                return
 
             if retry < len(RETRY_DELAYS):
                 delay = RETRY_DELAYS[retry]
@@ -799,6 +844,33 @@ class TaskRunner:
                     run.error = str(exc)
 
             await db.commit()
+
+    async def _pause_for_llm_unavailable(
+        self,
+        *,
+        task_id: int,
+        cooldown_seconds: int,
+        reason: str,
+    ) -> None:
+        from app.db.session import AsyncSessionLocal
+
+        now = datetime.now(timezone.utc)
+        next_time = now + timedelta(seconds=max(30, int(cooldown_seconds)))
+        async with AsyncSessionLocal() as db:
+            task = await db.get(Task, task_id)
+            if task is None:
+                return
+            task.status = "pending"
+            task.error = f"paused_unavailable: {reason}"
+            task.next_retry_at = next_time
+            task.next_run_at = next_time
+            await db.commit()
+        log.warning(
+            "task.preflight_paused_unavailable",
+            task_id=task_id,
+            cooldown_seconds=cooldown_seconds,
+            reason=reason,
+        )
 
     # ------------------------------------------------------------------
     # Push delivery — Sprint 4.3
@@ -881,6 +953,39 @@ def _build_tool_error_signature(exc: Exception, *, stage: str, model: str) -> st
 
 def _is_suppressed_tool_failure_error(exc: Exception) -> bool:
     return "Suppressed repeated tool failure:" in str(exc)
+
+
+def _classify_llm_unavailable_error(exc: Exception) -> tuple[bool, str]:
+    text = str(exc or "").strip()
+    lowered = text.lower()
+    indicators = (
+        "ollama_chatexception",
+        "apiconnectionerror",
+        "connection timed out",
+        "timeout passed=",
+        "connection refused",
+        "failed to establish a new connection",
+        "name or service not known",
+        "temporarily unavailable",
+    )
+    if any(marker in lowered for marker in indicators):
+        return True, text or "llm_unavailable"
+    return False, ""
+
+
+async def _preflight_llm_dispatch() -> tuple[int, str] | None:
+    """
+    Return (cooldown_seconds, reason) when local LLM is currently unavailable.
+    """
+    if settings.llm_backend not in ("ollama", "openai_compat"):
+        return None
+
+    from app.autonomy.scheduler import check_and_mark_llm_dispatch_health
+
+    allowed, cooldown, reason = await check_and_mark_llm_dispatch_health(probe=False)
+    if not allowed:
+        return cooldown, reason
+    return None
 
 
 def _format_run_diagnostics(run_debug: dict[str, object]) -> str:

@@ -200,6 +200,7 @@ _log = structlog.get_logger(__name__)
 
 _scheduler: "AsyncIOScheduler | None" = None
 _llm_unhealthy_until: datetime | None = None
+_llm_last_error: str | None = None
 
 
 def _as_utc_aware(dt: datetime | None) -> datetime | None:
@@ -297,38 +298,16 @@ async def tick() -> None:
 
 async def _llm_dispatch_allowed(now: datetime) -> bool:
     """Return True when scheduler can dispatch tasks to the agent loop."""
-    from app.config import settings
-    from app.metrics import metrics
-
-    global _llm_unhealthy_until
-
-    if not settings.scheduler_llm_health_gate_enabled:
-        return True
-
-    if _llm_unhealthy_until is not None and now < _llm_unhealthy_until:
-        metrics.inc_scheduler_llm_unavailable_ticks()
-        metrics.inc_scheduler_dispatch_suppressed_count()
-        return False
-
-    ok = await _is_llm_available()
-    if ok:
-        _llm_unhealthy_until = None
-        return True
-
-    cooldown = max(30, int(settings.scheduler_unhealthy_cooldown_seconds or 300))
-    _llm_unhealthy_until = now + timedelta(seconds=cooldown)
-    metrics.inc_scheduler_llm_unavailable_ticks()
-    metrics.inc_scheduler_dispatch_suppressed_count()
-    _log.warning("scheduler.llm_unavailable", cooldown_seconds=cooldown)
-    return False
+    allowed, _, _ = await check_and_mark_llm_dispatch_health(now=now)
+    return allowed
 
 
-async def _is_llm_available() -> bool:
+async def _is_llm_available() -> tuple[bool, str]:
     """Quick health probe for local/openai_compat LLM backends."""
     from app.config import settings
 
     if settings.llm_backend not in ("ollama", "openai_compat"):
-        return True
+        return True, "non_local_backend"
 
     base = settings.local_api_base.rstrip("/")
     if base.endswith("/v1"):
@@ -337,9 +316,78 @@ async def _is_llm_available() -> bool:
     try:
         async with httpx.AsyncClient(timeout=4) as client:
             resp = await client.get(base + "/api/tags")
-        return resp.status_code < 400
-    except Exception:
-        return False
+        if resp.status_code >= 400:
+            return False, f"http_{resp.status_code}"
+        return True, "ok"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def get_llm_dispatch_health(now: datetime | None = None) -> dict[str, object]:
+    """
+    Return scheduler LLM gate health state for diagnostics/admin endpoints.
+    """
+    now_utc = now or datetime.now(timezone.utc)
+    unhealthy_until = _as_utc_aware(_llm_unhealthy_until)
+    blocked = unhealthy_until is not None and now_utc < unhealthy_until
+    return {
+        "blocked": blocked,
+        "unhealthy_until": unhealthy_until.isoformat() if unhealthy_until else None,
+        "last_error": _llm_last_error,
+    }
+
+
+async def check_and_mark_llm_dispatch_health(
+    now: datetime | None = None,
+    *,
+    probe: bool = True,
+) -> tuple[bool, int, str]:
+    """
+    Shared LLM gate check for scheduler and runner.
+
+    Returns:
+        (allowed, cooldown_seconds, reason)
+    """
+    from app.config import settings
+    from app.metrics import metrics
+
+    global _llm_unhealthy_until, _llm_last_error
+
+    now_utc = now or datetime.now(timezone.utc)
+    cooldown = max(30, int(settings.scheduler_unhealthy_cooldown_seconds or 300))
+
+    if not settings.scheduler_llm_health_gate_enabled:
+        _llm_last_error = None
+        return True, cooldown, "disabled"
+
+    if _llm_unhealthy_until is not None and now_utc < _llm_unhealthy_until:
+        metrics.inc_scheduler_llm_unavailable_ticks()
+        metrics.inc_scheduler_dispatch_suppressed_count()
+        reason = _llm_last_error or "cooldown_active"
+        return False, cooldown, str(reason)
+
+    if not probe:
+        _llm_last_error = None
+        return True, cooldown, "probe_skipped"
+
+    probe_result = await _is_llm_available()
+    if isinstance(probe_result, tuple):
+        ok, detail = probe_result
+    else:
+        # Backward compatibility for tests monkeypatching `_is_llm_available`
+        ok = bool(probe_result)
+        detail = "ok" if ok else "unavailable"
+    if ok:
+        _llm_unhealthy_until = None
+        _llm_last_error = None
+        return True, cooldown, "ok"
+
+    _llm_unhealthy_until = now_utc + timedelta(seconds=cooldown)
+    _llm_last_error = detail
+    metrics.inc_scheduler_llm_unavailable_ticks()
+    metrics.inc_scheduler_dispatch_suppressed_count()
+    _log.warning("scheduler.llm_unavailable", cooldown_seconds=cooldown, detail=detail)
+    return False, cooldown, str(detail or "unavailable")
 
 
 async def _skip_recurring_backlog(due: list, now: datetime) -> int:

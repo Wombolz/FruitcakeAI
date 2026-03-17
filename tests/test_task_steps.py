@@ -4,6 +4,7 @@ FruitcakeAI v5 — Task step planning endpoints.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -220,6 +221,48 @@ async def test_recurring_task_auto_plans_once_when_missing_plan(client):
             await _run_once()
 
     assert gen_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_claims_task_once_under_duplicate_dispatch(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "dupedispatchowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "RSS Cache Refresh",
+            "instruction": "Refresh RSS cache and notify once",
+            "task_type": "one_shot",
+            "deliver": True,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    async def _slow_run_agent(*_args, **_kwargs):
+        await asyncio.sleep(0.01)
+        return "cache refreshed"
+
+    runner = TaskRunner()
+    task_ref = type("TaskRef", (), {"id": task_id})()
+
+    with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+        with patch("app.autonomy.runner._preflight_llm_dispatch", new=AsyncMock(return_value=None)):
+            with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_slow_run_agent)) as run_agent_mock:
+                with patch.object(runner, "_push", new=AsyncMock()) as push_mock:
+                    await asyncio.gather(
+                        runner.execute(task_ref),
+                        runner.execute(task_ref),
+                    )
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "completed"
+
+    assert run_agent_mock.await_count == 1
+    push_mock.assert_awaited_once_with(task_id, "cache refreshed")
 
 
 @pytest.mark.asyncio

@@ -1079,7 +1079,7 @@ Verification highlights:
 ## Phase 5.5 — Adaptive Chat Orchestration (Quality Parity)
 
 **Goal**: close the quality gap between single-turn chat and task-mode execution on local models by adding optional task-like scaffolding to chat only when complexity warrants it.
-**Status**: 5.5.1-5.5.4 implemented in branch `codex/phase5.5.2-chat-orchestrated`; 5.5.5 active in `codex/phase5.5.5-library-grounding`.
+**Status**: 5.5.1-5.5.5 implemented in branch `codex/phase5.5.5-library-grounding`; 5.5.6 planned next.
 
 **Why now**:
 - Current task runs outperform chat on reliability because tasks use explicit planning, tool-grounding, and final synthesis.
@@ -1138,14 +1138,29 @@ Verification highlights:
   - library list/detail answers are tool-grounded with no invented docs,
   - runtime fusion mode failures degrade gracefully (no user-facing hard failure),
   - chat/rag/library regression suites pass.
+- Completed:
+  - Added deterministic `list_library_documents` grounding path plus document detail/excerpt APIs.
+  - Finalized fusion fallback so invalid runtime fusion modes degrade to vector-only instead of breaking chat/task requests.
+  - Added scheduler/task guardrail follow-up:
+    - duplicate task dispatch now uses a DB claim step so the same task is only executed once,
+    - LLM-unavailable/task timeout paths now pause and requeue instead of churning long failures,
+    - `/admin/health` exposes `llm_dispatch_gate` diagnostics for soak visibility.
 
-**Memory relevance follow-up (carryover)**
-- Keep general retrieval/search from automatically raising memory relevance.
-- Reintroduce relevance updates for explicit/direct recalls only:
-  - direct user confirmation ("yes, that's correct")
-  - successful task use where recalled memory materially informed outcome
-  - explicit memory-open/recall actions in UI/API
-- Track this as a scoring-policy hardening item before Phase 6 entry.
+**Sprint 5.5.6 — Memory grounding parity and relevance control**
+- Goal:
+  - bring normal chat up to the same baseline user-memory context already used by tasks,
+  - stop passive retrieval/search from inflating memory access/relevance signals over time.
+- Implementation:
+  - inject memory context into normal chat before `run_agent` / `stream_agent`,
+  - split retrieval from scoring in `MemoryService` so passive retrieval does not mutate access metadata,
+  - add explicit recall/material-use access paths only,
+  - add `POST /memories/{id}/recall`,
+  - directionally unify prompt/context assembly so persona + memory + library/client context merge consistently.
+- Acceptance:
+  - chat and task prompts share the same baseline memory context model,
+  - generic retrieval does not increment `access_count`,
+  - explicit recall/material use updates access metadata once,
+  - chat/task/memory regression suites pass.
 
 **Acceptance criteria**
 1. Complex chat prompts show measurable quality improvement without forcing heavy orchestration on simple chat.
@@ -1153,7 +1168,7 @@ Verification highlights:
 3. No API-breaking changes; feature is additive and flag-gated.
 4. Implemented branch validation:
    - Chat-focused suites passed (`tests/test_chat_routing.py`, `tests/test_chat_orchestration.py`, `tests/test_chat_validation.py`, `tests/test_auth.py`).
-   - Core regression subsets passed (`tests/test_agent.py`, `tests/test_task_steps.py`, `tests/test_webhooks.py`).
+   - Core regression subsets passed (`tests/test_agent.py`, `tests/test_task_steps.py`, `tests/test_webhooks.py`, `tests/test_scheduler_guardrail.py`).
 
 ---
 
@@ -1263,6 +1278,34 @@ judgment:
 ```
 
 The `ContextSanitizer` and `JudgmentRouter` classes are built in this phase, not Phase 4. They solve a problem that requires real-world data to scope correctly.
+
+### Sprint 6.x — Client Context Integration (Apple additive, platform-neutral)
+
+This sprint adds a platform-neutral client context layer that Apple clients can use first via App Intents, Shortcuts, and similar system entry points without making Fruitcake Apple-dependent.
+
+Positioning rules:
+
+- Fruitcake core remains platform-neutral and fully functional for Android, web, and non-Apple users.
+- Apple is the first producer of optional client context, not the definition of the product.
+- The backend contract stays generic so Android-equivalent integrations can adopt it later.
+
+Planned scope:
+
+- optional `client_context` support in chat-facing backend APIs
+- shared prompt/context assembly that merges persona context, memory retrieval, optional client context, and existing library grounding
+- memory retrieval added to normal chat so chat and tasks share the same baseline context model
+- backend resolution of selected entities when possible, with graceful fallback when not
+
+Not in this sprint:
+
+- Apple-only backend paths
+- Spotlight/Core Spotlight indexing
+- Foundation Models offline fallback
+- syncing Apple semantic indexes into Postgres
+
+Reference:
+
+- `Docs/sprint_6_x_client_context_integration.md`
 
 ---
 

@@ -51,6 +51,7 @@ htmlcov/
 # macOS
 .DS_Store
 .claude/
+Docs/_internal_soak/
 
 # IDE
 .vscode/
