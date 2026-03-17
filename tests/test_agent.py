@@ -67,6 +67,13 @@ def test_summarize_document_has_document_name_parameter():
     assert "document_name" in required
 
 
+def test_list_library_documents_schema_fields():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "list_library_documents")
+    props = schema["function"]["parameters"]["properties"]
+    assert "limit" in props
+    assert "scope_filter" in props
+
+
 def test_create_task_plan_schema_has_required_fields():
     schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_task_plan")
     props = schema["function"]["parameters"]["properties"]

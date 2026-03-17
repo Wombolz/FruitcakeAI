@@ -30,6 +30,21 @@ class _Metrics:
     task_model_fallback_to_large_count: int = 0
     task_model_fallback_success_count: int = 0
     task_model_fallback_failure_count: int = 0
+    scheduler_llm_unavailable_ticks: int = 0
+    scheduler_dispatch_suppressed_count: int = 0
+    scheduler_recurring_backlog_skipped_count: int = 0
+    scheduler_stale_running_recovered_count: int = 0
+    chat_complexity_simple_count: int = 0
+    chat_complexity_complex_count: int = 0
+    chat_complexity_routed_complex_count: int = 0
+    chat_validation_retry_count: int = 0
+    chat_validation_invalid_link_count: int = 0
+    chat_validation_empty_retry_count: int = 0
+    chat_orchestration_kill_switch_suppressed_count: int = 0
+    chat_simple_latency_count: int = 0
+    chat_simple_latency_total_ms: float = 0.0
+    chat_orchestrated_latency_count: int = 0
+    chat_orchestrated_latency_total_ms: float = 0.0
 
     def inc_requests(self) -> None:
         with self._lock:
@@ -75,8 +90,71 @@ class _Metrics:
         with self._lock:
             self.task_model_fallback_failure_count += n
 
+    def inc_scheduler_llm_unavailable_ticks(self, n: int = 1) -> None:
+        with self._lock:
+            self.scheduler_llm_unavailable_ticks += n
+
+    def inc_scheduler_dispatch_suppressed_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.scheduler_dispatch_suppressed_count += n
+
+    def inc_scheduler_recurring_backlog_skipped_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.scheduler_recurring_backlog_skipped_count += n
+
+    def inc_scheduler_stale_running_recovered_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.scheduler_stale_running_recovered_count += n
+
+    def inc_chat_complexity_simple_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_complexity_simple_count += n
+
+    def inc_chat_complexity_complex_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_complexity_complex_count += n
+
+    def inc_chat_complexity_routed_complex_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_complexity_routed_complex_count += n
+
+    def inc_chat_validation_retry_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_validation_retry_count += n
+
+    def inc_chat_validation_invalid_link_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_validation_invalid_link_count += n
+
+    def inc_chat_validation_empty_retry_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_validation_empty_retry_count += n
+
+    def inc_chat_orchestration_kill_switch_suppressed_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.chat_orchestration_kill_switch_suppressed_count += n
+
+    def record_chat_latency(self, *, mode: str, elapsed_ms: float) -> None:
+        with self._lock:
+            if mode == "chat_orchestrated":
+                self.chat_orchestrated_latency_count += 1
+                self.chat_orchestrated_latency_total_ms += float(elapsed_ms)
+            else:
+                self.chat_simple_latency_count += 1
+                self.chat_simple_latency_total_ms += float(elapsed_ms)
+
     def snapshot(self) -> dict:
         with self._lock:
+            simple_avg = (
+                self.chat_simple_latency_total_ms / self.chat_simple_latency_count
+                if self.chat_simple_latency_count
+                else 0.0
+            )
+            orchestrated_avg = (
+                self.chat_orchestrated_latency_total_ms / self.chat_orchestrated_latency_count
+                if self.chat_orchestrated_latency_count
+                else 0.0
+            )
             return {
                 "total_requests": self.total_requests,
                 "error_count": self.error_count,
@@ -88,6 +166,22 @@ class _Metrics:
                 "task_model_fallback_to_large_count": self.task_model_fallback_to_large_count,
                 "task_model_fallback_success_count": self.task_model_fallback_success_count,
                 "task_model_fallback_failure_count": self.task_model_fallback_failure_count,
+                "scheduler_llm_unavailable_ticks": self.scheduler_llm_unavailable_ticks,
+                "scheduler_dispatch_suppressed_count": self.scheduler_dispatch_suppressed_count,
+                "scheduler_recurring_backlog_skipped_count": self.scheduler_recurring_backlog_skipped_count,
+                "scheduler_stale_running_recovered_count": self.scheduler_stale_running_recovered_count,
+                "chat_complexity_simple_count": self.chat_complexity_simple_count,
+                "chat_complexity_complex_count": self.chat_complexity_complex_count,
+                "chat_complexity_routed_complex_count": self.chat_complexity_routed_complex_count,
+                "chat_validation_retry_count": self.chat_validation_retry_count,
+                "chat_validation_invalid_link_count": self.chat_validation_invalid_link_count,
+                "chat_validation_empty_retry_count": self.chat_validation_empty_retry_count,
+                "chat_orchestration_kill_switch_suppressed_count": self.chat_orchestration_kill_switch_suppressed_count,
+                "chat_simple_latency_count": self.chat_simple_latency_count,
+                "chat_simple_latency_avg_ms": round(simple_avg, 2),
+                "chat_orchestrated_latency_count": self.chat_orchestrated_latency_count,
+                "chat_orchestrated_latency_avg_ms": round(orchestrated_avg, 2),
+                "chat_orchestration_latency_delta_ms": round(orchestrated_avg - simple_avg, 2),
             }
 
 

@@ -17,6 +17,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import httpx
 
 # Interval unit → seconds multiplier
 _UNIT_SECONDS: dict[str, int] = {
@@ -198,6 +199,16 @@ import structlog
 _log = structlog.get_logger(__name__)
 
 _scheduler: "AsyncIOScheduler | None" = None
+_llm_unhealthy_until: datetime | None = None
+_llm_last_error: str | None = None
+
+
+def _as_utc_aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 async def start_scheduler() -> None:
@@ -230,6 +241,9 @@ async def start_scheduler() -> None:
         replace_existing=True,
     )
     _scheduler.start()
+    recovered = await recover_stale_running_tasks()
+    if recovered:
+        _log.info("scheduler.recovered_stale_running", recovered=recovered)
     _log.info("scheduler.started")
 
 
@@ -270,7 +284,211 @@ async def tick() -> None:
     if due:
         _log.info("scheduler.tick", due_count=len(due))
 
+    if due and not await _llm_dispatch_allowed(now):
+        recurring_skipped = await _skip_recurring_backlog(due, now)
+        if recurring_skipped:
+            _log.info("scheduler.recurring_backlog_skipped", count=recurring_skipped)
+        return False
+
     runner = get_task_runner()
     for task in due:
         asyncio.create_task(runner.execute(task))
     return False
+
+
+async def _llm_dispatch_allowed(now: datetime) -> bool:
+    """Return True when scheduler can dispatch tasks to the agent loop."""
+    allowed, _, _ = await check_and_mark_llm_dispatch_health(now=now)
+    return allowed
+
+
+async def _is_llm_available() -> tuple[bool, str]:
+    """Quick health probe for local/openai_compat LLM backends."""
+    from app.config import settings
+
+    if settings.llm_backend not in ("ollama", "openai_compat"):
+        return True, "non_local_backend"
+
+    base = settings.local_api_base.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+
+    try:
+        async with httpx.AsyncClient(timeout=4) as client:
+            resp = await client.get(base + "/api/tags")
+        if resp.status_code >= 400:
+            return False, f"http_{resp.status_code}"
+        return True, "ok"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def get_llm_dispatch_health(now: datetime | None = None) -> dict[str, object]:
+    """
+    Return scheduler LLM gate health state for diagnostics/admin endpoints.
+    """
+    now_utc = now or datetime.now(timezone.utc)
+    unhealthy_until = _as_utc_aware(_llm_unhealthy_until)
+    blocked = unhealthy_until is not None and now_utc < unhealthy_until
+    return {
+        "blocked": blocked,
+        "unhealthy_until": unhealthy_until.isoformat() if unhealthy_until else None,
+        "last_error": _llm_last_error,
+    }
+
+
+async def check_and_mark_llm_dispatch_health(
+    now: datetime | None = None,
+    *,
+    probe: bool = True,
+) -> tuple[bool, int, str]:
+    """
+    Shared LLM gate check for scheduler and runner.
+
+    Returns:
+        (allowed, cooldown_seconds, reason)
+    """
+    from app.config import settings
+    from app.metrics import metrics
+
+    global _llm_unhealthy_until, _llm_last_error
+
+    now_utc = now or datetime.now(timezone.utc)
+    cooldown = max(30, int(settings.scheduler_unhealthy_cooldown_seconds or 300))
+
+    if not settings.scheduler_llm_health_gate_enabled:
+        _llm_last_error = None
+        return True, cooldown, "disabled"
+
+    if _llm_unhealthy_until is not None and now_utc < _llm_unhealthy_until:
+        metrics.inc_scheduler_llm_unavailable_ticks()
+        metrics.inc_scheduler_dispatch_suppressed_count()
+        reason = _llm_last_error or "cooldown_active"
+        return False, cooldown, str(reason)
+
+    if not probe:
+        _llm_last_error = None
+        return True, cooldown, "probe_skipped"
+
+    probe_result = await _is_llm_available()
+    if isinstance(probe_result, tuple):
+        ok, detail = probe_result
+    else:
+        # Backward compatibility for tests monkeypatching `_is_llm_available`
+        ok = bool(probe_result)
+        detail = "ok" if ok else "unavailable"
+    if ok:
+        _llm_unhealthy_until = None
+        _llm_last_error = None
+        return True, cooldown, "ok"
+
+    _llm_unhealthy_until = now_utc + timedelta(seconds=cooldown)
+    _llm_last_error = detail
+    metrics.inc_scheduler_llm_unavailable_ticks()
+    metrics.inc_scheduler_dispatch_suppressed_count()
+    _log.warning("scheduler.llm_unavailable", cooldown_seconds=cooldown, detail=detail)
+    return False, cooldown, str(detail or "unavailable")
+
+
+async def _skip_recurring_backlog(due: list, now: datetime) -> int:
+    """
+    Skip overdue recurring intervals while LLM is unavailable.
+    One-shot tasks remain due/pending and are not modified.
+    """
+    from sqlalchemy import select
+    from app.db.session import AsyncSessionLocal
+    from app.db.models import Task
+    from app.metrics import metrics
+
+    recurring_ids = [
+        t.id
+        for t in due
+        if getattr(t, "task_type", None) == "recurring" and bool(getattr(t, "schedule", None))
+    ]
+    if not recurring_ids:
+        return 0
+
+    skipped = 0
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(select(Task).where(Task.id.in_(recurring_ids)))
+        for task in rows.scalars().all():
+            nxt = compute_next_run_at(task.schedule, after=now) if task.schedule else None
+            task.next_run_at = nxt or (now + timedelta(minutes=1))
+            skipped += 1
+        await db.commit()
+
+    metrics.inc_scheduler_recurring_backlog_skipped_count(skipped)
+    return skipped
+
+
+async def recover_stale_running_tasks() -> int:
+    """
+    Recover tasks left in `running` after host sleep/crash/restart.
+
+    Stale tasks are re-queued (`pending`, `next_run_at=now`) and latest
+    running TaskRun is closed as failed with a deterministic error string.
+    """
+    from sqlalchemy import select, and_
+    from app.config import settings
+    from app.db.session import AsyncSessionLocal
+    from app.db.models import Task, TaskRun, TaskStep
+    from app.metrics import metrics
+
+    age_minutes = int(settings.scheduler_stale_running_recovery_minutes or 0)
+    if age_minutes <= 0:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=age_minutes)
+    recovered = 0
+
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(Task).where(Task.status == "running")
+        )
+        tasks = rows.scalars().all()
+
+        for task in tasks:
+            last_run_at = _as_utc_aware(task.last_run_at)
+            if last_run_at is not None and last_run_at > cutoff:
+                continue
+            run_rows = await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task.id, TaskRun.status == "running")
+                .order_by(TaskRun.started_at.desc())
+            )
+            run = run_rows.scalars().first()
+            if run is None:
+                continue
+            run_started = _as_utc_aware(run.started_at)
+            if run_started and run_started > cutoff:
+                continue
+
+            task.status = "pending"
+            task.next_run_at = now
+            task.error = "Recovered stale running task after restart/sleep."
+
+            if task.current_step_index is not None:
+                step_rows = await db.execute(
+                    select(TaskStep).where(
+                        TaskStep.task_id == task.id,
+                        TaskStep.step_index == task.current_step_index,
+                    )
+                )
+                step = step_rows.scalars().first()
+                if step is not None and step.status == "running":
+                    step.status = "pending"
+                    step.error = "Recovered stale running step after restart/sleep."
+                    step.waiting_approval_tool = None
+
+            run.status = "failed"
+            run.finished_at = now
+            run.error = "recovered_after_restart_or_sleep"
+            recovered += 1
+
+        if recovered:
+            await db.commit()
+
+    if recovered:
+        metrics.inc_scheduler_stale_running_recovered_count(recovered)
+    return recovered

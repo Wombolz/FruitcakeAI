@@ -1079,6 +1079,7 @@ Verification highlights:
 ## Phase 5.5 — Adaptive Chat Orchestration (Quality Parity)
 
 **Goal**: close the quality gap between single-turn chat and task-mode execution on local models by adding optional task-like scaffolding to chat only when complexity warrants it.
+**Status**: 5.5.1-5.5.5 implemented in branch `codex/phase5.5.5-library-grounding`; 5.5.6 planned next.
 
 **Why now**:
 - Current task runs outperform chat on reliability because tasks use explicit planning, tool-grounding, and final synthesis.
@@ -1088,11 +1089,17 @@ Verification highlights:
 - Add lightweight complexity scoring for chat turns (multi-part asks, high-stakes asks, tool-heavy asks).
 - Route low-complexity requests through existing fast single-pass chat path.
 - Route high-complexity requests to orchestrated chat path.
+- Completed:
+  - `classify_chat_complexity(...)` added with deterministic scoring and route decision.
+  - Complex chat turns routed to chat orchestration mode; simple turns remain single-pass.
 
 **Sprint 5.5.2 — Orchestrated chat path (non-task UX)**
 - Add internal micro-plan for complex chat turns (2-3 steps max).
 - Reuse existing tool + grounding patterns from task runner where safe.
 - Keep response as a single chat answer (no task creation required).
+- Completed:
+  - Internal orchestration overlay added for complex chat turns (micro-plan + grounded synthesis rules).
+  - Dedicated `chat_orchestrated` mode added (higher turn budget) while preserving normal chat UX.
 
 **Sprint 5.5.3 — Grounding and output checks for chat**
 - Add optional validation for news/research style answers:
@@ -1100,6 +1107,10 @@ Verification highlights:
   - invalid link rejection
   - empty-result retry policy
 - Add “deep mode” switch in API/UI later (optional), defaulting to auto-routing.
+- Completed:
+  - Chat validation module added for research/news responses.
+  - One-shot retry for missing links / invalid links / empty responses.
+  - Invalid/placeholder links are stripped from final output when retry is not taken.
 
 **Sprint 5.5.4 — Observability and controls**
 - Add counters for:
@@ -1107,19 +1118,57 @@ Verification highlights:
   - fallback/retry rates
   - latency delta vs single-pass path
 - Add kill switch env flag to disable orchestrated chat instantly.
+- Completed:
+  - Kill switch `chat_orchestration_kill_switch` added; complex prompts immediately degrade to simple chat mode when enabled.
+  - Chat metrics expanded with retry counters, invalid-link counters, and simple vs orchestrated latency delta.
+  - REST and WebSocket chat paths aligned to shared orchestration/validation behavior.
 
-**Memory relevance follow-up (carryover)**
-- Keep general retrieval/search from automatically raising memory relevance.
-- Reintroduce relevance updates for explicit/direct recalls only:
-  - direct user confirmation ("yes, that's correct")
-  - successful task use where recalled memory materially informed outcome
-  - explicit memory-open/recall actions in UI/API
-- Track this as a scoring-policy hardening item before Phase 6 entry.
+**Sprint 5.5.5 — Library grounding and RAG runtime reliability**
+- Goal:
+  - stop library-chat drift/hallucinated filenames,
+  - prevent runtime `Invalid fusion mode: rrf` errors from breaking chat/task flows.
+- Implementation:
+  - add explicit `list_library_documents` tool for deterministic doc listings,
+  - add `GET /library/documents/{id}` and `GET /library/documents/{id}/excerpts`,
+  - enforce tool-required grounding for library list/detail/excerpt intents,
+  - finalize runtime fusion fallback (auto-switch to vector-only + same-request retry),
+  - expose `fusion_runtime_disabled` in health for soak diagnostics.
+- Acceptance:
+  - weather -> library-list sequence does not drift,
+  - library list/detail answers are tool-grounded with no invented docs,
+  - runtime fusion mode failures degrade gracefully (no user-facing hard failure),
+  - chat/rag/library regression suites pass.
+- Completed:
+  - Added deterministic `list_library_documents` grounding path plus document detail/excerpt APIs.
+  - Finalized fusion fallback so invalid runtime fusion modes degrade to vector-only instead of breaking chat/task requests.
+  - Added scheduler/task guardrail follow-up:
+    - duplicate task dispatch now uses a DB claim step so the same task is only executed once,
+    - LLM-unavailable/task timeout paths now pause and requeue instead of churning long failures,
+    - `/admin/health` exposes `llm_dispatch_gate` diagnostics for soak visibility.
+
+**Sprint 5.5.6 — Memory grounding parity and relevance control**
+- Goal:
+  - bring normal chat up to the same baseline user-memory context already used by tasks,
+  - stop passive retrieval/search from inflating memory access/relevance signals over time.
+- Implementation:
+  - inject memory context into normal chat before `run_agent` / `stream_agent`,
+  - split retrieval from scoring in `MemoryService` so passive retrieval does not mutate access metadata,
+  - add explicit recall/material-use access paths only,
+  - add `POST /memories/{id}/recall`,
+  - directionally unify prompt/context assembly so persona + memory + library/client context merge consistently.
+- Acceptance:
+  - chat and task prompts share the same baseline memory context model,
+  - generic retrieval does not increment `access_count`,
+  - explicit recall/material use updates access metadata once,
+  - chat/task/memory regression suites pass.
 
 **Acceptance criteria**
 1. Complex chat prompts show measurable quality improvement without forcing heavy orchestration on simple chat.
 2. Median chat latency for simple prompts stays near current baseline.
 3. No API-breaking changes; feature is additive and flag-gated.
+4. Implemented branch validation:
+   - Chat-focused suites passed (`tests/test_chat_routing.py`, `tests/test_chat_orchestration.py`, `tests/test_chat_validation.py`, `tests/test_auth.py`).
+   - Core regression subsets passed (`tests/test_agent.py`, `tests/test_task_steps.py`, `tests/test_webhooks.py`, `tests/test_scheduler_guardrail.py`).
 
 ---
 
@@ -1229,6 +1278,34 @@ judgment:
 ```
 
 The `ContextSanitizer` and `JudgmentRouter` classes are built in this phase, not Phase 4. They solve a problem that requires real-world data to scope correctly.
+
+### Sprint 6.x — Client Context Integration (Apple additive, platform-neutral)
+
+This sprint adds a platform-neutral client context layer that Apple clients can use first via App Intents, Shortcuts, and similar system entry points without making Fruitcake Apple-dependent.
+
+Positioning rules:
+
+- Fruitcake core remains platform-neutral and fully functional for Android, web, and non-Apple users.
+- Apple is the first producer of optional client context, not the definition of the product.
+- The backend contract stays generic so Android-equivalent integrations can adopt it later.
+
+Planned scope:
+
+- optional `client_context` support in chat-facing backend APIs
+- shared prompt/context assembly that merges persona context, memory retrieval, optional client context, and existing library grounding
+- memory retrieval added to normal chat so chat and tasks share the same baseline context model
+- backend resolution of selected entities when possible, with graceful fallback when not
+
+Not in this sprint:
+
+- Apple-only backend paths
+- Spotlight/Core Spotlight indexing
+- Foundation Models offline fallback
+- syncing Apple semantic indexes into Postgres
+
+Reference:
+
+- `Docs/sprint_6_x_client_context_integration.md`
 
 ---
 

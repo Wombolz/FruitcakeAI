@@ -51,6 +51,21 @@ class Settings(BaseSettings):
     task_force_large_for_final_synthesis: bool = True
     task_plan_default_steps: int = 8
     task_plan_max_steps: int = 20
+    # Scheduler guardrails (laptop sleep / transient local LLM outages)
+    scheduler_llm_health_gate_enabled: bool = True
+    scheduler_unhealthy_cooldown_seconds: int = 300
+    scheduler_stale_running_recovery_minutes: int = 20
+    # Phase 5.5.1 chat complexity routing
+    chat_complexity_routing_enabled: bool = True
+    chat_complexity_threshold: int = 3
+    # Phase 5.5.2 orchestrated chat path
+    chat_orchestration_enabled: bool = True
+    chat_orchestration_max_steps: int = 3
+    chat_orchestration_kill_switch: bool = False
+    # Phase 5.5.3 chat grounding checks
+    chat_validation_enabled: bool = True
+    chat_validation_retry_enabled: bool = True
+    chat_validation_retry_max_attempts: int = 1
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"

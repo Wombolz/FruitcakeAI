@@ -11,6 +11,7 @@ GET  /chat/personas               — list available personas
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -22,6 +23,16 @@ from sqlalchemy import select
 import structlog
 
 from app.agent.context import UserContext
+from app.agent.chat_intents import (
+    is_library_detail_or_excerpt_intent,
+    is_library_lookup_intent,
+)
+from app.agent.chat_orchestration import build_orchestrated_chat_history
+from app.agent.chat_routing import classify_chat_complexity
+from app.agent.chat_validation import (
+    build_chat_retry_instruction,
+    validate_chat_response,
+)
 from app.agent.core import run_agent, stream_agent
 from app.auth.dependencies import get_current_user
 from app.config import settings
@@ -271,9 +282,48 @@ async def send_message(
         blocked_tools=body.blocked_tools,
     )
     user_context.session_id = session_id
+    library_list_intent = is_library_lookup_intent(body.content)
+    library_detail_intent = is_library_detail_or_excerpt_intent(body.content)
+    library_intent = library_list_intent or library_detail_intent
+    history = await _apply_required_library_grounding(
+        history,
+        user_context,
+        user_prompt=body.content,
+        intent_type=(
+            "detail_or_excerpt"
+            if library_detail_intent
+            else ("list_documents" if library_list_intent else None)
+        ),
+    )
+
+    decision = classify_chat_complexity(
+        body.content,
+        threshold=settings.chat_complexity_threshold,
+        routing_enabled=settings.chat_complexity_routing_enabled,
+    )
+    execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
+    execution_history = build_orchestrated_chat_history(
+        history,
+        enabled=(execution_mode == "chat_orchestrated" and settings.chat_orchestration_enabled),
+        max_steps=settings.chat_orchestration_max_steps,
+    )
+    effective_complex = (decision.is_complex or library_intent) and execution_mode == "chat_orchestrated"
+    if decision.is_complex:
+        metrics.inc_chat_complexity_complex_count()
+        if effective_complex:
+            metrics.inc_chat_complexity_routed_complex_count()
+    else:
+        metrics.inc_chat_complexity_simple_count()
 
     try:
-        reply = await run_agent(history, user_context)
+        reply = await _execute_chat_turn(
+            execution_history,
+            user_context,
+            user_prompt=body.content,
+            mode=execution_mode,
+            stage="chat_complex" if effective_complex else "chat_simple",
+            enable_validation=effective_complex,
+        )
     except Exception as e:
         log.exception("Agent error in REST handler", session_id=session_id)
         raise HTTPException(status_code=500, detail="Agent error — check server logs for details")
@@ -406,13 +456,66 @@ async def chat_websocket(
                         blocked_tools=blocked_tools,
                     )
                     user_context.session_id = session_id
+                    library_list_intent = is_library_lookup_intent(user_message)
+                    library_detail_intent = is_library_detail_or_excerpt_intent(user_message)
+                    library_intent = library_list_intent or library_detail_intent
+                    history = await _apply_required_library_grounding(
+                        history,
+                        user_context,
+                        user_prompt=user_message,
+                        intent_type=(
+                            "detail_or_excerpt"
+                            if library_detail_intent
+                            else ("list_documents" if library_list_intent else None)
+                        ),
+                    )
                     full_response = []
-
-                    async for token_chunk in stream_agent(history, user_context):
-                        full_response.append(token_chunk)
-                        await websocket.send_json({"type": "token", "content": token_chunk})
-
-                    complete = "".join(full_response)
+                    decision = classify_chat_complexity(
+                        user_message,
+                        threshold=settings.chat_complexity_threshold,
+                        routing_enabled=settings.chat_complexity_routing_enabled,
+                    )
+                    execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
+                    execution_history = build_orchestrated_chat_history(
+                        history,
+                        enabled=(execution_mode == "chat_orchestrated" and settings.chat_orchestration_enabled),
+                        max_steps=settings.chat_orchestration_max_steps,
+                    )
+                    effective_complex = (decision.is_complex or library_intent) and execution_mode == "chat_orchestrated"
+                    if decision.is_complex:
+                        metrics.inc_chat_complexity_complex_count()
+                        if effective_complex:
+                            metrics.inc_chat_complexity_routed_complex_count()
+                    else:
+                        metrics.inc_chat_complexity_simple_count()
+                    if effective_complex:
+                        complete = await _execute_chat_turn(
+                            execution_history,
+                            user_context,
+                            user_prompt=user_message,
+                            mode=execution_mode,
+                            stage="chat_complex",
+                            enable_validation=effective_complex,
+                        )
+                        for token_chunk in _chunk_text(complete):
+                            full_response.append(token_chunk)
+                            await websocket.send_json({"type": "token", "content": token_chunk})
+                        complete = "".join(full_response)
+                    else:
+                        started = time.perf_counter()
+                        async for token_chunk in stream_agent(
+                            execution_history,
+                            user_context,
+                            mode=execution_mode,
+                            stage="chat_simple",
+                        ):
+                            full_response.append(token_chunk)
+                            await websocket.send_json({"type": "token", "content": token_chunk})
+                        metrics.record_chat_latency(
+                            mode="chat",
+                            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                        )
+                        complete = "".join(full_response)
 
                     # Store assistant reply
                     assistant_msg = ChatMessage(
@@ -500,6 +603,136 @@ async def _switch_persona(
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _chunk_text(content: str, chunk_size: int = 64):
+    for i in range(0, len(content), chunk_size):
+        yield content[i : i + chunk_size]
+
+
+def _resolve_chat_mode(is_complex: bool) -> str:
+    if is_complex and settings.chat_orchestration_kill_switch:
+        metrics.inc_chat_orchestration_kill_switch_suppressed_count()
+        return "chat"
+    return "chat_orchestrated" if is_complex else "chat"
+
+
+async def _execute_chat_turn(
+    history: List[Dict[str, Any]],
+    user_context: UserContext,
+    *,
+    user_prompt: str,
+    mode: str,
+    stage: str,
+    enable_validation: bool,
+) -> str:
+    started = time.perf_counter()
+    reply = await run_agent(
+        history,
+        user_context,
+        mode=mode,
+        stage=stage,
+    )
+    if not (enable_validation and settings.chat_validation_enabled):
+        metrics.record_chat_latency(
+            mode=mode,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        )
+        return reply
+
+    max_attempts = max(0, int(settings.chat_validation_retry_max_attempts))
+    attempts = 0
+    current = reply
+
+    while True:
+        validation = validate_chat_response(user_prompt, current)
+        if validation.invalid_urls:
+            metrics.inc_chat_validation_invalid_link_count(len(validation.invalid_urls))
+
+        should_retry = (
+            settings.chat_validation_retry_enabled
+            and validation.should_retry
+            and attempts < max_attempts
+        )
+        if not should_retry:
+            metrics.record_chat_latency(
+                mode=mode,
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            return validation.cleaned_content if validation.invalid_urls else current
+
+        if validation.retry_reason == "empty_result":
+            metrics.inc_chat_validation_empty_retry_count()
+        metrics.inc_chat_validation_retry_count()
+        attempts += 1
+
+        retry_instruction = build_chat_retry_instruction(validation.retry_reason)
+        corrective = {"role": "system", "content": retry_instruction}
+        retry_history = list(history)
+        if retry_history and retry_history[-1].get("role") == "user":
+            retry_history = retry_history[:-1] + [corrective, retry_history[-1]]
+        else:
+            retry_history.append(corrective)
+
+        current = await run_agent(
+            retry_history,
+            user_context,
+            mode=mode,
+            stage=f"{stage}_retry",
+        )
+
+
+async def _apply_required_library_grounding(
+    history: List[Dict[str, Any]],
+    user_context: UserContext,
+    *,
+    user_prompt: str,
+    intent_type: str | None,
+) -> List[Dict[str, Any]]:
+    """
+    For explicit library lookup intents, fetch grounded library evidence before
+    the assistant turn so chat does not invent document names.
+    """
+    if not intent_type:
+        return history
+
+    blocked = {str(name).strip() for name in (user_context.blocked_tools or [])}
+    from app.agent.tools import _list_library_documents, _search_library, _write_audit_log
+
+    if intent_type == "list_documents":
+        tool_name = "list_library_documents"
+        args = {"limit": 50}
+        if tool_name in blocked:
+            result = "list_library_documents is unavailable for this persona."
+        else:
+            result = await _list_library_documents(args, user_context)
+    else:
+        tool_name = "search_library"
+        args = {"query": user_prompt, "top_k": 20}
+        if tool_name in blocked:
+            result = "search_library is unavailable for this persona."
+        else:
+            result = await _search_library(args, user_context)
+
+    await _write_audit_log(
+        user_id=user_context.user_id,
+        session_id=user_context.session_id,
+        tool_name=tool_name,
+        arguments=args,
+        result_summary=str(result)[:500],
+    )
+    grounding_note = (
+        "Required grounding for this turn: this is a library intent. "
+        "Prioritize the newest user message over prior context. "
+        "Use only the tool output below as source of truth for document names/metadata. "
+        "If output is empty, explicitly say no documents/excerpts were found.\n\n"
+        f"{tool_name} result:\n{result}"
+    )
+
+    grounded = list(history)
+    if grounded and grounded[-1].get("role") == "user":
+        return grounded[:-1] + [{"role": "system", "content": grounding_note}, grounded[-1]]
+    return grounded + [{"role": "system", "content": grounding_note}]
+
 
 async def _get_session_or_404(
     session_id: int, user_id: int, db: AsyncSession

@@ -162,6 +162,31 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_library_documents",
+            "description": (
+                "List accessible documents in the user's library. "
+                "Use for prompts like 'list my documents' or 'show my files'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum documents to return (1-100).",
+                        "default": 25,
+                    },
+                    "scope_filter": {
+                        "type": "string",
+                        "description": "Optional scope: personal, family, shared.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -293,6 +318,9 @@ async def _call_tool(
     if name == "summarize_document":
         return await _summarize_document(arguments, user_context)
 
+    if name == "list_library_documents":
+        return await _list_library_documents(arguments, user_context)
+
     if name == "create_task_plan":
         return await _create_task_plan(arguments, user_context)
 
@@ -356,6 +384,54 @@ async def _search_library(
         lines.append("")
 
     return "\n".join(lines)
+
+
+async def _list_library_documents(
+    arguments: Dict[str, Any], user_context: UserContext
+) -> str:
+    """Return deterministic metadata for accessible library documents."""
+    from sqlalchemy import or_, select
+
+    from app.db.models import Document
+    from app.db.session import AsyncSessionLocal
+
+    try:
+        limit = int(arguments.get("limit", 25))
+    except Exception:
+        limit = 25
+    limit = max(1, min(limit, 100))
+
+    scope_filter = str(arguments.get("scope_filter", "") or "").strip().lower()
+    if scope_filter and scope_filter not in {"personal", "family", "shared"}:
+        return "scope_filter must be one of: personal, family, shared."
+
+    async with AsyncSessionLocal() as db:
+        stmt = (
+            select(Document)
+            .where(
+                or_(
+                    Document.owner_id == user_context.user_id,
+                    Document.scope.in_(["family", "shared"]),
+                )
+            )
+            .order_by(Document.created_at.desc())
+            .limit(limit)
+        )
+        if scope_filter:
+            stmt = stmt.where(Document.scope == scope_filter)
+        rows = (await db.execute(stmt)).scalars().all()
+
+    docs = [
+        {
+            "id": d.id,
+            "filename": d.original_filename or d.filename,
+            "scope": d.scope,
+            "processing_status": d.processing_status,
+            "created_at": d.created_at.isoformat() if d.created_at else "",
+        }
+        for d in rows
+    ]
+    return json.dumps({"count": len(docs), "documents": docs}, ensure_ascii=False)
 
 
 async def _summarize_document(

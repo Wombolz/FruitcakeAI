@@ -100,6 +100,7 @@ async def admin_health(
     llm_status = await _check_llm()
     rag_status = _check_rag()
     mcp_status = _check_mcp()
+    llm_dispatch_gate = _check_llm_dispatch_gate()
 
     overall = "ok"
     if any(s.get("status") == "error" for s in [db_status, llm_status, rag_status]):
@@ -109,6 +110,7 @@ async def admin_health(
         "status": overall,
         "database": db_status,
         "llm": llm_status,
+        "llm_dispatch_gate": llm_dispatch_gate,
         "embedding_model": rag_status,
         "mcp": mcp_status,
     }
@@ -148,6 +150,17 @@ def _check_mcp() -> Dict[str, Any]:
     from app.mcp.registry import get_mcp_registry
     s = get_mcp_registry().get_status()
     return {"status": "ok" if s["ready"] else "not_ready", "tool_count": s["tool_count"]}
+
+
+def _check_llm_dispatch_gate() -> Dict[str, Any]:
+    from app.autonomy.scheduler import get_llm_dispatch_health
+
+    state = get_llm_dispatch_health()
+    return {
+        "status": "blocked" if state.get("blocked") else "ready",
+        "unhealthy_until": state.get("unhealthy_until"),
+        "last_error": state.get("last_error"),
+    }
 
 
 # ── GET /admin/tools ──────────────────────────────────────────────────────────
