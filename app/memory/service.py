@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable, Literal
 
 import structlog
 from sqlalchemy import and_, select
@@ -153,13 +153,6 @@ class MemoryService:
                 except Exception:
                     log.warning("memory.tier3_failed", exc_info=True)
 
-        # Record access for all returned memories (fire-and-forget).
-        # Pass IDs only — _record_accesses opens its own session so the
-        # caller's session can close without racing the background task.
-        import asyncio
-        if results:
-            asyncio.create_task(self._record_accesses([m.id for m in results]))
-
         return results
 
     # ------------------------------------------------------------------
@@ -236,29 +229,60 @@ class MemoryService:
         log.info("memory.deactivated", memory_id=memory_id, user_id=user_id)
         return True
 
+    async def mark_accessed(
+        self,
+        memory_ids: Iterable[int],
+        *,
+        mode: Literal["direct_recall", "task_materialized", "chat_materialized"],
+        db: AsyncSession | None = None,
+    ) -> None:
+        """
+        Record deliberate memory use. Passive retrieval paths must not call this.
+        """
+        ids = [int(m) for m in memory_ids if m is not None]
+        if not ids:
+            return
+        await self._record_accesses(ids, mode=mode, db=db)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _record_accesses(self, memory_ids: list[int]) -> None:
+    async def _record_accesses(
+        self,
+        memory_ids: list[int],
+        *,
+        mode: str,
+        db: AsyncSession | None = None,
+    ) -> None:
         """
         Increment access_count for each accessed memory.
-        Runs as a fire-and-forget background task (never blocks retrieval).
-
-        Opens its own session so the caller's session can close independently
-        without causing a state-change race on the shared connection.
+        Used only for explicit recall/material-use paths.
         """
         if not memory_ids:
             return
         try:
-            from app.db.session import AsyncSessionLocal
-            async with AsyncSessionLocal() as db:
+            now = datetime.now(timezone.utc)
+            if db is not None:
                 result = await db.execute(
                     select(Memory).where(Memory.id.in_(memory_ids))
                 )
                 for m in result.scalars().all():
                     m.access_count = (m.access_count or 0) + 1
-                await db.commit()
+                    m.last_accessed_at = now
+                await db.flush()
+            else:
+                from app.db.session import AsyncSessionLocal
+
+                async with AsyncSessionLocal() as db_session:
+                    result = await db_session.execute(
+                        select(Memory).where(Memory.id.in_(memory_ids))
+                    )
+                    for m in result.scalars().all():
+                        m.access_count = (m.access_count or 0) + 1
+                        m.last_accessed_at = now
+                    await db_session.commit()
+            log.info("memory.access_recorded", mode=mode, count=len(memory_ids))
         except Exception:
             log.warning("memory.record_access_failed", exc_info=True)
 

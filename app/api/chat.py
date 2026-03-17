@@ -39,6 +39,7 @@ from app.config import settings
 from app.db.models import ChatMessage, ChatSession, User
 from app.db.session import get_db
 from app.metrics import metrics
+from app.memory.service import get_memory_service
 
 log = structlog.get_logger(__name__)
 
@@ -182,7 +183,15 @@ async def get_session(
         "title": session.title,
         "persona": session.persona,
         "llm_model": session.llm_model,
-        "messages": [{"id": m.id, "role": m.role, "content": m.content} for m in messages],
+        "messages": [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at,
+            }
+            for m in messages
+        ],
     }
 
 
@@ -282,6 +291,12 @@ async def send_message(
         blocked_tools=body.blocked_tools,
     )
     user_context.session_id = session_id
+    history, _memory_ids = await _apply_memory_context(
+        history,
+        db,
+        current_user.id,
+        body.content,
+    )
     library_list_intent = is_library_lookup_intent(body.content)
     library_detail_intent = is_library_detail_or_excerpt_intent(body.content)
     library_intent = library_list_intent or library_detail_intent
@@ -456,6 +471,12 @@ async def chat_websocket(
                         blocked_tools=blocked_tools,
                     )
                     user_context.session_id = session_id
+                    history, _memory_ids = await _apply_memory_context(
+                        history,
+                        db,
+                        current_user.id,
+                        user_message,
+                    )
                     library_list_intent = is_library_lookup_intent(user_message)
                     library_detail_intent = is_library_detail_or_excerpt_intent(user_message)
                     library_intent = library_list_intent or library_detail_intent
@@ -732,6 +753,33 @@ async def _apply_required_library_grounding(
     if grounded and grounded[-1].get("role") == "user":
         return grounded[:-1] + [{"role": "system", "content": grounding_note}, grounded[-1]]
     return grounded + [{"role": "system", "content": grounding_note}]
+
+
+async def _apply_memory_context(
+    history: List[Dict[str, Any]],
+    db: AsyncSession,
+    user_id: int,
+    user_prompt: str,
+) -> tuple[List[Dict[str, Any]], List[int]]:
+    """
+    Inject baseline memory context for the current turn without mutating memory access scores.
+    """
+    svc = get_memory_service()
+    memories = await svc.retrieve_for_context(db, user_id, query=user_prompt)
+    if not memories:
+        return history, []
+
+    memory_note = (
+        "Baseline memory context for this user. Use it as supporting context, "
+        "but prioritize the latest user message and any grounded tool output.\n\n"
+        f"{svc.format_for_prompt(memories)}"
+    )
+    grounded = list(history)
+    if grounded and grounded[-1].get("role") == "user":
+        grounded = grounded[:-1] + [{"role": "system", "content": memory_note}, grounded[-1]]
+    else:
+        grounded.append({"role": "system", "content": memory_note})
+    return grounded, [int(m.id) for m in memories]
 
 
 async def _get_session_or_404(

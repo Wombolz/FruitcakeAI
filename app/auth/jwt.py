@@ -1,6 +1,6 @@
 """
 FruitcakeAI v5 — JWT helpers
-Ported from v4, adapted for v5 role model (admin | parent | child | guest).
+Ported from v4, adapted for v5 role model (admin | parent | restricted | guest).
 """
 
 from datetime import datetime, timedelta

@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 class UserContext:
     user_id: int
     username: str
-    role: str                          # admin | parent | child | guest
+    role: str                          # admin | parent | restricted | guest
     persona: str = "family_assistant"
     persona_description: str = ""
     persona_tone: str = "helpful"
@@ -106,7 +106,7 @@ class UserContext:
         if self.content_filter == "strict":
             lines += [
                 "",
-                "Content restrictions (STRICT — child user):",
+                "Content restrictions (STRICT — restricted-access user):",
                 "- Avoid all adult topics, violence, or inappropriate content.",
                 "- Keep explanations simple and age-appropriate.",
                 "- Gently redirect if asked about blocked topics.",

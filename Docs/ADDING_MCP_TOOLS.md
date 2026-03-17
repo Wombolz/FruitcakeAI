@@ -105,13 +105,13 @@ Restart the backend — no other changes needed.
 ## Blocking tools per persona
 
 To prevent a tool from appearing for a specific persona (e.g., block web search
-for the kids assistant), add its exact function name to `blocked_tools` in
+for the restricted assistant), add its exact function name to `blocked_tools` in
 `config/personas.yaml`:
 
 ```yaml
 # config/personas.yaml
 personas:
-  kids_assistant:
+  restricted_assistant:
     blocked_tools: [web_search, fetch_page, my_tool_name]
 ```
 

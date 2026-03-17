@@ -79,7 +79,7 @@ v4 wove user permissions through every layer of the stack — service layer, rou
 
 v5 implements multi-user scoping as injected prompt context. The system prompt for each session tells the model who the user is, what their role is, which tools they can use, and what they can access. The model enforces scope through its understanding of the instruction — not through code.
 
-This is auditable (log the system prompt, see exactly what the model was told), easy to extend (adding a new scope means adding a line to `personas.yaml`), and easy to test (assert that the system prompt for a child user does not include web research tools).
+This is auditable (log the system prompt, see exactly what the model was told), easy to extend (adding a new scope means adding a line to `personas.yaml`), and easy to test (assert that the system prompt for a restricted-access user does not include web research tools).
 
 The tradeoff is that prompt-based enforcement is less formally guaranteed than code-based enforcement. For the use cases FruitcakeAI targets — personal and small-team deployments where users are trusted — this tradeoff is correct.
 
@@ -103,7 +103,7 @@ FruitcakeAI supports multiple users with different roles and access levels, and 
 
 Three mechanisms enforce this:
 
-**Persona-scoped tool access.** The `kids_assistant` persona does not have access to web research tools. This is not a runtime check — the tools are simply not offered to the model in that context. You cannot prompt-inject your way to a blocked tool because the tool is not in the model's schema for that session.
+**Persona-scoped tool access.** The `restricted_assistant` persona does not have access to web research tools. This is not a runtime check — the tools are simply not offered to the model in that context. You cannot prompt-inject your way to a blocked tool because the tool is not in the model's schema for that session.
 
 **Approval gates.** Any task marked `requires_approval` pauses before executing irreversible actions, sends a push notification to the user, and waits. The task cannot proceed without explicit confirmation through the API. This is the primary defense against the autonomous agent doing something the user didn't intend.
 

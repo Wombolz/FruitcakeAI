@@ -21,12 +21,12 @@ users:
     library_scopes: ["family_docs", "recipes", "household"]
     calendar_access: ["family", "personal"]
 
-  - username: kid
-    email: kid@fruitcake.local
+  - username: restricted
+    email: restricted@fruitcake.local
     password: changeme123
-    full_name: Kid User
-    role: child
-    persona: kids_assistant
+    full_name: Restricted User
+    role: restricted
+    persona: restricted_assistant
     library_scopes: ["kids_books", "homework"]
     calendar_access: ["family"]
 

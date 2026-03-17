@@ -373,9 +373,11 @@ class TaskRunner:
                     )
 
         # Back-compat mode: single instruction task behavior.
+        recalled_memory_ids: set[int] = set()
         async with AsyncSessionLocal() as db:
             svc = get_memory_service()
             memories = await svc.retrieve_for_context(db, task_user_id, query=task_instruction)
+            recalled_memory_ids.update(int(m.id) for m in memories)
 
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         parts: list[str] = []
@@ -395,6 +397,8 @@ class TaskRunner:
                 model_override=model_profile.final_synthesis_model if model_profile else None,
                 stage="task_single_stage",
             )
+            if recalled_memory_ids:
+                await svc.mark_accessed(sorted(recalled_memory_ids), mode="task_materialized")
             return result, {}
         finally:
             _approval_armed.reset(token)
@@ -430,6 +434,7 @@ class TaskRunner:
         step_user_context = user_context
         run_context: dict[str, object] = {}
         grounding_report: dict[str, object] | None = None
+        recalled_memory_ids: set[int] = set()
         run_debug: dict[str, object] = {
             "profile": getattr(task_profile, "name", "default"),
             "tool_failure_suppressions": suppression_events,
@@ -478,6 +483,7 @@ class TaskRunner:
             async with AsyncSessionLocal() as db:
                 svc = get_memory_service()
                 memories = await svc.retrieve_for_context(db, user_id, query=step.instruction)
+                recalled_memory_ids.update(int(m.id) for m in memories)
 
             # Summaries from previous succeeded steps keep context compact.
             prior_summaries: list[str] = []
@@ -634,6 +640,9 @@ class TaskRunner:
 
         if grounding_report is not None:
             run_debug["grounding_report"] = grounding_report
+        if recalled_memory_ids:
+            svc = get_memory_service()
+            await svc.mark_accessed(sorted(recalled_memory_ids), mode="task_materialized")
         return final_result, run_debug
 
     async def _run_step_with_model_policy(

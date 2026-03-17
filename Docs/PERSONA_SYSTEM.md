@@ -17,8 +17,8 @@ personas:
     calendar_access: [family, personal]
     blocked_tools: []
 
-  kids_assistant:
-    description: Safe, age-appropriate assistant for children
+  restricted_assistant:
+    description: Restricted-access assistant with filtered content and limited tools
     tone: encouraging and simple
     library_scopes: [kids_books, homework]
     calendar_access: [family]
@@ -45,7 +45,7 @@ Changes take effect on the next server restart (personas are cached at startup).
 | `tone` | string | Appended to the system prompt: "be {tone}" |
 | `library_scopes` | list | Documents the LLM is allowed to surface when using `search_library` |
 | `calendar_access` | list | Calendar categories the assistant can read/write |
-| `content_filter` | `"strict"` or `""` | `"strict"` adds child-safe content restrictions to the system prompt |
+| `content_filter` | `"strict"` or `""` | `"strict"` adds restricted-access content restrictions to the system prompt |
 | `blocked_tools` | list | Tool function names removed from the LLM's schema — model never sees them |
 
 ---
@@ -69,11 +69,11 @@ get_tools_for_user(user_context)
 Each user record has a `persona` field. Set it at registration or update it via the admin API:
 
 ```bash
-# Update user 3's persona to kids_assistant
+# Update user 3's persona to restricted_assistant
 curl -X PATCH http://localhost:8000/admin/users/3 \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"persona": "kids_assistant"}'
+  -d '{"persona": "restricted_assistant"}'
 ```
 
 ---
@@ -118,7 +118,7 @@ The iOS/macOS app fetches personas from `GET /chat/personas` and displays
 them in the **Settings → Persona** picker. Each persona shows:
 - Description
 - Tone badge
-- Kids-safe badge (if `content_filter: strict`)
+- Filtered-access badge (if `content_filter: strict`)
 - Restricted-tools badge (if `blocked_tools` is non-empty)
 
 The selected persona is stored in `UserDefaults` and sent as part of the

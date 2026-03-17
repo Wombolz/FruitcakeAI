@@ -3,10 +3,10 @@ FruitcakeAI v5 — Agent tests
 
 Covers:
 - Tool schema format validation (all schemas have required keys)
-- Persona-based tool filtering (kids_assistant blocks web/rss tools)
+- Persona-based tool filtering (restricted_assistant blocks web/rss tools)
 - dispatch_tool_calls with an unknown tool returns an error string
 - Tool count: family_assistant sees all built-in + MCP tools;
-  kids_assistant sees only the unblocked subset
+  restricted_assistant sees only the unblocked subset
 
 No real LLM calls are made — the agent dispatch path is tested at the
 tool-registry level using mock UserContext objects.
@@ -108,11 +108,11 @@ def test_family_assistant_no_blocked_tools():
     assert "summarize_document" in names
 
 
-def test_kids_assistant_blocks_web_tools():
-    """kids_assistant blocks web_search, fetch_page, get_feed_items, search_feeds."""
+def test_restricted_assistant_blocks_web_tools():
+    """restricted_assistant blocks web_search, fetch_page, get_feed_items, search_feeds."""
     from unittest.mock import patch, MagicMock
-    kids_blocked = ["web_search", "fetch_page", "get_feed_items", "search_feeds"]
-    ctx = _make_context(persona="kids_assistant", blocked=kids_blocked)
+    restricted_blocked = ["web_search", "fetch_page", "get_feed_items", "search_feeds"]
+    ctx = _make_context(persona="restricted_assistant", blocked=restricted_blocked)
 
     fake_mcp_tools = [
         {"type": "function", "function": {"name": name, "description": "", "parameters": {"type": "object", "properties": {}}}}
@@ -126,8 +126,8 @@ def test_kids_assistant_blocks_web_tools():
         tools = get_tools_for_user(ctx)
 
     names = [t["function"]["name"] for t in tools]
-    for blocked in kids_blocked:
-        assert blocked not in names, f"Blocked tool '{blocked}' still in kids tool list"
+    for blocked in restricted_blocked:
+        assert blocked not in names, f"Blocked tool '{blocked}' still in restricted tool list"
     assert "list_events" in names
 
 
