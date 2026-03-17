@@ -39,7 +39,7 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     full_name = Column(String(255))
 
-    # Role: admin | parent | child | guest
+    # Role: admin | parent | restricted | guest
     role = Column(String(50), default=settings.default_user_role, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
 

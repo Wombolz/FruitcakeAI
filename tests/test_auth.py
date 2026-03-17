@@ -304,6 +304,16 @@ async def test_update_session_persona(client):
 
 
 @pytest.mark.asyncio
+async def test_personas_endpoint_uses_restricted_naming(client):
+    resp = await client.get("/chat/personas")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "restricted_assistant" in data
+    assert "kids_assistant" not in data
+    assert data["restricted_assistant"]["content_filter"] == "strict"
+
+
+@pytest.mark.asyncio
 async def test_chat_tools_endpoint_returns_tools(client):
     await client.post("/auth/register", json={
         "username": "tooluser",
@@ -400,3 +410,32 @@ async def test_missing_bearer_prefix_rejected(client):
 
     resp = await client.get("/auth/me", headers={"Authorization": token})
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_get_session_history_includes_message_timestamps(client):
+    await client.post("/auth/register", json={
+        "username": "historyuser",
+        "email": "history@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "historyuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "History"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with patch("app.api.chat.run_agent", new_callable=AsyncMock, return_value="ok"):
+        sent = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "hello"},
+            headers=headers,
+        )
+    assert sent.status_code == 200
+
+    history = await client.get(f"/chat/sessions/{session_id}", headers=headers)
+    assert history.status_code == 200
+    messages = history.json()["messages"]
+    assert len(messages) >= 2
+    assert all("created_at" in msg for msg in messages)

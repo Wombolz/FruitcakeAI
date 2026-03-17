@@ -1079,7 +1079,7 @@ Verification highlights:
 ## Phase 5.5 — Adaptive Chat Orchestration (Quality Parity)
 
 **Goal**: close the quality gap between single-turn chat and task-mode execution on local models by adding optional task-like scaffolding to chat only when complexity warrants it.
-**Status**: 5.5.1-5.5.5 merged to `main`; 5.5.6 implemented in branch `codex/phase5.5.6-memory-grounding`.
+**Status**: 5.5.1-5.5.5 merged to `main`; 5.5.6 implemented in branch `codex/phase5.5.6-memory-grounding`; 5.5.7 in progress.
 
 **Why now**:
 - Current task runs outperform chat on reliability because tasks use explicit planning, tool-grounding, and final synthesis.
@@ -1167,6 +1167,21 @@ Verification highlights:
   - Added explicit recall endpoint `POST /memories/{id}/recall`.
   - Added `last_accessed_at` tracking for deliberate recall/material-use paths.
   - Successful task runs now record deliberate memory access once per run for recalled memories used in task execution.
+
+**Sprint 5.5.7 — Restricted-access terminology cleanup**
+- Goal:
+  - remove child/kids product language from user roles, personas, prompts, and user-facing docs,
+  - preserve strict filtering and blocked-tool behavior under neutral capability-based naming.
+- Implementation:
+  - rename role `child` to `restricted`,
+  - rename persona `kids_assistant` to `restricted_assistant`,
+  - update seed users, prompt language, API/docs references, and persona picker labels,
+  - add compatibility migration to rewrite legacy `child` / `kids_assistant` values in `users`, `tasks`, and `chat_sessions`.
+- Acceptance:
+  - strict content filter and blocked tools behave exactly as before,
+  - clients/API surfaces return `restricted` / `restricted_assistant`,
+  - legacy DB rows are rewritten safely by migration,
+  - auth/agent/persona regression tests pass.
 
 **Acceptance criteria**
 1. Complex chat prompts show measurable quality improvement without forcing heavy orchestration on simple chat.

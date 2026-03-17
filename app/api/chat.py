@@ -183,7 +183,15 @@ async def get_session(
         "title": session.title,
         "persona": session.persona,
         "llm_model": session.llm_model,
-        "messages": [{"id": m.id, "role": m.role, "content": m.content} for m in messages],
+        "messages": [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at,
+            }
+            for m in messages
+        ],
     }
 
 

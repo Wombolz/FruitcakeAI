@@ -11,15 +11,15 @@ personas:
     blocked_tools: []
     intent_keywords: [family, home, household, chores, groceries, recipe]
 
-  kids_assistant:
-    description: Safe, age-appropriate assistant for children
+  restricted_assistant:
+    description: Restricted-access assistant with filtered content and limited tools
     tone: encouraging and simple
     library_scopes: [kids_books, homework]
     calendar_access: [family]
     content_filter: strict
     # Block all open-web tools by their exact function names
     blocked_tools: [web_search, fetch_page, get_feed_items, search_feeds]
-    intent_keywords: [homework, school, kids, child, spelling, reading]
+    intent_keywords: [homework, school, spelling, reading, beginner, student]
 
   work_assistant:
     description: Focused on professional tasks and productivity
