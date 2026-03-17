@@ -50,7 +50,7 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 
 **Agent and personas**
 - LiteLLM agent loop — works with Ollama, Claude, or OpenAI via one env var change
-- Multi-user JWT auth with role-based personas (`admin`, `parent`, `child`, `guest`)
+- Multi-user JWT auth with role-based personas (`admin`, `parent`, `restricted`, `guest`)
 - Per-persona tool scoping, content filtering, and tone configuration
 - Streaming chat via WebSocket; REST fallback
 
@@ -98,8 +98,8 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 ### 1. Clone and configure
 
 ```bash
-git clone https://github.com/Wombolz/fruitcake_v5.git fruitcake_v5
-cd fruitcake_v5
+git clone https://github.com/Wombolz/FruitcakeAI.git FruitcakeAI
+cd FruitcakeAI
 cp .env.example .env
 ```
 
@@ -135,7 +135,7 @@ Default users — **change these passwords before running on a shared network:**
 |----------|----------|------|
 | admin | changeme123 | admin |
 | parent | changeme123 | parent |
-| kid | changeme123 | child |
+| restricted | changeme123 | restricted |
 | guest | changeme123 | guest |
 
 ### 4. Verify
@@ -147,7 +147,7 @@ curl http://localhost:8000/health
 
 ### 5. Open the Swift app
 
-1. Open `../FruitcakeAi/FruitcakeAi.xcodeproj` in Xcode
+1. Open the `FruitcakeAI_Client` Swift project in Xcode
 2. Build and run (`⌘R`)
 3. Settings → Server URL → `http://localhost:8000`
 4. Log in with any seed user
@@ -188,7 +188,7 @@ pytest tests/
 ## Project Structure
 
 ```
-fruitcake_v5/
+FruitcakeAI/
 ├── app/
 │   ├── agent/          Agent loop, tools, personas, context builder
 │   ├── api/
@@ -227,6 +227,7 @@ fruitcake_v5/
 | [Persona System](Docs/PERSONA_SYSTEM.md) | Configuring users, roles, and personas |
 | [LLM Backends](Docs/LLM_BACKENDS.md) | Switching between Ollama, Claude, OpenAI |
 | [Roadmap](Docs/FruitcakeAi Roadmap.md) | Where development is now and where it's going |
+| [Repo Realignment Runbook](Docs/repo_realignment_runbook.md) | Release-prep rename, rollback, and validation checklist |
 
 ---
 
