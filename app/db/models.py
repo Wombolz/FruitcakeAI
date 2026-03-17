@@ -256,6 +256,7 @@ class Memory(Base):
     # Tracks how many times this memory has been retrieved.
     # Used for usage analytics and optional pruning heuristics.
     access_count = Column(Integer, default=0, nullable=False)
+    last_accessed_at = Column(DateTime(timezone=True), nullable=True)
 
     # Optional JSON array of string tags for filtering/grouping
     tags = Column(Text, default="[]")

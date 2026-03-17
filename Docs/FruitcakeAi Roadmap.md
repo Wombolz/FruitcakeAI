@@ -1079,7 +1079,7 @@ Verification highlights:
 ## Phase 5.5 — Adaptive Chat Orchestration (Quality Parity)
 
 **Goal**: close the quality gap between single-turn chat and task-mode execution on local models by adding optional task-like scaffolding to chat only when complexity warrants it.
-**Status**: 5.5.1-5.5.5 implemented in branch `codex/phase5.5.5-library-grounding`; 5.5.6 planned next.
+**Status**: 5.5.1-5.5.5 merged to `main`; 5.5.6 implemented in branch `codex/phase5.5.6-memory-grounding`.
 
 **Why now**:
 - Current task runs outperform chat on reliability because tasks use explicit planning, tool-grounding, and final synthesis.
@@ -1161,6 +1161,12 @@ Verification highlights:
   - generic retrieval does not increment `access_count`,
   - explicit recall/material use updates access metadata once,
   - chat/task/memory regression suites pass.
+- Completed:
+  - Normal chat now injects baseline memory context before agent execution, using the same `MemoryService` retrieval + prompt rendering pattern as task mode.
+  - Passive retrieval no longer mutates memory access metadata during chat/task context assembly.
+  - Added explicit recall endpoint `POST /memories/{id}/recall`.
+  - Added `last_accessed_at` tracking for deliberate recall/material-use paths.
+  - Successful task runs now record deliberate memory access once per run for recalled memories used in task execution.
 
 **Acceptance criteria**
 1. Complex chat prompts show measurable quality improvement without forcing heavy orchestration on simple chat.

@@ -3,6 +3,7 @@ FruitcakeAI v5 — Memories API (Phase 4)
 
 GET    /memories           List active memories for current user
 POST   /memories           Create a memory (for admin/testing — agent uses create_memory tool)
+POST   /memories/{id}/recall  Record an explicit memory recall/open action
 PATCH  /memories/{id}      Update importance or tags
 DELETE /memories/{id}      Deactivate (soft-delete)
 """
@@ -46,6 +47,7 @@ class MemoryOut(BaseModel):
     content: str
     importance: float
     access_count: int
+    last_accessed_at: Optional[datetime]
     tags: List[str]
     is_active: bool
     expires_at: Optional[datetime]
@@ -62,6 +64,7 @@ class MemoryOut(BaseModel):
             content=obj.content,
             importance=obj.importance,
             access_count=obj.access_count,
+            last_accessed_at=obj.last_accessed_at,
             tags=obj.tags_list,
             is_active=obj.is_active,
             expires_at=obj.expires_at,
@@ -150,6 +153,19 @@ async def delete_memory(
     found = await svc.deactivate(db=db, memory_id=memory_id, user_id=current_user.id)
     if not found:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found")
+
+
+@router.post("/memories/{memory_id}/recall", response_model=MemoryOut)
+async def recall_memory(
+    memory_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    memory = await _get_owned_memory(memory_id, current_user.id, db)
+    svc = get_memory_service()
+    await svc.mark_accessed([memory.id], mode="direct_recall", db=db)
+    await db.refresh(memory)
+    return MemoryOut.from_orm(memory)
 
 
 # ── Internal helper ───────────────────────────────────────────────────────────
