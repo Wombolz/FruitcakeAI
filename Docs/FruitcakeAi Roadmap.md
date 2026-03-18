@@ -1193,9 +1193,9 @@ Verification highlights:
 
 ---
 
-## Phase 5.6 — Release Prep: Repository Realignment (Planning Only)
+## Phase 5.6 — Release Prep: Repository Realignment
 
-**Status**: Planned only. Do not execute until Phase 5.5 stabilization is complete.
+**Status**: Completed. Backend/runtime repo now lives at `FruitcakeAI`; shared Apple client repo now lives at `FruitcakeAI_Client`.
 
 **Goal**: align repository boundaries before Phase 6 so ownership, release flow, and open-source onboarding are clean.
 
@@ -1261,9 +1261,35 @@ Acceptance additions for Sprint 5.6.5:
 
 ---
 
+## Phase 5.7 — Memory Governance and User Data Control
+
+**Goal**: give users a direct answer to “what do you know about me?” and “clear what you know about me” for memory data before public launch pressure increases.
+
+**Sprint 5.7.1 — Memory export + bulk delete**
+- Add `GET /memories/export` for authenticated user memory export in JSON.
+- Add `POST /memories/bulk-delete` to soft-delete all memories for the authenticated user.
+- Include active + inactive memory history in export so the file reflects both current and prior memory state.
+- Extend the Swift Memories UI with:
+  - `Export Memories`
+  - `Delete All Memories`
+- Keep delete behavior soft-delete only in this sprint; full user-data erasure is deferred.
+
+**Acceptance**
+1. Users can export all of their memories without database access.
+2. Users can clear all active memories from the Swift UI with explicit confirmation.
+3. Existing per-memory recall, ranking, and task/chat injection behavior remains unchanged.
+4. Export/delete actions are scoped strictly to the authenticated user.
+
+---
+
 ## Phase 6 Entry Criteria
 
 North Star governance note: this direction filters decisions and prioritization; it does not by itself expand implementation scope before phase gates are met.
+
+Phase 5.5 follow-up reliability note:
+- **Local LLM crash/unavailable hardening**
+  - current dispatch gating already covers transient unavailability and pause/requeue behavior,
+  - remaining work is explicit crash-state detection and recovery for Ollama/model-load failure modes so chat/tasks degrade cleanly when the local model process dies, hangs, or fails to reload.
 
 Phase 6 starts only when all are true:
 1. MCP error rate is below agreed threshold in daily use.
@@ -1347,6 +1373,11 @@ async def spawn_agent(instruction: str, persona: str, timeout_seconds: int = 120
     return result
 ```
 
+Design prerequisite before implementation:
+- Sub-agents must inherit the parent scope ceiling and approval requirements.
+- A child agent must not be able to trigger an irreversible action that would have required approval or been blocked in the parent context.
+- Audit lineage must preserve parent run -> child run relationships for any delegated action.
+
 **Sprint 7.4** — Graph Memory Foundation (MCP-informed, Fruitcake-native)
 
 Goal: add durable relationship memory for long-horizon reasoning without adopting the MCP demo memory server as a production dependency.
@@ -1398,6 +1429,11 @@ The extraction prompt reviews each session: *"Extract any facts about the user w
 
 **Delta from home version**: SSO/LDAP/SAML · Teams (10–500 users) · ACL role matrix · Compliance export + retention · Docker Compose / K8s manifests · All judgment routing locked to `local` = air-gapped compliance guarantee · HIPAA/SOC 2 path · Mandatory audit logging.
 
+Architecture note before Phase 9:
+- Enterprise tenant isolation is not fully modeled in the current family-scoped schema.
+- A tenant strategy decision (`tenant_id` column family vs stronger isolation model) must be made before enterprise data complexity grows further.
+- This is recorded now to avoid a painful retrofit later, but implementation is deferred until enterprise work is actually active.
+
 **Why v5 already supports this**: persona=role mapping · library scopes→workspaces · LiteLLM model swap via env var · Memory scoped per-user already · `autonomy.yaml` all-local = one config change.
 
 ---
@@ -1447,7 +1483,7 @@ Ollama runs locally. Tasks use the local model. The only thing that leaves the m
 If the agent decides nothing needs attention, return the token and suppress delivery. No noise, no training users to ignore notifications. The suppression threshold (300 chars) is configurable.
 
 **Active hours — first class, not optional.**
-A heartbeat that can fire at 3am is a product-killing failure mode. `active_hours` is stored per-user and enforced at the heartbeat runner level. ⚠️ Three config sources must resolve to one: `heartbeat.yaml` defaults → user-level fields → per-task override. Resolution order is task → user → yaml. The `User` model needs `active_hours_start`, `active_hours_end`, `active_hours_tz` columns (add to Alembic migration in Sprint 4.1 alongside Task and DeviceToken).
+A heartbeat that can fire at 3am is a product-killing failure mode. `active_hours` is stored per-user and enforced at the heartbeat runner level. ⚠️ Three config sources must resolve to one: `heartbeat.yaml` defaults → user-level fields → per-task override. Resolution order is task → user → yaml. The `User` model needs `active_hours_start`, `active_hours_end`, `active_hours_tz` columns (add to Alembic migration in Sprint 4.1 alongside Task and DeviceToken). Remaining follow-up: collapse this into one canonical active-hours resolver and lock it with tests before broader autonomous behavior expands.
 
 **Approval workflow for irreversible actions.**
 Primary documented failure mode in the OpenClaw community. Any tool in `APPROVAL_REQUIRED_TOOLS` pauses the task in `waiting_approval`, sends a push, and waits for the user to confirm from the Inbox tab. Safe-by-default is non-negotiable for a system that acts without the user present.

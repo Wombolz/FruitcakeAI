@@ -229,6 +229,38 @@ class MemoryService:
         log.info("memory.deactivated", memory_id=memory_id, user_id=user_id)
         return True
 
+    async def list_for_user(
+        self,
+        db: AsyncSession,
+        user_id: int,
+        *,
+        include_inactive: bool = False,
+    ) -> list[Memory]:
+        filters = [Memory.user_id == user_id]
+        if not include_inactive:
+            filters.append(Memory.is_active == True)
+
+        result = await db.execute(
+            select(Memory)
+            .where(and_(*filters))
+            .order_by(Memory.created_at.desc(), Memory.id.desc())
+        )
+        return list(result.scalars().all())
+
+    async def deactivate_all_for_user(self, db: AsyncSession, user_id: int) -> int:
+        result = await db.execute(
+            select(Memory).where(
+                and_(Memory.user_id == user_id, Memory.is_active == True)
+            )
+        )
+        memories = list(result.scalars().all())
+        for memory in memories:
+            memory.is_active = False
+        if memories:
+            await db.flush()
+        log.info("memory.bulk_deactivated", user_id=user_id, count=len(memories))
+        return len(memories)
+
     async def mark_accessed(
         self,
         memory_ids: Iterable[int],

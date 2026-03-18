@@ -14,8 +14,10 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import and_, desc, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
@@ -72,6 +74,18 @@ class MemoryOut(BaseModel):
         )
 
 
+class BulkDeleteMemoriesOut(BaseModel):
+    deactivated_count: int
+    deleted_at: datetime
+
+
+class MemoryExportOut(BaseModel):
+    user_id: int
+    exported_at: datetime
+    memory_count: int
+    memories: List[MemoryOut]
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get("/memories", response_model=List[MemoryOut])
@@ -80,17 +94,31 @@ async def list_memories(
     db: AsyncSession = Depends(get_db),
     include_inactive: bool = False,
 ):
-    filters = [Memory.user_id == current_user.id]
-    if not include_inactive:
-        filters.append(Memory.is_active == True)
-
-    result = await db.execute(
-        select(Memory)
-        .where(and_(*filters))
-        .order_by(desc(Memory.importance), desc(Memory.created_at))
-    )
-    memories = result.scalars().all()
+    svc = get_memory_service()
+    memories = await svc.list_for_user(db, current_user.id, include_inactive=include_inactive)
+    memories.sort(key=lambda m: ((m.importance or 0.0), m.created_at or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
     return [MemoryOut.from_orm(m) for m in memories]
+
+
+@router.get("/memories/export")
+async def export_memories(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    svc = get_memory_service()
+    memories = await svc.list_for_user(db, current_user.id, include_inactive=True)
+    exported_at = datetime.now(timezone.utc)
+    payload = MemoryExportOut(
+        user_id=current_user.id,
+        exported_at=exported_at,
+        memory_count=len(memories),
+        memories=[MemoryOut.from_orm(m) for m in memories],
+    )
+    filename = f"fruitcakeai-memories-user-{current_user.id}-{exported_at.strftime('%Y%m%dT%H%M%SZ')}.json"
+    return JSONResponse(
+        content=jsonable_encoder(payload.model_dump()),
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/memories", response_model=MemoryOut, status_code=status.HTTP_201_CREATED)
@@ -153,6 +181,20 @@ async def delete_memory(
     found = await svc.deactivate(db=db, memory_id=memory_id, user_id=current_user.id)
     if not found:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found")
+
+
+@router.post("/memories/bulk-delete", response_model=BulkDeleteMemoriesOut)
+async def bulk_delete_memories(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    svc = get_memory_service()
+    deleted_at = datetime.now(timezone.utc)
+    deactivated_count = await svc.deactivate_all_for_user(db=db, user_id=current_user.id)
+    return BulkDeleteMemoriesOut(
+        deactivated_count=deactivated_count,
+        deleted_at=deleted_at,
+    )
 
 
 @router.post("/memories/{memory_id}/recall", response_model=MemoryOut)
