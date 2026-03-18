@@ -343,12 +343,19 @@ class TaskRunner:
 
         # Build UserContext (re-fetch user while session open so from_user can read attributes)
         from app.agent.context import UserContext
+        from app.skills.service import hydrate_user_context
 
         async with AsyncSessionLocal() as db:
             user = await db.get(User, task_user_id)
             if user is None:
                 raise ValueError(f"User {task_user_id} not found for task {task_id}")
             user_context = UserContext.from_user(user, persona_name=persona_name)
+            user_context.allowed_tool_cap = list(resolved.allowed_tools)
+            user_context = await hydrate_user_context(
+                db,
+                user_context,
+                query=(task_instruction or task_title or ""),
+            )
         user_context.session_id = session_id
 
         # Planned mode: execute TaskStep graph.
@@ -397,9 +404,22 @@ class TaskRunner:
                 model_override=model_profile.final_synthesis_model if model_profile else None,
                 stage="task_single_stage",
             )
+            run_debug = {
+                "profile": getattr(task_profile, "name", "default"),
+                "active_skills": list(user_context.active_skill_slugs or []),
+                "skill_selection_mode": user_context.skill_selection_mode or "",
+                "skill_injection_events": [
+                    {
+                        "stage": "task_single_stage",
+                        "active_skills": list(user_context.active_skill_slugs or []),
+                        "selection_mode": user_context.skill_selection_mode or "",
+                        "details": list(user_context.skill_injection_details or []),
+                    }
+                ],
+            }
             if recalled_memory_ids:
                 await svc.mark_accessed(sorted(recalled_memory_ids), mode="task_materialized")
-            return result, {}
+            return result, run_debug
         finally:
             _approval_armed.reset(token)
 
@@ -427,6 +447,7 @@ class TaskRunner:
         from app.db.session import AsyncSessionLocal
         from app.agent.core import run_agent
         from app.memory.service import get_memory_service
+        from app.skills.service import hydrate_user_context
 
         final_result = ""
         repeated_error_counts: dict[str, int] = {}
@@ -438,6 +459,9 @@ class TaskRunner:
         run_debug: dict[str, object] = {
             "profile": getattr(task_profile, "name", "default"),
             "tool_failure_suppressions": suppression_events,
+            "active_skills": list(step_user_context.active_skill_slugs or []),
+            "skill_selection_mode": step_user_context.skill_selection_mode or "",
+            "skill_injection_events": [],
         }
 
         if task_profile and task_run_id:
@@ -484,6 +508,26 @@ class TaskRunner:
                 svc = get_memory_service()
                 memories = await svc.retrieve_for_context(db, user_id, query=step.instruction)
                 recalled_memory_ids.update(int(m.id) for m in memories)
+                step_context = replace(step_user_context)
+                step_context = await hydrate_user_context(
+                    db,
+                    step_context,
+                    query=step.instruction,
+                )
+                skill_events = run_debug.setdefault("skill_injection_events", [])
+                if isinstance(skill_events, list):
+                    skill_events.append(
+                        {
+                            "stage": f"step_{step.step_index}",
+                            "active_skills": list(step_context.active_skill_slugs or []),
+                            "selection_mode": step_context.skill_selection_mode or "",
+                            "details": list(step_context.skill_injection_details or []),
+                        }
+                    )
+                active_skills = set(run_debug.get("active_skills") or [])
+                active_skills.update(step_context.active_skill_slugs or [])
+                run_debug["active_skills"] = sorted(active_skills)
+                run_debug["skill_selection_mode"] = step_context.skill_selection_mode or run_debug.get("skill_selection_mode") or ""
 
             # Summaries from previous succeeded steps keep context compact.
             prior_summaries: list[str] = []
@@ -541,7 +585,7 @@ class TaskRunner:
             try:
                 result = await self._run_step_with_model_policy(
                     prompt="\n\n".join(prompt_parts),
-                    user_context=step_user_context,
+                    user_context=step_context,
                     primary_model=primary_model,
                     final_model=model_profile.final_synthesis_model,
                     stage=stage,

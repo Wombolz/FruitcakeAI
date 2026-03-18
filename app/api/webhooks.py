@@ -28,6 +28,7 @@ from app.auth.dependencies import get_current_user
 from app.db.models import ChatMessage, ChatSession, User, WebhookConfig
 from app.db.session import AsyncSessionLocal, get_db
 from app.metrics import metrics
+from app.skills.service import hydrate_user_context
 
 router = APIRouter()
 log = structlog.get_logger(__name__)
@@ -56,6 +57,7 @@ class WebhookOut(BaseModel):
 class WebhookTriggerOut(BaseModel):
     accepted: bool
     webhook_id: int
+    metadata: Dict[str, Any] | None = None
 
 
 # ── Public trigger endpoint (no auth) ────────────────────────────────────────
@@ -82,9 +84,19 @@ async def trigger_webhook(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook not found")
 
     payload = await _parse_payload(request)
+    user = await db.get(User, cfg.user_id)
+    metadata: Dict[str, Any] | None = None
+    if user is not None:
+        user_context = UserContext.from_user(user, persona_name=user.persona)
+        user_context.allowed_tool_cap = []
+        user_context = await hydrate_user_context(db, user_context, query=cfg.instruction)
+        metadata = {
+            "active_skills": list(user_context.active_skill_slugs or []),
+            "skill_selection_mode": user_context.skill_selection_mode or "",
+        }
     background_tasks.add_task(_execute_webhook, cfg.id, payload)
 
-    return WebhookTriggerOut(accepted=True, webhook_id=cfg.id)
+    return WebhookTriggerOut(accepted=True, webhook_id=cfg.id, metadata=metadata)
 
 
 # ── Authenticated webhook config CRUD ────────────────────────────────────────
@@ -214,6 +226,8 @@ async def _execute_webhook(webhook_id: int, payload: Dict[str, Any]) -> None:
             return
         model_profile = resolve_task_model_profile(task=None, user=user)
         user_context = UserContext.from_user(user, persona_name=persona)
+        user_context.allowed_tool_cap = []
+        user_context = await hydrate_user_context(db, user_context, query=cfg_instruction)
     user_context.session_id = session_id
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

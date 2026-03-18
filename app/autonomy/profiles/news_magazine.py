@@ -163,6 +163,9 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
             "dataset_stats": run_debug.get("dataset_stats", {}),
             "refresh_stats": run_debug.get("refresh_stats", {}),
             "suppression_events": run_debug.get("tool_failure_suppressions", []),
+            "active_skills": run_debug.get("active_skills", []),
+            "skill_selection_mode": run_debug.get("skill_selection_mode", ""),
+            "skill_injection_events": run_debug.get("skill_injection_events", []),
         }
         if isinstance(dataset, dict):
             out.append({"artifact_type": "prepared_dataset", "content_json": dataset})

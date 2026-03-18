@@ -13,11 +13,12 @@ GET  /admin/task-runs      — Phase 4 debug: task run history with tool calls
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,9 +27,16 @@ from app.auth.dependencies import require_admin
 from app.auth.jwt import hash_password
 from app.autonomy.push import get_apns_pusher
 from app.config import settings
-from app.db.models import AuditLog, DeviceToken, RSSSource, RSSSourceCandidate, Task, TaskRun, User
+from app.db.models import AuditLog, DeviceToken, RSSSource, RSSSourceCandidate, Skill, Task, TaskRun, User
+from app.db.models import TaskRunArtifact
 from app.db.session import get_db
 from app.metrics import metrics
+from app.skills.service import (
+    SkillConflictError,
+    SkillNotFoundError,
+    SkillValidationError,
+    get_skill_service,
+)
 
 router = APIRouter()
 
@@ -75,6 +83,86 @@ class TestPushRequest(BaseModel):
     body: str = "This is a test notification from FruitcakeAI."
 
 
+class SkillPreviewRequest(BaseModel):
+    content: Optional[str] = None
+    source_url: Optional[str] = None
+    personal_user_id: Optional[int] = None
+
+
+class SkillPreviewResponse(BaseModel):
+    slug: str
+    name: str
+    description: str
+    system_prompt_addition: str
+    allowed_tool_additions: List[str]
+    scope: str
+    personal_user_id: Optional[int]
+    source_url: Optional[str]
+    is_pinned: bool
+    validation_warnings: List[str]
+    preview_hash: str
+
+
+class SkillInstallRequest(BaseModel):
+    slug: str
+    name: str
+    description: str
+    system_prompt_addition: str
+    allowed_tool_additions: List[str] = []
+    scope: str
+    personal_user_id: Optional[int] = None
+    source_url: Optional[str] = None
+    is_pinned: bool = False
+    preview_hash: str
+
+
+class SkillUpdateRequest(BaseModel):
+    is_active: Optional[bool] = None
+    is_pinned: Optional[bool] = None
+    scope: Optional[str] = None
+    personal_user_id: Optional[int] = None
+
+
+class SkillOut(BaseModel):
+    id: int
+    slug: str
+    name: str
+    description: str
+    allowed_tool_additions: List[str]
+    scope: str
+    personal_user_id: Optional[int]
+    is_active: bool
+    is_pinned: bool
+    source_url: Optional[str]
+    content_hash: str
+    installed_at: Optional[datetime]
+    installed_by: Optional[int]
+    installed_by_username: Optional[str] = None
+    supersedes_skill_id: Optional[int] = None
+
+
+class SkillInjectionPreviewOut(BaseModel):
+    skill_id: int
+    slug: str
+    name: str
+    score: float
+    included: bool
+    reason: str
+    estimated_tokens: int
+    active: bool
+    scope: str
+    selection_mode: str
+
+
+_ARTIFACT_ORDER = {
+    "prepared_dataset": 0,
+    "draft_output": 1,
+    "final_output": 2,
+    "validation_report": 3,
+    "run_diagnostics": 4,
+}
+
+
 # ── GET /admin/metrics ────────────────────────────────────────────────────────
 
 @router.get("/metrics")
@@ -101,6 +189,7 @@ async def admin_health(
     rag_status = _check_rag()
     mcp_status = _check_mcp()
     llm_dispatch_gate = _check_llm_dispatch_gate()
+    skills_status = await _check_skills(db)
 
     overall = "ok"
     if any(s.get("status") == "error" for s in [db_status, llm_status, rag_status]):
@@ -113,6 +202,7 @@ async def admin_health(
         "llm_dispatch_gate": llm_dispatch_gate,
         "embedding_model": rag_status,
         "mcp": mcp_status,
+        "skills": skills_status,
     }
 
 
@@ -163,6 +253,22 @@ def _check_llm_dispatch_gate() -> Dict[str, Any]:
     }
 
 
+async def _check_skills(db: AsyncSession) -> Dict[str, Any]:
+    service = get_skill_service()
+    total = (
+        await db.execute(select(func.count()).select_from(Skill))
+    ).scalar_one()
+    active = (
+        await db.execute(select(func.count()).select_from(Skill).where(Skill.is_active == True))
+    ).scalar_one()
+    return {
+        "status": "ok",
+        "total_count": int(total or 0),
+        "active_count": int(active or 0),
+        "selection_mode": service.relevance_mode(),
+    }
+
+
 # ── GET /admin/tools ──────────────────────────────────────────────────────────
 
 @router.get("/tools")
@@ -176,6 +282,306 @@ async def list_tools(
     """
     from app.mcp.registry import get_mcp_registry
     return get_mcp_registry().get_status()
+
+
+def _skill_to_out(skill: Skill, installer: Optional[User] = None) -> SkillOut:
+    return SkillOut(
+        id=skill.id,
+        slug=skill.slug,
+        name=skill.name,
+        description=skill.description,
+        allowed_tool_additions=skill.allowed_tool_additions,
+        scope=skill.scope,
+        personal_user_id=skill.personal_user_id,
+        is_active=skill.is_active,
+        is_pinned=skill.is_pinned,
+        source_url=skill.source_url,
+        content_hash=skill.content_hash,
+        installed_at=skill.installed_at,
+        installed_by=skill.installed_by,
+        installed_by_username=getattr(installer, "username", None),
+        supersedes_skill_id=skill.supersedes_skill_id,
+    )
+
+
+def _decode_artifact_json(raw: Optional[str]) -> Any:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def _artifact_sort_key(artifact: TaskRunArtifact) -> tuple[int, datetime, int]:
+    created = artifact.created_at or datetime.min
+    return (_ARTIFACT_ORDER.get(artifact.artifact_type, 99), created, artifact.id or 0)
+
+
+def _serialize_artifact(artifact: TaskRunArtifact) -> Dict[str, Any]:
+    return {
+        "id": artifact.id,
+        "artifact_type": artifact.artifact_type,
+        "content_json": _decode_artifact_json(artifact.content_json),
+        "content_text": artifact.content_text,
+        "created_at": artifact.created_at,
+    }
+
+
+def _tool_call_payload(entry: AuditLog) -> Dict[str, Any]:
+    return {
+        "id": entry.id,
+        "tool": entry.tool,
+        "arguments": entry.arguments,
+        "result_summary": entry.result_summary,
+        "called_at": entry.created_at,
+    }
+
+
+def _normalized_diagnostics(artifacts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    artifact_map = {artifact["artifact_type"]: artifact for artifact in artifacts}
+    run_diagnostics = artifact_map.get("run_diagnostics", {}).get("content_json") or {}
+    validation_report = artifact_map.get("validation_report", {}).get("content_json") or {}
+
+    if not isinstance(run_diagnostics, dict):
+        run_diagnostics = {}
+    if not isinstance(validation_report, dict):
+        validation_report = {}
+
+    return {
+        "active_skills": run_diagnostics.get("active_skills", []),
+        "skill_selection_mode": run_diagnostics.get("skill_selection_mode", ""),
+        "skill_injection_events": run_diagnostics.get("skill_injection_events", []),
+        "dataset_stats": run_diagnostics.get("dataset_stats", {}),
+        "refresh_stats": run_diagnostics.get("refresh_stats", {}),
+        "tool_failure_suppressions": run_diagnostics.get("suppression_events", []),
+        "validation_report": validation_report,
+    }
+
+
+def _duration_seconds(run: TaskRun) -> Optional[float]:
+    if run.started_at is None or run.finished_at is None:
+        return None
+    return round((run.finished_at - run.started_at).total_seconds(), 3)
+
+
+async def _load_task_run_bundle(
+    db: AsyncSession,
+    run_id: int,
+) -> tuple[TaskRun, Task, List[AuditLog], List[TaskRunArtifact]]:
+    run_result = await db.execute(
+        select(TaskRun, Task)
+        .join(Task, TaskRun.task_id == Task.id)
+        .where(TaskRun.id == run_id)
+    )
+    row = run_result.first()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+
+    run, task = row
+    logs: List[AuditLog] = []
+    if run.session_id is not None:
+        log_result = await db.execute(
+            select(AuditLog)
+            .where(AuditLog.session_id == run.session_id)
+            .order_by(AuditLog.created_at, AuditLog.id)
+        )
+        logs = list(log_result.scalars().all())
+
+    artifact_result = await db.execute(
+        select(TaskRunArtifact)
+        .where(TaskRunArtifact.task_run_id == run.id)
+        .order_by(TaskRunArtifact.created_at, TaskRunArtifact.id)
+    )
+    artifacts = list(artifact_result.scalars().all())
+    return run, task, logs, artifacts
+
+
+async def _build_task_run_inspect_payload(db: AsyncSession, run_id: int) -> Dict[str, Any]:
+    run, task, logs, artifacts = await _load_task_run_bundle(db, run_id)
+    ordered_artifacts = [_serialize_artifact(a) for a in sorted(artifacts, key=_artifact_sort_key)]
+    tool_timeline = [_tool_call_payload(entry) for entry in logs]
+    diagnostics = _normalized_diagnostics(ordered_artifacts)
+
+    return {
+        "run": {
+            "id": run.id,
+            "status": run.status,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "duration_seconds": _duration_seconds(run),
+            "session_id": run.session_id,
+            "error": run.error,
+            "summary": run.summary,
+        },
+        "task": {
+            "id": task.id,
+            "title": task.title,
+            "instruction": task.instruction,
+            "task_type": task.task_type,
+            "profile": task.profile or "default",
+            "retry_count": task.retry_count,
+        },
+        "execution": {
+            "active_skills": diagnostics.get("active_skills", []),
+            "skill_selection_mode": diagnostics.get("skill_selection_mode", ""),
+            "tool_failure_suppressions": diagnostics.get("tool_failure_suppressions", []),
+            "refresh_stats": diagnostics.get("refresh_stats", {}),
+            "dataset_stats": diagnostics.get("dataset_stats", {}),
+        },
+        "tool_timeline": tool_timeline,
+        "artifacts": ordered_artifacts,
+        "diagnostics": diagnostics,
+    }
+
+
+@router.post("/skills/preview", response_model=SkillPreviewResponse)
+async def preview_skill(
+    body: SkillPreviewRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> SkillPreviewResponse:
+    service = get_skill_service()
+    try:
+        preview = await service.preview_from_request(
+            content=body.content,
+            source_url=body.source_url,
+            personal_user_id=body.personal_user_id,
+        )
+    except SkillValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return SkillPreviewResponse(
+        slug=preview.slug,
+        name=preview.name,
+        description=preview.description,
+        system_prompt_addition=preview.system_prompt_addition,
+        allowed_tool_additions=preview.allowed_tool_additions,
+        scope=preview.scope,
+        personal_user_id=preview.personal_user_id,
+        source_url=preview.source_url,
+        is_pinned=preview.is_pinned,
+        validation_warnings=preview.validation_warnings,
+        preview_hash=preview.preview_hash,
+    )
+
+
+@router.post("/skills/install", response_model=SkillOut, status_code=status.HTTP_201_CREATED)
+async def install_skill(
+    body: SkillInstallRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> SkillOut:
+    service = get_skill_service()
+    preview_payload = {
+        "slug": body.slug,
+        "name": body.name,
+        "description": body.description,
+        "system_prompt_addition": body.system_prompt_addition,
+        "allowed_tool_additions": body.allowed_tool_additions,
+        "scope": body.scope,
+        "personal_user_id": body.personal_user_id,
+        "source_url": body.source_url,
+        "is_pinned": body.is_pinned,
+    }
+    try:
+        preview = await service.preview_from_payload(preview_payload)
+        if preview.preview_hash != body.preview_hash:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="preview_hash mismatch")
+        skill = await service.install_preview(db, preview=preview, installed_by=current_user.id)
+        await db.commit()
+        await db.refresh(skill)
+    except SkillValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except SkillConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return _skill_to_out(skill, current_user)
+
+
+@router.get("/skills", response_model=List[SkillOut])
+async def list_skills(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> List[SkillOut]:
+    service = get_skill_service()
+    skills = await service.list_skills(db)
+    users = {u.id: u for u in (await db.execute(select(User))).scalars().all()}
+    return [_skill_to_out(skill, users.get(skill.installed_by)) for skill in skills]
+
+
+@router.patch("/skills/{skill_id}", response_model=SkillOut)
+async def update_skill(
+    skill_id: int,
+    body: SkillUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> SkillOut:
+    service = get_skill_service()
+    try:
+        skill = await service.update_skill(
+            db,
+            skill_id=skill_id,
+            is_active=body.is_active,
+            is_pinned=body.is_pinned,
+            scope=body.scope,
+            personal_user_id=body.personal_user_id,
+        )
+        await db.commit()
+        await db.refresh(skill)
+    except SkillValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except SkillNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return _skill_to_out(skill, current_user)
+
+
+@router.delete("/skills/{skill_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+async def delete_skill(
+    skill_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> Response:
+    service = get_skill_service()
+    try:
+        await service.delete_skill(db, skill_id=skill_id)
+        await db.commit()
+    except SkillNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/skills/{skill_id}/preview-injection", response_model=SkillInjectionPreviewOut)
+async def preview_skill_injection(
+    skill_id: int,
+    query: str = Query("", description="Sample query to test skill relevance"),
+    user_id: Optional[int] = Query(None, description="Optional user context for scope evaluation"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> SkillInjectionPreviewOut:
+    target_user_id = user_id or current_user.id
+    skill = await db.get(Skill, skill_id)
+    if skill is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="skill not found")
+    decisions = await get_skill_service().explain_injection(
+        db,
+        user_id=target_user_id,
+        query=query,
+        skill_id=skill_id,
+    )
+    if not decisions:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="skill not visible for that user")
+    decision = decisions[0]
+    return SkillInjectionPreviewOut(
+        skill_id=decision.skill_id,
+        slug=decision.slug,
+        name=decision.name,
+        score=decision.score,
+        included=decision.included,
+        reason=decision.reason,
+        estimated_tokens=decision.estimated_tokens,
+        active=skill.is_active,
+        scope=skill.scope,
+        selection_mode=decision.selection_mode,
+    )
 
 
 @router.get("/mcp/diagnostics")
@@ -416,6 +822,7 @@ async def task_runs(
     output = []
     for run, task in runs:
         tool_calls: List[Dict[str, Any]] = []
+        run_artifacts: List[Dict[str, Any]] = []
         if run.session_id is not None:
             log_result = await db.execute(
                 select(AuditLog)
@@ -431,6 +838,17 @@ async def task_runs(
                 }
                 for entry in log_result.scalars().all()
             ]
+        artifact_result = await db.execute(
+            select(TaskRunArtifact).where(TaskRunArtifact.task_run_id == run.id)
+        )
+        for artifact in artifact_result.scalars().all():
+            run_artifacts.append(
+                {
+                    "artifact_type": artifact.artifact_type,
+                    "content_json": artifact.content_json,
+                    "content_text": artifact.content_text,
+                }
+            )
 
         output.append(
             {
@@ -447,7 +865,17 @@ async def task_runs(
                 "error": run.error,
                 "retry_count": task.retry_count,
                 "tool_calls": tool_calls,
+                "artifacts": run_artifacts,
             }
         )
 
     return {"count": len(output), "runs": output}
+
+
+@router.get("/task-runs/{run_id}/inspect", tags=["admin"])
+async def inspect_task_run(
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    return await _build_task_run_inspect_payload(db, run_id)
