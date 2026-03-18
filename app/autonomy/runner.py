@@ -343,12 +343,19 @@ class TaskRunner:
 
         # Build UserContext (re-fetch user while session open so from_user can read attributes)
         from app.agent.context import UserContext
+        from app.skills.service import hydrate_user_context
 
         async with AsyncSessionLocal() as db:
             user = await db.get(User, task_user_id)
             if user is None:
                 raise ValueError(f"User {task_user_id} not found for task {task_id}")
             user_context = UserContext.from_user(user, persona_name=persona_name)
+            user_context.allowed_tool_cap = list(resolved.allowed_tools)
+            user_context = await hydrate_user_context(
+                db,
+                user_context,
+                query=(task_instruction or task_title or ""),
+            )
         user_context.session_id = session_id
 
         # Planned mode: execute TaskStep graph.
@@ -427,6 +434,7 @@ class TaskRunner:
         from app.db.session import AsyncSessionLocal
         from app.agent.core import run_agent
         from app.memory.service import get_memory_service
+        from app.skills.service import hydrate_user_context
 
         final_result = ""
         repeated_error_counts: dict[str, int] = {}
@@ -484,6 +492,12 @@ class TaskRunner:
                 svc = get_memory_service()
                 memories = await svc.retrieve_for_context(db, user_id, query=step.instruction)
                 recalled_memory_ids.update(int(m.id) for m in memories)
+                step_context = replace(step_user_context)
+                step_context = await hydrate_user_context(
+                    db,
+                    step_context,
+                    query=step.instruction,
+                )
 
             # Summaries from previous succeeded steps keep context compact.
             prior_summaries: list[str] = []
@@ -541,7 +555,7 @@ class TaskRunner:
             try:
                 result = await self._run_step_with_model_policy(
                     prompt="\n\n".join(prompt_parts),
-                    user_context=step_user_context,
+                    user_context=step_context,
                     primary_model=primary_model,
                     final_model=model_profile.final_synthesis_model,
                     stage=stage,

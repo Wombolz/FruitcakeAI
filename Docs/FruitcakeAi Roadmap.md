@@ -1236,10 +1236,11 @@ Target repository layout:
 
 **Sprint 5.6.5 — Knowledge Skills System (Admin-managed, additive)**
 - Add DB-backed `skills` records (frozen content at install time) with scope support (`shared` and `personal`).
-- Add admin two-step install flow: `POST /admin/skills/preview` then `POST /admin/skills/install` (no runtime URL fetch).
+- Add admin two-step install flow: `POST /admin/skills/preview` then `POST /admin/skills/install` (preview may fetch once from an allowlisted URL; runtime never re-fetches).
 - Inject relevant skills in `UserContext.build()` with semantic gating and explicit prompt-budget caps.
 - Keep skill tool grants additive but bounded: grants must intersect both persona `blocked_tools` and `resolve_execution_profile(...)` output.
 - Add `/admin/skills/{id}/preview-injection` diagnostics for threshold tuning and explainability.
+- Backend/admin first; defer Swift admin UI until the backend path proves useful in soak.
 
 Guardrails locked for this sprint:
 1. Query-empty behavior: do not inject all skills by default; only inject explicitly pinned/global-safe skills.

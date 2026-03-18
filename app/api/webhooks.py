@@ -28,6 +28,7 @@ from app.auth.dependencies import get_current_user
 from app.db.models import ChatMessage, ChatSession, User, WebhookConfig
 from app.db.session import AsyncSessionLocal, get_db
 from app.metrics import metrics
+from app.skills.service import hydrate_user_context
 
 router = APIRouter()
 log = structlog.get_logger(__name__)
@@ -214,6 +215,8 @@ async def _execute_webhook(webhook_id: int, payload: Dict[str, Any]) -> None:
             return
         model_profile = resolve_task_model_profile(task=None, user=user)
         user_context = UserContext.from_user(user, persona_name=persona)
+        user_context.allowed_tool_cap = []
+        user_context = await hydrate_user_context(db, user_context, query=cfg_instruction)
     user_context.session_id = session_id
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

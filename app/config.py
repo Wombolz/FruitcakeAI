@@ -67,6 +67,18 @@ class Settings(BaseSettings):
     chat_validation_enabled: bool = True
     chat_validation_retry_enabled: bool = True
     chat_validation_retry_max_attempts: int = 1
+    # Sprint 5.6.5 knowledge skills
+    skills_preview_allowed_domains: List[str] = [
+        "github.com",
+        "raw.githubusercontent.com",
+        "gist.githubusercontent.com",
+    ]
+    skills_preview_fetch_timeout_seconds: int = 5
+    skills_preview_fetch_max_bytes: int = 100_000
+    skills_similarity_threshold: float = 0.35
+    skills_max_injected: int = 3
+    skills_max_tokens_per_skill: int = 250
+    skills_total_max_tokens: int = 500
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"

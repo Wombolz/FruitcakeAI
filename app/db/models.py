@@ -79,6 +79,16 @@ class User(Base):
         back_populates="reviewer",
         foreign_keys="RSSSourceCandidate.reviewed_by",
     )
+    personal_skills = relationship(
+        "Skill",
+        back_populates="personal_user",
+        foreign_keys="Skill.personal_user_id",
+    )
+    installed_skills = relationship(
+        "Skill",
+        back_populates="installer",
+        foreign_keys="Skill.installed_by",
+    )
 
     @property
     def library_scopes(self) -> list[str]:
@@ -504,6 +514,58 @@ class WebhookConfig(Base):
 
     def __repr__(self):
         return f"<WebhookConfig(id={self.id}, user_id={self.user_id}, active={self.active})>"
+
+
+class Skill(Base):
+    """Admin-installed prompt extension. Content is frozen at install time."""
+    __tablename__ = "skills"
+    __table_args__ = (
+        UniqueConstraint("personal_user_id", "slug", name="uq_skills_personal_user_slug"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String(100), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=False)
+    system_prompt_addition = Column(Text, nullable=False)
+    _allowed_tool_additions = Column("allowed_tool_additions", Text, default="[]", nullable=False)
+    scope = Column(String(20), default="shared", nullable=False, index=True)
+    personal_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    installed_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    source_url = Column(Text)
+    content_hash = Column(String(64), nullable=False)
+    description_embedding = Column(Text)
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    is_pinned = Column(Boolean, default=False, nullable=False, index=True)
+    installed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    personal_user = relationship("User", back_populates="personal_skills", foreign_keys=[personal_user_id])
+    installer = relationship("User", back_populates="installed_skills", foreign_keys=[installed_by])
+
+    @property
+    def allowed_tool_additions(self) -> list[str]:
+        return json.loads(self._allowed_tool_additions or "[]")
+
+    @allowed_tool_additions.setter
+    def allowed_tool_additions(self, value: list[str]):
+        self._allowed_tool_additions = json.dumps(value or [])
+
+    @property
+    def description_embedding_vector(self) -> list[float] | None:
+        if not self.description_embedding:
+            return None
+        try:
+            return json.loads(self.description_embedding)
+        except Exception:
+            return None
+
+    @description_embedding_vector.setter
+    def description_embedding_vector(self, value: list[float] | None):
+        self.description_embedding = json.dumps(value) if value is not None else None
+
+    def __repr__(self):
+        return f"<Skill(slug='{self.slug}', scope='{self.scope}', active={self.is_active})>"
 
 
 class RSSSource(Base):

@@ -29,6 +29,10 @@ class UserContext:
     library_scopes: List[str] = field(default_factory=lambda: ["family_docs"])
     calendar_access: List[str] = field(default_factory=list)
     blocked_tools: List[str] = field(default_factory=list)
+    allowed_tool_cap: List[str] = field(default_factory=list)
+    skill_prompt_additions: List[str] = field(default_factory=list)
+    skill_granted_tools: List[str] = field(default_factory=list)
+    active_skill_slugs: List[str] = field(default_factory=list)
     content_filter: str = ""           # "" | "strict"
     session_id: Optional[int] = None   # set by chat.py for audit logging
     timezone: Optional[str] = None     # IANA tz string, e.g. "America/Chicago"
@@ -117,6 +121,18 @@ class UserContext:
                 "",
                 f"The following tools are NOT available in this persona and must not be used: "
                 f"{', '.join(self.blocked_tools)}.",
+            ]
+
+        if self.skill_prompt_additions:
+            lines += ["", "Active skills:"]
+            for addition in self.skill_prompt_additions:
+                lines += ["---", addition.strip()]
+            lines.append("---")
+        if self.skill_granted_tools:
+            lines += [
+                "",
+                "Relevant tool guidance from active skills:",
+                f"- Prefer these tools when they are available and appropriate: {', '.join(self.skill_granted_tools)}.",
             ]
 
         return "\n".join(lines)

@@ -40,6 +40,7 @@ from app.db.models import ChatMessage, ChatSession, User
 from app.db.session import get_db
 from app.metrics import metrics
 from app.memory.service import get_memory_service
+from app.skills.service import hydrate_user_context
 
 log = structlog.get_logger(__name__)
 
@@ -290,6 +291,7 @@ async def send_message(
         allowed_tools=body.allowed_tools,
         blocked_tools=body.blocked_tools,
     )
+    user_context = await hydrate_user_context(db, user_context, query=body.content)
     user_context.session_id = session_id
     history, _memory_ids = await _apply_memory_context(
         history,
@@ -470,6 +472,7 @@ async def chat_websocket(
                         allowed_tools=allowed_tools,
                         blocked_tools=blocked_tools,
                     )
+                    user_context = await hydrate_user_context(db, user_context, query=user_message)
                     user_context.session_id = session_id
                     history, _memory_ids = await _apply_memory_context(
                         history,

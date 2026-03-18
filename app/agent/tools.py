@@ -200,6 +200,7 @@ def get_tools_for_user(user_context: UserContext) -> List[Dict[str, Any]]:
     from app.mcp.registry import get_mcp_registry
 
     blocked = set(user_context.blocked_tools)
+    allowed_cap = set(user_context.allowed_tool_cap or [])
 
     tools = [t for t in TOOL_SCHEMAS if t["function"]["name"] not in blocked]
 
@@ -216,6 +217,9 @@ def get_tools_for_user(user_context: UserContext) -> List[Dict[str, Any]]:
             if has_web_search and tool_name == "search":
                 continue
             tools.append(tool)
+
+    if allowed_cap:
+        tools = [t for t in tools if t["function"]["name"] in allowed_cap]
 
     return tools
 
