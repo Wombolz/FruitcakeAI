@@ -36,6 +36,22 @@ FruitcakeAI is not a cloud-first assistant with a local mode. It is a local-firs
 
 ---
 
+## Security
+
+FruitcakeAI is designed for local-first, operator-controlled deployments. The current baseline is strong for trusted local hardware and trusted networks, but it is not positioned as internet-hardened by default.
+
+Before any shared-network or remote deployment:
+
+- change all seeded passwords
+- set a strong `SECRET_KEY` / JWT secret
+- keep PostgreSQL off public interfaces
+- put the API behind TLS and an authenticated reverse proxy or VPN
+- treat webhook keys, APNs keys, and MCP credentials as secrets
+
+See [Security Baseline](Docs/SECURITY_BASELINE.md) for the full operator checklist, trust assumptions, and current limits.
+
+---
+
 ## What's Shipped
 
 ```
@@ -223,6 +239,7 @@ FruitcakeAI/
 | Doc | Purpose |
 |-----|---------|
 | [Design Philosophy](Docs/DesignPhilosophy.md) | Why FruitcakeAI is built the way it is |
+| [Security Baseline](Docs/SECURITY_BASELINE.md) | Current security posture, operator responsibilities, and deployment limits |
 | [Adding MCP Tools](Docs/ADDING_MCP_TOOLS.md) | How to extend the system with new tools |
 | [Persona System](Docs/PERSONA_SYSTEM.md) | Configuring users, roles, and personas |
 | [LLM Backends](Docs/LLM_BACKENDS.md) | Switching between Ollama, Claude, OpenAI |
