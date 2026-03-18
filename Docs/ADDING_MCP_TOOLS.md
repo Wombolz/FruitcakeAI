@@ -47,11 +47,11 @@ docker pull mcp/mcp-filesystem
 The tool is now available to the agent. Check it appeared:
 
 ```bash
-TOKEN=$(curl -s -X POST http://localhost:8000/auth/login \
+TOKEN=$(curl -s -X POST http://localhost:30417/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"changeme123"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
-curl -s http://localhost:8000/admin/tools -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+curl -s http://localhost:30417/admin/tools -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
 ---
@@ -135,7 +135,7 @@ mcp_servers:
 ## Checking tool status
 
 ```bash
-curl http://localhost:8000/admin/tools -H "Authorization: Bearer $TOKEN"
+curl http://localhost:30417/admin/tools -H "Authorization: Bearer $TOKEN"
 ```
 
 Response includes:

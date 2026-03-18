@@ -107,7 +107,7 @@ to reindex.
 ## Verifying your backend is working
 
 ```bash
-curl http://localhost:8000/admin/health \
+curl http://localhost:30417/admin/health \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 

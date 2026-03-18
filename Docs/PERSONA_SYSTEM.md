@@ -70,7 +70,7 @@ Each user record has a `persona` field. Set it at registration or update it via 
 
 ```bash
 # Update user 3's persona to restricted_assistant
-curl -X PATCH http://localhost:8000/admin/users/3 \
+curl -X PATCH http://localhost:30417/admin/users/3 \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"persona": "restricted_assistant"}'
@@ -97,7 +97,7 @@ Switching back:
 
 Available personas are listed at:
 ```bash
-curl http://localhost:8000/chat/personas
+curl http://localhost:30417/chat/personas
 ```
 
 ---

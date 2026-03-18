@@ -5,6 +5,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+APP_PORT="${APP_PORT:-30417}"
+
 echo "▶ Starting PostgreSQL..."
 docker compose up -d postgres
 
@@ -58,4 +60,4 @@ echo "▶ Seeding default users (skips existing)..."
 python scripts/seed.py
 
 echo "▶ Starting FruitcakeAI API..."
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app.main:app --host 0.0.0.0 --port "$APP_PORT" --reload

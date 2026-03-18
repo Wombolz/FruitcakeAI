@@ -127,7 +127,7 @@ ollama pull qwen2.5:14b
 ./scripts/start.sh
 ```
 
-This starts PostgreSQL, waits for Ollama, runs migrations, seeds default users, and starts the API on `http://localhost:8000`.
+This starts PostgreSQL, waits for Ollama, runs migrations, seeds default users, and starts the API on `http://localhost:30417`.
 
 Default users — **change these passwords before running on a shared network:**
 
@@ -141,7 +141,7 @@ Default users — **change these passwords before running on a shared network:**
 ### 4. Verify
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:30417/health
 # → {"status": "ok"}
 ```
 
@@ -149,7 +149,7 @@ curl http://localhost:8000/health
 
 1. Open the `FruitcakeAI_Client` Swift project in Xcode
 2. Build and run (`⌘R`)
-3. Settings → Server URL → `http://localhost:8000`
+3. Settings → Server URL → `http://localhost:30417`
 4. Log in with any seed user
 
 Upload a document via the Library tab, then ask about it.

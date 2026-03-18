@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Sprint 1 verification — run after: pip install -r requirements.txt, and optionally
-  docker compose up -d postgres && uvicorn app.main:app --host 127.0.0.1 --port 8000
+  docker compose up -d postgres && uvicorn app.main:app --host 127.0.0.1 --port 30417
 
 Usage:
   python3 scripts/verify_sprint1.py              # structure + (if server running) live checks
@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
 
-BASE_URL = os.environ.get("FRUITCAKE_BASE_URL", "http://127.0.0.1:8000")
+BASE_URL = os.environ.get("FRUITCAKE_BASE_URL", "http://127.0.0.1:30417")
 
 
 def ok(msg: str) -> None:

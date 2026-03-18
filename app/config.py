@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     app_version: str = "0.6.5"
     debug: bool = False
     log_level: str = "INFO"
+    app_port: int = 30417
 
     # ── Database ─────────────────────────────────────────────────────────────
     database_url: str = "postgresql+asyncpg://fruitcake:fruitcake@localhost:5432/fruitcake_v5"
