@@ -483,20 +483,10 @@ async def install_skill(
         "source_url": body.source_url,
         "is_pinned": body.is_pinned,
     }
-    expected_hash = service.build_preview_hash(preview_payload)
-    if expected_hash != body.preview_hash:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="preview_hash mismatch")
     try:
-        await service.validate_tool_names(body.allowed_tool_additions)
-        if len(body.description.strip()) < 20:
-            raise SkillValidationError("description must be at least 20 characters")
-        if not body.system_prompt_addition.strip():
-            raise SkillValidationError("system prompt body must not be empty")
-        if body.scope not in {"shared", "personal"}:
-            raise SkillValidationError("scope must be 'shared' or 'personal'")
-        if body.scope == "personal" and body.personal_user_id is None:
-            raise SkillValidationError("personal scope requires personal_user_id")
-        preview = service.preview_from_payload(preview_payload)
+        preview = await service.preview_from_payload(preview_payload)
+        if preview.preview_hash != body.preview_hash:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="preview_hash mismatch")
         skill = await service.install_preview(db, preview=preview, installed_by=current_user.id)
         await db.commit()
         await db.refresh(skill)

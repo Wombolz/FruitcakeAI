@@ -13,6 +13,7 @@ import httpx
 import structlog
 import yaml
 from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -83,6 +84,84 @@ async def _embed(text: str) -> list[float] | None:
 
 
 class SkillService:
+    def _build_preview(
+        self,
+        *,
+        name: str,
+        slug: str | None,
+        description: str,
+        system_prompt_addition: str,
+        allowed_tool_additions: Any,
+        scope: str | None,
+        personal_user_id: int | None,
+        source_url: str | None,
+        is_pinned: bool,
+        shared_personal_user_id_policy: str = "clear",
+    ) -> SkillPreview:
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            raise SkillValidationError("name is required")
+
+        normalized_slug = str(slug or self.slugify(normalized_name)).strip()
+        if not _SLUG_RE.fullmatch(normalized_slug):
+            raise SkillValidationError("slug must match [a-z0-9-]+")
+
+        normalized_description = str(description or "").strip()
+        if len(normalized_description) < 20:
+            raise SkillValidationError("description must be at least 20 characters")
+
+        normalized_body = str(system_prompt_addition or "").strip()
+        if not normalized_body:
+            raise SkillValidationError("system prompt body must not be empty")
+
+        if allowed_tool_additions is None:
+            allowed_tool_additions = []
+        if not isinstance(allowed_tool_additions, list):
+            raise SkillValidationError("required_tools must be a list")
+        tool_names = [str(name).strip() for name in allowed_tool_additions if str(name).strip()]
+
+        normalized_scope = str(scope or "shared").strip().lower()
+        if normalized_scope not in {"shared", "personal"}:
+            raise SkillValidationError("scope must be 'shared' or 'personal'")
+
+        if normalized_scope == "personal":
+            if personal_user_id is None:
+                raise SkillValidationError("personal scope requires a personal_user_id")
+        elif personal_user_id is not None:
+            if shared_personal_user_id_policy == "reject":
+                raise SkillValidationError("personal_user_id must be null for shared scope")
+            personal_user_id = None
+
+        warnings: list[str] = []
+        if len(normalized_description) < 40:
+            warnings.append("description is short; relevance matching may be weak")
+
+        preview_core = {
+            "slug": normalized_slug,
+            "name": normalized_name,
+            "description": normalized_description,
+            "system_prompt_addition": normalized_body,
+            "allowed_tool_additions": tool_names,
+            "scope": normalized_scope,
+            "personal_user_id": personal_user_id,
+            "source_url": source_url,
+            "is_pinned": bool(is_pinned),
+        }
+        preview_hash = self.build_preview_hash(preview_core)
+        return SkillPreview(
+            slug=normalized_slug,
+            name=normalized_name,
+            description=normalized_description,
+            system_prompt_addition=normalized_body,
+            allowed_tool_additions=tool_names,
+            scope=normalized_scope,
+            personal_user_id=personal_user_id,
+            source_url=source_url,
+            is_pinned=bool(is_pinned),
+            validation_warnings=warnings,
+            preview_hash=preview_hash,
+        )
+
     async def fetch_preview_content(self, source_url: str) -> str:
         parsed = urlparse(source_url)
         if parsed.scheme != "https":
@@ -123,65 +202,20 @@ class SkillService:
         if not isinstance(meta, dict):
             raise SkillValidationError("frontmatter must parse to a mapping")
 
-        name = str(meta.get("name") or "").strip()
-        if not name:
-            raise SkillValidationError("name is required")
-        slug = str(meta.get("slug") or self.slugify(name)).strip()
-        if not _SLUG_RE.fullmatch(slug):
-            raise SkillValidationError("slug must match [a-z0-9-]+")
-
-        description = str(meta.get("description") or "").strip()
-        if len(description) < 20:
-            raise SkillValidationError("description must be at least 20 characters")
-
-        skill_body = body.strip()
-        if not skill_body:
-            raise SkillValidationError("system prompt body must not be empty")
-
         allowed_tool_additions = meta.get("required_tools")
         if allowed_tool_additions is None:
             allowed_tool_additions = meta.get("allowed_tool_additions", [])
-        if not isinstance(allowed_tool_additions, list):
-            raise SkillValidationError("required_tools must be a list")
-        tool_names = [str(name).strip() for name in allowed_tool_additions if str(name).strip()]
-
-        scope = str(meta.get("scope") or "shared").strip().lower()
-        if scope not in {"shared", "personal"}:
-            raise SkillValidationError("scope must be 'shared' or 'personal'")
-        if scope == "personal" and personal_user_id is None:
-            raise SkillValidationError("personal scope requires a personal_user_id")
-        if scope == "shared":
-            personal_user_id = None
-
-        is_pinned = bool(meta.get("pinned") or meta.get("global_safe") or meta.get("empty_query_safe"))
-        warnings: list[str] = []
-        if len(description) < 40:
-            warnings.append("description is short; relevance matching may be weak")
-
-        preview_core = {
-            "slug": slug,
-            "name": name,
-            "description": description,
-            "system_prompt_addition": skill_body,
-            "allowed_tool_additions": tool_names,
-            "scope": scope,
-            "personal_user_id": personal_user_id,
-            "source_url": source_url,
-            "is_pinned": is_pinned,
-        }
-        preview_hash = self.build_preview_hash(preview_core)
-        return SkillPreview(
-            slug=slug,
-            name=name,
-            description=description,
-            system_prompt_addition=skill_body,
-            allowed_tool_additions=tool_names,
-            scope=scope,
+        return self._build_preview(
+            name=meta.get("name") or "",
+            slug=meta.get("slug"),
+            description=meta.get("description") or "",
+            system_prompt_addition=body,
+            allowed_tool_additions=allowed_tool_additions,
+            scope=meta.get("scope"),
             personal_user_id=personal_user_id,
             source_url=source_url,
-            is_pinned=is_pinned,
-            validation_warnings=warnings,
-            preview_hash=preview_hash,
+            is_pinned=bool(meta.get("pinned") or meta.get("global_safe") or meta.get("empty_query_safe")),
+            shared_personal_user_id_policy="clear",
         )
 
     async def validate_tool_names(self, tool_names: Iterable[str]) -> None:
@@ -241,7 +275,11 @@ class SkillService:
         skill.allowed_tool_additions = preview.allowed_tool_additions
         skill.description_embedding_vector = description_embedding
         db.add(skill)
-        await db.flush()
+        try:
+            await db.flush()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise SkillConflictError("active skill slug already exists for this scope") from exc
         await db.refresh(skill)
         return skill
 
@@ -252,21 +290,21 @@ class SkillService:
         await db.delete(skill)
         await db.flush()
 
-    def preview_from_payload(self, payload: dict[str, Any]) -> SkillPreview:
-        preview_hash = self.build_preview_hash(payload)
-        return SkillPreview(
-            slug=str(payload["slug"]),
-            name=str(payload["name"]),
-            description=str(payload["description"]),
-            system_prompt_addition=str(payload["system_prompt_addition"]),
-            allowed_tool_additions=[str(name) for name in payload.get("allowed_tool_additions", [])],
-            scope=str(payload["scope"]),
+    async def preview_from_payload(self, payload: dict[str, Any]) -> SkillPreview:
+        preview = self._build_preview(
+            name=payload.get("name") or "",
+            slug=payload.get("slug"),
+            description=payload.get("description") or "",
+            system_prompt_addition=payload.get("system_prompt_addition") or "",
+            allowed_tool_additions=payload.get("allowed_tool_additions", []),
+            scope=payload.get("scope"),
             personal_user_id=payload.get("personal_user_id"),
             source_url=payload.get("source_url"),
             is_pinned=bool(payload.get("is_pinned", False)),
-            validation_warnings=[],
-            preview_hash=preview_hash,
+            shared_personal_user_id_policy="reject",
         )
+        await self.validate_tool_names(preview.allowed_tool_additions)
+        return preview
 
     async def list_skills(self, db: AsyncSession) -> list[Skill]:
         result = await db.execute(select(Skill).order_by(Skill.slug, Skill.installed_at.desc()))

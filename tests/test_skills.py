@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from unittest.mock import AsyncMock, patch
 
 from app.agent.context import UserContext
 from app.db.models import User
-from app.skills.service import get_skill_service, hydrate_user_context
+from app.skills.service import SkillConflictError, get_skill_service, hydrate_user_context
 from tests.conftest import TestSessionLocal
 
 
@@ -86,6 +87,69 @@ async def test_skill_install_and_list(client):
 
 
 @pytest.mark.asyncio
+async def test_skill_install_rejects_invalid_slug_payload(client):
+    token = await _register_admin_token(client, "badslugadmin")
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "slug": "Bad Slug",
+        "name": "Bad Slug",
+        "description": "This description is long enough to pass validation.",
+        "system_prompt_addition": "Use RSS carefully.",
+        "allowed_tool_additions": [],
+        "scope": "shared",
+        "personal_user_id": None,
+        "source_url": None,
+        "is_pinned": False,
+        "preview_hash": "bogus",
+    }
+    resp = await client.post("/admin/skills/install", headers=headers, json=payload)
+    assert resp.status_code == 400
+    assert "slug must match" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_skill_install_rejects_shared_payload_with_personal_user_id(client):
+    token = await _register_admin_token(client, "sharedscopeadmin")
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "slug": "rss-curator",
+        "name": "RSS Curator",
+        "description": "This description is long enough to pass validation.",
+        "system_prompt_addition": "Use RSS carefully.",
+        "allowed_tool_additions": [],
+        "scope": "shared",
+        "personal_user_id": 123,
+        "source_url": None,
+        "is_pinned": False,
+        "preview_hash": "bogus",
+    }
+    resp = await client.post("/admin/skills/install", headers=headers, json=payload)
+    assert resp.status_code == 400
+    assert "personal_user_id must be null for shared scope" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_skill_install_rejects_personal_payload_without_personal_user_id(client):
+    token = await _register_admin_token(client, "personalmissingadmin")
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "slug": "personal-rss",
+        "name": "Personal RSS",
+        "description": "This description is long enough to pass validation.",
+        "system_prompt_addition": "Use RSS carefully.",
+        "allowed_tool_additions": [],
+        "scope": "personal",
+        "personal_user_id": None,
+        "source_url": None,
+        "is_pinned": False,
+        "preview_hash": "bogus",
+    }
+    resp = await client.post("/admin/skills/install", headers=headers, json=payload)
+    assert resp.status_code == 400
+    assert "personal scope requires a personal_user_id" in resp.text
+
+
+@pytest.mark.asyncio
 async def test_skill_reinstall_supersedes_previous_active_record(client):
     token = await _register_admin_token(client, "dupeadmin")
     headers = {"Authorization": f"Bearer {token}"}
@@ -118,6 +182,19 @@ async def test_skill_hard_delete_removes_targeted_record(client):
 
     listing = await client.get("/admin/skills", headers=headers)
     assert all(row["id"] != skill_id for row in listing.json())
+
+
+@pytest.mark.asyncio
+async def test_install_preview_translates_integrity_error_to_skill_conflict():
+    service = get_skill_service()
+    async with TestSessionLocal() as db:
+        user = User(username="conflict", email="conflict@test.local", hashed_password="x", role="admin", persona="family_assistant")
+        db.add(user)
+        await db.flush()
+        preview = service.parse_markdown(_skill_markdown(), personal_user_id=None)
+        with patch.object(db, "flush", new=AsyncMock(side_effect=IntegrityError("insert", {}, Exception("dup")))):
+            with pytest.raises(SkillConflictError):
+                await service.install_preview(db, preview=preview, installed_by=user.id)
 
 
 @pytest.mark.asyncio
