@@ -1254,6 +1254,32 @@ Acceptance additions for Sprint 5.6.5:
 3. Existing chat/task APIs and runner behavior remain backward compatible.
 4. Admin diagnostics can explain why a skill did or did not inject for a sample query.
 
+**Sprint 5.6.6 — Skills Lifecycle Hardening and Explainability**
+- Add superseding install semantics for existing scoped slugs: installing a replacement skill creates a new active record and deactivates the prior active version instead of failing on collision.
+- Add admin hard delete for specific skill records with audit-friendly version retention handled by the supersede flow, not in-place mutation.
+- Harden degraded runtime selection so embedding-unavailable mode falls back to pinned-only injection rather than broad lexical matching.
+- Surface active-skill attribution in chat, task, and webhook metadata plus richer task-run diagnostics for included/excluded skill decisions.
+- Expand admin skill listings and diagnostics with lineage and selection-mode visibility so operators can inspect active, superseded, and degraded-mode behavior cleanly.
+
+Acceptance additions for Sprint 5.6.6:
+1. Reinstalling the same scoped slug supersedes the old active record without collision churn.
+2. Admins can hard-delete individual skill records without corrupting other versions of the same skill.
+3. Degraded selection mode uses pinned-only behavior and does not inject non-pinned skills by lexical accident.
+4. Chat/task/webhook responses and diagnostics expose which skill slugs were active for that execution.
+
+**Sprint 5.6.7 — Run Inspector**
+- Add a backend-only admin inspection endpoint for single task runs so operators can view run metadata, tool traces, artifacts, and normalized diagnostics in one response.
+- Keep the existing `/admin/task-runs` list endpoint lightweight; use a dedicated inspect route for joined debug payloads.
+- Return inline artifacts in deterministic order, including prepared datasets, outputs, validation reports, and run diagnostics.
+- Normalize common diagnostic fields such as active skills, skill injection events, refresh stats, dataset stats, and suppression events while preserving raw artifacts as source-of-truth.
+- Keep v1 scoped to task runs only; defer chat and webhook inspection unless the endpoint proves useful in soak.
+
+Acceptance additions for Sprint 5.6.7:
+1. A completed task run can be inspected from one admin endpoint without cross-referencing audit logs and artifacts separately.
+2. Artifact ordering and tool timelines are deterministic and stable across calls.
+3. Sparse or failed runs still return useful inspection payloads with empty arrays instead of hard errors when optional data is missing.
+4. Existing `/admin/task-runs` and `/admin/audit` behavior remain backward compatible.
+
 **Acceptance criteria**
 1. Both repos are renamed/repositioned with history intact.
 2. All documentation and remotes point to new canonical names.

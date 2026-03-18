@@ -350,7 +350,15 @@ async def send_message(
     db.add(assistant_msg)
     await db.commit()
 
-    return {"role": "assistant", "content": reply, "session_id": session_id}
+    return {
+        "role": "assistant",
+        "content": reply,
+        "session_id": session_id,
+        "metadata": {
+            "active_skills": list(user_context.active_skill_slugs or []),
+            "skill_selection_mode": user_context.skill_selection_mode or "",
+        },
+    }
 
 
 # ── WebSocket /chat/sessions/{id}/ws (streaming) ─────────────────────────────
@@ -548,7 +556,16 @@ async def chat_websocket(
                     db.add(assistant_msg)
                     await db.commit()
 
-                    await websocket.send_json({"type": "done", "content": complete})
+                    await websocket.send_json(
+                        {
+                            "type": "done",
+                            "content": complete,
+                            "metadata": {
+                                "active_skills": list(user_context.active_skill_slugs or []),
+                                "skill_selection_mode": user_context.skill_selection_mode or "",
+                            },
+                        }
+                    )
 
             # Wait for the next message from the client
             raw = await websocket.receive_text()

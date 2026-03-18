@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select
 
 from app.config import settings
-from app.db.models import ChatSession, RSSItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
+from app.db.models import AuditLog, ChatSession, RSSItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
 from app.autonomy.profiles.news_magazine import _ground_output
 from app.autonomy.runner import _format_result_for_inbox
 from tests.conftest import TestSessionLocal
@@ -23,6 +23,22 @@ async def _headers(client, username: str) -> dict[str, str]:
     await client.post(
         "/auth/register",
         json={"username": username, "email": f"{username}@example.com", "password": password},
+    )
+    login = await client.post("/auth/login", json={"username": username, "password": password})
+    token = login.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _admin_headers(client, username: str) -> dict[str, str]:
+    password = "pass123"
+    await client.post(
+        "/auth/register",
+        json={
+            "username": username,
+            "email": f"{username}@example.com",
+            "password": password,
+            "role": "admin",
+        },
     )
     login = await client.post("/auth/login", json={"username": username, "password": password})
     token = login.json()["access_token"]
@@ -525,6 +541,152 @@ async def test_create_and_patch_task_profile_validation(client):
         headers=headers,
     )
     assert invalid.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_admin_task_run_inspect_returns_ordered_payloads_and_diagnostics(client):
+    admin_headers = await _admin_headers(client, "inspectadmin")
+    owner_headers = await _headers(client, "inspectowner")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={
+            "title": "Inspect me",
+            "instruction": "Build debug payload",
+            "profile": "news_magazine",
+        },
+        headers=owner_headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        session = ChatSession(user_id=task.user_id, title="task session", is_task_session=True)
+        db.add(session)
+        await db.flush()
+
+        run = TaskRun(
+            task_id=task_id,
+            session_id=session.id,
+            status="completed",
+            summary="Published magazine",
+            started_at=datetime(2026, 3, 18, 12, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 3, 18, 12, 5, tzinfo=timezone.utc),
+        )
+        db.add(run)
+        await db.flush()
+
+        db.add_all(
+            [
+                AuditLog(
+                    user_id=task.user_id,
+                    tool="list_recent_feed_items",
+                    arguments='{"max_results": 5}',
+                    result_summary="Recent feed items (5)",
+                    session_id=session.id,
+                    created_at=datetime(2026, 3, 18, 12, 1, tzinfo=timezone.utc),
+                ),
+                AuditLog(
+                    user_id=task.user_id,
+                    tool="render_magazine",
+                    arguments='{"section":"Top"}',
+                    result_summary="Rendered top section",
+                    session_id=session.id,
+                    created_at=datetime(2026, 3, 18, 12, 2, tzinfo=timezone.utc),
+                ),
+            ]
+        )
+        db.add_all(
+            [
+                TaskRunArtifact(
+                    task_run_id=run.id,
+                    artifact_type="validation_report",
+                    content_json='{"publish_mode":"full","fatal":false}',
+                ),
+                TaskRunArtifact(
+                    task_run_id=run.id,
+                    artifact_type="final_output",
+                    content_text="# Final magazine",
+                ),
+                TaskRunArtifact(
+                    task_run_id=run.id,
+                    artifact_type="prepared_dataset",
+                    content_json='{"stats":{"selected_count":12},"refresh":{"sources_refreshed":9}}',
+                ),
+                TaskRunArtifact(
+                    task_run_id=run.id,
+                    artifact_type="run_diagnostics",
+                    content_json='{"active_skills":["rss-grounded-briefing"],"skill_selection_mode":"embedding","skill_injection_events":[{"stage":"step_1"}],"dataset_stats":{"selected_count":12},"refresh_stats":{"sources_refreshed":9},"suppression_events":[]}',
+                ),
+            ]
+        )
+        await db.commit()
+        run_id = run.id
+
+    inspect = await client.get(f"/admin/task-runs/{run_id}/inspect", headers=admin_headers)
+    assert inspect.status_code == 200
+    payload = inspect.json()
+
+    assert payload["run"]["id"] == run_id
+    assert payload["run"]["duration_seconds"] == 300.0
+    assert payload["task"]["id"] == task_id
+    assert payload["task"]["profile"] == "news_magazine"
+    assert payload["execution"]["active_skills"] == ["rss-grounded-briefing"]
+    assert payload["execution"]["refresh_stats"] == {"sources_refreshed": 9}
+    assert [row["tool"] for row in payload["tool_timeline"]] == [
+        "list_recent_feed_items",
+        "render_magazine",
+    ]
+    assert [row["artifact_type"] for row in payload["artifacts"]] == [
+        "prepared_dataset",
+        "final_output",
+        "validation_report",
+        "run_diagnostics",
+    ]
+    assert payload["diagnostics"]["active_skills"] == ["rss-grounded-briefing"]
+    assert payload["diagnostics"]["validation_report"]["publish_mode"] == "full"
+
+
+@pytest.mark.asyncio
+async def test_admin_task_run_inspect_handles_sparse_runs(client):
+    admin_headers = await _admin_headers(client, "inspectadmin2")
+    owner_headers = await _headers(client, "inspectowner2")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Sparse inspect", "instruction": "No artifacts"},
+        headers=owner_headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    async with TestSessionLocal() as db:
+        run = TaskRun(
+            task_id=task_id,
+            status="cancelled",
+            error="paused_unavailable",
+            summary="No run data",
+            started_at=datetime(2026, 3, 18, 13, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 3, 18, 13, 1, tzinfo=timezone.utc),
+        )
+        db.add(run)
+        await db.commit()
+        run_id = run.id
+
+    inspect = await client.get(f"/admin/task-runs/{run_id}/inspect", headers=admin_headers)
+    assert inspect.status_code == 200
+    payload = inspect.json()
+    assert payload["run"]["error"] == "paused_unavailable"
+    assert payload["tool_timeline"] == []
+    assert payload["artifacts"] == []
+    assert payload["diagnostics"]["active_skills"] == []
+
+
+@pytest.mark.asyncio
+async def test_admin_task_run_inspect_returns_404_for_unknown_run(client):
+    admin_headers = await _admin_headers(client, "inspectadmin3")
+    resp = await client.get("/admin/task-runs/999999/inspect", headers=admin_headers)
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio

@@ -57,6 +57,7 @@ class WebhookOut(BaseModel):
 class WebhookTriggerOut(BaseModel):
     accepted: bool
     webhook_id: int
+    metadata: Dict[str, Any] | None = None
 
 
 # ── Public trigger endpoint (no auth) ────────────────────────────────────────
@@ -83,9 +84,19 @@ async def trigger_webhook(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Webhook not found")
 
     payload = await _parse_payload(request)
+    user = await db.get(User, cfg.user_id)
+    metadata: Dict[str, Any] | None = None
+    if user is not None:
+        user_context = UserContext.from_user(user, persona_name=user.persona)
+        user_context.allowed_tool_cap = []
+        user_context = await hydrate_user_context(db, user_context, query=cfg.instruction)
+        metadata = {
+            "active_skills": list(user_context.active_skill_slugs or []),
+            "skill_selection_mode": user_context.skill_selection_mode or "",
+        }
     background_tasks.add_task(_execute_webhook, cfg.id, payload)
 
-    return WebhookTriggerOut(accepted=True, webhook_id=cfg.id)
+    return WebhookTriggerOut(accepted=True, webhook_id=cfg.id, metadata=metadata)
 
 
 # ── Authenticated webhook config CRUD ────────────────────────────────────────

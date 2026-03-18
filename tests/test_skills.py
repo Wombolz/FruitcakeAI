@@ -86,14 +86,38 @@ async def test_skill_install_and_list(client):
 
 
 @pytest.mark.asyncio
-async def test_skill_duplicate_scoped_slug_conflicts(client):
+async def test_skill_reinstall_supersedes_previous_active_record(client):
     token = await _register_admin_token(client, "dupeadmin")
     headers = {"Authorization": f"Bearer {token}"}
     preview = await client.post("/admin/skills/preview", headers=headers, json={"content": _skill_markdown()})
     body = preview.json()
-    assert (await client.post("/admin/skills/install", headers=headers, json=body)).status_code == 201
+    first = await client.post("/admin/skills/install", headers=headers, json=body)
+    assert first.status_code == 201
     dupe = await client.post("/admin/skills/install", headers=headers, json=body)
-    assert dupe.status_code == 409
+    assert dupe.status_code == 201
+
+    listing = await client.get("/admin/skills", headers=headers)
+    rows = [row for row in listing.json() if row["slug"] == "rss-curator"]
+    active_rows = [row for row in rows if row["is_active"]]
+    inactive_rows = [row for row in rows if not row["is_active"]]
+    assert len(active_rows) == 1
+    assert len(inactive_rows) >= 1
+    assert active_rows[0]["supersedes_skill_id"] == first.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_skill_hard_delete_removes_targeted_record(client):
+    token = await _register_admin_token(client, "deleteadmin")
+    headers = {"Authorization": f"Bearer {token}"}
+    preview = await client.post("/admin/skills/preview", headers=headers, json={"content": _skill_markdown()})
+    installed = await client.post("/admin/skills/install", headers=headers, json=preview.json())
+    skill_id = installed.json()["id"]
+
+    deleted = await client.delete(f"/admin/skills/{skill_id}", headers=headers)
+    assert deleted.status_code == 204
+
+    listing = await client.get("/admin/skills", headers=headers)
+    assert all(row["id"] != skill_id for row in listing.json())
 
 
 @pytest.mark.asyncio
@@ -104,7 +128,7 @@ async def test_personal_skill_only_visible_to_owner():
         other = User(username="other", email="other@test.local", hashed_password="x", role="parent", persona="family_assistant")
         db.add_all([owner, other])
         await db.flush()
-        preview = service.parse_markdown(_skill_markdown(scope="personal"), personal_user_id=owner.id)
+        preview = service.parse_markdown(_skill_markdown(scope="personal", pinned=True), personal_user_id=owner.id)
         await service.install_preview(db, preview=preview, installed_by=owner.id)
         await db.commit()
 
@@ -134,10 +158,30 @@ async def test_empty_query_only_injects_pinned_skill():
 
 
 @pytest.mark.asyncio
+async def test_embedding_unavailable_uses_pinned_only_fallback():
+    service = get_skill_service()
+    async with TestSessionLocal() as db:
+        user = User(username="fallback", email="fallback@test.local", hashed_password="x", role="parent", persona="family_assistant")
+        db.add(user)
+        await db.flush()
+        pinned = service.parse_markdown(_skill_markdown(name="Pinned RSS", slug="pinned-rss", pinned=True))
+        regular = service.parse_markdown(_skill_markdown(name="Regular RSS", slug="regular-rss"))
+        await service.install_preview(db, preview=pinned, installed_by=user.id)
+        await service.install_preview(db, preview=regular, installed_by=user.id)
+        await db.commit()
+        with patch("app.skills.service._embed", new=AsyncMock(return_value=None)):
+            decisions = await service.explain_injection(db, user_id=user.id, query="rss updates")
+
+    included = {d.slug for d in decisions if d.included}
+    assert included == {"pinned-rss"}
+    assert all(d.selection_mode == "pinned_only" for d in decisions)
+
+
+@pytest.mark.asyncio
 async def test_chat_injects_relevant_skill_into_user_context(client):
     token = await _register_admin_token(client, "chatskill")
     headers = {"Authorization": f"Bearer {token}"}
-    preview = await client.post("/admin/skills/preview", headers=headers, json={"content": _skill_markdown()})
+    preview = await client.post("/admin/skills/preview", headers=headers, json={"content": _skill_markdown(pinned=True)})
     assert preview.status_code == 200
     assert (await client.post("/admin/skills/install", headers=headers, json=preview.json())).status_code == 201
 
@@ -151,9 +195,12 @@ async def test_chat_injects_relevant_skill_into_user_context(client):
             json={"content": "Summarize RSS news feeds and coverage"},
         )
     assert sent.status_code == 200
+    metadata = sent.json()["metadata"]
     user_context = mock_run.await_args.args[1]
     assert user_context.active_skill_slugs == ["rss-curator"]
     assert user_context.skill_prompt_additions
+    assert metadata["active_skills"] == ["rss-curator"]
+    assert metadata["skill_selection_mode"] in {"embedding", "pinned_only"}
 
 
 @pytest.mark.asyncio
@@ -188,4 +235,26 @@ async def test_preview_injection_endpoint_explains_reason(client):
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["reason"] in {"below_similarity_threshold", "relevant"}
+    assert data["reason"] in {"below_similarity_threshold", "relevant", "embedding_unavailable_not_pinned", "pinned_only_fallback"}
+    assert data["selection_mode"] in {"embedding", "pinned_only"}
+
+
+@pytest.mark.asyncio
+async def test_webhook_trigger_returns_skill_metadata(client):
+    token = await _register_admin_token(client, "webhookskill")
+    headers = {"Authorization": f"Bearer {token}"}
+    preview = await client.post("/admin/skills/preview", headers=headers, json={"content": _skill_markdown(pinned=True)})
+    assert (await client.post("/admin/skills/install", headers=headers, json=preview.json())).status_code == 201
+
+    created = await client.post(
+        "/webhooks",
+        headers=headers,
+        json={"name": "RSS hook", "instruction": "Summarize RSS news", "active": True},
+    )
+    webhook_key = created.json()["webhook_key"]
+    with patch("app.api.webhooks._execute_webhook", new=AsyncMock(return_value=None)):
+        triggered = await client.post(f"/webhooks/trigger/{webhook_key}", json={"event": "test"})
+    assert triggered.status_code == 202
+    data = triggered.json()
+    assert "metadata" in data
+    assert data["metadata"]["active_skills"] == ["rss-curator"]

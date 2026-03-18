@@ -13,13 +13,14 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, text
 
 from app.db.session import Base
 from app.config import settings
@@ -520,7 +521,21 @@ class Skill(Base):
     """Admin-installed prompt extension. Content is frozen at install time."""
     __tablename__ = "skills"
     __table_args__ = (
-        UniqueConstraint("personal_user_id", "slug", name="uq_skills_personal_user_slug"),
+        Index(
+            "uq_skills_active_shared_slug",
+            "slug",
+            unique=True,
+            sqlite_where=text("personal_user_id IS NULL AND is_active = 1"),
+            postgresql_where=text("personal_user_id IS NULL AND is_active = true"),
+        ),
+        Index(
+            "uq_skills_active_personal_user_slug",
+            "personal_user_id",
+            "slug",
+            unique=True,
+            sqlite_where=text("personal_user_id IS NOT NULL AND is_active = 1"),
+            postgresql_where=text("personal_user_id IS NOT NULL AND is_active = true"),
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -537,11 +552,13 @@ class Skill(Base):
     description_embedding = Column(Text)
     is_active = Column(Boolean, default=True, nullable=False, index=True)
     is_pinned = Column(Boolean, default=False, nullable=False, index=True)
+    supersedes_skill_id = Column(Integer, ForeignKey("skills.id", ondelete="SET NULL"), nullable=True, index=True)
     installed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     personal_user = relationship("User", back_populates="personal_skills", foreign_keys=[personal_user_id])
     installer = relationship("User", back_populates="installed_skills", foreign_keys=[installed_by])
+    supersedes_skill = relationship("Skill", remote_side=[id], uselist=False)
 
     @property
     def allowed_tool_additions(self) -> list[str]:

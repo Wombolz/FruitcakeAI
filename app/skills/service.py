@@ -63,6 +63,7 @@ class SkillInjectionDecision:
     rendered_text: str = ""
     estimated_tokens: int = 0
     allowed_tool_additions: list[str] | None = None
+    selection_mode: str = "embedding"
 
 
 async def _embed(text: str) -> list[float] | None:
@@ -210,16 +211,19 @@ class SkillService:
         preview: SkillPreview,
         installed_by: int,
     ) -> Skill:
-        existing = await db.execute(
-            select(Skill).where(
-                Skill.slug == preview.slug,
-                Skill.personal_user_id == preview.personal_user_id,
+        existing = (
+            await db.execute(
+                select(Skill).where(
+                    Skill.slug == preview.slug,
+                    Skill.personal_user_id == preview.personal_user_id,
+                    Skill.is_active == True,
+                ).order_by(Skill.installed_at.desc())
             )
-        )
-        if existing.scalar_one_or_none() is not None:
-            raise SkillConflictError(f"skill slug '{preview.slug}' already exists for this scope")
-
+        ).scalars().all()
+        superseded = existing[0] if existing else None
         description_embedding = await _embed(preview.description)
+        for row in existing:
+            row.is_active = False
         skill = Skill(
             slug=preview.slug,
             name=preview.name,
@@ -232,6 +236,7 @@ class SkillService:
             content_hash=hashlib.sha256(preview.system_prompt_addition.encode("utf-8")).hexdigest(),
             is_active=True,
             is_pinned=preview.is_pinned,
+            supersedes_skill_id=superseded.id if superseded is not None else None,
         )
         skill.allowed_tool_additions = preview.allowed_tool_additions
         skill.description_embedding_vector = description_embedding
@@ -239,6 +244,13 @@ class SkillService:
         await db.flush()
         await db.refresh(skill)
         return skill
+
+    async def delete_skill(self, db: AsyncSession, *, skill_id: int) -> None:
+        skill = await db.get(Skill, skill_id)
+        if skill is None:
+            raise SkillNotFoundError(f"skill {skill_id} not found")
+        await db.delete(skill)
+        await db.flush()
 
     def preview_from_payload(self, payload: dict[str, Any]) -> SkillPreview:
         preview_hash = self.build_preview_hash(payload)
@@ -321,7 +333,7 @@ class SkillService:
     ) -> list[SkillInjectionDecision]:
         stmt = select(Skill).where(
             or_(Skill.scope == "shared", and_(Skill.scope == "personal", Skill.personal_user_id == user_id))
-        ).order_by(Skill.is_pinned.desc(), Skill.slug.asc())
+        ).order_by(Skill.is_pinned.desc(), Skill.slug.asc(), Skill.installed_at.desc())
         if skill_id is not None:
             stmt = stmt.where(Skill.id == skill_id)
         rows = await db.execute(stmt)
@@ -331,6 +343,7 @@ class SkillService:
 
         stripped_query = (query or "").strip()
         query_embedding = await _embed(stripped_query) if stripped_query else None
+        selection_mode = "embedding" if query_embedding is not None else "pinned_only"
         ranked: list[SkillInjectionDecision] = []
         for skill in skills:
             score = await self._score_skill(skill, stripped_query, query_embedding)
@@ -346,6 +359,13 @@ class SkillService:
                 else:
                     include = False
                     reason = "empty_query_not_pinned"
+            elif query_embedding is None:
+                if skill.is_pinned:
+                    score = max(score, 1.0)
+                    reason = "pinned_only_fallback"
+                else:
+                    include = False
+                    reason = "embedding_unavailable_not_pinned"
             elif score < settings.skills_similarity_threshold:
                 include = False
                 reason = "below_similarity_threshold"
@@ -362,6 +382,7 @@ class SkillService:
                     rendered_text=rendered,
                     estimated_tokens=self._estimate_tokens(rendered),
                     allowed_tool_additions=skill.allowed_tool_additions,
+                    selection_mode=selection_mode,
                 )
             )
 
@@ -379,7 +400,17 @@ class SkillService:
         skill_embedding = skill.description_embedding_vector
         if query_embedding is not None and skill_embedding:
             return self._cosine_similarity(query_embedding, skill_embedding)
-        return self._lexical_score(query, f"{skill.name} {skill.description} {skill.system_prompt_addition}")
+        return 0.0
+
+    def relevance_mode(self) -> str:
+        try:
+            from app.rag.service import get_rag_service
+
+            svc = get_rag_service()
+            embed_model = svc._index._embed_model if getattr(svc, "_loaded", False) else None
+            return "embedding" if embed_model is not None else "pinned_only"
+        except Exception:
+            return "pinned_only"
 
     def _apply_budget(self, decisions: list[SkillInjectionDecision]) -> list[SkillInjectionDecision]:
         total_tokens = 0
@@ -482,6 +513,18 @@ async def hydrate_user_context(
     user_context.skill_prompt_additions = prompt_blocks
     user_context.skill_granted_tools = sorted(effective_grants)
     user_context.active_skill_slugs = [decision.slug for decision in decisions if decision.included]
+    user_context.skill_selection_mode = decisions[0].selection_mode if decisions else get_skill_service().relevance_mode()
+    user_context.skill_injection_details = [
+        {
+            "skill_id": decision.skill_id,
+            "slug": decision.slug,
+            "score": decision.score,
+            "included": decision.included,
+            "reason": decision.reason,
+            "selection_mode": decision.selection_mode,
+        }
+        for decision in decisions
+    ]
     if allowed_tool_cap is not None:
         user_context.allowed_tool_cap = sorted(effective_cap)
     return user_context
