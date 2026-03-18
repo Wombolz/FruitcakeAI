@@ -1,11 +1,11 @@
 # 🍰 FruitcakeAI Roadmap
 
-**Version**: 5.5  
-**Status**: Phase 1 ✅ · Phase 2 ✅ · Phase 3 ✅ · Phase 4 ✅ · Phase 5.1 ✅ · Phase 5.2 ✅ · Phase 5.3 ✅ · Phase 5.4 Hardening (In Progress)  
+**Version**: 5.6  
+**Status**: Phase 1 ✅ · Phase 2 ✅ · Phase 3 ✅ · Phase 4 ✅ · Phase 5.1 ✅ · Phase 5.2 ✅ · Phase 5.3 ✅ · Phase 5.4 ✅ · Phase 5.5 ✅ · Phase 5.6 ✅  
 **Philosophy**: Trust · Privacy · Continuity. Local-first, cloud-optional, resilient by construction.  
 **Build Location**: `fruitcake_v5/`  
-**Last Updated**: March 15, 2026  
-**Checkpoint Note**: North Star direction is now the decision filter; Phase 5.4 remains the pre-Phase-6 reliability gate.
+**Last Updated**: March 18, 2026  
+**Checkpoint Note**: North Star direction is now the decision filter; Phase 6 remains gated behind reliability soak and measured need for cloud judgment.
 
 ---
 
@@ -1079,7 +1079,7 @@ Verification highlights:
 ## Phase 5.5 — Adaptive Chat Orchestration (Quality Parity)
 
 **Goal**: close the quality gap between single-turn chat and task-mode execution on local models by adding optional task-like scaffolding to chat only when complexity warrants it.
-**Status**: 5.5.1-5.5.5 merged to `main`; 5.5.6 implemented in branch `codex/phase5.5.6-memory-grounding`; 5.5.7 in progress.
+**Status**: 5.5.1-5.5.7 merged to `main`.
 
 **Why now**:
 - Current task runs outperform chat on reliability because tasks use explicit planning, tool-grounding, and final synthesis.
@@ -1182,6 +1182,10 @@ Verification highlights:
   - clients/API surfaces return `restricted` / `restricted_assistant`,
   - legacy DB rows are rewritten safely by migration,
   - auth/agent/persona regression tests pass.
+- Completed:
+  - Renamed role `child` -> `restricted` and persona `kids_assistant` -> `restricted_assistant`.
+  - Updated seed users, prompt language, docs, and persona picker labeling.
+  - Added compatibility migration for legacy DB rows and merged the terminology cleanup into `main`.
 
 **Acceptance criteria**
 1. Complex chat prompts show measurable quality improvement without forcing heavy orchestration on simple chat.
@@ -1193,9 +1197,9 @@ Verification highlights:
 
 ---
 
-## Phase 5.6 — Release Prep: Repository Realignment (Planning Only)
+## Phase 5.6 — Release Prep: Repository Realignment
 
-**Status**: Planned only. Do not execute until Phase 5.5 stabilization is complete.
+**Status**: 5.6.1-5.6.7 merged to `main` in release `v0.6.6`.
 
 **Goal**: align repository boundaries before Phase 6 so ownership, release flow, and open-source onboarding are clean.
 
@@ -1218,21 +1222,33 @@ Target repository layout:
 - Create pre-move checkpoint tags on both repos.
 - Freeze feature work during the move window.
 - Record rollback commands and branch protection expectations.
+- Completed:
+  - Created pre-realignment checkpoint tags for backend and client repos.
+  - Added rollback/runbook documentation before repo realignment.
 
 **Sprint 5.6.2 — Backend repo transition**
 - Rename/move backend repo identity to `FruitcakeAI`.
 - Update remotes, badges, clone URLs, and contributor docs.
 - Validate backend startup, MCP health, and full test suite.
+- Completed:
+  - Backend repo realigned to `FruitcakeAI`.
+  - Local remotes, docs, clone references, and release flow were updated and verified.
 
 **Sprint 5.6.3 — Swift client repo transition**
 - Rename/move Swift repo identity to `FruitcakeAI_Client`.
 - Update project docs, build references, and CI workflows.
 - Validate a supported Apple build target and API connectivity.
+- Completed:
+  - Swift client repo realigned to `FruitcakeAI_Client`.
+  - Shared Apple-client positioning documented and build validation completed.
 
 **Sprint 5.6.4 — Cross-repo release validation**
 - Run end-to-end smoke flow (chat, task, RSS, push path).
 - Confirm release tags and rollback path on both repos.
 - Publish updated onboarding docs for open-source readiness.
+- Completed:
+  - Cross-repo remotes, tags, and rollback checkpoints were validated after rename.
+  - Open-source-facing onboarding/docs cleanup was completed.
 
 **Sprint 5.6.5 — Knowledge Skills System (Admin-managed, additive)**
 - Add DB-backed `skills` records (frozen content at install time) with scope support (`shared` and `personal`).
@@ -1253,6 +1269,10 @@ Acceptance additions for Sprint 5.6.5:
 2. Skill injection remains context-relevant and bounded by token budget.
 3. Existing chat/task APIs and runner behavior remain backward compatible.
 4. Admin diagnostics can explain why a skill did or did not inject for a sample query.
+- Completed:
+  - Added DB-backed skills with shared/personal scope, frozen install content, and admin preview/install flow.
+  - Added semantic skill injection with bounded prompt budgets across chat, task, and webhook execution.
+  - Added admin preview-injection diagnostics and backend-only rollout.
 
 **Sprint 5.6.6 — Skills Lifecycle Hardening and Explainability**
 - Add superseding install semantics for existing scoped slugs: installing a replacement skill creates a new active record and deactivates the prior active version instead of failing on collision.
@@ -1266,6 +1286,13 @@ Acceptance additions for Sprint 5.6.6:
 2. Admins can hard-delete individual skill records without corrupting other versions of the same skill.
 3. Degraded selection mode uses pinned-only behavior and does not inject non-pinned skills by lexical accident.
 4. Chat/task/webhook responses and diagnostics expose which skill slugs were active for that execution.
+- Completed:
+  - Added superseding reinstall semantics, admin hard delete, and pinned-only degraded selection mode.
+  - Added skill attribution metadata to chat/task/webhook responses and richer run diagnostics.
+  - Post-review hardening merged in `v0.6.6`:
+    - direct install payloads now enforce the same slug/scope invariants as markdown preview,
+    - malformed payloads return `400` instead of creating inconsistent rows,
+    - DB uniqueness conflicts now resolve to clean `409` responses instead of leaking raw `500`s.
 
 **Sprint 5.6.7 — Run Inspector**
 - Add a backend-only admin inspection endpoint for single task runs so operators can view run metadata, tool traces, artifacts, and normalized diagnostics in one response.
@@ -1279,6 +1306,9 @@ Acceptance additions for Sprint 5.6.7:
 2. Artifact ordering and tool timelines are deterministic and stable across calls.
 3. Sparse or failed runs still return useful inspection payloads with empty arrays instead of hard errors when optional data is missing.
 4. Existing `/admin/task-runs` and `/admin/audit` behavior remain backward compatible.
+- Completed:
+  - Added `GET /admin/task-runs/{run_id}/inspect` for a one-response execution trace.
+  - Inline artifacts, normalized diagnostics, and ordered tool timelines now make single-run debugging possible without cross-referencing multiple endpoints.
 
 **Acceptance criteria**
 1. Both repos are renamed/repositioned with history intact.
