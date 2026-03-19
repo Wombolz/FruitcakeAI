@@ -1199,7 +1199,7 @@ Verification highlights:
 
 ## Phase 5.6 — Release Prep: Repository Realignment
 
-**Status**: 5.6.1-5.6.7 merged to `main` in release `v0.6.6`.
+**Status**: 5.6.1-5.6.9 merged to `main` in release `v0.6.7`.
 
 **Goal**: align repository boundaries before Phase 6 so ownership, release flow, and open-source onboarding are clean.
 

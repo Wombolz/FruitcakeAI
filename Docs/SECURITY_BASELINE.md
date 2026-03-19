@@ -1,6 +1,6 @@
 # Security Baseline
 
-This document describes the current security baseline for FruitcakeAI as of release `v0.6.6`.
+This document describes the current security baseline for FruitcakeAI as of release `v0.6.7`.
 
 It is not a formal security audit. It is the minimum operator and contributor reference for understanding:
 
@@ -166,7 +166,7 @@ These should never be committed with live secrets.
 Current practice in the repo:
 
 - Python runtime upgraded to 3.11
-- recent security-driven dependency updates were merged before `v0.6.6`
+- recent security-driven dependency updates were merged before `v0.6.7`
 - skills install path now enforces preview/install invariants and converts DB uniqueness conflicts into clean `409` responses
 
 Recommended ongoing hygiene:
