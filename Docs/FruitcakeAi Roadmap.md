@@ -1310,6 +1310,25 @@ Acceptance additions for Sprint 5.6.7:
   - Added `GET /admin/task-runs/{run_id}/inspect` for a one-response execution trace.
   - Inline artifacts, normalized diagnostics, and ordered tool timelines now make single-run debugging possible without cross-referencing multiple endpoints.
 
+**Sprint 5.6.8 — Simple Chat True Streaming**
+- Add true token streaming for the simple WebSocket chat path end to end.
+- Keep complex/orchestrated chat buffered in this sprint.
+- Preserve the current token/done/error wire contract while making simple chat feel live in the Swift client.
+- Follow-up soak hardening tightens calendar mutation trust boundaries so chat does not claim success without a confirmed tool result.
+- Completed:
+  - Added true simple-chat token streaming over WebSocket.
+  - Hardened client streaming state handling and offline fallback messaging.
+  - Stopped false calendar success claims when tool execution was missing or provider status was not successful.
+
+**Sprint 5.6.9 — Auth and Dependency Hardening**
+- Targeted dependency security cleanup without changing auth APIs or JWT behavior.
+- Upgrade `python-jose[cryptography]` to `3.5.0` so `pyasn1` can resolve to a safe version.
+- Re-run dependency audit plus auth/retrieval regression after the update.
+- Explicitly track current upstream blockers:
+  - `nltk` advisories remain upstream because the latest published `nltk` release is still `3.9.3`
+  - `ecdsa` advisory remains upstream because the latest published `ecdsa` release is still `0.19.1`
+- Success for this sprint is reducing the actionable auth-side vulnerability set, verifying no auth regressions, and documenting any unresolved upstream advisories clearly.
+
 **Acceptance criteria**
 1. Both repos are renamed/repositioned with history intact.
 2. All documentation and remotes point to new canonical names.
