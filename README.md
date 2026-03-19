@@ -81,6 +81,12 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - Hybrid BM25 + vector + RRF retrieval with source citations
 - Per-user library scoping — personal, shared, team
 
+**Knowledge skills**
+- Admin-managed skills stored in the database as frozen prompt extensions
+- Shared or personal scope, injected into chat, tasks, and webhooks only when relevant
+- Semantic gating with prompt-budget caps to prevent prompt bloat and drift
+- Preview/install flow, injection diagnostics, superseding updates, and per-run skill attribution
+
 **Autonomous tasks**
 - One-shot and recurring tasks with `every:Xm/h/d` or cron schedules
 - Active-hours windows prevent off-hours autonomous action
@@ -189,6 +195,8 @@ See [Adding MCP Tools](Docs/ADDING_MCP_TOOLS.md) for the full guide.
 
 FruitcakeAI core functions fully without any optional provider. Every integration is additive.
 
+FruitcakeAI also supports admin-managed knowledge skills. Skills do not add new runtime processes or MCP servers; they add scoped, installable prompt extensions that can be injected into chat, tasks, and webhooks when relevant. They are installed through the admin API with a preview → install flow and remain bounded by existing persona and execution-profile restrictions.
+
 ---
 
 ## Tests
@@ -208,7 +216,7 @@ FruitcakeAI/
 ├── app/
 │   ├── agent/          Agent loop, tools, personas, context builder
 │   ├── api/
-│   │   ├── admin.py    Admin: users, audit, metrics, task-runs
+│   │   ├── admin.py    Admin: users, audit, metrics, task-runs, skills
 │   │   ├── chat.py     Chat sessions + WebSocket streaming
 │   │   ├── devices.py  APNs device token registration
 │   │   ├── library.py  Document upload + RAG query
@@ -219,6 +227,7 @@ FruitcakeAI/
 │   ├── autonomy/       TaskRunner, scheduler, approval gate, APNs push
 │   ├── memory/         MemoryService — 3-tier retrieval, dedup, pgvector
 │   ├── mcp/            MCP registry + internal servers (calendar, web, RSS)
+│   ├── skills/         Skill install, selection, validation, and injection logic
 │   └── rag/            LlamaIndex RAG + hybrid BM25/vector/RRF retriever
 ├── config/
 │   ├── mcp_config.yaml     MCP server definitions
