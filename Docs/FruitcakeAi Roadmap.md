@@ -1310,6 +1310,25 @@ Acceptance additions for Sprint 5.6.7:
   - Added `GET /admin/task-runs/{run_id}/inspect` for a one-response execution trace.
   - Inline artifacts, normalized diagnostics, and ordered tool timelines now make single-run debugging possible without cross-referencing multiple endpoints.
 
+**Sprint 5.6.8 — Simple Chat True Streaming**
+- Add true token streaming for the simple WebSocket chat path end to end.
+- Keep complex/orchestrated chat buffered in this sprint.
+- Preserve the current token/done/error wire contract while making simple chat feel live in the Swift client.
+- Follow-up soak hardening tightens calendar mutation trust boundaries so chat does not claim success without a confirmed tool result.
+- Completed:
+  - Added true simple-chat token streaming over WebSocket.
+  - Hardened client streaming state handling and offline fallback messaging.
+  - Stopped false calendar success claims when tool execution was missing or provider status was not successful.
+
+**Sprint 5.6.9 — Auth and Dependency Hardening**
+- Targeted dependency security cleanup without changing auth APIs or JWT behavior.
+- Upgrade `python-jose[cryptography]` to `3.5.0` so `pyasn1` can resolve to a safe version.
+- Re-run dependency audit plus auth/retrieval regression after the update.
+- Explicitly track current upstream blockers:
+  - `nltk` advisories remain upstream because the latest published `nltk` release is still `3.9.3`
+  - `ecdsa` advisory remains upstream because the latest published `ecdsa` release is still `0.19.1`
+- Success for this sprint is reducing the actionable auth-side vulnerability set, verifying no auth regressions, and documenting any unresolved upstream advisories clearly.
+
 **Acceptance criteria**
 1. Both repos are renamed/repositioned with history intact.
 2. All documentation and remotes point to new canonical names.
@@ -1456,6 +1475,72 @@ The extraction prompt reviews each session: *"Extract any facts about the user w
 **Delta from home version**: SSO/LDAP/SAML · Teams (10–500 users) · ACL role matrix · Compliance export + retention · Docker Compose / K8s manifests · All judgment routing locked to `local` = air-gapped compliance guarantee · HIPAA/SOC 2 path · Mandatory audit logging.
 
 **Why v5 already supports this**: persona=role mapping · library scopes→workspaces · LiteLLM model swap via env var · Memory scoped per-user already · `autonomy.yaml` all-local = one config change.
+
+---
+
+## Deferred Decisions and Design Notes
+
+These items are intentionally tracked outside the sprint list because they are real design pressures, but they are not yet decision-complete enough to justify a full sprint or implementation commitment.
+
+### Near-Term Decisions
+
+- **Calendar mutation model**
+  - Why it matters: chat can create events, but true move/update semantics are still unsupported and smaller models can mis-handle calendar identifiers.
+  - Current status: calendar trust-boundary fixes stop false success claims; no first-class `update_event` or `move_event` tool exists yet.
+  - Decision needed later: whether calendar writes remain create-only or expand to explicit event lookup + update semantics.
+  - Earliest likely sprint: next chat/tooling reliability follow-up.
+
+- **Run Inspector client surface**
+  - Why it matters: the backend inspector is now good enough to debug task runs, but operators still need to hit the API directly.
+  - Current status: `GET /admin/task-runs/{run_id}/inspect` exists and is useful in practice.
+  - Decision needed later: whether to add a Swift admin/debug view or keep inspection API-only.
+  - Earliest likely sprint: after more soak confirms the payload shape is stable.
+
+- **Product positioning / tagline refresh**
+  - Why it matters: the current product direction is more memory- and continuity-driven than the older preparedness-focused tagline implies.
+  - Current status: README positioning has improved; public-facing tagline strategy is still unsettled.
+  - Decision needed later: whether to refresh public launch language around memory, continuity, and trusted local operation.
+  - Earliest likely sprint: before broader public launch/open-source promotion.
+
+### Phase-Gated Design Notes
+
+- **Ollama crash-state hardening**
+  - Why it matters: dispatch gating handles some unavailability cases, but hard process death/model reload failure still needs deeper handling.
+  - Current status: partially addressed through pause/requeue and local gating work.
+  - Decision needed later: what explicit crash detection and recovery contract should exist for local LLM outages.
+  - Earliest likely sprint: Phase 5 reliability follow-up.
+
+- **Canonical `active_hours` resolution**
+  - Why it matters: three-source policy resolution remains a subtle failure seam for scheduler behavior.
+  - Current status: the risk is documented; behavior needs one canonical resolver and sharper tests.
+  - Decision needed later: whether to centralize resolution in one policy layer and remove distributed fallback logic.
+  - Earliest likely sprint: scheduler/reliability cleanup before additional autonomy complexity.
+
+- **Sub-agent approval inheritance**
+  - Why it matters: Phase 7 sub-agents become unsafe or confusing if approval and scope ceilings are not inherited cleanly.
+  - Current status: roadmap principle exists (`child cannot escalate parent scopes`), but execution semantics are still open.
+  - Decision needed later: exact inheritance model for approvals, tool ceilings, and audit lineage across spawned agents.
+  - Earliest likely sprint: before Phase 7 implementation starts.
+
+- **Tenant isolation model**
+  - Why it matters: enterprise support gets expensive fast if tenant boundaries are bolted on late.
+  - Current status: single-household/single-deployment model remains the active assumption.
+  - Decision needed later: shared schema with `tenant_id`, schema-per-tenant, or deployment-per-tenant.
+  - Earliest likely sprint: before Phase 9 implementation.
+
+### Upstream / External Blockers
+
+- **`nltk` security advisories**
+  - Why it matters: the current dependency audit still flags `nltk 3.9.3`.
+  - Current status: latest published `nltk` release is still `3.9.3`; no newer package release is available to clear the advisories from this stack today.
+  - Decision needed later: whether to wait for upstream, patch around the dependency, or replace the dependency path in a broader retrieval-stack refresh.
+  - Earliest likely sprint: next dependency/security review if upstream remains stalled.
+
+- **`ecdsa` security advisory**
+  - Why it matters: the current audit still flags `ecdsa 0.19.1` through the `python-jose` dependency chain.
+  - Current status: latest published `ecdsa` release is still `0.19.1`; `python-jose 3.5.0` cleared `pyasn1` but not this residual advisory.
+  - Decision needed later: whether to accept the residual risk temporarily, remove the native backend dependency path, or replace the JWT library in a later auth refresh.
+  - Earliest likely sprint: next auth/security review.
 
 ---
 
