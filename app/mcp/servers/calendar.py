@@ -256,6 +256,12 @@ async def _create_event(args: Dict[str, Any], user_context: Any) -> str:
                 location=args.get("location"),
             ),
         )
+        status = str(result.get("status") or "").strip().lower()
+        if status and status != "created":
+            if status == "calendar_not_found":
+                requested = args.get("calendar_id") or provider.default_calendar_id()
+                return f"Failed to create event: calendar '{requested}' not found."
+            return f"Failed to create event: provider returned status '{status}'."
         display_start = start[:16].replace("T", " ")
         return f"Event created: '{title}' on {display_start} (id: {result.get('id', 'ok')})"
     except Exception as e:

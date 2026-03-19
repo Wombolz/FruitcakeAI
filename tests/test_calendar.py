@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from app.mcp.servers.calendar import (
     _calendar_matches,
     _collect_vevent_components,
+    _create_event,
     _dedupe_events,
     _parse_dt,
 )
@@ -61,3 +65,23 @@ def test_dedupe_events_removes_exact_duplicates_preserving_order():
     assert len(out) == 2
     assert out[0]["id"] == "a"
     assert out[1]["id"] == "b"
+
+
+@pytest.mark.asyncio
+async def test_create_event_returns_failure_when_provider_calendar_not_found():
+    provider = AsyncMock()
+    provider.default_calendar_id.return_value = "home"
+    provider.create_event.return_value = {"id": "", "status": "calendar_not_found"}
+
+    with patch("app.mcp.servers.calendar._get_provider", return_value=provider):
+        out = await _create_event(
+            {
+                "title": "Lunch with Rod",
+                "start": "2026-03-26T12:00:00",
+                "end": "2026-03-26T13:00:00",
+                "calendar_id": "mcp",
+            },
+            user_context=None,
+        )
+
+    assert out == "Failed to create event: calendar 'mcp' not found."

@@ -41,6 +41,11 @@ from app.db.session import get_db
 from app.metrics import metrics
 from app.memory.service import get_memory_service
 from app.skills.service import hydrate_user_context
+from app.agent.tools import (
+    get_tool_execution_records,
+    reset_tool_execution_records,
+    restore_tool_execution_records,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -333,6 +338,7 @@ async def send_message(
         metrics.inc_chat_complexity_simple_count()
 
     try:
+        record_token = reset_tool_execution_records()
         reply = await _execute_chat_turn(
             execution_history,
             user_context,
@@ -341,9 +347,19 @@ async def send_message(
             stage="chat_complex" if effective_complex else "chat_simple",
             enable_validation=effective_complex,
         )
+        reply = _enforce_calendar_mutation_integrity(
+            body.content,
+            reply,
+            get_tool_execution_records(),
+        )
     except Exception as e:
         log.exception("Agent error in REST handler", session_id=session_id)
         raise HTTPException(status_code=500, detail="Agent error — check server logs for details")
+    finally:
+        try:
+            restore_tool_execution_records(record_token)
+        except Exception:
+            pass
 
     # Store assistant reply
     assistant_msg = ChatMessage(session_id=session_id, role="assistant", content=reply)
@@ -521,6 +537,7 @@ async def chat_websocket(
                     else:
                         metrics.inc_chat_complexity_simple_count()
                     if effective_complex:
+                        record_token = reset_tool_execution_records()
                         complete = await _execute_chat_turn(
                             execution_history,
                             user_context,
@@ -529,11 +546,17 @@ async def chat_websocket(
                             stage="chat_complex",
                             enable_validation=effective_complex,
                         )
+                        complete = _enforce_calendar_mutation_integrity(
+                            user_message,
+                            complete,
+                            get_tool_execution_records(),
+                        )
                         for token_chunk in _chunk_text(complete):
                             full_response.append(token_chunk)
                             await websocket.send_json({"type": "token", "content": token_chunk})
                         complete = "".join(full_response)
                     else:
+                        record_token = reset_tool_execution_records()
                         started = time.perf_counter()
                         async for token_chunk in stream_agent(
                             execution_history,
@@ -547,7 +570,12 @@ async def chat_websocket(
                             mode="chat",
                             elapsed_ms=(time.perf_counter() - started) * 1000.0,
                         )
-                        complete = "".join(full_response)
+                        complete = _enforce_calendar_mutation_integrity(
+                            user_message,
+                            "".join(full_response),
+                            get_tool_execution_records(),
+                        )
+                    restore_tool_execution_records(record_token)
 
                     # Store assistant reply
                     assistant_msg = ChatMessage(
@@ -685,7 +713,11 @@ async def _execute_chat_turn(
     current = reply
 
     while True:
-        validation = validate_chat_response(user_prompt, current)
+        validation = validate_chat_response(
+            user_prompt,
+            current,
+            executed_tools=get_tool_execution_records(),
+        )
         if validation.invalid_urls:
             metrics.inc_chat_validation_invalid_link_count(len(validation.invalid_urls))
 
@@ -720,6 +752,24 @@ async def _execute_chat_turn(
             mode=mode,
             stage=f"{stage}_retry",
         )
+
+
+def _enforce_calendar_mutation_integrity(
+    user_prompt: str,
+    response: str,
+    executed_tools: list[dict[str, Any]],
+) -> str:
+    validation = validate_chat_response(
+        user_prompt,
+        response,
+        executed_tools=executed_tools,
+    )
+    if validation.mutation_unconfirmed:
+        return (
+            "I couldn't confirm that the calendar change actually succeeded. "
+            "Please check your calendar and try again."
+        )
+    return response
 
 
 async def _apply_required_library_grounding(
