@@ -1310,6 +1310,19 @@ Acceptance additions for Sprint 5.6.7:
   - Added `GET /admin/task-runs/{run_id}/inspect` for a one-response execution trace.
   - Inline artifacts, normalized diagnostics, and ordered tool timelines now make single-run debugging possible without cross-referencing multiple endpoints.
 
+**Sprint 5.6.8 — Simple Chat True Streaming**
+- Upgrade the normal WebSocket chat path so simple `chat` turns stream real LLM token output end to end instead of chunking a completed response.
+- Keep the current token/done/error/persona event contract stable so the Swift client does not need a protocol redesign.
+- Preserve the complexity classifier boundary: `chat_orchestrated` turns remain buffered/full-response in this sprint.
+- Keep intermediate tool turns internal and non-streaming; only the final assistant reply should stream live.
+- Harden the client chat view so in-flight streaming state clears cleanly on `done`, `error`, reconnect, and session switch.
+
+Acceptance additions for Sprint 5.6.8:
+1. Simple WebSocket chat emits multiple real token events before `done`.
+2. `done.content` remains the canonical final response and matches the streamed text.
+3. Complex/orchestrated chat stays backward compatible even if it still appears buffered.
+4. REST fallback and offline/on-device fallback remain unchanged.
+
 **Acceptance criteria**
 1. Both repos are renamed/repositioned with history intact.
 2. All documentation and remotes point to new canonical names.

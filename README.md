@@ -1,38 +1,39 @@
-# 🍰 FruitcakeAI
+# FruitcakeAI
 
-> *Put a fruitcake in your home and be ready for anything.*
+**A self-hosted AI agent platform you run on your own hardware and extend however you want.**
 
-A private, local-first AI assistant for individuals, households, and small teams — one that knows its people and keeps working under degraded conditions. Runs entirely on your hardware. No data leaves unless you choose to send it.
+FruitcakeAI is a complete autonomous agent runtime — persistent memory, task scheduling, multi-user access control, hybrid RAG document pipeline, MCP extensibility, and a native Swift client, all wired together and working. There's no SaaS dependency, no ongoing API cost, and no vendor lock-in. You bring your own models via Ollama, or swap in Claude or OpenAI with one environment variable.
 
-→ [Design Philosophy](Docs/DesignPhilosophy.md)
+It's built for self-hosters, homelab tinkerers, developers, and small teams who want real autonomous AI capabilities without giving up ownership of their data or their stack. The foundation is fully working. What you build on top of it is up to you.
 
 ---
 
 ## What It Is
 
-FruitcakeAI is built around three outcomes:
+FruitcakeAI is not a chat UI wrapper. It's an agent platform with a full working runtime underneath:
 
-**Trust.** An assistant that multiple people can use, with per-user personas that scope tool access, filter content, and gate irreversible actions. Safety controls are a design constraint, not a feature layer.
+- The **agent** reasons over your memory, documents, and tools — not just the current message
+- The **task engine** plans and executes multi-step work autonomously, on a schedule, or triggered by webhooks
+- The **memory system** persists what matters across sessions, with 3-tier retrieval and semantic search
+- The **RAG pipeline** ingests your documents and makes them queryable with hybrid BM25 + vector retrieval
+- The **MCP layer** lets you drop in any tool server via a config file — no code changes required
+- The **persona system** scopes what each user can do, see, and ask — down to individual tools
 
-**Privacy.** Local Ollama is the default and the baseline. The system is fully functional without a cloud API key. Cloud LLMs are an opt-in enhancement for users who choose to trade some privacy for a higher reasoning ceiling — not the starting point, not the assumption.
-
-**Continuity.** The architecture degrades gracefully. When connectivity is limited, the system keeps working from cached data and local knowledge. When it's gone entirely, the local model and document library remain available. When data has an age, the system says so.
-
-FruitcakeAI is not a cloud-first assistant with a local mode. It is a local-first system with an optional cloud enhancement. It is not a single-user power tool. It is not a prescribed configuration — what you put in it reflects your context and your priorities.
+Every subsystem is independently testable, swap-able, and extensible. If you want to rip out a layer and replace it with your own, the seams are there.
 
 ---
 
 ## Design Principles
 
-**Privacy first, cloud optional.** Local Ollama is the default. Anyone who never configures a cloud API key never sends a token outside their network. That is a complete, fully-functional experience.
+**Local-first, cloud opt-in.** The system runs fully offline against Ollama. Cloud LLMs are one env var away. Your data stays on your hardware unless you explicitly route it elsewhere.
 
-**Resilience by construction.** The system degrades gracefully through explicit tiers — from full local with live feeds, through cached-data operation, to fully offline on local library and memory alone. Every component communicates data freshness and confidence when it matters.
+**Zero ongoing API cost by default.** Ollama with a local model costs nothing to run. Cloud routing is opt-in and per-signal — you decide what, if anything, leaves the machine.
 
-**Knows its people.** Persistent per-user semantic memory across sessions. Procedural preferences, episodic facts, long-term knowledge — retrieved and injected into every interaction. The system doesn't just remember what's in a checklist; it remembers what's been relevant for this person lately.
+**Extensible via MCP — additive integrations.** New capabilities arrive as MCP servers in a config file. The agent discovers them at startup. Nothing in core depends on any optional provider. Everything added is additive; nothing is load-bearing.
 
-**Multi-user and safe by default.** Role-based personas with scoped tool access. Per-persona content filtering and blocked tool lists. Approval gates before irreversible actions. Active-hours windows that prevent the autonomous agent from acting at 3am.
+**Multi-user and safe by default.** Role-based personas with scoped tool access. Per-persona content filtering and blocked tool lists. Approval gates before irreversible actions. Active-hours windows that prevent the autonomous agent from running at 3am.
 
-**Modular via MCP — additive integrations.** New capabilities arrive as MCP servers added to a config file. The agent discovers them and starts using them. FruitcakeAI core must function fully without any optional provider. Everything added is additive; nothing is load-bearing.
+**No speculative infrastructure.** The codebase contains only what the current use case requires. No Kubernetes, no distributed queues, no ELK stack. Complexity is added when real friction demands it, not in anticipation of scale that doesn't exist yet.
 
 ---
 
@@ -104,6 +105,7 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - Native Swift app for iPhone and Mac
 - APNs push notifications for task results and approval requests
 - On-device FoundationModels fallback for calendar, reminders, and contacts when offline
+
 
 ---
 
