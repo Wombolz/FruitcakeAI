@@ -1329,6 +1329,27 @@ Acceptance additions for Sprint 5.6.7:
   - `ecdsa` advisory remains upstream because the latest published `ecdsa` release is still `0.19.1`
 - Success for this sprint is reducing the actionable auth-side vulnerability set, verifying no auth regressions, and documenting any unresolved upstream advisories clearly.
 
+**Sprint 5.6.10 — RSS Newspaper Export and Demo Polish**
+- Focus the polish work on the `news_magazine` task for demo readiness.
+- Normalize final magazine markdown so story blocks and `Read More` links render with reliable spacing.
+- Export each successful full publish to a dated edition bundle under `storage/exports/newspapers`.
+- Save `edition.pdf`, `edition.md`, and `edition.json` for each run, with run/task metadata that shows continuity over multiple days.
+- Add an `edition_export` task-run artifact plus an admin PDF download endpoint (`GET /admin/task-runs/{run_id}/edition.pdf`) so exported editions are easy to inspect and demo.
+
+**Sprint 5.6.11 — `Fruitcake News` Layout and Edition Density**
+- Keep the internal profile key as `news_magazine`, but brand the rendered edition as `Fruitcake News`.
+- Refactor the final pass so it builds a canonical edition first, then publishes/export renders from that finalized structure.
+- Raise the effective edition density to roughly 10 to 12 linked stories when enough dataset items are available.
+- Use a two-tier paper structure: featured top stories first, followed by shorter section briefs across multiple categories.
+- Preserve grounded-link validation while allowing the finalized edition builder to backfill additional publishable briefs from the prepared dataset when the model draft is too sparse.
+
+**Sprint 5.6.13 — Chat Responsiveness Optimization**
+- Prioritize perceived speed on ordinary chat without rewriting the full chat architecture.
+- Replace the current fake streaming path with true token streaming for the simple WebSocket chat path.
+- Reduce simple-chat overhead by trimming the default history window and making memory retrieval and tool exposure conditional instead of always-on.
+- Keep complex/orchestrated chat behavior intact, including grounded/library flows and stronger validation where those paths already apply.
+- Add latency breakdown instrumentation so future slowdowns can be attributed to prompt assembly, memory/skills, tool exposure, or model generation instead of being inferred from feel.
+
 **Acceptance criteria**
 1. Both repos are renamed/repositioned with history intact.
 2. All documentation and remotes point to new canonical names.
