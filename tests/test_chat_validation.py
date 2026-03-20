@@ -44,6 +44,18 @@ def test_build_retry_instruction_has_reason_specific_text():
     assert "too brief/empty" in build_chat_retry_instruction("empty_result").lower()
     assert "grounded sources" in build_chat_retry_instruction("missing_links").lower()
     assert "invalid/placeholder links" in build_chat_retry_instruction("invalid_links").lower()
+    assert "calendar" in build_chat_retry_instruction("calendar_mutation_unconfirmed").lower()
+
+
+def test_validate_chat_response_flags_unconfirmed_calendar_mutation_claim():
+    out = validate_chat_response(
+        "Create an event for next Wednesday at 12pm for lunch with Rod",
+        "I've created an event titled 'Lunch with Rod' on your calendar for next Wednesday at 12 PM.",
+        executed_tools=[],
+    )
+    assert out.mutation_unconfirmed is True
+    assert out.should_retry is True
+    assert out.retry_reason == "calendar_mutation_unconfirmed"
 
 
 @pytest.mark.asyncio
@@ -232,6 +244,28 @@ async def test_library_excerpt_intent_uses_search_library_grounding(client):
         m.get("role") == "system" and "search_library result" in m.get("content", "")
         for m in injected_history
     )
+
+
+@pytest.mark.asyncio
+async def test_rest_chat_does_not_claim_calendar_mutation_without_confirmed_tool(client):
+    token = await _login_token(client, "chatcalendarclaim", "chatcalendarclaim@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    create = await client.post("/chat/sessions", json={"title": "Calendar Claim"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with patch(
+        "app.api.chat.run_agent",
+        new_callable=AsyncMock,
+        return_value="I've created an event titled 'Lunch with Rod' on your calendar for next Wednesday at 12 PM.",
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "Create an event for next Wednesday at 12pm for lunch with Rod"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert "couldn't confirm" in resp.json()["content"].lower()
 
 
 async def _login_token(client, username: str, email: str) -> str:

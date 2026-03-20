@@ -10,6 +10,7 @@ Sprint 2.1: MCP tools added here automatically via registry.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -20,6 +21,23 @@ from app.agent.context import UserContext
 from app.autonomy.approval import ApprovalRequired
 
 log = structlog.get_logger(__name__)
+
+_tool_execution_records: contextvars.ContextVar[List[Dict[str, str]]] = contextvars.ContextVar(
+    "tool_execution_records",
+    default=[],
+)
+
+
+def reset_tool_execution_records() -> contextvars.Token:
+    return _tool_execution_records.set([])
+
+
+def get_tool_execution_records() -> List[Dict[str, str]]:
+    return list(_tool_execution_records.get())
+
+
+def restore_tool_execution_records(token: contextvars.Token) -> None:
+    _tool_execution_records.reset(token)
 
 # ── Tool schema definitions ───────────────────────────────────────────────────
 # These are sent to the LLM so it knows what tools it can call.
@@ -265,6 +283,10 @@ async def dispatch_tool_calls(
                 result_summary=str(result_content)[:500],
             )
         )
+
+        records = list(_tool_execution_records.get())
+        records.append({"tool": tool_name, "result_summary": str(result_content)})
+        _tool_execution_records.set(records)
 
         results.append(
             {

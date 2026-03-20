@@ -68,6 +68,60 @@ def _litellm_kwargs() -> Dict[str, Any]:
     return kwargs
 
 
+async def _stream_final_response(
+    history: List[Dict[str, Any]],
+    user_context: UserContext,
+    *,
+    selected_model: str,
+    stage: str | None,
+) -> AsyncGenerator[str, None]:
+    """
+    Stream the final assistant text for a simple chat turn.
+
+    Tools are disabled on this second pass so we do not reopen the tool-calling
+    loop after the non-streaming probe determined the turn is a plain text
+    response.
+    """
+    extra = _litellm_kwargs()
+    emitted = False
+
+    try:
+        response = await litellm.acompletion(
+            model=selected_model,
+            messages=_build_messages(history, user_context),
+            stream=True,
+            **extra,
+        )
+    except Exception as e:
+        log.error(
+            "LLM streaming call failed",
+            error=str(e),
+            model=selected_model,
+            mode="chat",
+            stage=stage,
+        )
+        raise
+
+    async for chunk in response:
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = getattr(choice, "delta", None)
+        content = getattr(delta, "content", None) if delta is not None else None
+        if content:
+            emitted = True
+            yield content
+
+    if not emitted:
+        log.warning(
+            "LLM streaming completed without token content",
+            model=selected_model,
+            mode="chat",
+            stage=stage,
+        )
+
+
 async def run_agent(
     messages: List[Dict[str, Any]],
     user_context: UserContext,
@@ -156,8 +210,7 @@ async def stream_agent(
     selected_model = model_override or settings.llm_model
 
     for turn in range(max_turns):
-        # Non-streaming for intermediate turns that involve tool calls —
-        # we only stream the final text response turn.
+        # Probe turn non-streaming so intermediate tool turns stay internal.
         try:
             response = await litellm.acompletion(
                 model=selected_model,
@@ -178,11 +231,9 @@ async def stream_agent(
             raise
 
         message = response.choices[0].message
-        finish_reason = response.choices[0].finish_reason
-
-        history.append(_normalize_tool_calls(message.model_dump(exclude_none=True)))
 
         if message.tool_calls:
+            history.append(_normalize_tool_calls(message.model_dump(exclude_none=True)))
             tool_results = await dispatch_tool_calls(message.tool_calls, user_context)
             history.extend(tool_results)
             metrics.inc_tool_calls(len(message.tool_calls))
@@ -195,13 +246,13 @@ async def stream_agent(
                 stage=stage,
             )
         else:
-            # Final turn — yield the already-computed response directly.
-            # Re-generating with stream=True risks the LLM paraphrasing or
-            # truncating large tool results (e.g. document summaries).
-            content = message.content or ""
-            CHUNK_SIZE = 64
-            for i in range(0, len(content), CHUNK_SIZE):
-                yield content[i : i + CHUNK_SIZE]
+            async for token in _stream_final_response(
+                history,
+                user_context,
+                selected_model=selected_model,
+                stage=stage,
+            ):
+                yield token
             return
 
     yield "I ran into an issue processing your request. Please try again."
