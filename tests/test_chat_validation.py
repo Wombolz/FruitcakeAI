@@ -247,6 +247,42 @@ async def test_library_excerpt_intent_uses_search_library_grounding(client):
 
 
 @pytest.mark.asyncio
+async def test_library_summary_intent_uses_summarize_document_grounding(client):
+    token = await _login_token(client, "chatlibrarysummary", "chatlibrarysummary@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    create = await client.post("/chat/sessions", json={"title": "Library Summary Grounding"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", False),
+        patch.object(settings, "chat_orchestration_kill_switch", False),
+        patch(
+            "app.agent.tools._summarize_document",
+            new_callable=AsyncMock,
+            return_value="Document summary for SGAO_Studio_Manual_v1.0-2.pdf",
+        ),
+        patch("app.agent.tools._write_audit_log", new_callable=AsyncMock),
+        patch(
+            "app.api.chat.run_agent",
+            new_callable=AsyncMock,
+            return_value="Grounded document summary response.",
+        ) as mock_run,
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "summarize the SGAO_Studio_Manual_v1.0-2.pdf from my library"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    injected_history = mock_run.await_args_list[0].args[0]
+    assert any(
+        m.get("role") == "system" and "summarize_document result" in m.get("content", "")
+        for m in injected_history
+    )
+
+
+@pytest.mark.asyncio
 async def test_rest_chat_does_not_claim_calendar_mutation_without_confirmed_tool(client):
     token = await _login_token(client, "chatcalendarclaim", "chatcalendarclaim@example.com")
     headers = {"Authorization": f"Bearer {token}"}

@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     chat_validation_enabled: bool = True
     chat_validation_retry_enabled: bool = True
     chat_validation_retry_max_attempts: int = 1
+    chat_simple_history_max_messages: int = 8
+    chat_simple_memory_enabled: bool = True
+    chat_simple_tools_enabled: bool = True
     # Sprint 5.6.5 knowledge skills
     skills_preview_allowed_domains: List[str] = [
         "github.com",

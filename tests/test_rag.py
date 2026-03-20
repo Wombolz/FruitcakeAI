@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.rag.service import RAGService
+from app.rag.ingest import _load_documents
 
 
 # ── RAGService — pre-startup behaviour ────────────────────────────────────────
@@ -69,6 +70,24 @@ def test_rag_health_ready():
     h = svc.health()
     assert h["status"] == "ready"
     assert "fusion_runtime_disabled" in h
+
+
+def test_load_documents_extracts_text_from_pdf(tmp_path):
+    from reportlab.pdfgen import canvas
+
+    pdf_path = tmp_path / "manual.pdf"
+    c = canvas.Canvas(str(pdf_path))
+    c.drawString(72, 720, "Stained Glass Adversarial Obfuscation Studio Manual")
+    c.drawString(72, 700, "Identity Mode B preserves human familiarity.")
+    c.save()
+
+    docs = _load_documents(pdf_path)
+
+    assert len(docs) == 1
+    text = docs[0].text
+    assert "Stained Glass Adversarial Obfuscation Studio Manual" in text
+    assert "Identity Mode B preserves human familiarity." in text
+    assert "%PDF" not in text
 
 
 # ── RAGService — delete_document (best-effort, no error when not ready) ────────

@@ -76,7 +76,7 @@ async def test_recall_memory_endpoint_increments_access_and_timestamp(client):
 
 
 @pytest.mark.asyncio
-async def test_chat_rest_injects_memory_context_before_agent_execution(client):
+async def test_chat_rest_injects_memory_context_for_referential_simple_chat(client):
     headers = await _headers(client, "chatmemoryuser")
     user_id = await _user_id(client, headers)
     memory_id = await _seed_memory(user_id, content="This user likes bullet summaries.")
@@ -93,7 +93,7 @@ async def test_chat_rest_injects_memory_context_before_agent_execution(client):
     with patch("app.api.chat.run_agent", new=AsyncMock(side_effect=_fake_run_agent)):
         resp = await client.post(
             f"/chat/sessions/{session_id}/messages",
-            json={"content": "How should you respond to me?"},
+            json={"content": "Remember how should you respond to me?"},
             headers=headers,
         )
 
