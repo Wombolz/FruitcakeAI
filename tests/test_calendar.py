@@ -6,6 +6,7 @@ from app.mcp.servers.calendar import (
     _calendar_matches,
     _collect_vevent_components,
     _dedupe_events,
+    _format_event_timestamp,
     _parse_dt,
 )
 
@@ -61,3 +62,10 @@ def test_dedupe_events_removes_exact_duplicates_preserving_order():
     assert len(out) == 2
     assert out[0]["id"] == "a"
     assert out[1]["id"] == "b"
+
+
+def test_format_event_timestamp_derives_correct_weekday_from_iso_date():
+    assert _format_event_timestamp("2026-03-19T11:00:00+00:00") == "Thursday, 2026-03-19 11:00"
+    assert _format_event_timestamp("2026-03-20T13:00:00+00:00") == "Friday, 2026-03-20 13:00"
+    assert _format_event_timestamp("2026-03-21T09:00:00+00:00") == "Saturday, 2026-03-21 09:00"
+    assert _format_event_timestamp("2026-03-22T14:00:00+00:00") == "Sunday, 2026-03-22 14:00"
