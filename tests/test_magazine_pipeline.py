@@ -1,6 +1,10 @@
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from pypdf import PdfReader
 
 from app.autonomy.magazine_pipeline import (
     _choose_section,
@@ -8,13 +12,16 @@ from app.autonomy.magazine_pipeline import (
     build_magazine_dataset,
     validate_magazine_markdown,
 )
+from app.autonomy.newspaper_export import export_newspaper_edition, normalize_magazine_markdown
 from app.autonomy.profiles.news_magazine import (
     NewsMagazineExecutionProfile,
     _dedupe_output_by_url,
     _drop_unlinked_item_blocks,
     _inject_missing_links_from_dataset,
     _inject_missing_links_from_dataset_with_report,
+    _trim_summary,
 )
+from app.config import settings
 from app.db.models import RSSItem, RSSSource
 from tests.conftest import TestSessionLocal
 
@@ -240,6 +247,288 @@ def test_drop_unlinked_item_blocks_keeps_linked_items_only():
     assert dropped == 1
 
 
+def test_normalize_magazine_markdown_preserves_blank_lines_after_links():
+    source = (
+        "March 19, 2026 Top of the Hour News Magazine\n"
+        "Top Stories\n"
+        "- **Headline:** Story One\n"
+        "Source: Reuters\n"
+        "Published at: 2026-03-19T15:56:03+00:00\n"
+        "Summary: First summary.\n"
+        "[Read More](https://example.com/one)\n"
+        "- **Headline:** Story Two\n"
+        "Source: BBC\n"
+        "Published at: 2026-03-19T15:19:54+00:00\n"
+        "Summary: Second summary.\n"
+        "[Read More](https://example.com/two)\n"
+    )
+    normalized = normalize_magazine_markdown(source)
+    assert "# Fruitcake News" in normalized
+    assert "## Top Stories" in normalized
+    assert "[Read More](https://example.com/one)\n\n- **Headline:** Story Two" in normalized
+    assert normalized.endswith("\n")
+
+
+def test_export_newspaper_edition_writes_pdf_markdown_and_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "storage_dir", str(tmp_path))
+    markdown = (
+        "# Fruitcake News\n\n"
+        "## Top Stories\n\n"
+        "- **Headline:** Story One\n"
+        "Source: Reuters\n"
+        "Published at: 2026-03-19T15:56:03+00:00\n"
+        "Summary: First summary.\n"
+        "[Read More](https://example.com/one)\n\n"
+    )
+    edition = export_newspaper_edition(
+        task_id=48,
+        task_run_id=561,
+        session_id=688,
+        profile="news_magazine",
+        final_markdown=markdown,
+        started_at=datetime(2026, 3, 19, 15, 54, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 3, 19, 16, 0, 21, tzinfo=timezone.utc),
+        duration_seconds=381.0,
+        publish_mode="full",
+        dataset_stats={"selected_count": 100},
+        refresh_stats={"sources_refreshed": 137},
+        active_skills=["rss-grounded-briefing"],
+    )
+
+    assert edition.pdf_path.exists()
+    assert edition.markdown_path.exists()
+    assert edition.manifest_path.exists()
+    assert "task-48/2026-03-19/" in edition.manifest["pdf_relative_path"]
+
+    reader = PdfReader(str(edition.pdf_path))
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+    assert "Fruitcake News" in extracted
+    assert "Story One" in extracted
+    assert "Read More" in extracted
+
+    manifest = json.loads(Path(edition.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["task_id"] == 48
+    assert manifest["task_run_id"] == 561
+    assert manifest["publish_mode"] == "full"
+    assert manifest["display_timezone"]
+    assert manifest["display_published_at"].endswith(("-04:00", "-05:00"))
+
+
+def test_news_magazine_validate_finalize_builds_dense_fruitcake_news_edition():
+    profile = NewsMagazineExecutionProfile()
+    dataset_items = []
+    sections = ["World", "Politics", "Business", "Tech", "Science", "Culture", "Other", "World", "Business", "Tech"]
+    for idx, section in enumerate(sections, start=1):
+        dataset_items.append(
+            {
+                "item_id": idx,
+                "section": section,
+                "title": f"Story {idx}",
+                "source": f"Source {idx}",
+                "summary": f"Summary for story {idx}.",
+                "url": f"https://example.com/{idx}",
+                "published_at": f"2026-03-19T1{idx % 10}:00:00+00:00",
+            }
+        )
+    run_context = {
+        "dataset": {"run_id": 201, "items": dataset_items},
+        "dataset_prompt": "\n".join(f"URL: https://example.com/{idx}" for idx in range(1, 11)),
+    }
+    source = (
+        "## Top Stories\n"
+        "- **Headline:** Story 1\n"
+        "Source: Source 1\n"
+        "Published at: 2026-03-19T10:00:00+00:00\n"
+        "Summary: Lead summary.\n"
+        "[Read More](https://example.com/1)\n"
+        "- **Headline:** Story 2\n"
+        "Source: Source 2\n"
+        "Published at: 2026-03-19T11:00:00+00:00\n"
+        "Summary: Second summary.\n"
+        "[Read More](https://example.com/2)\n"
+    )
+    cleaned, report = profile.validate_finalize(
+        result=source,
+        prior_full_outputs=[],
+        run_context=run_context,
+        is_final_step=True,
+    )
+    assert cleaned.startswith("# Fruitcake News\n")
+    assert cleaned.count("[Read More](") == 10
+    assert "## Technology" in cleaned
+    assert "## Editor's Note" in cleaned
+    assert "This hour's edition was led by" in cleaned
+    assert report is not None
+    assert report["edition"]["story_count"] == 10
+    assert report["edition"]["section_count"] >= 5
+    assert report["edition"]["auto_filled_story_count"] >= 8
+
+
+def test_news_magazine_validate_finalize_preserves_clean_model_editors_note():
+    profile = NewsMagazineExecutionProfile()
+    dataset_items = []
+    sections = ["World", "Politics", "Business", "Tech", "Science", "Culture", "Other", "World", "Business", "Tech"]
+    for idx, section in enumerate(sections, start=1):
+        dataset_items.append(
+            {
+                "item_id": idx,
+                "section": section,
+                "title": f"Story {idx}",
+                "source": f"Source {idx}",
+                "summary": f"Summary for story {idx}.",
+                "url": f"https://example.com/{idx}",
+                "published_at": f"2026-03-19T1{idx % 10}:00:00+00:00",
+            }
+        )
+    run_context = {
+        "dataset": {"run_id": 211, "items": dataset_items},
+        "dataset_prompt": "\n".join(f"URL: https://example.com/{idx}" for idx in range(1, 11)),
+    }
+    source = (
+        "## Top Stories\n"
+        "- **Headline:** Story 1\n"
+        "Source: Source 1\n"
+        "Published at: 2026-03-19T10:00:00+00:00\n"
+        "Summary: Lead summary with some nuance.\n"
+        "[Read More](https://example.com/1)\n\n"
+        "## Editor's Note\n"
+        "Markets, conflict diplomacy, and vaccine policy defined the hour, with technology funding and regional security shifts broadening the agenda.\n"
+    )
+    cleaned, report = profile.validate_finalize(
+        result=source,
+        prior_full_outputs=[],
+        run_context=run_context,
+        is_final_step=True,
+    )
+    assert "Markets, conflict diplomacy, and vaccine policy defined the hour" in cleaned
+    assert "This hour's edition was led by" not in cleaned
+    assert report is not None
+    assert report.get("fatal") is False
+
+
+def test_news_magazine_validate_finalize_cleans_malformed_model_story_fields():
+    profile = NewsMagazineExecutionProfile()
+    dataset = {
+        "run_id": 202,
+        "items": [
+            {
+                "title": "Iran conflict looms large over Trump's meeting with Japan PM",
+                "url": "https://example.com/world-1",
+                "source": "BBC World",
+                "summary": "The ongoing tension between the US and Iran overshadowed a meeting.",
+                "published_at": "2026-03-19T18:06:37+00:00",
+                "section": "World",
+            }
+        ],
+    }
+    run_context = {
+        "dataset": dataset,
+        "dataset_prompt": "URL: https://example.com/world-1\n",
+    }
+    source = (
+        "## Top Stories\n"
+        "- **Headline:** [Read More](https://example.com/world-1)\n"
+        "**Source:** **Source:** BBC World\n"
+        "**Published at:** 2026-03-19T18:06:37+00:00\n"
+        "**Summary:** **Headline:** Iran conflict looms large over Trump's meeting with Japan PM "
+        "**Published:** 19 March 2026 The ongoing tension between the US and Iran overshadowed a meeting. ---\n"
+        "[Read More](https://example.com/world-1)\n"
+    )
+    cleaned, report = profile.validate_finalize(
+        result=source,
+        prior_full_outputs=[],
+        run_context=run_context,
+        is_final_step=True,
+    )
+    assert "- **Headline:** Iran conflict looms large over Trump's meeting with Japan PM" in cleaned
+    assert "**Source:** BBC World" in cleaned
+    assert "**Source:** **Source:**" not in cleaned
+    assert "**Summary:** The ongoing tension between the US and Iran overshadowed a meeting." in cleaned
+    assert "## Editor's Note" in cleaned
+    assert report is not None
+    assert report.get("fatal") is False
+
+
+def test_news_magazine_validate_finalize_prefers_clean_model_summary_when_available():
+    profile = NewsMagazineExecutionProfile()
+    dataset = {
+        "run_id": 203,
+        "items": [
+            {
+                "title": "Lead Story",
+                "url": "https://example.com/lead",
+                "source": "Example Source",
+                "summary": "Dataset summary fallback.",
+                "published_at": "2026-03-19T18:06:37+00:00",
+                "section": "World",
+            }
+        ],
+    }
+    run_context = {
+        "dataset": dataset,
+        "dataset_prompt": "URL: https://example.com/lead\n",
+    }
+    source = (
+        "## Top Stories\n"
+        "- **Headline:** Lead Story\n"
+        "Source: Example Source\n"
+        "Published at: 2026-03-19T18:06:37+00:00\n"
+        "Summary: A cleaner model-written summary adds context beyond the raw feed blurb while staying grounded.\n"
+        "[Read More](https://example.com/lead)\n"
+    )
+    cleaned, _ = profile.validate_finalize(
+        result=source,
+        prior_full_outputs=[],
+        run_context=run_context,
+        is_final_step=True,
+    )
+    assert "**Summary:** A cleaner model-written summary adds context beyond the raw feed blurb while staying grounded." in cleaned
+
+
+def test_trim_summary_prefers_complete_sentence_boundary():
+    text = (
+        "Iranian aerial attacks caused extensive damage to the world's largest gas plant in Qatar. "
+        "Analysts warned of further disruption to regional energy supplies."
+    )
+    trimmed = _trim_summary(text, 95)
+    assert trimmed.endswith(".")
+    assert "world's largest gas plant in Qatar." in trimmed
+    assert "Analysts warned" not in trimmed
+
+
+def test_export_newspaper_pdf_normalizes_unicode_for_helvetica(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "storage_dir", str(tmp_path))
+    markdown = (
+        "# Fruitcake News\n\n"
+        "## Top Stories\n\n"
+        "- **Headline:** Japan’s PM — delicate “Iran” talks\n"
+        "**Source:** BBC World\n"
+        "**Published at:** 2026-03-19T18:06:37+00:00\n"
+        "**Summary:** The prime minister’s remarks used smart quotes, dashes — and an ellipsis…\n"
+        "[Read More](https://example.com/world-1)\n\n"
+        "## Editor's Note\n\n"
+        "This hour’s edition was led by Japan’s PM — delicate talks.\n"
+    )
+    edition = export_newspaper_edition(
+        task_id=48,
+        task_run_id=648,
+        session_id=688,
+        profile="news_magazine",
+        final_markdown=markdown,
+        started_at=datetime(2026, 3, 19, 18, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 3, 19, 18, 5, tzinfo=timezone.utc),
+        duration_seconds=300.0,
+        publish_mode="full",
+        dataset_stats={"selected_count": 1},
+        refresh_stats={"sources_refreshed": 1},
+        active_skills=[],
+    )
+    reader = PdfReader(str(edition.pdf_path))
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+    assert "Japan's PM - delicate" in extracted
+    assert "This hour's edition was led by" in extracted
+
+
 def test_news_magazine_validate_finalize_publishes_partial_when_some_items_missing_links():
     profile = NewsMagazineExecutionProfile()
     dataset = {
@@ -275,11 +564,20 @@ def test_news_magazine_validate_finalize_publishes_partial_when_some_items_missi
     assert "https://example.com/two" in cleaned
 
 
-def test_news_magazine_validate_finalize_fails_when_no_publishable_linked_items():
+def test_news_magazine_validate_finalize_backfills_from_dataset_when_model_output_is_unusable():
     profile = NewsMagazineExecutionProfile()
     dataset = {
         "run_id": 102,
-        "items": [{"title": "Known Story", "url": "https://example.com/known"}],
+        "items": [
+            {
+                "title": "Known Story",
+                "url": "https://example.com/known",
+                "source": "Example Wire",
+                "summary": "Known summary.",
+                "published_at": "2026-03-19T12:00:00+00:00",
+                "section": "World",
+            }
+        ],
     }
     run_context = {
         "dataset": dataset,
@@ -292,7 +590,53 @@ def test_news_magazine_validate_finalize_fails_when_no_publishable_linked_items(
         run_context=run_context,
         is_final_step=True,
     )
-    assert "https://example.com/" not in cleaned
+    assert "Unmatched Headline" not in cleaned
+    assert "https://example.com/known" in cleaned
     assert report is not None
-    assert report.get("fatal") is True
-    assert "no publishable linked items" in str(report.get("fatal_reason", "")).lower()
+    assert report.get("fatal") is False
+    assert report["edition"]["story_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_news_magazine_export_artifacts_allows_nonfatal_partial_publish(tmp_path, monkeypatch):
+    profile = NewsMagazineExecutionProfile()
+    monkeypatch.setattr(settings, "storage_dir", str(tmp_path))
+
+    task = SimpleNamespace(id=48)
+    run = SimpleNamespace(
+        id=681,
+        session_id=805,
+        started_at=datetime(2026, 3, 20, 11, 54, 17, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 3, 20, 12, 1, 26, tzinfo=timezone.utc),
+    )
+    markdown = (
+        "# Fruitcake News\n\n"
+        "## Top Stories\n\n"
+        "- **Headline:** Story One\n"
+        "**Source:** Example Wire\n"
+        "**Published at:** 2026-03-20T11:43:13+00:00\n"
+        "**Summary:** Example summary.\n"
+        "[Read More](https://example.com/one)\n\n"
+        "## Editor's Note\n\n"
+        "This hour's edition was led by Story One.\n"
+    )
+    run_debug = {
+        "grounding_report": {"publish_mode": "partial", "fatal": False},
+        "dataset_stats": {"selected_count": 100},
+        "refresh_stats": {"sources_refreshed": 137},
+        "active_skills": ["rss-grounded-briefing"],
+    }
+
+    payloads = await profile.export_artifact_payloads(
+        task=task,
+        run=run,
+        final_markdown=markdown,
+        run_debug=run_debug,
+    )
+
+    assert len(payloads) == 1
+    assert payloads[0]["artifact_type"] == "edition_export"
+    manifest = payloads[0]["content_json"]
+    assert manifest["publish_mode"] == "partial"
+    assert manifest["download_path"] == f"/admin/task-runs/{run.id}/edition.pdf"
+    assert (tmp_path / manifest["pdf_relative_path"]).exists()

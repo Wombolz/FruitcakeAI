@@ -1311,22 +1311,10 @@ Acceptance additions for Sprint 5.6.7:
   - Inline artifacts, normalized diagnostics, and ordered tool timelines now make single-run debugging possible without cross-referencing multiple endpoints.
 
 **Sprint 5.6.8 — Simple Chat True Streaming**
-<<<<<<< HEAD
 - Add true token streaming for the simple WebSocket chat path end to end.
 - Keep complex/orchestrated chat buffered in this sprint.
 - Preserve the current token/done/error wire contract while making simple chat feel live in the Swift client.
 - Follow-up soak hardening tightens calendar mutation trust boundaries so chat does not claim success without a confirmed tool result.
-- Completed:
-  - Added true simple-chat token streaming over WebSocket.
-  - Hardened client streaming state handling and offline fallback messaging.
-  - Stopped false calendar success claims when tool execution was missing or provider status was not successful.
-
-**Sprint 5.6.8 — Simple Chat True Streaming**
-- Upgrade the normal WebSocket chat path so simple `chat` turns stream real LLM token output end to end instead of chunking a completed response.
-- Keep the current token/done/error/persona event contract stable so the Swift client does not need a protocol redesign.
-- Preserve the complexity classifier boundary: `chat_orchestrated` turns remain buffered/full-response in this sprint.
-- Keep intermediate tool turns internal and non-streaming; only the final assistant reply should stream live.
-- Harden the client chat view so in-flight streaming state clears cleanly on `done`, `error`, reconnect, and session switch.
 - Completed:
   - Added true simple-chat token streaming over WebSocket.
   - Hardened client streaming state handling and offline fallback messaging.
@@ -1340,6 +1328,27 @@ Acceptance additions for Sprint 5.6.7:
   - `nltk` advisories remain upstream because the latest published `nltk` release is still `3.9.3`
   - `ecdsa` advisory remains upstream because the latest published `ecdsa` release is still `0.19.1`
 - Success for this sprint is reducing the actionable auth-side vulnerability set, verifying no auth regressions, and documenting any unresolved upstream advisories clearly.
+
+**Sprint 5.6.10 — RSS Newspaper Export and Demo Polish**
+- Focus the polish work on the `news_magazine` task for demo readiness.
+- Normalize final magazine markdown so story blocks and `Read More` links render with reliable spacing.
+- Export each successful full publish to a dated edition bundle under `storage/exports/newspapers`.
+- Save `edition.pdf`, `edition.md`, and `edition.json` for each run, with run/task metadata that shows continuity over multiple days.
+- Add an `edition_export` task-run artifact plus an admin PDF download endpoint (`GET /admin/task-runs/{run_id}/edition.pdf`) so exported editions are easy to inspect and demo.
+
+**Sprint 5.6.11 — `Fruitcake News` Layout and Edition Density**
+- Keep the internal profile key as `news_magazine`, but brand the rendered edition as `Fruitcake News`.
+- Refactor the final pass so it builds a canonical edition first, then publishes/export renders from that finalized structure.
+- Raise the effective edition density to roughly 10 to 12 linked stories when enough dataset items are available.
+- Use a two-tier paper structure: featured top stories first, followed by shorter section briefs across multiple categories.
+- Preserve grounded-link validation while allowing the finalized edition builder to backfill additional publishable briefs from the prepared dataset when the model draft is too sparse.
+
+**Sprint 5.6.13 — Chat Responsiveness Optimization**
+- Prioritize perceived speed on ordinary chat without rewriting the full chat architecture.
+- Replace the current fake streaming path with true token streaming for the simple WebSocket chat path.
+- Reduce simple-chat overhead by trimming the default history window and making memory retrieval and tool exposure conditional instead of always-on.
+- Keep complex/orchestrated chat behavior intact, including grounded/library flows and stronger validation where those paths already apply.
+- Add latency breakdown instrumentation so future slowdowns can be attributed to prompt assembly, memory/skills, tool exposure, or model generation instead of being inferred from feel.
 
 **Acceptance criteria**
 1. Both repos are renamed/repositioned with history intact.

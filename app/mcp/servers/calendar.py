@@ -224,11 +224,11 @@ async def _list_events(args: Dict[str, Any], user_context: Any) -> str:
 
     lines = [f"Events from {start_dt.date()} to {end_dt.date()}:\n"]
     for ev in events:
-        s = (ev.get("start") or "")[:16].replace("T", " ")
-        e = (ev.get("end") or "")[:16].replace("T", " ")
+        start_label = _format_event_timestamp(ev.get("start") or "")
+        end_label = _format_event_timestamp(ev.get("end") or "")
         summary = ev.get("summary") or "Untitled"
         loc = f" @ {ev['location']}" if ev.get("location") else ""
-        lines.append(f"• {s} – {e}: {summary}{loc}")
+        lines.append(f"• {start_label} – {end_label}: {summary}{loc}")
         if ev.get("description"):
             lines.append(f"  {ev['description'][:100]}")
     return "\n".join(lines)
@@ -431,6 +431,13 @@ def _dedupe_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen.add(key)
         deduped.append(ev)
     return deduped
+
+
+def _format_event_timestamp(value: str) -> str:
+    dt = _parse_dt(value, default=datetime.now(timezone.utc))
+    if dt is None:
+        return str(value)[:16].replace("T", " ")
+    return dt.strftime("%A, %Y-%m-%d %H:%M")
 
 
 @dataclass

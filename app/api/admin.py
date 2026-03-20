@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -158,8 +160,9 @@ _ARTIFACT_ORDER = {
     "prepared_dataset": 0,
     "draft_output": 1,
     "final_output": 2,
-    "validation_report": 3,
-    "run_diagnostics": 4,
+    "edition_export": 3,
+    "validation_report": 4,
+    "run_diagnostics": 5,
 }
 
 
@@ -342,11 +345,14 @@ def _normalized_diagnostics(artifacts: List[Dict[str, Any]]) -> Dict[str, Any]:
     artifact_map = {artifact["artifact_type"]: artifact for artifact in artifacts}
     run_diagnostics = artifact_map.get("run_diagnostics", {}).get("content_json") or {}
     validation_report = artifact_map.get("validation_report", {}).get("content_json") or {}
+    edition_export = artifact_map.get("edition_export", {}).get("content_json") or {}
 
     if not isinstance(run_diagnostics, dict):
         run_diagnostics = {}
     if not isinstance(validation_report, dict):
         validation_report = {}
+    if not isinstance(edition_export, dict):
+        edition_export = {}
 
     return {
         "active_skills": run_diagnostics.get("active_skills", []),
@@ -356,6 +362,7 @@ def _normalized_diagnostics(artifacts: List[Dict[str, Any]]) -> Dict[str, Any]:
         "refresh_stats": run_diagnostics.get("refresh_stats", {}),
         "tool_failure_suppressions": run_diagnostics.get("suppression_events", []),
         "validation_report": validation_report,
+        "edition_export": edition_export,
     }
 
 
@@ -428,11 +435,30 @@ async def _build_task_run_inspect_payload(db: AsyncSession, run_id: int) -> Dict
             "tool_failure_suppressions": diagnostics.get("tool_failure_suppressions", []),
             "refresh_stats": diagnostics.get("refresh_stats", {}),
             "dataset_stats": diagnostics.get("dataset_stats", {}),
+            "edition_export": diagnostics.get("edition_export", {}),
         },
         "tool_timeline": tool_timeline,
         "artifacts": ordered_artifacts,
         "diagnostics": diagnostics,
     }
+
+
+def _edition_pdf_path_from_artifacts(artifacts: List[TaskRunArtifact]) -> Optional[Path]:
+    for artifact in artifacts:
+        if artifact.artifact_type != "edition_export" or not artifact.content_json:
+            continue
+        try:
+            payload = json.loads(artifact.content_json)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        relative = str(payload.get("pdf_relative_path") or "").strip()
+        if not relative:
+            continue
+        path = Path(settings.storage_dir) / relative
+        return path
+    return None
 
 
 @router.post("/skills/preview", response_model=SkillPreviewResponse)
@@ -879,3 +905,20 @@ async def inspect_task_run(
     _: User = Depends(require_admin),
 ):
     return await _build_task_run_inspect_payload(db, run_id)
+
+
+@router.get("/task-runs/{run_id}/edition.pdf", tags=["admin"])
+async def download_task_run_edition_pdf(
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    run, task, _logs, artifacts = await _load_task_run_bundle(db, run_id)
+    pdf_path = _edition_pdf_path_from_artifacts(artifacts)
+    if pdf_path is None or not pdf_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Edition PDF not found")
+    return FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
+        filename=f"task-{task.id}-run-{run.id}-edition.pdf",
+    )

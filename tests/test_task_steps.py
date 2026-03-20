@@ -5,6 +5,7 @@ FruitcakeAI v5 — Task step planning endpoints.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -14,7 +15,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.db.models import AuditLog, ChatSession, RSSItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
 from app.autonomy.profiles.news_magazine import _ground_output
-from app.autonomy.runner import _format_result_for_inbox
+from app.autonomy.runner import _format_result_for_inbox, _persist_run_artifacts
 from tests.conftest import TestSessionLocal
 
 
@@ -611,6 +612,11 @@ async def test_admin_task_run_inspect_returns_ordered_payloads_and_diagnostics(c
                 ),
                 TaskRunArtifact(
                     task_run_id=run.id,
+                    artifact_type="edition_export",
+                    content_json='{"pdf_relative_path":"exports/newspapers/task-1/2026-03-18/demo/edition.pdf","download_path":"/admin/task-runs/1/edition.pdf"}',
+                ),
+                TaskRunArtifact(
+                    task_run_id=run.id,
                     artifact_type="prepared_dataset",
                     content_json='{"stats":{"selected_count":12},"refresh":{"sources_refreshed":9}}',
                 ),
@@ -641,11 +647,13 @@ async def test_admin_task_run_inspect_returns_ordered_payloads_and_diagnostics(c
     assert [row["artifact_type"] for row in payload["artifacts"]] == [
         "prepared_dataset",
         "final_output",
+        "edition_export",
         "validation_report",
         "run_diagnostics",
     ]
     assert payload["diagnostics"]["active_skills"] == ["rss-grounded-briefing"]
     assert payload["diagnostics"]["validation_report"]["publish_mode"] == "full"
+    assert payload["execution"]["edition_export"]["pdf_relative_path"].endswith("edition.pdf")
 
 
 @pytest.mark.asyncio
@@ -687,6 +695,118 @@ async def test_admin_task_run_inspect_returns_404_for_unknown_run(client):
     admin_headers = await _admin_headers(client, "inspectadmin3")
     resp = await client.get("/admin/task-runs/999999/inspect", headers=admin_headers)
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_admin_task_run_edition_pdf_download_returns_file(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "storage_dir", str(tmp_path))
+    admin_headers = await _admin_headers(client, "editionadmin")
+    owner_headers = await _headers(client, "editionowner")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Edition download", "instruction": "Publish magazine", "profile": "news_magazine"},
+        headers=owner_headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    pdf_dir = tmp_path / "exports" / "newspapers" / "task-1" / "2026-03-18" / "demo"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = pdf_dir / "edition.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n% demo pdf\n")
+
+    async with TestSessionLocal() as db:
+        run = TaskRun(
+            task_id=task_id,
+            status="completed",
+            started_at=datetime(2026, 3, 18, 12, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 3, 18, 12, 5, tzinfo=timezone.utc),
+        )
+        db.add(run)
+        await db.flush()
+        db.add(
+            TaskRunArtifact(
+                task_run_id=run.id,
+                artifact_type="edition_export",
+                content_json='{"pdf_relative_path":"exports/newspapers/task-1/2026-03-18/demo/edition.pdf"}',
+            )
+        )
+        await db.commit()
+        run_id = run.id
+
+    resp = await client.get(f"/admin/task-runs/{run_id}/edition.pdf", headers=admin_headers)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/pdf")
+    assert resp.content.startswith(b"%PDF-1.4")
+
+
+@pytest.mark.asyncio
+async def test_persist_run_artifacts_exports_full_news_magazine_edition(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "storage_dir", str(tmp_path))
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Hourly paper",
+            instruction="Publish hourly paper",
+            profile="news_magazine",
+            status="completed",
+        )
+        db.add(task)
+        await db.flush()
+
+        run = TaskRun(
+            task_id=task.id,
+            session_id=688,
+            status="completed",
+            started_at=datetime(2026, 3, 19, 15, 54, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 3, 19, 16, 0, 21, tzinfo=timezone.utc),
+        )
+        db.add(run)
+        await db.flush()
+
+        markdown = (
+            "Fruitcake News\n"
+            "Top Stories\n"
+            "- **Headline:** Story One\n"
+            "Source: Reuters\n"
+            "Published at: 2026-03-19T15:56:03+00:00\n"
+            "Summary: First summary.\n"
+            "[Read More](https://example.com/one)\n"
+        )
+        run_debug = {
+            "profile": "news_magazine",
+            "grounding_report": {"publish_mode": "partial", "fatal": False},
+            "dataset_stats": {"selected_count": 100},
+            "refresh_stats": {"sources_refreshed": 137},
+            "active_skills": ["rss-grounded-briefing"],
+        }
+
+        await _persist_run_artifacts(
+            db,
+            task_run_id=run.id,
+            final_markdown=markdown,
+            run_debug=run_debug,
+        )
+        await db.commit()
+
+        artifacts = (
+            await db.execute(select(TaskRunArtifact).where(TaskRunArtifact.task_run_id == run.id))
+        ).scalars().all()
+        by_type = {a.artifact_type: a for a in artifacts}
+        assert "edition_export" in by_type
+        payload = json.loads(by_type["edition_export"].content_json)
+        assert payload["task_id"] == task.id
+        assert payload["task_run_id"] == run.id
+        assert payload["publish_mode"] == "partial"
+        assert payload["download_path"] == f"/admin/task-runs/{run.id}/edition.pdf"
+
+        pdf_path = tmp_path / payload["pdf_relative_path"]
+        md_path = tmp_path / payload["markdown_relative_path"]
+        manifest_path = tmp_path / payload["manifest_relative_path"]
+        assert pdf_path.exists()
+        assert md_path.exists()
+        assert manifest_path.exists()
 
 
 @pytest.mark.asyncio
@@ -954,7 +1074,7 @@ async def test_magazine_run_persists_dataset_and_grounding_artifacts(client):
             new=AsyncMock(
                 side_effect=[
                     "Draft created from dataset.",
-                    "## Daily News Magazine\\n\\n- [Story](https://mag.example/story-1)",
+                    "# Fruitcake News\\n\\n## Top Stories\\n\\n- **Headline:** Story\\n**Source:** Magazine Feed\\n**Published at:** 2026-03-19T12:00:00+00:00\\n**Summary:** Summary\\n[Read More](https://mag.example/story-1)",
                 ]
             ),
         ):
