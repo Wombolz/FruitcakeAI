@@ -80,3 +80,13 @@ class TaskExecutionProfile(ABC):
             out.append({"artifact_type": "final_output", "content_text": final_markdown})
         out.append({"artifact_type": "run_diagnostics", "content_json": diagnostics})
         return out
+
+    async def export_artifact_payloads(
+        self,
+        *,
+        task,
+        run,
+        final_markdown: str,
+        run_debug: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        return []

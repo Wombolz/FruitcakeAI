@@ -1076,6 +1076,17 @@ async def _persist_run_artifacts(
 ) -> None:
     profile = resolve_task_profile_by_name(str(run_debug.get("profile") or "default"))
     payloads = profile.artifact_payloads(final_markdown=final_markdown, run_debug=run_debug)
+    run = await db.get(TaskRun, task_run_id)
+    task = await db.get(Task, run.task_id) if run is not None else None
+    if run is not None and task is not None:
+        payloads.extend(
+            await profile.export_artifact_payloads(
+                task=task,
+                run=run,
+                final_markdown=final_markdown,
+                run_debug=run_debug,
+            )
+        )
 
     # Replace previous artifacts for this run/type to keep data deterministic.
     existing_rows = (
