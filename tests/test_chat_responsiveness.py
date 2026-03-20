@@ -6,10 +6,12 @@ from app.agent.context import UserContext
 from app.api.chat import (
     _apply_tool_overrides,
     _is_simple_chat_tool_relevant,
+    _record_chat_stage_timing,
     _should_apply_simple_chat_memory,
     _trim_simple_chat_history,
 )
 from app.config import settings
+from app.metrics import _Metrics
 
 
 def test_trim_simple_chat_history_keeps_recent_messages_only():
@@ -41,3 +43,11 @@ def test_apply_tool_overrides_supports_block_all_wildcard():
     _apply_tool_overrides(user_context, allowed_tools=None, blocked_tools=["*"])
     assert "create_memory" in user_context.blocked_tools
     assert "search_library" in user_context.blocked_tools
+
+
+def test_record_chat_stage_timing_records_elapsed_ms():
+    stage_timings = {}
+    with patch("app.api.chat.metrics", new=_Metrics()):
+        with patch("app.api.chat.time.perf_counter", return_value=10.025):
+            _record_chat_stage_timing(stage_timings, "history_load", 10.0)
+        assert stage_timings["history_load"] == 25.0

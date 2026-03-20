@@ -15,6 +15,7 @@ Usage:
 
 from dataclasses import dataclass, field
 from threading import Lock
+from typing import Dict
 
 
 @dataclass
@@ -45,6 +46,8 @@ class _Metrics:
     chat_simple_latency_total_ms: float = 0.0
     chat_orchestrated_latency_count: int = 0
     chat_orchestrated_latency_total_ms: float = 0.0
+    chat_stage_latency_counts: Dict[str, int] = field(default_factory=dict)
+    chat_stage_latency_totals_ms: Dict[str, float] = field(default_factory=dict)
 
     def inc_requests(self) -> None:
         with self._lock:
@@ -143,6 +146,16 @@ class _Metrics:
                 self.chat_simple_latency_count += 1
                 self.chat_simple_latency_total_ms += float(elapsed_ms)
 
+    def record_chat_stage_latency(self, *, stage: str, elapsed_ms: float) -> None:
+        key = str(stage or "").strip().lower()
+        if not key:
+            return
+        with self._lock:
+            self.chat_stage_latency_counts[key] = self.chat_stage_latency_counts.get(key, 0) + 1
+            self.chat_stage_latency_totals_ms[key] = (
+                self.chat_stage_latency_totals_ms.get(key, 0.0) + float(elapsed_ms)
+            )
+
     def snapshot(self) -> dict:
         with self._lock:
             simple_avg = (
@@ -155,6 +168,14 @@ class _Metrics:
                 if self.chat_orchestrated_latency_count
                 else 0.0
             )
+            stage_avgs = {
+                stage: round(
+                    self.chat_stage_latency_totals_ms.get(stage, 0.0)
+                    / max(1, self.chat_stage_latency_counts.get(stage, 0)),
+                    2,
+                )
+                for stage in sorted(self.chat_stage_latency_counts)
+            }
             return {
                 "total_requests": self.total_requests,
                 "error_count": self.error_count,
@@ -182,6 +203,8 @@ class _Metrics:
                 "chat_orchestrated_latency_count": self.chat_orchestrated_latency_count,
                 "chat_orchestrated_latency_avg_ms": round(orchestrated_avg, 2),
                 "chat_orchestration_latency_delta_ms": round(orchestrated_avg - simple_avg, 2),
+                "chat_stage_latency_counts": dict(sorted(self.chat_stage_latency_counts.items())),
+                "chat_stage_latency_avg_ms": stage_avgs,
             }
 
 
