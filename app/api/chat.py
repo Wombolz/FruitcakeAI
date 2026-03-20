@@ -305,40 +305,18 @@ async def send_message(
     user_context = await hydrate_user_context(db, user_context, query=body.content)
     _record_chat_stage_timing(stage_timings_ms, "context_hydration", stage_started)
     user_context.session_id = session_id
+    stage_started = time.perf_counter()
+    history, _memory_ids = await _apply_memory_context(
+        history,
+        db,
+        current_user.id,
+        body.content,
+    )
+    _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
     library_list_intent = is_library_lookup_intent(body.content)
     library_summary_intent = is_library_summary_intent(body.content)
     library_detail_intent = is_library_detail_or_excerpt_intent(body.content)
     library_intent = library_list_intent or library_summary_intent or library_detail_intent
-    decision = classify_chat_complexity(
-        body.content,
-        threshold=settings.chat_complexity_threshold,
-        routing_enabled=settings.chat_complexity_routing_enabled,
-    )
-    execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
-    if execution_mode == "chat":
-        history = _trim_simple_chat_history(history)
-        if not _is_simple_chat_tool_relevant(body.content, library_intent=library_intent):
-            _apply_tool_overrides(user_context, allowed_tools=[], blocked_tools=["*"])
-        if _should_apply_simple_chat_memory(body.content, history):
-            stage_started = time.perf_counter()
-            history, _memory_ids = await _apply_memory_context(
-                history,
-                db,
-                current_user.id,
-                body.content,
-            )
-            _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
-        else:
-            _memory_ids = []
-    else:
-        stage_started = time.perf_counter()
-        history, _memory_ids = await _apply_memory_context(
-            history,
-            db,
-            current_user.id,
-            body.content,
-        )
-        _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
     stage_started = time.perf_counter()
     history = await _apply_required_library_grounding(
         history,
@@ -349,12 +327,19 @@ async def send_message(
             if library_summary_intent
             else (
                 "detail_or_excerpt"
-            if library_detail_intent
-            else ("list_documents" if library_list_intent else None)
+                if library_detail_intent
+                else ("list_documents" if library_list_intent else None)
             )
         ),
     )
     _record_chat_stage_timing(stage_timings_ms, "library_grounding", stage_started)
+
+    decision = classify_chat_complexity(
+        body.content,
+        threshold=settings.chat_complexity_threshold,
+        routing_enabled=settings.chat_complexity_routing_enabled,
+    )
+    execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
     stage_started = time.perf_counter()
     execution_history = build_orchestrated_chat_history(
         history,
@@ -546,6 +531,14 @@ async def chat_websocket(
                     user_context = await hydrate_user_context(db, user_context, query=user_message)
                     _record_chat_stage_timing(stage_timings_ms, "context_hydration", stage_started)
                     user_context.session_id = session_id
+                    stage_started = time.perf_counter()
+                    history, _memory_ids = await _apply_memory_context(
+                        history,
+                        db,
+                        current_user.id,
+                        user_message,
+                    )
+                    _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
                     library_list_intent = is_library_lookup_intent(user_message)
                     library_summary_intent = is_library_summary_intent(user_message)
                     library_detail_intent = is_library_detail_or_excerpt_intent(user_message)
@@ -554,37 +547,6 @@ async def chat_websocket(
                         or library_summary_intent
                         or library_detail_intent
                     )
-                    full_response = []
-                    decision = classify_chat_complexity(
-                        user_message,
-                        threshold=settings.chat_complexity_threshold,
-                        routing_enabled=settings.chat_complexity_routing_enabled,
-                    )
-                    execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
-                    if execution_mode == "chat":
-                        history = _trim_simple_chat_history(history)
-                        if not _is_simple_chat_tool_relevant(user_message, library_intent=library_intent):
-                            _apply_tool_overrides(user_context, allowed_tools=[], blocked_tools=["*"])
-                        if _should_apply_simple_chat_memory(user_message, history):
-                            stage_started = time.perf_counter()
-                            history, _memory_ids = await _apply_memory_context(
-                                history,
-                                db,
-                                current_user.id,
-                                user_message,
-                            )
-                            _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
-                        else:
-                            _memory_ids = []
-                    else:
-                        stage_started = time.perf_counter()
-                        history, _memory_ids = await _apply_memory_context(
-                            history,
-                            db,
-                            current_user.id,
-                            user_message,
-                        )
-                        _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
                     stage_started = time.perf_counter()
                     history = await _apply_required_library_grounding(
                         history,
@@ -595,12 +557,19 @@ async def chat_websocket(
                             if library_summary_intent
                             else (
                                 "detail_or_excerpt"
-                            if library_detail_intent
-                            else ("list_documents" if library_list_intent else None)
+                                if library_detail_intent
+                                else ("list_documents" if library_list_intent else None)
                             )
                         ),
                     )
                     _record_chat_stage_timing(stage_timings_ms, "library_grounding", stage_started)
+                    full_response = []
+                    decision = classify_chat_complexity(
+                        user_message,
+                        threshold=settings.chat_complexity_threshold,
+                        routing_enabled=settings.chat_complexity_routing_enabled,
+                    )
+                    execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
                     stage_started = time.perf_counter()
                     execution_history = build_orchestrated_chat_history(
                         history,
@@ -791,86 +760,11 @@ def _log_chat_latency_breakdown(
     )
 
 
-_SIMPLE_TOOL_KEYWORDS = {
-    "calendar",
-    "event",
-    "schedule",
-    "remind",
-    "task",
-    "library",
-    "document",
-    "file",
-    "rss",
-    "feed",
-    "headline",
-    "news",
-    "search",
-    "research",
-    "find",
-    "look up",
-    "lookup",
-    "web",
-    "latest",
-    "source",
-    "sources",
-    "citation",
-    "citations",
-    "weather",
-}
-
-_MEMORY_HINT_KEYWORDS = {
-    "remember",
-    "recall",
-    "last time",
-    "before",
-    "again",
-    "still",
-    "usual",
-    "normally",
-    "preference",
-    "prefer",
-    "family",
-    "daughter",
-    "son",
-    "wife",
-    "husband",
-    "kids",
-    "our",
-    "my",
-}
-
-
 def _resolve_chat_mode(is_complex: bool) -> str:
     if is_complex and settings.chat_orchestration_kill_switch:
         metrics.inc_chat_orchestration_kill_switch_suppressed_count()
         return "chat"
     return "chat_orchestrated" if is_complex else "chat"
-
-
-def _trim_simple_chat_history(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    max_messages = max(2, int(settings.chat_simple_history_max_messages))
-    if len(history) <= max_messages:
-        return history
-    return history[-max_messages:]
-
-
-def _should_apply_simple_chat_memory(user_prompt: str, history: List[Dict[str, Any]]) -> bool:
-    if not settings.chat_simple_memory_enabled:
-        return False
-    lowered = (user_prompt or "").strip().lower()
-    if any(marker in lowered for marker in _MEMORY_HINT_KEYWORDS):
-        return True
-    # If the session is still very short, skip baseline memory for ordinary chat.
-    return len(history) >= 8
-
-
-def _is_simple_chat_tool_relevant(user_prompt: str, *, library_intent: bool) -> bool:
-    if not settings.chat_simple_tools_enabled:
-        return False
-    if library_intent:
-        return True
-    lowered = (user_prompt or "").strip().lower()
-    return any(marker in lowered for marker in _SIMPLE_TOOL_KEYWORDS)
 
 
 async def _execute_chat_turn(
@@ -1108,11 +1002,6 @@ def _apply_tool_overrides(
         str(name).strip() for name in (blocked_tools or [])
         if str(name).strip()
     }
-
-    if "*" in normalized_blocked:
-        base_blocked.update(all_tools)
-        user_context.blocked_tools = sorted(base_blocked)
-        return
 
     if normalized_allowed:
         valid_allowed = normalized_allowed.intersection(all_tools)

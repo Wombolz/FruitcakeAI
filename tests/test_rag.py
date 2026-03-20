@@ -19,8 +19,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.rag.service import RAGService
 from app.rag.ingest import _load_documents
+from app.rag.service import RAGService
 
 
 # ── RAGService — pre-startup behaviour ────────────────────────────────────────
