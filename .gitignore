@@ -20,6 +20,7 @@ env/
 
 # Local overrides / secrets
 *.env.*
+!.env.example
 config/*local*.yaml
 config/*secrets*.yaml
 

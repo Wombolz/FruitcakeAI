@@ -132,8 +132,12 @@ Edit `.env` — the only required change for a local setup:
 ```env
 SECRET_KEY=change-me-to-a-random-string
 DATABASE_URL=postgresql+asyncpg://fruitcake:fruitcake@localhost:5432/fruitcake_v5
-LLM_MODEL=ollama_chat/qwen2.5:14b
+LLM_MODEL=ollama_chat/qwen2.5:32b
 LOCAL_API_BASE=http://localhost:11434/v1
+TASK_SMALL_MODEL=ollama_chat/qwen2.5:14b
+TASK_LARGE_MODEL=ollama_chat/qwen2.5:32b
+TASK_FORCE_LARGE_FOR_PLANNING=false
+TASK_FORCE_LARGE_FOR_FINAL_SYNTHESIS=true
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 ```
 
@@ -141,9 +145,10 @@ EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 
 ```bash
 ollama pull qwen2.5:14b
+ollama pull qwen2.5:32b
 ```
 
-> Verified on M1 Max 64GB. `qwen2.5:32b` (~20GB) is a capable step up if you close other apps first. Cloud backends (Claude, OpenAI) are configured in `.env` — see [LLM Backends](Docs/LLM_BACKENDS.md).
+> Verified on M1 Max 64GB with mixed routing: `32b` for chat and final synthesis, `14b` for heavier task planning/execution. If memory pressure or stability becomes a problem, fall back to all-`14b`. Cloud backends (Claude, OpenAI) are configured in `.env` — see [LLM Backends](Docs/LLM_BACKENDS.md).
 
 ### 3. Start
 

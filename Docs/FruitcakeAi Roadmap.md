@@ -1567,12 +1567,18 @@ These items are intentionally tracked outside the sprint list because they are r
 ## LLM Backend Configuration
 
 ```env
-# Default — local, privacy-first, verified M1 Max 64GB
-LLM_MODEL=ollama_chat/qwen2.5:14b
+# Default — mixed local routing, verified on M1 Max 64GB
+LLM_MODEL=ollama_chat/qwen2.5:32b
 LOCAL_API_BASE=http://localhost:11434/v1
+TASK_SMALL_MODEL=ollama_chat/qwen2.5:14b
+TASK_LARGE_MODEL=ollama_chat/qwen2.5:32b
+TASK_FORCE_LARGE_FOR_PLANNING=false
+TASK_FORCE_LARGE_FOR_FINAL_SYNTHESIS=true
 
-# Step up (close other apps first)
-# LLM_MODEL=ollama_chat/qwen2.5:32b
+# All-14b fallback if stability or memory pressure becomes a problem
+# LLM_MODEL=ollama_chat/qwen2.5:14b
+# TASK_SMALL_MODEL=ollama_chat/qwen2.5:14b
+# TASK_LARGE_MODEL=ollama_chat/qwen2.5:14b
 
 # Cloud — best quality, opt-in only
 # LLM_MODEL=claude-sonnet-4-6
