@@ -1,4 +1,4 @@
-Phase 7 — Skills Tool Expansion
+Phase 7 — Curated OpenClaw Skill Conversion
 
 **Status**: Planned — do not implement until Phase 7 sprint begins
 **Related**: `Docs/OpenClaw_Skill_Converter_Spec.md`
@@ -18,7 +18,7 @@ in Phase 7 to fully enable the skill converter pipeline.
 
 ## Tools to Add to Approved List (Sprint 7.x)
 
-These four tools need to be added to the converter's approved tool list and to the
+These three tools need to be added to the converter's approved tool list and to the
 fruitcake tool registry once their MCP servers are live.
 
 ### `read_file`
@@ -48,19 +48,10 @@ skills where the shell commands are meaningful within the sandbox constraints
 network calls via shell (e.g. `curl` to external APIs) should still use
 `web_search`/`fetch_page` instead.
 
-### `spawn_agent`
-**Source**: Sprint 7.3 sub-agent spawning
-**Description**: Delegate a subtask to a specialist sub-agent with a given persona
-and instruction. Child agent cannot escalate parent scopes.
-**Unlocks**: skill-creator, coding-agent, agent-based workflow skills, and any
-OpenClaw skill that spawns sub-sessions.
-
----
-
 ## Converter Pipeline Work (Sprint 7.x)
 
 ### 7.x.1 — Update converter approved tool list
-- Add `read_file`, `write_file`, `shell_exec`, `spawn_agent` to the approved tool
+- Add `read_file`, `write_file`, and `shell_exec` to the approved tool
   list in the converter system prompt.
 - Add conditional logic: converter should use Phase 7 tools only when the admin
   specifies `phase7_tools: true` in the convert request. This allows converting
@@ -96,6 +87,11 @@ OpenClaw skill that spawns sub-sessions.
 - Track `source: "openclaw"` in skill metadata for provenance
 - Log conversion report as admin audit entry
 
+### 7.x.5 — Naming and provenance rules
+- Core Fruitcake skills remain first-party Fruitcake skills even when they parallel an OpenClaw concept.
+- OpenClaw-derived prefixes or provenance labels should only be applied to direct imported/converted skills.
+- Do not brand foundational or product-defining skills as imported just because similar skills existed upstream.
+
 ---
 
 ## Impact Estimate by Tool
@@ -104,7 +100,6 @@ OpenClaw skill that spawns sub-sessions.
 |---|---|---|
 | `read_file` + `write_file` | ~40% of 53 bundled | Biggest single unlock |
 | `shell_exec` | ~25% additional | github, gog, tmux, coding-agent |
-| `spawn_agent` | ~10% additional | skill-creator, agent workflows |
 | No new tools (Phase 5 only) | ~25% | summarize, oracle, calendar, RSS skills |
 
 ---
@@ -114,9 +109,9 @@ OpenClaw skill that spawns sub-sessions.
 - `oc-github` — requires `gh` and `git` via shell_exec
 - `oc-gog` — requires gog binary
 - `oc-tmux` — requires tmux binary
-- `oc-coding-agent` — requires shell + sub-agent
+- `oc-coding-agent` — requires shell-heavy workflows outside current curated scope
 - `oc-peekaboo` — macOS UI automation binary
-- `oc-skill-creator` — requires write_file + spawn_agent
+- `oc-skill-creator` — remains deferred because direct import would blur the line between core Fruitcake skills and imported skills
 - `oc-obsidian` (write paths) — requires write_file
 - `oc-node-connect` — requires Node.js binary
 - `oc-openai-whisper` — requires whisper binary
@@ -133,7 +128,8 @@ OpenClaw skill that spawns sub-sessions.
    report without auto-installing.
 4. `shell_exec` tool grants are only included for skills where sandbox constraints
    are respected (no outbound network via shell).
-5. All converted skills pass the existing `/admin/skills/preview` validation.
-6. Conversion report distinguishes: converted, skipped, needs-review.
+5. Converted skills are selected for product fit, not just technical convertibility.
+6. All converted skills pass the existing `/admin/skills/preview` validation.
+7. Conversion report distinguishes: converted, skipped, needs-review.
 
 Both files are self-contained and cross-reference each other. Drop them in Docs/ and they'll be there waiting when you're ready for Phase 7. Go focus on the demo.
