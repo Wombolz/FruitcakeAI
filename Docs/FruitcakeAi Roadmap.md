@@ -1424,6 +1424,8 @@ Reference:
 
 ## Phase 7 — Trusted Local Capability Expansion (2 weeks)
 
+Skill imports are curated, not bulk. Technical convertibility is not sufficient; a skill is included only if it strengthens Fruitcake's identity as a trusted, local personal assistant.
+
 **Sprint 7.1** — Sandboxed filesystem MCP: `--allowed-paths /workspace`, per-user `workspace/{user_id}/`.
 
 **Sprint 7.2** — Shell MCP: `docker run --network none`, 30s timeout, 8k output cap, explicit blocked commands list.
