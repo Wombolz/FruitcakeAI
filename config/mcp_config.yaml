@@ -19,6 +19,11 @@ mcp_servers:
     module: app.mcp.servers.rss
     enabled: true
 
+  filesystem:
+    type: internal_python
+    module: app.mcp.servers.filesystem
+    enabled: true
+
   # ── Docker stdio servers ─────────────────────────────────────────────────────
   # These require Docker + the image to be available locally.
 

@@ -90,7 +90,10 @@ class Settings(BaseSettings):
 
     # ── Storage ───────────────────────────────────────────────────────────────
     storage_dir: str = "./storage"
+    workspace_dir: str = "./workspace"
     upload_max_size_mb: int = 50
+    filesystem_mcp_max_read_bytes: int = 100_000
+    filesystem_mcp_max_write_bytes: int = 100_000
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:5173"]

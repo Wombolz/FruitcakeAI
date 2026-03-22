@@ -165,6 +165,29 @@ def test_prefers_web_search_over_generic_search_tool():
     assert "search" not in names
 
 
+def test_family_assistant_sees_filesystem_mcp_tools_when_registry_ready():
+    """Filesystem MCP tools should flow through the normal agent tool surface."""
+    from unittest.mock import patch, MagicMock
+
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    fake_mcp_tools = [
+        {"type": "function", "function": {"name": "list_directory", "description": "", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "read_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "write_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
+    ]
+    mock_registry = MagicMock()
+    mock_registry._is_ready = True
+    mock_registry.get_tools_for_agent.return_value = fake_mcp_tools
+
+    with patch("app.mcp.registry.get_mcp_registry", return_value=mock_registry):
+        tools = get_tools_for_user(ctx)
+
+    names = [t["function"]["name"] for t in tools]
+    assert "list_directory" in names
+    assert "read_file" in names
+    assert "write_file" in names
+
+
 # ── Dispatch tests ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
