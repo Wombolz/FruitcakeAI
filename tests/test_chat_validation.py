@@ -257,11 +257,16 @@ async def test_library_summary_intent_uses_summarize_document_grounding(client):
         patch.object(settings, "chat_complexity_routing_enabled", False),
         patch.object(settings, "chat_orchestration_kill_switch", False),
         patch(
+            "app.agent.tools._list_library_documents",
+            new_callable=AsyncMock,
+            return_value='{"count":1,"documents":[{"id":17,"filename":"SGAO_Studio_Manual_v1.0-2.pdf"}]}',
+        ),
+        patch(
             "app.agent.tools._summarize_document",
             new_callable=AsyncMock,
             return_value="Document summary for SGAO_Studio_Manual_v1.0-2.pdf",
-        ),
-        patch("app.agent.tools._write_audit_log", new_callable=AsyncMock),
+        ) as mock_summary,
+        patch("app.agent.tools._write_audit_log", new_callable=AsyncMock) as mock_audit,
         patch(
             "app.api.chat.run_agent",
             new_callable=AsyncMock,
@@ -275,9 +280,52 @@ async def test_library_summary_intent_uses_summarize_document_grounding(client):
         )
 
     assert resp.status_code == 200
+    assert mock_summary.await_args.kwargs == {}
+    assert mock_summary.await_args.args[0]["document_name"] == "SGAO_Studio_Manual_v1.0-2.pdf"
+    assert mock_audit.await_args.kwargs["arguments"]["document_name"] == "SGAO_Studio_Manual_v1.0-2.pdf"
     injected_history = mock_run.await_args_list[0].args[0]
     assert any(
         m.get("role") == "system" and "summarize_document result" in m.get("content", "")
+        for m in injected_history
+    )
+
+
+@pytest.mark.asyncio
+async def test_library_summary_intent_returns_ambiguity_prompt_when_multiple_docs_match(client):
+    token = await _login_token(client, "chatlibraryambig", "chatlibraryambig@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    create = await client.post("/chat/sessions", json={"title": "Library Summary Ambiguity"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", False),
+        patch.object(settings, "chat_orchestration_kill_switch", False),
+        patch(
+            "app.agent.tools._list_library_documents",
+            new_callable=AsyncMock,
+            return_value='{"count":2,"documents":[{"id":17,"filename":"WorkerNode.md"},{"id":18,"filename":"WorkerNode-Notes.md"}]}',
+        ),
+        patch("app.agent.tools._summarize_document", new_callable=AsyncMock) as mock_summary,
+        patch("app.agent.tools._write_audit_log", new_callable=AsyncMock) as mock_audit,
+        patch(
+            "app.api.chat.run_agent",
+            new_callable=AsyncMock,
+            return_value="Please clarify the filename.",
+        ) as mock_run,
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "summarize workernode from my library"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert mock_summary.await_count == 0
+    assert mock_audit.await_args.kwargs["arguments"]["document_name"] == "workernode"
+    injected_history = mock_run.await_args_list[0].args[0]
+    assert any(
+        m.get("role") == "system"
+        and "Multiple documents match 'summarize workernode from my library'" in m.get("content", "")
         for m in injected_history
     )
 

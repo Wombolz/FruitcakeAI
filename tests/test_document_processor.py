@@ -5,17 +5,24 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy import select
 
-from app.api.library import _ingest_background
-from app.db.models import Document, User
+from app.db.models import Document, DocumentIngestJob
 from app.rag.document_processor import DocumentProcessor
 from app.rag.extractor import DocumentExtractor, ExtractionError
+from app.rag.job_runner import (
+    _claim_next_due_job,
+    _run_claimed_job,
+    enqueue_document_ingest,
+    recover_stale_document_ingest_jobs,
+)
 from tests.conftest import TestSessionLocal
 
 
 class FakeIndexSink:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_times: int = 0) -> None:
         self.is_ready = True
+        self.fail_times = fail_times
         self.calls: list[dict] = []
         self.deleted: list[int] = []
 
@@ -37,6 +44,9 @@ class FakeIndexSink:
                 "filename": filename,
             }
         )
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError("temporary ingest failure")
         return 1
 
     async def delete_document(self, document_id: int) -> None:
@@ -122,7 +132,7 @@ async def test_markdown_frontmatter_stripped(tmp_path):
 
     assert method == "markdown"
     assert "Hello" in text
-    assert "This is content." not in text or "This is content" in text
+    assert "This is content" in text
     assert "title: Test" not in text
     assert "date: 2026-01-01" not in text
 
@@ -184,33 +194,117 @@ async def test_ingest_lifecycle_transitions(tmp_path, client):
 
 
 @pytest.mark.asyncio
-async def test_failed_extraction_sets_error_state(tmp_path, client):
-    headers = await _headers(client, "docfailure")
-    user_id = await _user_id(client, headers)
-    txt_file = tmp_path / "bad.txt"
-    txt_file.write_text("irrelevant")
-    doc_id = await _create_document(owner_id=user_id, file_path=txt_file)
+async def test_upload_creates_queued_ingest_job(client, tmp_path):
+    headers = await _headers(client, "docqueue")
+    doc_file = tmp_path / "queued.txt"
+    doc_file.write_text("queue me")
 
-    processor = DocumentProcessor(extractor=FailingExtractor(), index_sink=FakeIndexSink())
-    async with TestSessionLocal() as db:
-        await processor.process(
-            db=db,
-            document_id=doc_id,
-            file_path=txt_file,
-            user_id=user_id,
-            scope="personal",
-            filename=txt_file.name,
+    with doc_file.open("rb") as handle:
+        resp = await client.post(
+            "/library/ingest",
+            headers=headers,
+            files={"file": ("queued.txt", handle, "text/plain")},
+            data={"scope": "personal"},
         )
-        doc = await db.get(Document, doc_id)
+
+    assert resp.status_code == 202
+    payload = resp.json()
+    assert payload["status"] == "processing"
+    assert payload["ingest_job_status"] == "queued"
+
+    async with TestSessionLocal() as db:
+        doc = await db.get(Document, int(payload["id"]))
+        job = (
+            await db.execute(
+                select(DocumentIngestJob).where(DocumentIngestJob.document_id == int(payload["id"]))
+            )
+        ).scalar_one_or_none()
 
     assert doc is not None
-    assert doc.processing_status == "error"
-    assert doc.error_message == "boom"
-    assert doc.processing_started_at is None
+    assert doc.processing_status == "processing"
+    assert job is not None
+    assert job.status == "queued"
+    assert job.attempt_count == 0
 
 
 @pytest.mark.asyncio
-async def test_stale_document_recovery(client, tmp_path):
+async def test_retryable_failure_requeues_job(tmp_path, client):
+    headers = await _headers(client, "docretry")
+    user_id = await _user_id(client, headers)
+    txt_file = tmp_path / "retry.txt"
+    txt_file.write_text("Retry me.")
+    doc_id = await _create_document(owner_id=user_id, file_path=txt_file)
+
+    async with TestSessionLocal() as db:
+        doc = await db.get(Document, doc_id)
+        assert doc is not None
+        await enqueue_document_ingest(db, document=doc)
+        await db.commit()
+
+    processor = DocumentProcessor(index_sink=FakeIndexSink(fail_times=1))
+    with (
+        patch("app.rag.job_runner.AsyncSessionLocal", new=TestSessionLocal),
+        patch("app.rag.job_runner.get_document_processor", return_value=processor),
+    ):
+        claimed = await _claim_next_due_job()
+        assert claimed is not None
+        await _run_claimed_job(claimed)
+
+    async with TestSessionLocal() as db:
+        job = (
+            await db.execute(select(DocumentIngestJob).where(DocumentIngestJob.document_id == doc_id))
+        ).scalar_one()
+        doc = await db.get(Document, doc_id)
+
+    assert job.status == "queued"
+    assert job.attempt_count == 1
+    assert job.last_error == "temporary ingest failure"
+    assert job.next_attempt_at is not None
+    assert doc is not None
+    assert doc.processing_status == "processing"
+    assert doc.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_marks_job_failed(tmp_path, client):
+    headers = await _headers(client, "docmaxfail")
+    user_id = await _user_id(client, headers)
+    txt_file = tmp_path / "bad.txt"
+    txt_file.write_text("bad")
+    doc_id = await _create_document(owner_id=user_id, file_path=txt_file)
+
+    async with TestSessionLocal() as db:
+        doc = await db.get(Document, doc_id)
+        assert doc is not None
+        job = await enqueue_document_ingest(db, document=doc, max_attempts=1)
+        await db.commit()
+        assert job.max_attempts == 1
+
+    processor = DocumentProcessor(extractor=FailingExtractor(), index_sink=FakeIndexSink())
+    with (
+        patch("app.rag.job_runner.AsyncSessionLocal", new=TestSessionLocal),
+        patch("app.rag.job_runner.get_document_processor", return_value=processor),
+    ):
+        claimed = await _claim_next_due_job()
+        assert claimed is not None
+        await _run_claimed_job(claimed)
+
+    async with TestSessionLocal() as db:
+        job = (
+            await db.execute(select(DocumentIngestJob).where(DocumentIngestJob.document_id == doc_id))
+        ).scalar_one()
+        doc = await db.get(Document, doc_id)
+
+    assert job.status == "failed"
+    assert job.attempt_count == 1
+    assert job.last_error == "boom"
+    assert doc is not None
+    assert doc.processing_status == "error"
+    assert doc.error_message == "boom"
+
+
+@pytest.mark.asyncio
+async def test_stale_running_job_recovery_requeues(client, tmp_path):
     headers = await _headers(client, "docrecover")
     user_id = await _user_id(client, headers)
     txt_file = tmp_path / "recover.txt"
@@ -220,48 +314,94 @@ async def test_stale_document_recovery(client, tmp_path):
     async with TestSessionLocal() as db:
         doc = await db.get(Document, doc_id)
         assert doc is not None
-        doc.processing_started_at = datetime.now(timezone.utc) - timedelta(minutes=20)
+        job = DocumentIngestJob(
+            document_id=doc_id,
+            status="running",
+            attempt_count=1,
+            max_attempts=3,
+            queued_at=datetime.now(timezone.utc) - timedelta(minutes=30),
+            started_at=datetime.now(timezone.utc) - timedelta(minutes=20),
+            claimed_at=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        db.add(job)
         await db.commit()
 
-    processor = DocumentProcessor(index_sink=FakeIndexSink())
-    async with TestSessionLocal() as db:
-        recovered = await processor.recover_stale_documents(db=db, stale_threshold_minutes=15)
-        doc = await db.get(Document, doc_id)
+    with patch("app.rag.job_runner.AsyncSessionLocal", new=TestSessionLocal):
+        recovered = await recover_stale_document_ingest_jobs(stale_threshold_minutes=15)
 
     assert recovered == 1
+    async with TestSessionLocal() as db:
+        job = (
+            await db.execute(select(DocumentIngestJob).where(DocumentIngestJob.document_id == doc_id))
+        ).scalar_one()
+        doc = await db.get(Document, doc_id)
+
+    assert job.status == "queued"
+    assert "Recovered interrupted ingest" in (job.last_error or "")
     assert doc is not None
-    assert doc.processing_status == "error"
-    assert "reprocess" in (doc.error_message or "").lower()
-    assert doc.processing_started_at is None
+    assert doc.processing_status == "processing"
 
 
 @pytest.mark.asyncio
-async def test_reprocess_endpoint(client, tmp_path):
+async def test_reprocess_endpoint_requeues_existing_job(client, tmp_path):
     headers = await _headers(client, "docreprocess")
     user_id = await _user_id(client, headers)
     txt_file = tmp_path / "redo.txt"
     txt_file.write_text("First sentence. Second sentence.")
     doc_id = await _create_document(owner_id=user_id, file_path=txt_file, status="error")
 
-    processor = DocumentProcessor(index_sink=FakeIndexSink())
-    async with TestSessionLocal() as db:
-        doc = await db.get(Document, doc_id)
-        assert doc is not None
-        doc.error_message = "old error"
-        await db.commit()
+    class FakeRag:
+        is_ready = True
 
-    with (
-        patch("app.api.library.get_document_processor", return_value=processor),
-        patch("app.api.library.AsyncSessionLocal", new=TestSessionLocal),
-    ):
+        def __init__(self) -> None:
+            self.deleted: list[int] = []
+
+        async def delete_document(self, document_id: int) -> None:
+            self.deleted.append(document_id)
+
+    fake_rag = FakeRag()
+    with patch("app.api.library.get_rag_service", return_value=fake_rag):
         resp = await client.post(f"/library/documents/{doc_id}/reprocess", headers=headers)
 
     assert resp.status_code == 202
+    payload = resp.json()
+    assert payload["ingest_job_status"] == "queued"
+    assert fake_rag.deleted == [doc_id]
+
     async with TestSessionLocal() as db:
         doc = await db.get(Document, doc_id)
+        job = (
+            await db.execute(select(DocumentIngestJob).where(DocumentIngestJob.document_id == doc_id))
+        ).scalar_one_or_none()
+
     assert doc is not None
-    assert doc.processing_status == "ready"
-    assert doc.chunk_count == 1
+    assert doc.processing_status == "processing"
+    assert job is not None
+    assert job.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_enqueue_does_not_create_competing_jobs(client, tmp_path):
+    headers = await _headers(client, "docdedupe")
+    user_id = await _user_id(client, headers)
+    txt_file = tmp_path / "same.txt"
+    txt_file.write_text("same job")
+    doc_id = await _create_document(owner_id=user_id, file_path=txt_file)
+
+    async with TestSessionLocal() as db:
+        doc = await db.get(Document, doc_id)
+        assert doc is not None
+        job1 = await enqueue_document_ingest(db, document=doc)
+        await db.flush()
+        job2 = await enqueue_document_ingest(db, document=doc)
+        await db.commit()
+
+    assert job1.id == job2.id
+    async with TestSessionLocal() as db:
+        jobs = (
+            await db.execute(select(DocumentIngestJob).where(DocumentIngestJob.document_id == doc_id))
+        ).scalars().all()
+    assert len(jobs) == 1
 
 
 @pytest.mark.asyncio
@@ -287,7 +427,6 @@ async def test_scoped_access_unchanged(client, tmp_path):
     headers_a = await _headers(client, "docscopea")
     user_a = await _user_id(client, headers_a)
     headers_b = await _headers(client, "docscopeb")
-    user_b = await _user_id(client, headers_b)
 
     base = tmp_path
     personal = base / "personal.txt"

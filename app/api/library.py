@@ -8,49 +8,27 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
+from sqlalchemy.orm import selectinload
 
 from app.auth.dependencies import get_current_user
 from app.config import settings
 from app.db.models import Document, User
-from app.db.session import AsyncSessionLocal, get_db
-from app.rag.document_processor import get_document_processor
+from app.db.session import get_db
+from app.rag.job_runner import enqueue_document_ingest
 from app.rag.service import get_rag_service
 
 router = APIRouter()
 
 _ALLOWED_SCOPES = {"personal", "family", "shared"}
 
-
-# ── Background ingest helper ──────────────────────────────────────────────────
-
-async def _ingest_background(
-    doc_id: int,
-    file_path: Path,
-    user_id: int,
-    scope: str,
-    filename: str,
-) -> None:
-    """Run document processing after the HTTP response is sent."""
-    async with AsyncSessionLocal() as db:
-        await get_document_processor().process(
-            db=db,
-            document_id=doc_id,
-            file_path=file_path,
-            user_id=user_id,
-            scope=scope,
-            filename=filename,
-        )
-
-
 # ── POST /library/ingest ──────────────────────────────────────────────────────
 
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
 async def ingest_document(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     scope: str = Form("personal"),
     db: AsyncSession = Depends(get_db),
@@ -78,7 +56,7 @@ async def ingest_document(
 
     file_size = file_path.stat().st_size
 
-    # ── Create DB record (status=processing) ──────────────────────────────────
+    # ── Create DB record + durable ingest job ────────────────────────────────
     doc = Document(
         owner_id=current_user.id,
         filename=safe_name,
@@ -93,22 +71,14 @@ async def ingest_document(
     db.add(doc)
     await db.flush()
     await db.refresh(doc)
-
-    # ── Schedule embedding in the background ──────────────────────────────────
-    background_tasks.add_task(
-        _ingest_background,
-        doc_id=doc.id,
-        file_path=file_path,
-        user_id=current_user.id,
-        scope=scope,
-        filename=file.filename or safe_name,
-    )
+    job = await enqueue_document_ingest(db, document=doc)
 
     return {
         "id": doc.id,
         "filename": file.filename,
         "scope": scope,
         "status": "processing",
+        "ingest_job_status": job.status,
     }
 
 
@@ -153,6 +123,7 @@ async def list_documents(
     """
     result = await db.execute(
         select(Document)
+        .options(selectinload(Document.ingest_job))
         .where(
             or_(
                 Document.owner_id == current_user.id,
@@ -173,6 +144,9 @@ async def list_documents(
             "content_type": d.content_type,
             "chunk_count": d.chunk_count,
             "summary": d.summary,
+            "ingest_job_status": d.ingest_job.status if d.ingest_job else None,
+            "ingest_attempt_count": d.ingest_job.attempt_count if d.ingest_job else 0,
+            "ingest_last_error": d.ingest_job.last_error if d.ingest_job else None,
         }
         for d in docs
     ]
@@ -185,7 +159,11 @@ async def get_document_details(
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Return metadata and processing state for one accessible document."""
-    result = await db.execute(select(Document).where(Document.id == doc_id))
+    result = await db.execute(
+        select(Document)
+        .options(selectinload(Document.ingest_job))
+        .where(Document.id == doc_id)
+    )
     doc = result.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -203,6 +181,9 @@ async def get_document_details(
         "chunk_count": doc.chunk_count,
         "summary": doc.summary,
         "error_message": doc.error_message,
+        "ingest_job_status": doc.ingest_job.status if doc.ingest_job else None,
+        "ingest_attempt_count": doc.ingest_job.attempt_count if doc.ingest_job else 0,
+        "ingest_last_error": doc.ingest_job.last_error if doc.ingest_job else None,
         "mime_type": doc.mime_type,
         "file_size_bytes": doc.file_size_bytes,
         "processing_started_at": doc.processing_started_at.isoformat() if doc.processing_started_at else None,
@@ -310,27 +291,33 @@ class UpdateDocumentRequest(BaseModel):
 @router.post("/documents/{doc_id}/reprocess", status_code=status.HTTP_202_ACCEPTED)
 async def reprocess_document(
     doc_id: int,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    result = await db.execute(select(Document).where(Document.id == doc_id))
+    result = await db.execute(
+        select(Document)
+        .options(selectinload(Document.ingest_job))
+        .where(Document.id == doc_id)
+    )
     doc = result.scalar_one_or_none()
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not your document")
-
-    async def _reprocess_background() -> None:
-        async with AsyncSessionLocal() as bg_db:
-            await get_document_processor().reprocess(
-                db=bg_db,
-                document_id=doc_id,
-                user_id=current_user.id,
-            )
-
-    background_tasks.add_task(_reprocess_background)
-    return {"id": doc.id, "status": "processing"}
+    rag = get_rag_service()
+    await rag.delete_document(doc.id)
+    doc.chunk_count = None
+    doc.content = None
+    doc.summary = None
+    doc.extracted_text_length = None
+    doc.extraction_method = None
+    doc.content_type = None
+    job = await enqueue_document_ingest(db, document=doc)
+    return {
+        "id": doc.id,
+        "status": "processing",
+        "ingest_job_status": job.status,
+    }
 
 
 @router.patch("/documents/{doc_id}", status_code=200)

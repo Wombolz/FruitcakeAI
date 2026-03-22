@@ -5,11 +5,10 @@ FruitcakeAI v5 — Document processor lifecycle.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,9 +16,6 @@ from app.db.models import Document
 from app.metrics import metrics
 from app.rag.extractor import DocumentExtractor, ExtractionError
 from app.rag.service import get_rag_service
-
-
-log = structlog.get_logger(__name__)
 
 
 @runtime_checkable
@@ -62,7 +58,7 @@ class DocumentProcessor:
     ) -> None:
         doc = await self._get_owned_document(db, document_id, user_id)
         if doc is None:
-            return
+            raise ValueError(f"Document {document_id} not found for user {user_id}")
 
         doc.processing_status = "processing"
         doc.processing_started_at = datetime.now(timezone.utc)
@@ -73,115 +69,34 @@ class DocumentProcessor:
 
         sink = self._get_sink()
         if not sink.is_ready:
-            await self._mark_error(db, doc, "RAG service not ready")
-            return
+            raise RuntimeError("RAG service not ready")
 
-        try:
-            loop = asyncio.get_running_loop()
-            method, text = await loop.run_in_executor(None, self._extractor.extract, file_path)
-            if not text.strip():
-                raise ExtractionError("No text extracted from document")
+        loop = asyncio.get_running_loop()
+        method, text = await loop.run_in_executor(None, self._extractor.extract, file_path)
+        if not text.strip():
+            raise ExtractionError("No text extracted from document")
 
-            doc.content = text
-            doc.summary = self._generate_summary(text)
-            doc.content_type = self._extractor.content_type_from_extension(file_path)
-            doc.extraction_method = method
-            doc.extracted_text_length = len(text)
-            doc.error_message = None
-            await db.commit()
-
-            chunk_count = await sink.ingest_text(
-                text=text,
-                document_id=document_id,
-                user_id=user_id,
-                scope=scope,
-                filename=filename,
-            )
-
-            doc.chunk_count = int(chunk_count)
-            doc.processing_status = "ready"
-            doc.processing_completed_at = datetime.now(timezone.utc)
-            await db.commit()
-            log.info(
-                "document.ingest_succeeded",
-                document_id=document_id,
-                filename=filename,
-                extraction_method=method,
-                chunk_count=int(chunk_count),
-            )
-            metrics.inc_document_ingest_succeeded_count()
-        except Exception as exc:
-            await self._mark_error(db, doc, str(exc))
-            log.error(
-                "document.ingest_failed",
-                document_id=document_id,
-                filename=filename,
-                error=str(exc),
-            )
-            metrics.inc_document_ingest_failed_count()
-
-    async def reprocess(
-        self,
-        *,
-        db: AsyncSession,
-        document_id: int,
-        user_id: int,
-    ) -> bool:
-        doc = await self._get_owned_document(db, document_id, user_id)
-        if doc is None:
-            return False
-
-        sink = self._get_sink()
-        await sink.delete_document(document_id)
-
-        doc.processing_status = "pending"
+        doc.content = text
+        doc.summary = self._generate_summary(text)
+        doc.content_type = self._extractor.content_type_from_extension(file_path)
+        doc.extraction_method = method
+        doc.extracted_text_length = len(text)
         doc.error_message = None
-        doc.processing_started_at = None
-        doc.processing_completed_at = None
-        doc.chunk_count = None
         await db.commit()
 
-        await self.process(
-            db=db,
+        chunk_count = await sink.ingest_text(
+            text=text,
             document_id=document_id,
-            file_path=Path(doc.file_path),
             user_id=user_id,
-            scope=doc.scope,
-            filename=doc.original_filename or doc.filename,
+            scope=scope,
+            filename=filename,
         )
-        return True
 
-    async def recover_stale_documents(
-        self,
-        *,
-        db: AsyncSession,
-        stale_threshold_minutes: int = 15,
-    ) -> int:
-        rows = (
-            await db.execute(
-                select(Document).where(Document.processing_status == "processing")
-            )
-        ).scalars().all()
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_threshold_minutes)
-        recovered = 0
-        for doc in rows:
-            started = self._normalize_dt(doc.processing_started_at)
-            if started is None or started > cutoff:
-                continue
-            doc.processing_status = "error"
-            doc.error_message = "Processing interrupted — reprocess to retry."
-            doc.processing_started_at = None
-            doc.processing_completed_at = None
-            recovered += 1
-            metrics.inc_document_ingest_recovered_count()
-            log.warning(
-                "document.ingest_recovered",
-                document_id=doc.id,
-                filename=doc.original_filename or doc.filename,
-            )
-        if recovered:
-            await db.commit()
-        return recovered
+        doc.chunk_count = int(chunk_count)
+        doc.processing_status = "ready"
+        doc.processing_completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        metrics.inc_document_ingest_succeeded_count()
 
     def _generate_summary(self, text: str, max_length: int = 300) -> str:
         cleaned = " ".join((text or "").split())
@@ -216,22 +131,8 @@ class DocumentProcessor:
             )
         ).scalar_one_or_none()
 
-    async def _mark_error(self, db: AsyncSession, doc: Document, message: str) -> None:
-        doc.processing_status = "error"
-        doc.error_message = message
-        doc.processing_started_at = None
-        doc.processing_completed_at = None
-        await db.commit()
-
     def _get_sink(self) -> DocumentIndexSink:
         return self._index_sink or get_rag_service()
-
-    def _normalize_dt(self, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
 
 
 _processor: DocumentProcessor | None = None

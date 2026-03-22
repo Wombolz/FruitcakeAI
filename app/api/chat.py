@@ -43,6 +43,8 @@ from app.metrics import metrics
 from app.memory.service import get_memory_service
 from app.skills.service import hydrate_user_context
 from app.agent.tools import (
+    normalize_document_name_query,
+    resolve_document_name,
     get_tool_execution_records,
     reset_tool_execution_records,
     restore_tool_execution_records,
@@ -885,11 +887,36 @@ async def _apply_required_library_grounding(
             result = await _list_library_documents(args, user_context)
     elif intent_type == "summary":
         tool_name = "summarize_document"
-        args = {"document_name": user_prompt}
         if tool_name in blocked:
+            args = {"document_name": user_prompt}
             result = "summarize_document is unavailable for this persona."
         else:
-            result = await _summarize_document(args, user_context)
+            listing = await _list_library_documents({"limit": 50}, user_context)
+            resolved_name = None
+            ambiguous: list[str] = []
+            try:
+                payload = json.loads(listing)
+                filenames = [
+                    str(doc.get("filename", "")).strip()
+                    for doc in payload.get("documents", [])
+                    if str(doc.get("filename", "")).strip()
+                ]
+                resolved_name, ambiguous = resolve_document_name(user_prompt, filenames)
+            except Exception:
+                filenames = []
+            if resolved_name:
+                args = {"document_name": resolved_name}
+                result = await _summarize_document(args, user_context)
+            elif ambiguous:
+                args = {"document_name": normalize_document_name_query(user_prompt)}
+                choices = "\n".join(f"- {name}" for name in ambiguous)
+                result = (
+                    f"Multiple documents match '{user_prompt}':\n{choices}\n"
+                    "Please use the exact filename."
+                )
+            else:
+                args = {"document_name": normalize_document_name_query(user_prompt)}
+                result = await _summarize_document(args, user_context)
     else:
         tool_name = "search_library"
         args = {"query": user_prompt, "top_k": 20}

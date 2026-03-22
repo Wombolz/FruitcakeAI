@@ -13,6 +13,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import structlog
@@ -38,6 +39,78 @@ def get_tool_execution_records() -> List[Dict[str, str]]:
 
 def restore_tool_execution_records(token: contextvars.Token) -> None:
     _tool_execution_records.reset(token)
+
+
+def normalize_document_name_query(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    text = text.strip().strip("\"'`")
+    lowered = text.lower()
+    prefix_patterns = [
+        r"^(?:please\s+)?summarize\s+",
+        r"^(?:please\s+)?give me an overview of\s+",
+        r"^(?:please\s+)?give me a summary of\s+",
+        r"^(?:please\s+)?what is in\s+",
+        r"^(?:please\s+)?tell me about\s+",
+    ]
+    for pattern in prefix_patterns:
+        lowered = re.sub(pattern, "", lowered, flags=re.IGNORECASE)
+    lowered = re.sub(r"^the\s+", "", lowered, flags=re.IGNORECASE)
+    lowered = re.sub(r"\b(?:from|in)\s+my\s+library\b", "", lowered, flags=re.IGNORECASE)
+    lowered = re.sub(r"\b(?:the|this|that)\s+document\b", "", lowered, flags=re.IGNORECASE)
+    lowered = re.sub(r"\b(?:document|file|doc)\b", "", lowered, flags=re.IGNORECASE)
+    lowered = re.sub(r"\s+", " ", lowered).strip(" .,:;!?-")
+    return lowered
+
+
+def _tokenize_document_name(value: str) -> str:
+    normalized = normalize_document_name_query(value).lower()
+    normalized = normalized.replace("_", " ").replace("-", " ")
+    normalized = re.sub(r"\.(pdf|md|txt|docx)\b", r" \1", normalized)
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def resolve_document_name(query: str, filenames: List[str]) -> tuple[str | None, List[str]]:
+    candidate = normalize_document_name_query(query)
+    if not candidate:
+        return None, []
+    filenames = [f for f in filenames if f]
+    lower_map = {f.lower(): f for f in filenames}
+    if candidate.lower() in lower_map:
+        return lower_map[candidate.lower()], []
+
+    token_candidate = _tokenize_document_name(candidate)
+    if not token_candidate:
+        return None, []
+
+    exact_token_matches = []
+    prefix_matches = []
+    substring_matches = []
+    for filename in filenames:
+        token_name = _tokenize_document_name(filename)
+        stem_name = _tokenize_document_name(filename.rsplit(".", 1)[0])
+        if token_candidate in {token_name, stem_name}:
+            exact_token_matches.append(filename)
+        if stem_name.startswith(token_candidate) or token_name.startswith(token_candidate):
+            prefix_matches.append(filename)
+        elif token_candidate and token_candidate in token_name:
+            substring_matches.append(filename)
+
+    if len(exact_token_matches) > 1:
+        return None, exact_token_matches
+    if len(prefix_matches) > 1:
+        return None, prefix_matches
+    if len(exact_token_matches) == 1 and len(prefix_matches) <= 1:
+        return exact_token_matches[0], []
+    if len(prefix_matches) == 1:
+        return prefix_matches[0], []
+    if len(substring_matches) > 1:
+        return None, substring_matches
+    if len(substring_matches) == 1:
+        return substring_matches[0], []
+    return None, []
 
 # ── Tool schema definitions ───────────────────────────────────────────────────
 # These are sent to the LLM so it knows what tools it can call.
@@ -481,38 +554,37 @@ async def _summarize_document(
     MAX_CHUNKS = 64
     BATCH_SIZE = 8
 
-    doc_name = arguments.get("document_name", "").strip()
+    raw_doc_name = arguments.get("document_name", "").strip()
+    doc_name = normalize_document_name_query(raw_doc_name)
     if not doc_name:
         return "No document name provided."
 
     async with AsyncSessionLocal() as db:
-        # Find document by partial filename match (owner only)
-        result = await db.execute(
+        all_docs = await db.execute(
             select(Document)
-            .where(
-                Document.owner_id == user_context.user_id,
-                Document.original_filename.ilike(f"%{doc_name}%"),
-            )
-            .limit(1)
+            .where(Document.owner_id == user_context.user_id)
+            .order_by(Document.created_at.desc())
         )
-        doc = result.scalar_one_or_none()
+        docs = all_docs.scalars().all()
+        filenames = [d.original_filename for d in docs if d.original_filename]
+        resolved_name, ambiguous = resolve_document_name(doc_name, filenames)
+        doc = next((d for d in docs if d.original_filename == resolved_name), None) if resolved_name else None
         if not doc:
-            # Return actual library contents so the LLM doesn't hallucinate filenames
-            all_docs = await db.execute(
-                select(Document.original_filename)
-                .where(Document.owner_id == user_context.user_id)
-                .order_by(Document.created_at.desc())
-            )
-            filenames = [r[0] for r in all_docs.fetchall() if r[0]]
+            if ambiguous:
+                doc_list = "\n".join(f"- {f}" for f in ambiguous)
+                return (
+                    f"Multiple documents match '{raw_doc_name}':\n{doc_list}\n"
+                    "Call summarize_document again with the exact filename from this list."
+                )
             if filenames:
                 doc_list = "\n".join(f"- {f}" for f in filenames)
                 return (
-                    f"No document found matching '{doc_name}'. "
+                    f"No document found matching '{raw_doc_name}'. "
                     f"The documents actually in this user's library are:\n{doc_list}\n"
                     "Call summarize_document again with the exact filename from this list."
                 )
             return (
-                f"No document found matching '{doc_name}'. "
+                f"No document found matching '{raw_doc_name}'. "
                 "The library is empty — no documents have been uploaded yet."
             )
         if doc.processing_status != "ready":

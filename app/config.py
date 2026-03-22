@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     scheduler_llm_health_gate_enabled: bool = True
     scheduler_unhealthy_cooldown_seconds: int = 300
     scheduler_stale_running_recovery_minutes: int = 20
+    document_ingest_poll_seconds: int = 5
+    document_ingest_stale_running_recovery_minutes: int = 20
+    document_ingest_max_concurrent: int = 1
     # Phase 5.5.1 chat complexity routing
     chat_complexity_routing_enabled: bool = True
     chat_complexity_threshold: int = 3
