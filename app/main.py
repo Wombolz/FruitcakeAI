@@ -35,6 +35,14 @@ async def lifespan(app: FastAPI):
     from app.rag.service import get_rag_service
     await get_rag_service().startup()
 
+    from app.db.session import AsyncSessionLocal
+    from app.rag.document_processor import get_document_processor
+
+    async with AsyncSessionLocal() as db:
+        recovered = await get_document_processor().recover_stale_documents(db=db)
+        if recovered > 0:
+            log.warning("Recovered interrupted documents on startup", count=recovered)
+
     # Initialize MCP registry (connects to enabled Docker servers, loads internal modules)
     from app.mcp.registry import get_mcp_registry
     await get_mcp_registry().startup()

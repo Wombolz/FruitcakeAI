@@ -515,6 +515,11 @@ async def _summarize_document(
                 f"No document found matching '{doc_name}'. "
                 "The library is empty — no documents have been uploaded yet."
             )
+        if doc.processing_status != "ready":
+            return (
+                f"Document '{doc.original_filename}' is not ready yet "
+                f"(status: {doc.processing_status})."
+            )
 
         # Fetch all non-empty chunks from LlamaIndex's table, ordered by rowid
         rows = await db.execute(

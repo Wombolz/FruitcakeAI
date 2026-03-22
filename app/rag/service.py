@@ -245,6 +245,37 @@ class RAGService:
 
         return len(nodes)
 
+    async def ingest_text(
+        self,
+        *,
+        text: str,
+        document_id: int,
+        user_id: int,
+        scope: str,
+        filename: str,
+    ) -> int:
+        """Chunk, embed, and store pre-extracted text. Returns the node count."""
+        if not self._loaded:
+            raise RuntimeError("RAG service is not initialized")
+
+        from app.rag.ingest import chunk_and_index
+
+        nodes = await chunk_and_index(
+            text=text,
+            metadata={
+                "document_id": str(document_id),
+                "user_id": str(user_id),
+                "scope": scope,
+                "filename": filename,
+            },
+            config=self._config,
+        )
+
+        await self._index.ainsert_nodes(nodes)
+        log.info("Document text ingested", document_id=document_id, nodes=len(nodes))
+        await self._rebuild_retriever_async()
+        return len(nodes)
+
     async def _rebuild_retriever_async(self) -> None:
         """Rebuild hybrid retriever using persisted chunk rows for BM25 corpus."""
         from app.rag.retriever import build_hybrid_retriever

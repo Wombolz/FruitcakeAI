@@ -17,6 +17,7 @@ from app.auth.dependencies import get_current_user
 from app.config import settings
 from app.db.models import Document, User
 from app.db.session import AsyncSessionLocal, get_db
+from app.rag.document_processor import get_document_processor
 from app.rag.service import get_rag_service
 
 router = APIRouter()
@@ -33,31 +34,16 @@ async def _ingest_background(
     scope: str,
     filename: str,
 ) -> None:
-    """Run RAG embedding after the HTTP response is sent; update processing_status."""
+    """Run document processing after the HTTP response is sent."""
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Document).where(Document.id == doc_id))
-        doc = result.scalar_one_or_none()
-        if not doc:
-            return
-        rag = get_rag_service()
-        if not rag.is_ready:
-            doc.processing_status = "error"
-            doc.error_message = "RAG service not ready"
-            await db.commit()
-            return
-        try:
-            await rag.ingest(
-                file_path=file_path,
-                document_id=doc_id,
-                user_id=user_id,
-                scope=scope,
-                filename=filename,
-            )
-            doc.processing_status = "ready"
-        except Exception as e:
-            doc.processing_status = "error"
-            doc.error_message = str(e)
-        await db.commit()
+        await get_document_processor().process(
+            db=db,
+            document_id=doc_id,
+            file_path=file_path,
+            user_id=user_id,
+            scope=scope,
+            filename=filename,
+        )
 
 
 # ── POST /library/ingest ──────────────────────────────────────────────────────
@@ -101,7 +87,7 @@ async def ingest_document(
         file_size_bytes=file_size,
         mime_type=file.content_type,
         scope=scope,
-        processing_status="processing",
+        processing_status="pending",
         title=file.filename,
     )
     db.add(doc)
@@ -184,6 +170,9 @@ async def list_documents(
             "scope": d.scope,
             "created_at": d.created_at.isoformat() if d.created_at else "",
             "processing_status": d.processing_status,
+            "content_type": d.content_type,
+            "chunk_count": d.chunk_count,
+            "summary": d.summary,
         }
         for d in docs
     ]
@@ -208,9 +197,16 @@ async def get_document_details(
         "filename": doc.original_filename or doc.filename,
         "scope": doc.scope,
         "processing_status": doc.processing_status,
+        "content_type": doc.content_type,
+        "extraction_method": doc.extraction_method,
+        "extracted_text_length": doc.extracted_text_length,
+        "chunk_count": doc.chunk_count,
+        "summary": doc.summary,
         "error_message": doc.error_message,
         "mime_type": doc.mime_type,
         "file_size_bytes": doc.file_size_bytes,
+        "processing_started_at": doc.processing_started_at.isoformat() if doc.processing_started_at else None,
+        "processing_completed_at": doc.processing_completed_at.isoformat() if doc.processing_completed_at else None,
         "created_at": doc.created_at.isoformat() if doc.created_at else "",
         "updated_at": doc.updated_at.isoformat() if doc.updated_at else "",
     }
@@ -234,6 +230,8 @@ async def get_document_excerpts(
         raise HTTPException(status_code=404, detail="Document not found")
     if not _can_access_document(doc, current_user):
         raise HTTPException(status_code=403, detail="Not authorized to access this document")
+    if doc.processing_status != "ready":
+        raise HTTPException(status_code=409, detail="Document is not ready for excerpts")
 
     rag = get_rag_service()
     if not rag.is_ready:
@@ -307,6 +305,32 @@ async def delete_document(
 
 class UpdateDocumentRequest(BaseModel):
     scope: str
+
+
+@router.post("/documents/{doc_id}/reprocess", status_code=status.HTTP_202_ACCEPTED)
+async def reprocess_document(
+    doc_id: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your document")
+
+    async def _reprocess_background() -> None:
+        async with AsyncSessionLocal() as bg_db:
+            await get_document_processor().reprocess(
+                db=bg_db,
+                document_id=doc_id,
+                user_id=current_user.id,
+            )
+
+    background_tasks.add_task(_reprocess_background)
+    return {"id": doc.id, "status": "processing"}
 
 
 @router.patch("/documents/{doc_id}", status_code=200)

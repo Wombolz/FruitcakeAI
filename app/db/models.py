@@ -127,6 +127,10 @@ class Document(Base):
     title = Column(String(500))
     content = Column(Text)
     summary = Column(Text)
+    content_type = Column(String(50), nullable=True)
+    extraction_method = Column(String(50), nullable=True)
+    extracted_text_length = Column(Integer, nullable=True)
+    chunk_count = Column(Integer, nullable=True)
 
     # v5: scope controls visibility — personal | family | shared
     scope = Column(String(50), default="personal", nullable=False)
@@ -134,6 +138,8 @@ class Document(Base):
 
     processing_status = Column(String(50), default="pending")
     error_message = Column(Text)
+    processing_started_at = Column(DateTime(timezone=True), nullable=True)
+    processing_completed_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

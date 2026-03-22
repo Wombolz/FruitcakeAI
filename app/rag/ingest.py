@@ -11,25 +11,42 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
+from app.rag.extractor import DocumentExtractor
+
 
 def _load_documents(file_path: Path) -> List[Any]:
-    from llama_index.core import Document, SimpleDirectoryReader
+    from llama_index.core import Document
 
-    suffix = file_path.suffix.lower()
-    if suffix == ".pdf":
-        from pypdf import PdfReader
+    extractor = DocumentExtractor()
+    _, text = extractor.extract(file_path)
+    return [Document(text=text)]
 
-        reader = PdfReader(str(file_path))
-        pages: List[str] = []
-        for page in reader.pages:
-            text = (page.extract_text() or "").strip()
-            if text:
-                pages.append(text)
-        if pages:
-            return [Document(text="\n\n".join(pages))]
 
-    reader = SimpleDirectoryReader(input_files=[str(file_path)])
-    return reader.load_data()
+async def chunk_and_index(
+    text: str,
+    metadata: Dict[str, Any],
+    config: Dict[str, Any],
+) -> List[Any]:
+    """
+    Split pre-extracted text into LlamaIndex TextNodes ready for ainsert_nodes().
+    """
+    chunk_cfg = config.get("chunking", {})
+    chunk_size = int(chunk_cfg.get("chunk_size", 900))
+    chunk_overlap = int(chunk_cfg.get("chunk_overlap", 120))
+
+    loop = asyncio.get_running_loop()
+
+    def _chunk() -> List[Any]:
+        from llama_index.core import Document
+        from llama_index.core.node_parser import SentenceSplitter
+
+        doc_id = str(metadata.get("document_id", uuid.uuid4()))
+        document = Document(text=text, metadata=dict(metadata))
+        document.doc_id = doc_id
+        splitter = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        return splitter.get_nodes_from_documents([document])
+
+    return await loop.run_in_executor(None, _chunk)
 
 
 async def read_and_chunk(
@@ -41,33 +58,14 @@ async def read_and_chunk(
     Read a file and split it into LlamaIndex TextNodes.
 
     Supported formats: PDF, DOCX, TXT (via LlamaIndex SimpleDirectoryReader).
-    Chunking: SentenceSplitter with configurable size + overlap.
-
     Returns a list of TextNodes with metadata attached, ready for ainsert_nodes().
     """
-    chunk_cfg = config.get("chunking", {})
-    chunk_size = int(chunk_cfg.get("chunk_size", 900))
-    chunk_overlap = int(chunk_cfg.get("chunk_overlap", 120))
-
     loop = asyncio.get_running_loop()
+    extractor = DocumentExtractor()
 
-    def _load_and_chunk() -> List[Any]:
-        from llama_index.core.node_parser import SentenceSplitter
+    def _extract_text() -> str:
+        _, extracted_text = extractor.extract(file_path)
+        return extracted_text
 
-        documents = _load_documents(file_path)
-
-        # Attach user metadata and set ref_doc_id for later deletion
-        doc_id = str(metadata.get("document_id", uuid.uuid4()))
-        for doc in documents:
-            doc.metadata.update(metadata)
-            doc.doc_id = doc_id
-
-        # Chunk
-        splitter = SentenceSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-        )
-        nodes = splitter.get_nodes_from_documents(documents)
-        return nodes
-
-    return await loop.run_in_executor(None, _load_and_chunk)
+    extracted_text = await loop.run_in_executor(None, _extract_text)
+    return await chunk_and_index(extracted_text, metadata, config)
