@@ -26,6 +26,7 @@ from app.agent.context import UserContext
 from app.agent.chat_intents import (
     is_library_detail_or_excerpt_intent,
     is_library_lookup_intent,
+    is_library_summary_intent,
 )
 from app.agent.chat_orchestration import build_orchestrated_chat_history
 from app.agent.chat_routing import classify_chat_complexity
@@ -272,6 +273,8 @@ async def send_message(
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Send a message and get the full response (no streaming)."""
+    request_started = time.perf_counter()
+    stage_timings_ms: Dict[str, float] = {}
     session = await _get_session_or_404(session_id, current_user.id, db)
 
     # Handle /persona command before touching history or running the agent
@@ -280,7 +283,9 @@ async def send_message(
         return await _switch_persona(session_id, persona_name, session, db)
 
     # Load conversation history
+    stage_started = time.perf_counter()
     history = await _load_history(session_id, db)
+    _record_chat_stage_timing(stage_timings_ms, "history_load", stage_started)
 
     # Store user message
     user_msg = ChatMessage(session_id=session_id, role="user", content=body.content)
@@ -296,27 +301,38 @@ async def send_message(
         allowed_tools=body.allowed_tools,
         blocked_tools=body.blocked_tools,
     )
+    stage_started = time.perf_counter()
     user_context = await hydrate_user_context(db, user_context, query=body.content)
+    _record_chat_stage_timing(stage_timings_ms, "context_hydration", stage_started)
     user_context.session_id = session_id
+    stage_started = time.perf_counter()
     history, _memory_ids = await _apply_memory_context(
         history,
         db,
         current_user.id,
         body.content,
     )
+    _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
     library_list_intent = is_library_lookup_intent(body.content)
+    library_summary_intent = is_library_summary_intent(body.content)
     library_detail_intent = is_library_detail_or_excerpt_intent(body.content)
-    library_intent = library_list_intent or library_detail_intent
+    library_intent = library_list_intent or library_summary_intent or library_detail_intent
+    stage_started = time.perf_counter()
     history = await _apply_required_library_grounding(
         history,
         user_context,
         user_prompt=body.content,
         intent_type=(
-            "detail_or_excerpt"
-            if library_detail_intent
-            else ("list_documents" if library_list_intent else None)
+            "summary"
+            if library_summary_intent
+            else (
+                "detail_or_excerpt"
+                if library_detail_intent
+                else ("list_documents" if library_list_intent else None)
+            )
         ),
     )
+    _record_chat_stage_timing(stage_timings_ms, "library_grounding", stage_started)
 
     decision = classify_chat_complexity(
         body.content,
@@ -324,11 +340,13 @@ async def send_message(
         routing_enabled=settings.chat_complexity_routing_enabled,
     )
     execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
+    stage_started = time.perf_counter()
     execution_history = build_orchestrated_chat_history(
         history,
         enabled=(execution_mode == "chat_orchestrated" and settings.chat_orchestration_enabled),
         max_steps=settings.chat_orchestration_max_steps,
     )
+    _record_chat_stage_timing(stage_timings_ms, "orchestration_build", stage_started)
     effective_complex = (decision.is_complex or library_intent) and execution_mode == "chat_orchestrated"
     if decision.is_complex:
         metrics.inc_chat_complexity_complex_count()
@@ -339,6 +357,7 @@ async def send_message(
 
     try:
         record_token = reset_tool_execution_records()
+        stage_started = time.perf_counter()
         reply = await _execute_chat_turn(
             execution_history,
             user_context,
@@ -347,6 +366,7 @@ async def send_message(
             stage="chat_complex" if effective_complex else "chat_simple",
             enable_validation=effective_complex,
         )
+        _record_chat_stage_timing(stage_timings_ms, "model_execution", stage_started)
         reply = _enforce_calendar_mutation_integrity(
             body.content,
             reply,
@@ -365,6 +385,13 @@ async def send_message(
     assistant_msg = ChatMessage(session_id=session_id, role="assistant", content=reply)
     db.add(assistant_msg)
     await db.commit()
+    _log_chat_latency_breakdown(
+        session_id=session_id,
+        mode=execution_mode,
+        total_started=request_started,
+        stage_timings_ms=stage_timings_ms,
+        transport="rest",
+    )
 
     return {
         "role": "assistant",
@@ -467,6 +494,8 @@ async def chat_websocket(
             if not user_message:
                 await websocket.send_json({"type": "error", "content": "content required"})
             else:
+                message_started = time.perf_counter()
+                stage_timings_ms: Dict[str, float] = {}
                 # Handle /persona command
                 persona_name = _parse_persona_command(user_message)
                 if persona_name is not None:
@@ -487,7 +516,9 @@ async def chat_websocket(
                     await db.flush()
 
                     # Load history and append new user message
+                    stage_started = time.perf_counter()
                     history = await _load_history(session_id, db)
+                    _record_chat_stage_timing(stage_timings_ms, "history_load", stage_started)
 
                     # Build context from session's current persona
                     user_context = UserContext.from_user(current_user, persona_name=session.persona)
@@ -496,27 +527,42 @@ async def chat_websocket(
                         allowed_tools=allowed_tools,
                         blocked_tools=blocked_tools,
                     )
+                    stage_started = time.perf_counter()
                     user_context = await hydrate_user_context(db, user_context, query=user_message)
+                    _record_chat_stage_timing(stage_timings_ms, "context_hydration", stage_started)
                     user_context.session_id = session_id
+                    stage_started = time.perf_counter()
                     history, _memory_ids = await _apply_memory_context(
                         history,
                         db,
                         current_user.id,
                         user_message,
                     )
+                    _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
                     library_list_intent = is_library_lookup_intent(user_message)
+                    library_summary_intent = is_library_summary_intent(user_message)
                     library_detail_intent = is_library_detail_or_excerpt_intent(user_message)
-                    library_intent = library_list_intent or library_detail_intent
+                    library_intent = (
+                        library_list_intent
+                        or library_summary_intent
+                        or library_detail_intent
+                    )
+                    stage_started = time.perf_counter()
                     history = await _apply_required_library_grounding(
                         history,
                         user_context,
                         user_prompt=user_message,
                         intent_type=(
-                            "detail_or_excerpt"
-                            if library_detail_intent
-                            else ("list_documents" if library_list_intent else None)
+                            "summary"
+                            if library_summary_intent
+                            else (
+                                "detail_or_excerpt"
+                                if library_detail_intent
+                                else ("list_documents" if library_list_intent else None)
+                            )
                         ),
                     )
+                    _record_chat_stage_timing(stage_timings_ms, "library_grounding", stage_started)
                     full_response = []
                     decision = classify_chat_complexity(
                         user_message,
@@ -524,11 +570,13 @@ async def chat_websocket(
                         routing_enabled=settings.chat_complexity_routing_enabled,
                     )
                     execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
+                    stage_started = time.perf_counter()
                     execution_history = build_orchestrated_chat_history(
                         history,
                         enabled=(execution_mode == "chat_orchestrated" and settings.chat_orchestration_enabled),
                         max_steps=settings.chat_orchestration_max_steps,
                     )
+                    _record_chat_stage_timing(stage_timings_ms, "orchestration_build", stage_started)
                     effective_complex = (decision.is_complex or library_intent) and execution_mode == "chat_orchestrated"
                     if decision.is_complex:
                         metrics.inc_chat_complexity_complex_count()
@@ -538,6 +586,7 @@ async def chat_websocket(
                         metrics.inc_chat_complexity_simple_count()
                     if effective_complex:
                         record_token = reset_tool_execution_records()
+                        stage_started = time.perf_counter()
                         complete = await _execute_chat_turn(
                             execution_history,
                             user_context,
@@ -546,6 +595,7 @@ async def chat_websocket(
                             stage="chat_complex",
                             enable_validation=effective_complex,
                         )
+                        _record_chat_stage_timing(stage_timings_ms, "model_execution", stage_started)
                         complete = _enforce_calendar_mutation_integrity(
                             user_message,
                             complete,
@@ -570,6 +620,7 @@ async def chat_websocket(
                             mode="chat",
                             elapsed_ms=(time.perf_counter() - started) * 1000.0,
                         )
+                        _record_chat_stage_timing(stage_timings_ms, "model_execution", started)
                         complete = _enforce_calendar_mutation_integrity(
                             user_message,
                             "".join(full_response),
@@ -583,6 +634,13 @@ async def chat_websocket(
                     )
                     db.add(assistant_msg)
                     await db.commit()
+                    _log_chat_latency_breakdown(
+                        session_id=session_id,
+                        mode=execution_mode,
+                        total_started=message_started,
+                        stage_timings_ms=stage_timings_ms,
+                        transport="websocket",
+                    )
 
                     await websocket.send_json(
                         {
@@ -676,6 +734,30 @@ async def _switch_persona(
 def _chunk_text(content: str, chunk_size: int = 64):
     for i in range(0, len(content), chunk_size):
         yield content[i : i + chunk_size]
+
+
+def _record_chat_stage_timing(stage_timings_ms: Dict[str, float], stage: str, started: float) -> None:
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    stage_timings_ms[stage] = round(elapsed_ms, 2)
+    metrics.record_chat_stage_latency(stage=stage, elapsed_ms=elapsed_ms)
+
+
+def _log_chat_latency_breakdown(
+    *,
+    session_id: int,
+    mode: str,
+    total_started: float,
+    stage_timings_ms: Dict[str, float],
+    transport: str,
+) -> None:
+    log.info(
+        "chat.latency_breakdown",
+        session_id=session_id,
+        mode=mode,
+        transport=transport,
+        total_ms=round((time.perf_counter() - total_started) * 1000.0, 2),
+        **{f"{stage}_ms": elapsed for stage, elapsed in sorted(stage_timings_ms.items())},
+    )
 
 
 def _resolve_chat_mode(is_complex: bool) -> str:
@@ -787,7 +869,12 @@ async def _apply_required_library_grounding(
         return history
 
     blocked = {str(name).strip() for name in (user_context.blocked_tools or [])}
-    from app.agent.tools import _list_library_documents, _search_library, _write_audit_log
+    from app.agent.tools import (
+        _list_library_documents,
+        _search_library,
+        _summarize_document,
+        _write_audit_log,
+    )
 
     if intent_type == "list_documents":
         tool_name = "list_library_documents"
@@ -796,6 +883,13 @@ async def _apply_required_library_grounding(
             result = "list_library_documents is unavailable for this persona."
         else:
             result = await _list_library_documents(args, user_context)
+    elif intent_type == "summary":
+        tool_name = "summarize_document"
+        args = {"document_name": user_prompt}
+        if tool_name in blocked:
+            result = "summarize_document is unavailable for this persona."
+        else:
+            result = await _summarize_document(args, user_context)
     else:
         tool_name = "search_library"
         args = {"query": user_prompt, "top_k": 20}

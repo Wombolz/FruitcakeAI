@@ -12,6 +12,26 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
+def _load_documents(file_path: Path) -> List[Any]:
+    from llama_index.core import Document, SimpleDirectoryReader
+
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(file_path))
+        pages: List[str] = []
+        for page in reader.pages:
+            text = (page.extract_text() or "").strip()
+            if text:
+                pages.append(text)
+        if pages:
+            return [Document(text="\n\n".join(pages))]
+
+    reader = SimpleDirectoryReader(input_files=[str(file_path)])
+    return reader.load_data()
+
+
 async def read_and_chunk(
     file_path: Path,
     metadata: Dict[str, Any],
@@ -32,12 +52,9 @@ async def read_and_chunk(
     loop = asyncio.get_running_loop()
 
     def _load_and_chunk() -> List[Any]:
-        from llama_index.core import SimpleDirectoryReader
         from llama_index.core.node_parser import SentenceSplitter
 
-        # Load — SimpleDirectoryReader handles PDF, DOCX, TXT, HTML, etc.
-        reader = SimpleDirectoryReader(input_files=[str(file_path)])
-        documents = reader.load_data()
+        documents = _load_documents(file_path)
 
         # Attach user metadata and set ref_doc_id for later deletion
         doc_id = str(metadata.get("document_id", uuid.uuid4()))

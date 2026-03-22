@@ -1199,7 +1199,7 @@ Verification highlights:
 
 ## Phase 5.6 — Release Prep: Repository Realignment
 
-**Status**: 5.6.1-5.6.9 merged to `main` in release `v0.6.7`.
+**Status**: 5.6.1-5.6.10 merged to `main` through release `v0.6.8`. `5.6.13` was trialed on a branch, partially kept, and moved to deferred follow-up after heuristic chat gating regressed response quality and tool reliability.
 
 **Goal**: align repository boundaries before Phase 6 so ownership, release flow, and open-source onboarding are clean.
 
@@ -1342,13 +1342,6 @@ Acceptance additions for Sprint 5.6.7:
 - Raise the effective edition density to roughly 10 to 12 linked stories when enough dataset items are available.
 - Use a two-tier paper structure: featured top stories first, followed by shorter section briefs across multiple categories.
 - Preserve grounded-link validation while allowing the finalized edition builder to backfill additional publishable briefs from the prepared dataset when the model draft is too sparse.
-
-**Sprint 5.6.13 — Chat Responsiveness Optimization**
-- Prioritize perceived speed on ordinary chat without rewriting the full chat architecture.
-- Replace the current fake streaming path with true token streaming for the simple WebSocket chat path.
-- Reduce simple-chat overhead by trimming the default history window and making memory retrieval and tool exposure conditional instead of always-on.
-- Keep complex/orchestrated chat behavior intact, including grounded/library flows and stronger validation where those paths already apply.
-- Add latency breakdown instrumentation so future slowdowns can be attributed to prompt assembly, memory/skills, tool exposure, or model generation instead of being inferred from feel.
 
 **Acceptance criteria**
 1. Both repos are renamed/repositioned with history intact.
@@ -1517,6 +1510,12 @@ These items are intentionally tracked outside the sprint list because they are r
   - Decision needed later: whether to add a Swift admin/debug view or keep inspection API-only.
   - Earliest likely sprint: after more soak confirms the payload shape is stable.
 
+- **Chat responsiveness optimization**
+  - Why it matters: local chat still feels slower than direct model interaction, especially once memory, tools, and grounding are layered in.
+  - Current status: a `5.6.13` branch tried heuristic tool/memory/history gating to improve perceived speed, but it regressed response quality and caused brittle tool-access failures; those changes were rolled back. The safe pieces kept from that work are stage latency instrumentation plus grounded library summary and PDF ingest fixes.
+  - Decision needed later: whether to improve responsiveness through true streaming, prompt/context budgeting, or architecture changes rather than heuristic suppression of capabilities.
+  - Earliest likely sprint: after the RAG restoration pass, using measured latency data instead of aggressive chat-path trimming.
+
 - **Product positioning / tagline refresh**
   - Why it matters: the current product direction is more memory- and continuity-driven than the older preparedness-focused tagline implies.
   - Current status: README positioning has improved; public-facing tagline strategy is still unsettled.
@@ -1568,12 +1567,18 @@ These items are intentionally tracked outside the sprint list because they are r
 ## LLM Backend Configuration
 
 ```env
-# Default — local, privacy-first, verified M1 Max 64GB
-LLM_MODEL=ollama_chat/qwen2.5:14b
+# Default — mixed local routing, verified on M1 Max 64GB
+LLM_MODEL=ollama_chat/qwen2.5:32b
 LOCAL_API_BASE=http://localhost:11434/v1
+TASK_SMALL_MODEL=ollama_chat/qwen2.5:14b
+TASK_LARGE_MODEL=ollama_chat/qwen2.5:32b
+TASK_FORCE_LARGE_FOR_PLANNING=false
+TASK_FORCE_LARGE_FOR_FINAL_SYNTHESIS=true
 
-# Step up (close other apps first)
-# LLM_MODEL=ollama_chat/qwen2.5:32b
+# All-14b fallback if stability or memory pressure becomes a problem
+# LLM_MODEL=ollama_chat/qwen2.5:14b
+# TASK_SMALL_MODEL=ollama_chat/qwen2.5:14b
+# TASK_LARGE_MODEL=ollama_chat/qwen2.5:14b
 
 # Cloud — best quality, opt-in only
 # LLM_MODEL=claude-sonnet-4-6

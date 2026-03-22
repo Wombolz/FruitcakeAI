@@ -35,20 +35,20 @@ class Settings(BaseSettings):
     # ── LLM Backend ───────────────────────────────────────────────────────────
     # Supported: anthropic | openai | ollama | openai_compat
     llm_backend: str = "ollama"
-    llm_model: str = "ollama_chat/qwen2.5:14b"
+    llm_model: str = "ollama_chat/qwen2.5:32b"
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     # For Ollama / llama.cpp (openai_compat)
     local_api_base: str = "http://localhost:11434/v1"
     local_api_key: str = "sk-local"
-    local_model: str = "qwen2.5:14b"
+    local_model: str = "qwen2.5:32b"
     # Task-stage routing (Phase 5.4.x)
-    task_small_model: str = "ollama_chat/qwen2.5:7b"
-    task_large_model: str = "ollama_chat/qwen2.5:14b"
+    task_small_model: str = "ollama_chat/qwen2.5:14b"
+    task_large_model: str = "ollama_chat/qwen2.5:32b"
     task_model_routing_enabled: bool = True
     task_large_retry_enabled: bool = True
     task_large_retry_max_attempts: int = 1
-    task_force_large_for_planning: bool = True
+    task_force_large_for_planning: bool = False
     task_force_large_for_final_synthesis: bool = True
     task_plan_default_steps: int = 8
     task_plan_max_steps: int = 20
