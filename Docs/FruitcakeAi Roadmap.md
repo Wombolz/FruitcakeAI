@@ -1470,6 +1470,24 @@ Rollout:
 3. Run recall/grounding evals in soak before default enablement.
 4. Keep cloud routing and graph memory decoupled; either can ship independently once Phase 6 gate is open.
 
+**Sprint 7.5** — OpenClaw skill converter expansion
+
+Goal: once Phase 7 MCP tools are live, extend the existing skill converter pipeline so Fruitcake can convert a much larger share of OpenClaw's bundled skills safely and reviewably.
+
+Planned outcomes:
+- add `read_file`, `write_file`, `shell_exec`, and `spawn_agent` to the converter's approved tool list when enabled
+- add `POST /admin/skills/convert` to convert raw `SKILL.md` content into previewable Fruitcake skill payloads
+- add a batch conversion script for directory-based OpenClaw skill conversion with a human-review report
+- preserve review-first install flow: convert -> preview -> install, no blind auto-install
+- track `source: "openclaw"` provenance on converted skills
+- only grant `shell_exec` when the converted skill still makes sense inside Fruitcake's sandbox constraints
+
+Reference:
+- `Docs/OpenClaw_Skill_Converter_Spec.md`
+
+Note:
+- `Docs/Phase 7 Tool Expansion.md` overlaps this sprint heavily and should be treated as supporting planning material, not a separate roadmap item.
+
 ---
 
 ## Phase 8 — Nightly Memory Extraction
@@ -1541,6 +1559,12 @@ These items are intentionally tracked outside the sprint list because they are r
   - Current status: roadmap principle exists (`child cannot escalate parent scopes`), but execution semantics are still open.
   - Decision needed later: exact inheritance model for approvals, tool ceilings, and audit lineage across spawned agents.
   - Earliest likely sprint: before Phase 7 implementation starts.
+
+- **Distributed worker-node architecture**
+  - Why it matters: the current single-instance deployment model will eventually limit throughput once autonomy, larger models, or multiple concurrent users become normal.
+  - Current status: architecture direction documented in `Docs/WorkerNode.md`; concept is coherent and fits Fruitcake's shared-DB design, but it is not implementation-ready enough to commit as an active sprint.
+  - Decision needed later: whether to scale task execution with dedicated worker nodes, worker registry/heartbeat, and model-tier routing rather than continuing to scale vertically on one machine.
+  - Earliest likely sprint: after task durability, task claiming, and worker recovery semantics are stable enough to distribute safely.
 
 - **Tenant isolation model**
   - Why it matters: enterprise support gets expensive fast if tenant boundaries are bolted on late.
