@@ -127,6 +127,10 @@ class Document(Base):
     title = Column(String(500))
     content = Column(Text)
     summary = Column(Text)
+    content_type = Column(String(50), nullable=True)
+    extraction_method = Column(String(50), nullable=True)
+    extracted_text_length = Column(Integer, nullable=True)
+    chunk_count = Column(Integer, nullable=True)
 
     # v5: scope controls visibility — personal | family | shared
     scope = Column(String(50), default="personal", nullable=False)
@@ -134,15 +138,52 @@ class Document(Base):
 
     processing_status = Column(String(50), default="pending")
     error_message = Column(Text)
+    processing_started_at = Column(DateTime(timezone=True), nullable=True)
+    processing_completed_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     owner = relationship("User", back_populates="documents")
     chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
+    ingest_job = relationship(
+        "DocumentIngestJob",
+        back_populates="document",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self):
         return f"<Document(filename='{self.filename}', scope='{self.scope}')>"
+
+
+class DocumentIngestJob(Base):
+    __tablename__ = "document_ingest_jobs"
+    __table_args__ = (
+        UniqueConstraint("document_id", name="uq_document_ingest_jobs_document_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    status = Column(String(30), nullable=False, default="queued", index=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=3)
+    last_error = Column(Text)
+
+    queued_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    started_at = Column(DateTime(timezone=True))
+    finished_at = Column(DateTime(timezone=True))
+    next_attempt_at = Column(DateTime(timezone=True))
+    claimed_at = Column(DateTime(timezone=True))
+
+    document = relationship("Document", back_populates="ingest_job")
+
+    def __repr__(self):
+        return (
+            f"<DocumentIngestJob(document_id={self.document_id}, "
+            f"status='{self.status}', attempts={self.attempt_count})>"
+        )
 
 
 class DocumentChunk(Base):

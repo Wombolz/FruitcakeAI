@@ -48,6 +48,10 @@ class _Metrics:
     chat_orchestrated_latency_total_ms: float = 0.0
     chat_stage_latency_counts: Dict[str, int] = field(default_factory=dict)
     chat_stage_latency_totals_ms: Dict[str, float] = field(default_factory=dict)
+    document_ingest_started_count: int = 0
+    document_ingest_succeeded_count: int = 0
+    document_ingest_failed_count: int = 0
+    document_ingest_recovered_count: int = 0
 
     def inc_requests(self) -> None:
         with self._lock:
@@ -156,6 +160,22 @@ class _Metrics:
                 self.chat_stage_latency_totals_ms.get(key, 0.0) + float(elapsed_ms)
             )
 
+    def inc_document_ingest_started_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.document_ingest_started_count += n
+
+    def inc_document_ingest_succeeded_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.document_ingest_succeeded_count += n
+
+    def inc_document_ingest_failed_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.document_ingest_failed_count += n
+
+    def inc_document_ingest_recovered_count(self, n: int = 1) -> None:
+        with self._lock:
+            self.document_ingest_recovered_count += n
+
     def snapshot(self) -> dict:
         with self._lock:
             simple_avg = (
@@ -205,6 +225,10 @@ class _Metrics:
                 "chat_orchestration_latency_delta_ms": round(orchestrated_avg - simple_avg, 2),
                 "chat_stage_latency_counts": dict(sorted(self.chat_stage_latency_counts.items())),
                 "chat_stage_latency_avg_ms": stage_avgs,
+                "document_ingest_started_count": self.document_ingest_started_count,
+                "document_ingest_succeeded_count": self.document_ingest_succeeded_count,
+                "document_ingest_failed_count": self.document_ingest_failed_count,
+                "document_ingest_recovered_count": self.document_ingest_recovered_count,
             }
 
 

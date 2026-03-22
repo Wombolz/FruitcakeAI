@@ -1366,6 +1366,8 @@ Phase 6 starts only when all are true:
 
 **Dependency**: Depends on completion of the Phase 5.4 reliability gate.
 
+**Checkpoint Note**: Phase 6 remains intentionally postponed while local model quality, routing, and document/tool reliability continue to improve. Cloud judgment routing is still the next numbered phase, but it will not begin until real usage shows a measured need that justifies the data-exposure tradeoff.
+
 **Trigger**: A user requests it, or local judgment quality on heartbeats is demonstrably causing missed-important / false-alarm patterns in daily use.
 
 Cloud routing remains opt-in and justified by measured local judgment gaps.
@@ -1420,24 +1422,15 @@ Reference:
 
 ---
 
-## Phase 7 — Filesystem + Sub-Agent Spawning (2 weeks)
+## Phase 7 — Trusted Local Capability Expansion (2 weeks)
+
+Skill imports are curated, not bulk. Technical convertibility is not sufficient; a skill is included only if it strengthens Fruitcake's identity as a trusted, local personal assistant.
 
 **Sprint 7.1** — Sandboxed filesystem MCP: `--allowed-paths /workspace`, per-user `workspace/{user_id}/`.
 
 **Sprint 7.2** — Shell MCP: `docker run --network none`, 30s timeout, 8k output cap, explicit blocked commands list.
 
-**Sprint 7.3** — Sub-agent spawning:
-
-```python
-async def spawn_agent(instruction: str, persona: str, timeout_seconds: int = 120):
-    """Delegate to a specialist sub-agent. Child cannot escalate parent scopes."""
-    child_session = create_child_session(parent=current_session, persona=persona)
-    result = await run_agent(child_session, mode="task", max_turns=16)
-    audit_log_child(parent=current_session, child=child_session)
-    return result
-```
-
-**Sprint 7.4** — Graph Memory Foundation (MCP-informed, Fruitcake-native)
+**Sprint 7.3** — Graph Memory Foundation (MCP-informed, Fruitcake-native)
 
 Goal: add durable relationship memory for long-horizon reasoning without adopting the MCP demo memory server as a production dependency.
 
@@ -1469,6 +1462,29 @@ Rollout:
 2. Add additive tool/API interfaces and admin diagnostics.
 3. Run recall/grounding evals in soak before default enablement.
 4. Keep cloud routing and graph memory decoupled; either can ship independently once Phase 6 gate is open.
+
+**Sprint 7.4** — Curated OpenClaw skill conversion
+
+Goal: once Phase 7 MCP tools are live, selectively convert the subset of OpenClaw skills that strengthens Fruitcake as a trusted, local personal assistant.
+
+Planned outcomes:
+- add `read_file`, `write_file`, and `shell_exec` to the converter's approved tool list when enabled
+- add `POST /admin/skills/convert` to convert raw `SKILL.md` content into previewable Fruitcake skill payloads
+- add a batch conversion script for directory-based OpenClaw skill conversion with a human-review report
+- preserve review-first install flow: convert -> preview -> install, no blind auto-install
+- track `source: "openclaw"` provenance on converted skills
+- only grant `shell_exec` when the converted skill still makes sense inside Fruitcake's sandbox constraints
+
+Naming and provenance rules:
+- Core Fruitcake skills remain first-party Fruitcake skills even when they parallel an OpenClaw concept.
+- OpenClaw-derived prefixes or provenance labels should only be applied to direct imported/converted skills.
+- Do not brand foundational or product-defining skills as imported just because similar skills existed upstream.
+
+Reference:
+- `Docs/OpenClaw_Skill_Converter_Spec.md`
+
+Note:
+- `Docs/Phase 7 Tool Expansion.md` overlaps this sprint heavily and should be treated as supporting planning material, not a separate roadmap item.
 
 ---
 
@@ -1536,11 +1552,17 @@ These items are intentionally tracked outside the sprint list because they are r
   - Decision needed later: whether to centralize resolution in one policy layer and remove distributed fallback logic.
   - Earliest likely sprint: scheduler/reliability cleanup before additional autonomy complexity.
 
-- **Sub-agent approval inheritance**
-  - Why it matters: Phase 7 sub-agents become unsafe or confusing if approval and scope ceilings are not inherited cleanly.
-  - Current status: roadmap principle exists (`child cannot escalate parent scopes`), but execution semantics are still open.
-  - Decision needed later: exact inheritance model for approvals, tool ceilings, and audit lineage across spawned agents.
-  - Earliest likely sprint: before Phase 7 implementation starts.
+- **Sub-agent spawning**
+  - Why it matters: specialist delegation could unlock more complex workflows later, but it complicates trust, approval, and audit lineage in a product that currently benefits from a simple execution model.
+  - Current status: postponed out of Phase 7 and not currently assigned to an active phase.
+  - Decision needed later: whether child agents can be introduced without weakening approval clarity, audit transparency, or the single-agent trust model.
+  - Earliest likely sprint: after the local-capability and dream-cycle roadmap is stable enough to absorb the added complexity.
+
+- **Distributed worker-node architecture**
+  - Why it matters: the current single-instance deployment model will eventually limit throughput once autonomy, larger models, or multiple concurrent users become normal.
+  - Current status: architecture direction documented in `Docs/WorkerNode.md`; concept is coherent and fits Fruitcake's shared-DB design, but it is not implementation-ready enough to commit as an active sprint.
+  - Decision needed later: whether to scale task execution with dedicated worker nodes, worker registry/heartbeat, and model-tier routing rather than continuing to scale vertically on one machine.
+  - Earliest likely sprint: after task durability, task claiming, and worker recovery semantics are stable enough to distribute safely.
 
 - **Tenant isolation model**
   - Why it matters: enterprise support gets expensive fast if tenant boundaries are bolted on late.

@@ -35,6 +35,16 @@ async def lifespan(app: FastAPI):
     from app.rag.service import get_rag_service
     await get_rag_service().startup()
 
+    from app.rag.job_runner import (
+        recover_stale_document_ingest_jobs,
+        start_document_ingest_runner,
+    )
+
+    recovered = await recover_stale_document_ingest_jobs()
+    if recovered > 0:
+        log.warning("Recovered interrupted document ingest jobs on startup", count=recovered)
+    await start_document_ingest_runner()
+
     # Initialize MCP registry (connects to enabled Docker servers, loads internal modules)
     from app.mcp.registry import get_mcp_registry
     await get_mcp_registry().startup()
@@ -47,7 +57,9 @@ async def lifespan(app: FastAPI):
 
     log.info("FruitcakeAI v5 shutting down")
     from app.autonomy.scheduler import shutdown_scheduler
+    from app.rag.job_runner import shutdown_document_ingest_runner
     shutdown_scheduler()
+    shutdown_document_ingest_runner()
     await get_mcp_registry().shutdown()
     await engine.dispose()
 
