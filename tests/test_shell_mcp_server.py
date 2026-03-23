@@ -10,6 +10,7 @@ import pytest
 from mcp_shell_server.server import (
     DEFAULT_BLOCKED_PATTERNS,
     ShellServerConfig,
+    TOOL_SCHEMA,
     detect_blocked_command,
     execute_command,
     resolve_execution_dir,
@@ -20,6 +21,13 @@ def test_detect_blocked_command_rejects_network_tool():
     reason = detect_blocked_command("curl https://example.com", DEFAULT_BLOCKED_PATTERNS)
     assert reason is not None
     assert "network" in reason
+
+
+def test_shell_tool_description_instructs_tool_level_refusal():
+    description = TOOL_SCHEMA["description"].lower()
+    command_desc = TOOL_SCHEMA["inputSchema"]["properties"]["command"]["description"].lower()
+    assert "report the tool's refusal result" in description
+    assert "blocked-command" in command_desc
 
 
 def test_resolve_execution_dir_uses_user_scoped_workspace(tmp_path):

@@ -28,14 +28,19 @@ TOOL_SCHEMA = {
     "name": "shell_exec",
     "description": (
         "Execute a constrained shell command inside the local sandbox workspace. "
-        "Use for bounded local CLI workflows that do not require network access."
+        "Use for bounded local CLI workflows and explicit shell-policy tests that do not require network access. "
+        "If a command is blocked by sandbox policy, call this tool anyway and report the tool's refusal result "
+        "instead of refusing from general assistant policy."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Shell command to execute inside the sandboxed workspace.",
+                "description": (
+                    "Shell command to execute inside the sandboxed workspace. "
+                    "The tool itself enforces blocked-command, timeout, and output-cap policy."
+                ),
             }
         },
         "required": ["command"],
