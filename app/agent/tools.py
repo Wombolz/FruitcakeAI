@@ -258,8 +258,11 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "list_library_documents",
             "description": (
-                "List accessible documents in the user's library. "
-                "Use for prompts like 'list my documents' or 'show my files'."
+                "List accessible uploaded documents in the user's document library. "
+                "Use for prompts about uploaded library documents, PDFs, school papers, "
+                "manuals, or 'documents in my library'. "
+                "Do not use this for sandbox workspace folders or files created by filesystem tools; "
+                "use workspace filesystem tools like list_directory or find_files instead."
             ),
             "parameters": {
                 "type": "object",

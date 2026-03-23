@@ -298,3 +298,29 @@ async def test_registry_get_diagnostics_includes_servers(fake_config: Path):
     assert diagnostics["tool_count"] == 1
     assert diagnostics["servers"]
     assert diagnostics["servers"][0]["server"] == "test_server"
+
+
+@pytest.mark.asyncio
+async def test_registry_loads_filesystem_server_from_config(tmp_path: Path):
+    cfg = {
+        "mcp_servers": {
+            "filesystem": {
+                "type": "internal_python",
+                "module": "app.mcp.servers.filesystem",
+                "enabled": True,
+            }
+        }
+    }
+    config_file = tmp_path / "mcp_config.yaml"
+    config_file.write_text(yaml.dump(cfg))
+
+    registry = MCPRegistry()
+    await registry.startup(config_path=config_file)
+
+    tools = [schema["function"]["name"] for schema in registry.get_tools_for_agent()]
+    assert "list_directory" in tools
+    assert "find_files" in tools
+    assert "stat_file" in tools
+    assert "read_file" in tools
+    assert "write_file" in tools
+    assert "make_directory" in tools
