@@ -61,6 +61,22 @@ def _extract_text(result: Any) -> str:
     return str(result)
 
 
+def _serialize_user_context(user_context: Any) -> Dict[str, Any]:
+    if user_context is None:
+        return {}
+    if isinstance(user_context, dict):
+        source = user_context
+    else:
+        source = {
+            "user_id": getattr(user_context, "user_id", None),
+            "username": getattr(user_context, "username", None),
+            "role": getattr(user_context, "role", None),
+            "persona": getattr(user_context, "persona", None),
+            "timezone": getattr(user_context, "timezone", None),
+        }
+    return {k: v for k, v in source.items() if v is not None}
+
+
 class MCPRegistry:
     """
     Singleton registry for all MCP tools available to the agent.
@@ -75,6 +91,8 @@ class MCPRegistry:
         self._clients: Dict[str, MCPClient] = {}
         # internal_python: imported modules
         self._modules: Dict[str, Any] = {}
+        # server_name -> raw config
+        self._server_configs: Dict[str, Dict[str, Any]] = {}
         # tool_name → (server_name, server_type)
         self._tool_map: Dict[str, Tuple[str, str]] = {}
         # All registered tools in LiteLLM format
@@ -121,6 +139,7 @@ class MCPRegistry:
 
         servers = self._raw_config.get("mcp_servers", {})
         for server_name, config in servers.items():
+            self._server_configs[server_name] = dict(config)
             if not config.get("enabled", True):
                 log.info("MCP server disabled (skipping)", server=server_name)
                 continue
@@ -170,10 +189,13 @@ class MCPRegistry:
             log.error("No image specified for docker_stdio server", server=server_name)
             return
 
+        docker_run_args = list(config.get("docker_run_args", []) or [])
+        server_args = list(config.get("server_args", []) or [])
+
         client = MCPClient(
             server_name=server_name,
             command="docker",
-            args=["run", "-i", "--rm", image],
+            args=["run", "-i", "--rm", *docker_run_args, image, *server_args],
             timeout=config.get("timeout", 60),
         )
         ok = await client.connect()
@@ -237,7 +259,11 @@ class MCPRegistry:
             client = self._clients.get(server_name)
             if not client or not client.is_connected():
                 return f"MCP server '{server_name}' is not available"
-            raw = await client.call_tool(tool_name, arguments)
+            effective_args = dict(arguments)
+            config = self._server_configs.get(server_name, {})
+            if config.get("pass_user_context"):
+                effective_args["_fruitcake_user_context"] = _serialize_user_context(user_context)
+            raw = await client.call_tool(tool_name, effective_args)
             if raw["success"]:
                 return _extract_text(raw["result"])
             return f"Tool {tool_name} failed: {raw.get('error', 'unknown error')}"

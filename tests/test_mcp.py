@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
-from app.mcp.registry import MCPRegistry, _extract_text, _to_litellm_schema
+from app.mcp.registry import MCPRegistry, _extract_text, _serialize_user_context, _to_litellm_schema
 from app.mcp.client import MCPClient
 
 
@@ -79,6 +79,11 @@ def test_extract_text_direct_string_content():
 
 def test_extract_text_non_dict():
     assert _extract_text(42) == "42"
+
+
+def test_serialize_user_context_filters_none_fields():
+    result = _serialize_user_context({"user_id": 7, "username": "tester", "timezone": None})
+    assert result == {"user_id": 7, "username": "tester"}
 
 
 # ── MCPRegistry internals ──────────────────────────────────────────────────────
@@ -324,3 +329,85 @@ async def test_registry_loads_filesystem_server_from_config(tmp_path: Path):
     assert "read_file" in tools
     assert "write_file" in tools
     assert "make_directory" in tools
+
+
+@pytest.mark.asyncio
+async def test_registry_init_docker_uses_configured_run_and_server_args():
+    registry = MCPRegistry()
+    config = {
+        "image": "mcp/shell",
+        "timeout": 45,
+        "docker_run_args": ["--network", "none", "-v", "/tmp/workspace:/workspace"],
+        "server_args": ["--allowed-paths", "/workspace"],
+    }
+
+    fake_client = MagicMock()
+    fake_client.connect = AsyncMock(return_value=True)
+    fake_client.get_tools.return_value = []
+
+    with patch("app.mcp.registry.MCPClient", return_value=fake_client) as mock_client_cls:
+        await registry._init_docker("shell", config)
+
+    mock_client_cls.assert_called_once()
+    kwargs = mock_client_cls.call_args.kwargs
+    assert kwargs["command"] == "docker"
+    assert kwargs["args"] == [
+        "run",
+        "-i",
+        "--rm",
+        "--network",
+        "none",
+        "-v",
+        "/tmp/workspace:/workspace",
+        "mcp/shell",
+        "--allowed-paths",
+        "/workspace",
+    ]
+    assert kwargs["timeout"] == 45
+
+
+@pytest.mark.asyncio
+async def test_registry_docker_call_can_inject_user_context():
+    registry = MCPRegistry()
+    registry._tool_map["shell_exec"] = ("shell", "docker_stdio")
+    registry._server_configs["shell"] = {"pass_user_context": True}
+
+    fake_client = MagicMock()
+    fake_client.is_connected.return_value = True
+    fake_client.call_tool = AsyncMock(
+        return_value={"success": True, "result": {"content": [{"type": "text", "text": "ok"}]}}
+    )
+    registry._clients["shell"] = fake_client
+
+    result = await registry.call_tool(
+        "shell_exec",
+        {"command": "pwd"},
+        user_context={"user_id": 12, "username": "admin"},
+    )
+
+    assert result == "ok"
+    fake_client.call_tool.assert_awaited_once_with(
+        "shell_exec",
+        {
+            "command": "pwd",
+            "_fruitcake_user_context": {"user_id": 12, "username": "admin"},
+        },
+    )
+
+
+def test_default_mcp_config_defines_shell_server_contract():
+    config_path = Path("config/mcp_config.yaml")
+    cfg = yaml.safe_load(config_path.read_text())
+    shell = cfg["mcp_servers"]["shell"]
+
+    assert shell["type"] == "docker_stdio"
+    assert shell["enabled"] is True
+    assert shell["timeout"] == 30
+    assert shell["pass_user_context"] is True
+    assert shell["docker_run_args"] == ["--network", "none", "-v", "./workspace:/workspace"]
+    assert shell["server_args"] == [
+        "--allowed-paths",
+        "/workspace",
+        "--output-limit-bytes",
+        "8192",
+    ]

@@ -1430,6 +1430,9 @@ Skill imports are curated, not bulk. Technical convertibility is not sufficient;
 
 **Sprint 7.2** — Shell MCP: `docker run --network none`, 30s timeout, 8k output cap, explicit blocked commands list.
 
+Soak note:
+- shell enforcement is working and auditable, but explicit shell-security-test prompts may still need stronger user wording before the model routes them to `shell_exec` on the first attempt. Once routed, tool-level refusal behavior is correct. Track as a follow-up only if it starts affecting normal workflows rather than deliberate security tests.
+
 **Sprint 7.3** — Graph Memory Foundation (MCP-informed, Fruitcake-native)
 
 Goal: add durable relationship memory for long-horizon reasoning without adopting the MCP demo memory server as a production dependency.
@@ -1496,6 +1499,8 @@ A nightly background task reviews the previous 24 hours of chat sessions and ext
 
 The extraction prompt reviews each session: *"Extract any facts about the user worth remembering. Return JSON: [{content, type, importance, expires_in_days}]."* New memories are deduplicated against existing ones before insertion.
 
+Phase 8 is also the natural place for retrospective prompt-quality review. A related concept note, [Prompt_Drift_Review.md](/Users/jwomble/Development/fruitcake_v5/Docs/Prompt_Drift_Review.md), outlines a nightly loop that inspects run traces, detects recurring prompt drift, and proposes tighter prompt variants for review rather than silently mutating live prompts.
+
 ---
 
 ## Phase 9 — Enterprise Fork
@@ -1537,6 +1542,12 @@ These items are intentionally tracked outside the sprint list because they are r
   - Current status: a `5.6.13` branch tried heuristic tool/memory/history gating to improve perceived speed, but it regressed response quality and caused brittle tool-access failures; those changes were rolled back. The safe pieces kept from that work are stage latency instrumentation plus grounded library summary and PDF ingest fixes.
   - Decision needed later: whether to improve responsiveness through true streaming, prompt/context budgeting, or architecture changes rather than heuristic suppression of capabilities.
   - Earliest likely sprint: after the RAG restoration pass, using measured latency data instead of aggressive chat-path trimming.
+
+- **Nightly prompt drift review**
+  - Why it matters: smaller local models often benefit from tighter prompts, but prompt bloat should be justified by observed failures rather than guesswork.
+  - Current status: early shell/tooling soak already shows cases where more explicit wording improves precision. The concept is documented in [Prompt_Drift_Review.md](/Users/jwomble/Development/fruitcake_v5/Docs/Prompt_Drift_Review.md).
+  - Decision needed later: whether nightly prompt review should remain recommendation-only or evolve into a more automated prompt-tuning loop for low-risk prompt surfaces.
+  - Earliest likely sprint: Phase 8 follow-on, once dream-cycle review infrastructure is in place.
 
 - **Product positioning / tagline refresh**
   - Why it matters: the current product direction is more memory- and continuity-driven than the older preparedness-focused tagline implies.

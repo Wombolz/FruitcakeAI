@@ -82,6 +82,15 @@ def test_list_library_documents_description_distinguishes_uploaded_library_docs(
     assert "workspace" in description
 
 
+def test_system_prompt_prefers_available_shell_tool_over_generic_refusal():
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    prompt = ctx.to_system_prompt().lower()
+    assert "use it and report the tool result" in prompt
+    assert "do not claim a tool is unavailable" in prompt
+    assert "shell_exec" in prompt
+    assert "let the shell tool enforce what is blocked" in prompt
+
+
 def test_create_task_plan_schema_has_required_fields():
     schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_task_plan")
     props = schema["function"]["parameters"]["properties"]
