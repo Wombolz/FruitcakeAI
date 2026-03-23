@@ -116,47 +116,51 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - macOS with [Homebrew](https://brew.sh)
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - [Ollama](https://ollama.ai) — `brew install ollama`
-- [Xcode 16+](https://developer.apple.com/xcode/) — for the iOS/macOS Swift app
 - Python 3.11+
 
-### 1. Clone and configure
+Optional later:
+- [Xcode 16+](https://developer.apple.com/xcode/) — for the iOS/macOS Swift app after backend setup succeeds
+
+### 1. Clone
 
 ```bash
 git clone https://github.com/Wombolz/FruitcakeAI.git FruitcakeAI
 cd FruitcakeAI
-cp .env.example .env
 ```
 
-Edit `.env` — the only required change for a local setup:
-
-```env
-SECRET_KEY=change-me-to-a-random-string
-DATABASE_URL=postgresql+asyncpg://fruitcake:fruitcake@localhost:5432/fruitcake_v5
-LLM_MODEL=ollama_chat/qwen2.5:32b
-LOCAL_API_BASE=http://localhost:11434/v1
-TASK_SMALL_MODEL=ollama_chat/qwen2.5:14b
-TASK_LARGE_MODEL=ollama_chat/qwen2.5:32b
-TASK_FORCE_LARGE_FOR_PLANNING=false
-TASK_FORCE_LARGE_FOR_FINAL_SYNTHESIS=true
-EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
-```
-
-### 2. Pull the model
+### 2. Bootstrap the backend
 
 ```bash
-ollama pull qwen2.5:14b
-ollama pull qwen2.5:32b
+./scripts/bootstrap.sh
 ```
 
-> Verified on M1 Max 64GB with mixed routing: `32b` for chat and final synthesis, `14b` for heavier task planning/execution. If memory pressure or stability becomes a problem, fall back to all-`14b`. Cloud backends (Claude, OpenAI) are configured in `.env` — see [LLM Backends](Docs/LLM_BACKENDS.md).
+Bootstrap does the following:
+- creates `.env` from `.env.example` if needed
+- detects RAM and chooses local model defaults
+- creates `.venv` and installs dependencies
+- starts PostgreSQL
+- ensures the required Ollama models are present
+- runs migrations
+- seeds default users
+- starts the API on `http://localhost:30417`
 
-### 3. Start
+RAM-aware defaults:
+- systems with **less than 64 GB RAM** default to all-`14b`
+- systems with **64 GB RAM or more** default to mixed `14b/32b`
+- existing `.env` values are preserved on rerun
+
+> Verified on M1 Max 64GB with mixed routing: `32b` for chat and final synthesis, `14b` for heavier task planning/execution. If memory pressure or stability becomes a problem, edit `.env` and switch to all-`14b`. Cloud backends (Claude, OpenAI) are configured in `.env` — see [LLM Backends](Docs/LLM_BACKENDS.md).
+
+### 3. Verify backend health
 
 ```bash
-./scripts/start.sh
+curl http://localhost:30417/health
+# -> {"status":"ok"}
+
+./scripts/doctor.sh
 ```
 
-This starts PostgreSQL, waits for Ollama, runs migrations, seeds default users, and starts the API on `http://localhost:30417`.
+Use `./scripts/doctor.sh` whenever setup looks wrong. It reports required failures separately from optional degraded components like the shell MCP image or APNs config.
 
 Default users — **change these passwords before running on a shared network:**
 
@@ -167,14 +171,7 @@ Default users — **change these passwords before running on a shared network:**
 | restricted | changeme123 | restricted |
 | guest | changeme123 | guest |
 
-### 4. Verify
-
-```bash
-curl http://localhost:30417/health
-# → {"status": "ok"}
-```
-
-### 5. Open the Swift app
+### 4. Open the Swift app (optional)
 
 1. Open the `FruitcakeAI_Client` Swift project in Xcode
 2. Build and run (`⌘R`)
@@ -182,6 +179,8 @@ curl http://localhost:30417/health
 4. Log in with any seed user
 
 Upload a document via the Library tab, then ask about it.
+
+If bootstrap or verification fails, see [Pre-Alpha Troubleshooting](Docs/PreAlpha_Troubleshooting.md).
 
 ---
 
