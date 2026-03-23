@@ -393,3 +393,21 @@ async def test_registry_docker_call_can_inject_user_context():
             "_fruitcake_user_context": {"user_id": 12, "username": "admin"},
         },
     )
+
+
+def test_default_mcp_config_defines_disabled_shell_server_contract():
+    config_path = Path("config/mcp_config.yaml")
+    cfg = yaml.safe_load(config_path.read_text())
+    shell = cfg["mcp_servers"]["shell"]
+
+    assert shell["type"] == "docker_stdio"
+    assert shell["enabled"] is False
+    assert shell["timeout"] == 30
+    assert shell["pass_user_context"] is True
+    assert shell["docker_run_args"] == ["--network", "none", "-v", "./workspace:/workspace"]
+    assert shell["server_args"] == [
+        "--allowed-paths",
+        "/workspace",
+        "--output-limit-bytes",
+        "8192",
+    ]
