@@ -49,9 +49,11 @@ Execution rule:
 - shell MCP sprint brief and runtime contract
 - docker stdio config support for custom run args
 - shell server registration path in MCP config
+- Fruitcake-owned standalone shell MCP server implementation
 - timeout and output-cap expectations
 - blocked-command policy definition
 - tests for config-driven docker stdio arguments
+- end-to-end Docker-backed shell MCP smoke coverage
 
 ### Not in scope
 - direct host shell execution
@@ -88,6 +90,18 @@ Execution rule:
   - output cap
   - blocked-command rejection before execution when possible
 
+### Standalone distribution note
+- the shell server is implemented as a small Fruitcake-owned standalone-ready MCP component under `mcp_shell_server/`
+- Fruitcake consumes it first through Docker stdio, but the server should remain cleanly extractable for separate build/publish later
+- current local image contract:
+  - build: `docker build -t fruitcake/mcp-shell -f mcp_shell_server/Dockerfile .`
+  - run entrypoint: `python -m mcp_shell_server.server`
+- if this server is later published independently, keep the CLI/config surface stable:
+  - `--allowed-paths`
+  - `--timeout-seconds`
+  - `--output-limit-bytes`
+  - blocked-policy file support
+
 ### Safety posture
 - shell is more dangerous than filesystem tools and must stay visibly constrained
 - this sprint should prefer “refuse clearly” over “try anyway”
@@ -119,21 +133,27 @@ This is useful only if the sandbox contract is explicit and narrow.
 ## Acceptance Criteria
 
 1. MCP docker stdio runtime supports config-defined docker run arguments cleanly.
-2. A shell MCP server can be configured with:
+2. A Fruitcake-owned shell MCP server exists and can be configured with:
    - no network
    - workspace-only mount
    - timeout
 3. Runtime/config tests prove the shell server flags are passed through as intended.
-4. The sprint brief and config make the shell trust boundary explicit.
-5. Shell capability remains additive and constrained; no host-shell shortcut is introduced.
+4. Server behavior tests prove:
+   - allowed workspace command execution
+   - blocked-command refusal
+   - timeout handling
+   - output truncation
+5. A real Docker-backed smoke test works through Fruitcake's MCP registry.
+6. The sprint brief and config make the shell trust boundary explicit.
+7. Shell capability remains additive and constrained; no host-shell shortcut is introduced.
 
 ---
 
 ## Follow-on Work
 
 Likely next additions after the shell contract proves out:
-- actual `shell_exec` server integration with blocked-command policy
 - shell-specific admin diagnostics
 - converter updates that selectively allow `shell_exec`
+- optional default enablement after soak and product review
 
 Do not treat this sprint as a green light for broad shell-first product behavior.
