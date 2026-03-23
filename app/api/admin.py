@@ -206,6 +206,7 @@ class MemoryGraphObservationAdminOut(BaseModel):
     content: Optional[str]
     observed_at: Optional[datetime]
     confidence: float
+    is_active: bool
     source_memory_id: Optional[int]
     source_session_id: Optional[int]
     source_task_id: Optional[int]
@@ -342,7 +343,7 @@ async def _admin_load_graph_counts(
 
     observation_counts_result = await db.execute(
         select(MemoryObservation.entity_id, func.count(MemoryObservation.id))
-        .where(MemoryObservation.entity_id.in_(entity_ids))
+        .where(and_(MemoryObservation.entity_id.in_(entity_ids), MemoryObservation.is_active == True))
         .group_by(MemoryObservation.entity_id)
     )
     observation_counts = {
@@ -764,6 +765,7 @@ async def memory_graph_diagnostics(
         entity_filters.append(MemoryEntity.user_id == user_id)
         relation_filters.append(MemoryRelation.user_id == user_id)
         observation_filters.append(MemoryObservation.user_id == user_id)
+    observation_filters.append(MemoryObservation.is_active == True)
     if q:
         entity_filters.append(func.lower(MemoryEntity.name).like(f"%{q.strip().lower()}%"))
 
@@ -868,6 +870,7 @@ async def inspect_memory_graph_entity(
                 content=obs.content,
                 observed_at=obs.observed_at,
                 confidence=obs.confidence,
+                is_active=obs.is_active,
                 source_memory_id=obs.source_memory_id,
                 source_session_id=obs.source_session_id,
                 source_task_id=obs.source_task_id,

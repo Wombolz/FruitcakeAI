@@ -9,6 +9,10 @@ DELETE /memories/{id}                   Deactivate (soft-delete)
 POST   /memories/graph/entities         Create a graph entity
 POST   /memories/graph/relations        Create a graph relation
 POST   /memories/graph/observations     Add a graph observation
+PATCH  /memories/graph/entities/{id}    Update one graph entity
+DELETE /memories/graph/entities/{id}    Soft-deactivate one graph entity
+PATCH  /memories/graph/observations/{id} Update one graph observation
+DELETE /memories/graph/observations/{id} Soft-deactivate one graph observation
 GET    /memories/graph/search           Search graph entities
 GET    /memories/graph/entities/{id}    Open one graph node
 """
@@ -18,7 +22,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -105,6 +109,21 @@ class MemoryObservationCreate(BaseModel):
     source_task_id: Optional[int] = None
 
 
+class MemoryEntityPatch(BaseModel):
+    name: Optional[str] = None
+    entity_type: Optional[str] = None
+    aliases: Optional[List[str]] = None
+    confidence: Optional[float] = None
+    is_active: Optional[bool] = None
+
+
+class MemoryObservationPatch(BaseModel):
+    content: Optional[str] = None
+    observed_at: Optional[datetime] = None
+    confidence: Optional[float] = None
+    is_active: Optional[bool] = None
+
+
 class MemoryEntityOut(BaseModel):
     id: int
     name: str
@@ -159,6 +178,7 @@ class MemoryObservationOut(BaseModel):
     content: Optional[str]
     observed_at: Optional[datetime]
     confidence: float
+    is_active: bool
     source_memory_id: Optional[int]
     source_session_id: Optional[int]
     source_task_id: Optional[int]
@@ -345,6 +365,118 @@ async def add_graph_observation(
     return MemoryObservationOut.model_validate(observation)
 
 
+@router.patch("/memories/graph/entities/{entity_id}", response_model=MemoryEntityOut)
+async def update_graph_entity(
+    entity_id: int,
+    body: MemoryEntityPatch,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    svc = get_graph_memory_service()
+    try:
+        entity = await svc.get_owned_entity(db=db, entity_id=entity_id, user_id=current_user.id, include_inactive=True)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory entity not found")
+
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Entity name is required.")
+        entity.name = name
+        entity.normalized_name = " ".join(name.lower().split())
+    if body.entity_type is not None:
+        entity.entity_type = (body.entity_type or "unknown").strip() or "unknown"
+    if body.aliases is not None:
+        entity.aliases_list = [item.strip() for item in body.aliases if item and item.strip()]
+    if body.confidence is not None:
+        entity.confidence = max(0.0, min(1.0, body.confidence))
+    if body.is_active is not None:
+        entity.is_active = body.is_active
+    entity.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(entity)
+    return MemoryEntityOut.from_orm(entity)
+
+
+@router.delete("/memories/graph/entities/{entity_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+async def deactivate_graph_entity(
+    entity_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    svc = get_graph_memory_service()
+    try:
+        entity = await svc.get_owned_entity(db=db, entity_id=entity_id, user_id=current_user.id, include_inactive=True)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory entity not found")
+    entity.is_active = False
+    entity.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.patch("/memories/graph/observations/{observation_id}", response_model=MemoryObservationOut)
+async def update_graph_observation(
+    observation_id: int,
+    body: MemoryObservationPatch,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    svc = get_graph_memory_service()
+    try:
+        observation = await svc.get_owned_observation(
+            db=db,
+            observation_id=observation_id,
+            user_id=current_user.id,
+            include_inactive=True,
+        )
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory observation not found")
+
+    if body.content is not None:
+        content = body.content.strip()
+        if observation.source_memory_id is None and not content:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Observation requires content or source_memory_id.",
+            )
+        observation.content = content or None
+    if body.observed_at is not None:
+        observation.observed_at = body.observed_at
+    if body.confidence is not None:
+        observation.confidence = max(0.0, min(1.0, body.confidence))
+    if body.is_active is not None:
+        observation.is_active = body.is_active
+    await db.commit()
+    await db.refresh(observation)
+    return MemoryObservationOut.model_validate(observation)
+
+
+@router.delete(
+    "/memories/graph/observations/{observation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+async def deactivate_graph_observation(
+    observation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    svc = get_graph_memory_service()
+    try:
+        observation = await svc.get_owned_observation(
+            db=db,
+            observation_id=observation_id,
+            user_id=current_user.id,
+            include_inactive=True,
+        )
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory observation not found")
+    observation.is_active = False
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get("/memories/graph/entities", response_model=List[MemoryEntityListOut])
 async def list_graph_entities(
     current_user: User = Depends(get_current_user),
@@ -460,6 +592,7 @@ async def _load_graph_counts(
             and_(
                 MemoryObservation.user_id == user_id,
                 MemoryObservation.entity_id.in_(entity_ids),
+                MemoryObservation.is_active == True,
             )
         )
         .group_by(MemoryObservation.entity_id)

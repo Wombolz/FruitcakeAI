@@ -408,6 +408,7 @@ class MemoryObservation(Base):
     content = Column(Text, nullable=True)
     observed_at = Column(DateTime(timezone=True), nullable=True)
     confidence = Column(Float, default=0.5, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
     source_memory_id = Column(Integer, ForeignKey("memories.id"), nullable=True, index=True)
     source_session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=True, index=True)
     source_task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True, index=True)

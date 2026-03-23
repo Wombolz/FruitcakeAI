@@ -151,6 +151,7 @@ class GraphMemoryService:
             content=(content or "").strip() or None,
             observed_at=observed_at,
             confidence=max(0.0, min(1.0, confidence)),
+            is_active=True,
             source_memory_id=source_memory_id,
             source_session_id=source_session_id,
             source_task_id=source_task_id,
@@ -213,6 +214,7 @@ class GraphMemoryService:
                 and_(
                     MemoryObservation.user_id == user_id,
                     MemoryObservation.entity_id == entity.id,
+                    MemoryObservation.is_active == True,
                 )
             )
             .order_by(MemoryObservation.created_at.desc())
@@ -237,6 +239,40 @@ class GraphMemoryService:
         if entity is None:
             raise ValueError("Memory entity not found.")
         return entity
+
+    async def get_owned_entity(
+        self,
+        db: AsyncSession,
+        *,
+        entity_id: int,
+        user_id: int,
+        include_inactive: bool = False,
+    ) -> MemoryEntity:
+        filters = [MemoryEntity.id == entity_id, MemoryEntity.user_id == user_id]
+        if not include_inactive:
+            filters.append(MemoryEntity.is_active == True)
+        result = await db.execute(select(MemoryEntity).where(and_(*filters)))
+        entity = result.scalar_one_or_none()
+        if entity is None:
+            raise ValueError("Memory entity not found.")
+        return entity
+
+    async def get_owned_observation(
+        self,
+        db: AsyncSession,
+        *,
+        observation_id: int,
+        user_id: int,
+        include_inactive: bool = False,
+    ) -> MemoryObservation:
+        filters = [MemoryObservation.id == observation_id, MemoryObservation.user_id == user_id]
+        if not include_inactive:
+            filters.append(MemoryObservation.is_active == True)
+        result = await db.execute(select(MemoryObservation).where(and_(*filters)))
+        observation = result.scalar_one_or_none()
+        if observation is None:
+            raise ValueError("Memory observation not found.")
+        return observation
 
     async def _ensure_owned_memory(self, db: AsyncSession, *, memory_id: int, user_id: int) -> Memory:
         result = await db.execute(

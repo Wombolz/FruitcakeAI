@@ -144,3 +144,80 @@ async def test_memory_graph_rejects_cross_user_relation(client):
     )
     assert resp.status_code == 422
     assert "not found" in resp.json()["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_memory_graph_entity_and_observation_updates_and_deactivation(client):
+    headers = await _headers(client, "graphmutate")
+    user_id = await _user_id(client, headers)
+    memory_id = await _seed_memory(user_id, content="Jim lives in Savannah.")
+
+    entity = await client.post(
+        "/memories/graph/entities",
+        json={"name": "Jim", "entity_type": "person", "aliases": ["James"]},
+        headers=headers,
+    )
+    assert entity.status_code == 201
+    entity_id = entity.json()["id"]
+
+    observation = await client.post(
+        "/memories/graph/observations",
+        json={"entity_id": entity_id, "content": "Lives in Savannah", "source_memory_id": memory_id},
+        headers=headers,
+    )
+    assert observation.status_code == 201
+    observation_id = observation.json()["id"]
+    assert observation.json()["is_active"] is True
+
+    patched_entity = await client.patch(
+        f"/memories/graph/entities/{entity_id}",
+        json={"name": "James", "aliases": ["Jim"], "confidence": 0.9},
+        headers=headers,
+    )
+    assert patched_entity.status_code == 200
+    assert patched_entity.json()["name"] == "James"
+    assert patched_entity.json()["aliases"] == ["Jim"]
+    assert patched_entity.json()["confidence"] == pytest.approx(0.9)
+
+    patched_observation = await client.patch(
+        f"/memories/graph/observations/{observation_id}",
+        json={"content": "Lives in Savannah, Georgia", "confidence": 0.8},
+        headers=headers,
+    )
+    assert patched_observation.status_code == 200
+    assert patched_observation.json()["content"] == "Lives in Savannah, Georgia"
+    assert patched_observation.json()["confidence"] == pytest.approx(0.8)
+    assert patched_observation.json()["is_active"] is True
+
+    listed_before = await client.get("/memories/graph/entities", headers=headers)
+    assert listed_before.status_code == 200
+    assert listed_before.json()[0]["observation_count"] == 1
+
+    deactivated_observation = await client.delete(
+        f"/memories/graph/observations/{observation_id}",
+        headers=headers,
+    )
+    assert deactivated_observation.status_code == 204
+
+    opened_after_observation_delete = await client.get(f"/memories/graph/entities/{entity_id}", headers=headers)
+    assert opened_after_observation_delete.status_code == 200
+    assert opened_after_observation_delete.json()["observation_count"] == 0
+    assert opened_after_observation_delete.json()["observations"] == []
+
+    listed_after = await client.get("/memories/graph/entities", headers=headers)
+    assert listed_after.status_code == 200
+    assert listed_after.json()[0]["observation_count"] == 0
+
+    deactivated_entity = await client.delete(f"/memories/graph/entities/{entity_id}", headers=headers)
+    assert deactivated_entity.status_code == 204
+
+    list_after_entity_delete = await client.get("/memories/graph/entities", headers=headers)
+    assert list_after_entity_delete.status_code == 200
+    assert list_after_entity_delete.json() == []
+
+    search_after_entity_delete = await client.get("/memories/graph/search", params={"q": "james"}, headers=headers)
+    assert search_after_entity_delete.status_code == 200
+    assert search_after_entity_delete.json() == []
+
+    opened_after_entity_delete = await client.get(f"/memories/graph/entities/{entity_id}", headers=headers)
+    assert opened_after_entity_delete.status_code == 404
