@@ -1430,6 +1430,9 @@ Skill imports are curated, not bulk. Technical convertibility is not sufficient;
 
 **Sprint 7.2** — Shell MCP: `docker run --network none`, 30s timeout, 8k output cap, explicit blocked commands list.
 
+Soak note:
+- shell enforcement is working and auditable, but explicit shell-security-test prompts may still need stronger user wording before the model routes them to `shell_exec` on the first attempt. Once routed, tool-level refusal behavior is correct. Track as a follow-up only if it starts affecting normal workflows rather than deliberate security tests.
+
 **Sprint 7.3** — Graph Memory Foundation (MCP-informed, Fruitcake-native)
 
 Goal: add durable relationship memory for long-horizon reasoning without adopting the MCP demo memory server as a production dependency.
