@@ -1496,6 +1496,8 @@ A nightly background task reviews the previous 24 hours of chat sessions and ext
 
 The extraction prompt reviews each session: *"Extract any facts about the user worth remembering. Return JSON: [{content, type, importance, expires_in_days}]."* New memories are deduplicated against existing ones before insertion.
 
+Phase 8 is also the natural place for retrospective prompt-quality review. A related concept note, [Prompt_Drift_Review.md](/Users/jwomble/Development/fruitcake_v5/Docs/Prompt_Drift_Review.md), outlines a nightly loop that inspects run traces, detects recurring prompt drift, and proposes tighter prompt variants for review rather than silently mutating live prompts.
+
 ---
 
 ## Phase 9 — Enterprise Fork
@@ -1537,6 +1539,12 @@ These items are intentionally tracked outside the sprint list because they are r
   - Current status: a `5.6.13` branch tried heuristic tool/memory/history gating to improve perceived speed, but it regressed response quality and caused brittle tool-access failures; those changes were rolled back. The safe pieces kept from that work are stage latency instrumentation plus grounded library summary and PDF ingest fixes.
   - Decision needed later: whether to improve responsiveness through true streaming, prompt/context budgeting, or architecture changes rather than heuristic suppression of capabilities.
   - Earliest likely sprint: after the RAG restoration pass, using measured latency data instead of aggressive chat-path trimming.
+
+- **Nightly prompt drift review**
+  - Why it matters: smaller local models often benefit from tighter prompts, but prompt bloat should be justified by observed failures rather than guesswork.
+  - Current status: early shell/tooling soak already shows cases where more explicit wording improves precision. The concept is documented in [Prompt_Drift_Review.md](/Users/jwomble/Development/fruitcake_v5/Docs/Prompt_Drift_Review.md).
+  - Decision needed later: whether nightly prompt review should remain recommendation-only or evolve into a more automated prompt-tuning loop for low-risk prompt surfaces.
+  - Earliest likely sprint: Phase 8 follow-on, once dream-cycle review infrastructure is in place.
 
 - **Product positioning / tagline refresh**
   - Why it matters: the current product direction is more memory- and continuity-driven than the older preparedness-focused tagline implies.
