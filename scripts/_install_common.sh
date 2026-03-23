@@ -8,6 +8,8 @@ APP_PORT="${APP_PORT:-30417}"
 OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434}"
 ENV_FILE="$ROOT/.env"
 ENV_TEMPLATE="$ROOT/.env.example"
+REQUIREMENTS_FILE="$ROOT/requirements.txt"
+REQUIREMENTS_STAMP="$ROOT/.venv/.fruitcake-requirements.sha256"
 
 ram_gb() {
   local bytes
@@ -120,48 +122,83 @@ load_env_file() {
   fi
 }
 
+configured_llm_backend() {
+  if [[ -f "$ENV_FILE" ]]; then
+    local backend
+    backend="$(sed -n 's/^LLM_BACKEND=//p' "$ENV_FILE" | head -n 1)"
+    if [[ -n "$backend" ]]; then
+      printf '%s\n' "$backend"
+      return
+    fi
+  fi
+  printf '%s\n' "ollama"
+}
+
+configured_ollama_models() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    return 1
+  fi
+
+  local backend
+  backend="$(configured_llm_backend)"
+  if [[ "$backend" != "ollama" ]]; then
+    return 1
+  fi
+
+  local llm_model task_small task_large
+  llm_model="$(sed -n 's/^LLM_MODEL=ollama_chat\///p' "$ENV_FILE" | head -n 1)"
+  task_small="$(sed -n 's/^TASK_SMALL_MODEL=ollama_chat\///p' "$ENV_FILE" | head -n 1)"
+  task_large="$(sed -n 's/^TASK_LARGE_MODEL=ollama_chat\///p' "$ENV_FILE" | head -n 1)"
+
+  [[ -n "$llm_model" ]] && printf '%s\n' "$llm_model"
+  [[ -n "$task_small" ]] && printf '%s\n' "$task_small"
+  [[ -n "$task_large" ]] && printf '%s\n' "$task_large"
+  return 0
+}
+
+unique_lines() {
+  awk 'NF && !seen[$0]++'
+}
+
 ensure_venv() {
   if [[ ! -d "$ROOT/.venv" ]]; then
     python3.11 -m venv "$ROOT/.venv"
   fi
   # shellcheck disable=SC1091
   source "$ROOT/.venv/bin/activate"
-  if [[ ! -f "$ROOT/.venv/.fruitcake-deps-installed" ]]; then
+
+  local current_hash existing_hash
+  current_hash="$(shasum -a 256 "$REQUIREMENTS_FILE" | awk '{print $1}')"
+  existing_hash=""
+  if [[ -f "$REQUIREMENTS_STAMP" ]]; then
+    existing_hash="$(cat "$REQUIREMENTS_STAMP")"
+  fi
+
+  if [[ "$current_hash" != "$existing_hash" ]]; then
     pip install -q -r "$ROOT/requirements.txt"
-    touch "$ROOT/.venv/.fruitcake-deps-installed"
+    printf '%s\n' "$current_hash" > "$REQUIREMENTS_STAMP"
   fi
 }
 
 ensure_models() {
-  local models
-  mapfile -t models < <(required_model_list "$(ram_tier)")
-  if [[ -f "$ENV_FILE" ]]; then
-    if grep -q '^LLM_MODEL=ollama_chat/' "$ENV_FILE"; then
-      models=()
-      local llm_model task_small task_large
-      llm_model="$(sed -n 's/^LLM_MODEL=ollama_chat\///p' "$ENV_FILE" | head -n 1)"
-      task_small="$(sed -n 's/^TASK_SMALL_MODEL=ollama_chat\///p' "$ENV_FILE" | head -n 1)"
-      task_large="$(sed -n 's/^TASK_LARGE_MODEL=ollama_chat\///p' "$ENV_FILE" | head -n 1)"
-      [[ -n "$llm_model" ]] && models+=("$llm_model")
-      [[ -n "$task_small" ]] && models+=("$task_small")
-      [[ -n "$task_large" ]] && models+=("$task_large")
-    fi
+  local backend
+  backend="$(configured_llm_backend)"
+  if [[ "$backend" != "ollama" ]]; then
+    echo "  Skipping Ollama model checks because LLM_BACKEND=$backend"
+    return 0
   fi
 
-  local unique_models=()
-  local seen=""
-  local model
-  for model in "${models[@]}"; do
-    [[ -z "$model" ]] && continue
-    if [[ " $seen " != *" $model "* ]]; then
-      seen+=" $model"
-      unique_models+=("$model")
-    fi
-  done
+  local models
+  if configured_ollama_models >/dev/null 2>&1; then
+    mapfile -t models < <(configured_ollama_models | unique_lines)
+  else
+    mapfile -t models < <(required_model_list "$(ram_tier)")
+  fi
 
+  local model
   local tags
   tags="$(curl -sf "$OLLAMA_BASE_URL/api/tags" || true)"
-  for model in "${unique_models[@]}"; do
+  for model in "${models[@]}"; do
     if [[ "$tags" == *"\"name\":\"$model\""* ]]; then
       echo "  Ollama model present: $model"
     else

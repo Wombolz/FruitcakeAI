@@ -94,16 +94,25 @@ if [[ -d "$ROOT/.venv" ]]; then
   fi
 fi
 
-if ollama_ready; then
+if [[ "$(configured_llm_backend)" == "ollama" ]] && ollama_ready; then
+  mapfile -t required_models < <(
+    if configured_ollama_models >/dev/null 2>&1; then
+      configured_ollama_models | unique_lines
+    else
+      required_model_list "$(ram_tier)"
+    fi
+  )
   tags="$(curl -sf "$OLLAMA_BASE_URL/api/tags" || true)"
-  while IFS= read -r model; do
+  for model in "${required_models[@]}"; do
     [[ -z "$model" ]] && continue
     if [[ "$tags" == *"\"name\":\"$model\""* ]]; then
       pass "Required Ollama model present: $model"
     else
       fail "Required Ollama model missing: $model" "Run 'ollama pull $model' or rerun ./scripts/bootstrap.sh"
     fi
-  done < <(required_model_list "$(ram_tier)")
+  done
+elif [[ "$(configured_llm_backend)" != "ollama" ]]; then
+  degraded "Ollama model checks skipped" "Current LLM_BACKEND is $(configured_llm_backend), so local Ollama model validation is not required"
 fi
 
 health_status="$(curl -sf "$(health_url)" 2>/dev/null || true)"
