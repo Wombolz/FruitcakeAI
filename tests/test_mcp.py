@@ -320,5 +320,6 @@ async def test_registry_loads_filesystem_server_from_config(tmp_path: Path):
     tools = [schema["function"]["name"] for schema in registry.get_tools_for_agent()]
     assert "list_directory" in tools
     assert "find_files" in tools
+    assert "stat_file" in tools
     assert "read_file" in tools
     assert "write_file" in tools

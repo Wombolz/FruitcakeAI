@@ -181,6 +181,7 @@ def test_family_assistant_sees_filesystem_mcp_tools_when_registry_ready():
     fake_mcp_tools = [
         {"type": "function", "function": {"name": "list_directory", "description": "", "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "find_files", "description": "", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "stat_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "read_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "write_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
     ]
@@ -194,6 +195,7 @@ def test_family_assistant_sees_filesystem_mcp_tools_when_registry_ready():
     names = [t["function"]["name"] for t in tools]
     assert "list_directory" in names
     assert "find_files" in names
+    assert "stat_file" in names
     assert "read_file" in names
     assert "write_file" in names
 

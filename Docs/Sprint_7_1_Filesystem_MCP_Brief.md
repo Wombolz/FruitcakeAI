@@ -15,6 +15,7 @@ This sprint is about a narrow, trustworthy workspace contract, not broad filesys
 Initial tool surface:
 - `list_directory`
 - `find_files`
+- `stat_file`
 - `read_file`
 - `write_file`
 
@@ -49,6 +50,7 @@ Workspace rule:
 - per-user workspace path resolution
 - `list_directory`
 - `find_files`
+- `stat_file`
 - `read_file`
 - `write_file`
 - path traversal prevention
@@ -91,6 +93,11 @@ Workspace rule:
 - returns bounded filename/path matches only
 - does not inspect file contents
 
+#### `stat_file`
+- returns metadata for one file or folder
+- exposes type, size, modified time, and file extension when applicable
+- gives the agent a safer inspection step before reading or overwriting content
+
 #### `write_file`
 - writes UTF-8 text to a file inside the current user's workspace
 - creates parent directories as needed
@@ -122,7 +129,7 @@ This is the right first step for Phase 7.
 
 ## Acceptance Criteria
 
-1. MCP registry exposes `list_directory`, `find_files`, `read_file`, and `write_file`.
+1. MCP registry exposes `list_directory`, `find_files`, `stat_file`, `read_file`, and `write_file`.
 2. Files are always resolved under `workspace/{user_id}/`.
 3. Path traversal and cross-user path access are blocked.
 4. The agent can discover files before attempting reads.

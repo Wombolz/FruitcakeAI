@@ -13,13 +13,14 @@ def test_filesystem_server_exposes_read_and_write_tools():
     tool_names = [tool["name"] for tool in get_tools()]
     assert "list_directory" in tool_names
     assert "find_files" in tool_names
+    assert "stat_file" in tool_names
     assert "read_file" in tool_names
     assert "write_file" in tool_names
 
 
 def test_filesystem_tool_descriptions_distinguish_workspace_from_library():
     tools = {tool["name"]: tool for tool in get_tools()}
-    for tool_name in ("list_directory", "find_files", "read_file", "write_file"):
+    for tool_name in ("list_directory", "find_files", "stat_file", "read_file", "write_file"):
         description = tools[tool_name]["description"].lower()
         assert "workspace" in description
         assert "library" in description
@@ -38,6 +39,7 @@ async def test_list_directory_shows_user_workspace_contents(tmp_path, monkeypatc
     assert "Contents of ." in result
     assert "[dir] notes/" in result
     assert "[file] todo.txt" in result
+    assert "bytes, modified" in result
 
 
 @pytest.mark.asyncio
@@ -75,6 +77,24 @@ async def test_find_files_returns_bounded_matches(tmp_path, monkeypatch):
     result = await call_tool("find_files", {"query": "notes"}, user_context)
     assert "Matches for 'notes' in ." in result
     assert "(Result limit reached: 2)" in result
+    assert "bytes, modified" in result
+
+
+@pytest.mark.asyncio
+async def test_stat_file_returns_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    user_root = Path(tmp_path) / "6"
+    (user_root / "notes").mkdir(parents=True)
+    target = user_root / "notes" / "today.md"
+    target.write_text("hello workspace")
+    user_context = UserContext(user_id=6, username="tester", role="parent")
+
+    result = await call_tool("stat_file", {"path": "notes/today.md"}, user_context)
+    assert "Path: notes/today.md" in result
+    assert "Type: file" in result
+    assert "Size bytes:" in result
+    assert "Modified:" in result
+    assert "Extension: .md" in result
 
 
 @pytest.mark.asyncio
@@ -90,6 +110,9 @@ async def test_read_file_blocks_path_escape(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="within the user's workspace"):
         await call_tool("find_files", {"path": "../outside", "query": "x"}, user_context)
+
+    with pytest.raises(ValueError, match="within the user's workspace"):
+        await call_tool("stat_file", {"path": "../outside.txt"}, user_context)
 
 
 @pytest.mark.asyncio

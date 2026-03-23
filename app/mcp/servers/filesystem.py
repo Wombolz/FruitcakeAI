@@ -4,6 +4,7 @@ FruitcakeAI v5 — Filesystem MCP server (internal_python)
 Phase 7.1 starts with a narrow, user-scoped workspace contract:
 - list_directory
 - find_files
+- stat_file
 - read_file
 - write_file
 
@@ -12,6 +13,7 @@ All file access is constrained to settings.workspace_dir / {user_id}.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -75,6 +77,24 @@ def get_tools() -> List[Dict[str, Any]]:
             },
         },
         {
+            "name": "stat_file",
+            "description": (
+                "Inspect metadata for one file or folder in the current user's sandbox workspace. "
+                "Use this to check type, size, and modified time before reading or rewriting a path. "
+                "Do not use this for uploaded document-library items."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path inside the user's workspace.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+        {
             "name": "read_file",
             "description": (
                 "Read a text file from the current user's sandbox workspace. "
@@ -127,6 +147,8 @@ async def call_tool(tool_name: str, arguments: Dict[str, Any], user_context: Any
         return _list_directory(arguments, user_context)
     if tool_name == "find_files":
         return _find_files(arguments, user_context)
+    if tool_name == "stat_file":
+        return _stat_file(arguments, user_context)
     if tool_name == "read_file":
         return _read_file(arguments, user_context)
     if tool_name == "write_file":
@@ -208,10 +230,7 @@ def _list_directory(arguments: Dict[str, Any], user_context: Any) -> str:
 
     lines = [f"Contents of {display_dir}:"]
     for entry in entries:
-        rel_path = entry.relative_to(workspace_root)
-        kind = "dir" if entry.is_dir() else "file"
-        suffix = "/" if entry.is_dir() else ""
-        lines.append(f"- [{kind}] {rel_path}{suffix}")
+        lines.append(_format_entry_line(entry, workspace_root))
     return "\n".join(lines)
 
 
@@ -237,9 +256,7 @@ def _find_files(arguments: Dict[str, Any], user_context: Any) -> str:
         rel_path = entry.relative_to(workspace_root)
         haystack = str(rel_path).lower()
         if query in haystack:
-            kind = "dir" if entry.is_dir() else "file"
-            suffix = "/" if entry.is_dir() else ""
-            matches.append(f"- [{kind}] {rel_path}{suffix}")
+            matches.append(_format_entry_line(entry, workspace_root))
         if len(matches) >= limit:
             break
 
@@ -252,6 +269,26 @@ def _find_files(arguments: Dict[str, Any], user_context: Any) -> str:
     lines.extend(matches)
     if len(matches) == limit:
         lines.append(f"(Result limit reached: {limit})")
+    return "\n".join(lines)
+
+
+def _stat_file(arguments: Dict[str, Any], user_context: Any) -> str:
+    workspace_root, path = _resolve_workspace_path(arguments.get("path", ""), user_context)
+    if not path.exists():
+        return f"Path not found: {arguments.get('path', '')}"
+
+    rel_path = path.relative_to(workspace_root)
+    stat = path.stat()
+    kind = "directory" if path.is_dir() else "file"
+    modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+    lines = [
+        f"Path: {rel_path}",
+        f"Type: {kind}",
+        f"Size bytes: {stat.st_size}",
+        f"Modified: {modified}",
+    ]
+    if path.is_file():
+        lines.append(f"Extension: {path.suffix or '(none)'}")
     return "\n".join(lines)
 
 
@@ -269,3 +306,12 @@ def _write_file(arguments: Dict[str, Any], user_context: Any) -> str:
     path.write_text(content, encoding="utf-8")
     log.info("Workspace file written", user_id=_user_id_from_context(user_context), path=str(path))
     return f"Wrote {len(encoded)} bytes to {path.name}"
+
+
+def _format_entry_line(entry: Path, workspace_root: Path) -> str:
+    rel_path = entry.relative_to(workspace_root)
+    stat = entry.stat()
+    kind = "dir" if entry.is_dir() else "file"
+    suffix = "/" if entry.is_dir() else ""
+    modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return f"- [{kind}] {rel_path}{suffix} ({stat.st_size} bytes, modified {modified})"
