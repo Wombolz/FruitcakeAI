@@ -592,6 +592,16 @@ async def _call_tool(
     return f"Unknown tool: {name}"
 
 
+def _parse_iso_datetime(value: str):
+    from datetime import datetime, timezone
+
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    dt = datetime.fromisoformat(normalized)
+    return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 async def _search_library(
     arguments: Dict[str, Any], user_context: UserContext
 ) -> str:
@@ -820,7 +830,6 @@ async def _create_memory(
     arguments: Dict[str, Any], user_context: UserContext
 ) -> str:
     """Persist a new memory for the user via MemoryService."""
-    from datetime import datetime, timezone
     from app.db.session import AsyncSessionLocal
     from app.memory.service import get_memory_service
 
@@ -839,8 +848,7 @@ async def _create_memory(
     expires_at = None
     if expires_at_str:
         try:
-            dt = datetime.fromisoformat(expires_at_str)
-            expires_at = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            expires_at = _parse_iso_datetime(expires_at_str)
         except ValueError:
             return f"Invalid expires_at format: '{expires_at_str}'. Use ISO 8601."
 
@@ -925,7 +933,6 @@ async def _create_memory_relations(arguments: Dict[str, Any], user_context: User
 
 
 async def _add_memory_observations(arguments: Dict[str, Any], user_context: UserContext) -> str:
-    from datetime import datetime, timezone
     from app.db.session import AsyncSessionLocal
     from app.memory.graph_service import get_graph_memory_service
 
@@ -940,8 +947,7 @@ async def _add_memory_observations(arguments: Dict[str, Any], user_context: User
             observed_at = None
             if item.get("observed_at"):
                 try:
-                    dt = datetime.fromisoformat(str(item["observed_at"]))
-                    observed_at = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                    observed_at = _parse_iso_datetime(str(item["observed_at"]))
                 except ValueError:
                     return f"Invalid observed_at format: '{item['observed_at']}'. Use ISO 8601."
             try:
