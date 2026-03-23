@@ -125,7 +125,8 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "Use 'semantic' for persistent facts (e.g. 'The user has a daughter named Emma'). "
                 "Use 'procedural' for behavioral rules (e.g. 'Always remind the user about medication at 9am'). "
                 "Use 'episodic' for time-bound events (e.g. 'The family is visiting grandparents this weekend'). "
-                "Only call this when you have learned something meaningful that should persist across sessions."
+                "Call this for stable personal facts, durable preferences, recurring household procedures, or meaningful near-term events that should persist beyond the current turn. "
+                "Do not call it for trivial one-off chatter, temporary reasoning, or facts already present in visible memory context."
             ),
             "parameters": {
                 "type": "object",
