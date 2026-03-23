@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -144,3 +145,46 @@ async def test_successful_task_marks_recalled_memories_accessed(client):
         assert task.status == "completed"
         assert memory.access_count == 1
         assert memory.last_accessed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_memories_export_route_returns_json_payload(client):
+    headers = await _headers(client, "memoryexportuser")
+    user_id = await _user_id(client, headers)
+    memory_id = await _seed_memory(user_id, content="Export me.")
+
+    resp = await client.get("/memories/export", headers=headers)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/json")
+    assert "fruitcakeai-memories.json" in resp.headers.get("content-disposition", "")
+    payload = json.loads(resp.text)
+    assert isinstance(payload, list)
+    assert any(item["id"] == memory_id and item["content"] == "Export me." for item in payload)
+
+
+@pytest.mark.asyncio
+async def test_memories_bulk_delete_deactivates_active_memories(client):
+    headers = await _headers(client, "memorybulkdeleteuser")
+    user_id = await _user_id(client, headers)
+    memory_id = await _seed_memory(user_id, content="Delete me in bulk.")
+
+    resp = await client.post("/memories/bulk-delete", headers=headers)
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["deactivated_count"] == 1
+    assert payload["deleted_at"] is not None
+
+    async with TestSessionLocal() as db:
+        memory = await db.get(Memory, memory_id)
+        assert memory is not None
+        assert memory.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_memories_export_route_is_not_captured_by_memory_id_patch_route(client):
+    headers = await _headers(client, "memoryexportroutinguser")
+    user_id = await _user_id(client, headers)
+    _ = await _seed_memory(user_id, content="Routing check.")
+
+    resp = await client.get("/memories/export", headers=headers)
+    assert resp.status_code == 200

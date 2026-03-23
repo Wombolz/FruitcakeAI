@@ -3,6 +3,8 @@ FruitcakeAI v5 — Memories API (Phase 4)
 
 GET    /memories                         List active memories for current user
 POST   /memories                         Create a memory (for admin/testing — agent uses create_memory tool)
+GET    /memories/export                  Export memories for current user
+POST   /memories/bulk-delete             Deactivate all memories for current user
 POST   /memories/{id}/recall            Record an explicit memory recall/open action
 PATCH  /memories/{id}                   Update importance or tags
 DELETE /memories/{id}                   Deactivate (soft-delete)
@@ -19,6 +21,7 @@ GET    /memories/graph/entities/{id}    Open one graph node
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -80,6 +83,11 @@ class MemoryOut(BaseModel):
             expires_at=obj.expires_at,
             created_at=obj.created_at,
         )
+
+
+class MemoryBulkDeleteResponse(BaseModel):
+    deactivated_count: int
+    deleted_at: datetime
 
 
 class MemoryEntityCreate(BaseModel):
@@ -247,6 +255,47 @@ async def create_memory(
         )
 
     return MemoryOut.from_orm(result)
+
+
+@router.get("/memories/export")
+async def export_memories(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Memory)
+        .where(Memory.user_id == current_user.id)
+        .order_by(desc(Memory.importance), desc(Memory.created_at))
+    )
+    payload = [MemoryOut.from_orm(memory).model_dump(mode="json") for memory in result.scalars().all()]
+    return Response(
+        content=json.dumps(payload, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="fruitcakeai-memories.json"'},
+    )
+
+
+@router.post("/memories/bulk-delete", response_model=MemoryBulkDeleteResponse)
+async def bulk_delete_memories(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Memory).where(
+            and_(
+                Memory.user_id == current_user.id,
+                Memory.is_active == True,
+            )
+        )
+    )
+    memories = list(result.scalars().all())
+    deleted_at = datetime.now(timezone.utc)
+    for memory in memories:
+        memory.is_active = False
+    return MemoryBulkDeleteResponse(
+        deactivated_count=len(memories),
+        deleted_at=deleted_at,
+    )
 
 
 @router.patch("/memories/{memory_id}", response_model=MemoryOut)

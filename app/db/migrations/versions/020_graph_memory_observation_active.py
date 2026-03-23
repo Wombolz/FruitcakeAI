@@ -1,6 +1,6 @@
 """graph memory observation active flag
 
-Revision ID: 020_graph_memory_observation_active
+Revision ID: 020_graph_obs_active
 Revises: 019_graph_memory_foundation
 Create Date: 2026-03-23
 """
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "020_graph_memory_observation_active"
+revision = "020_graph_obs_active"
 down_revision = "019_graph_memory_foundation"
 branch_labels = None
 depends_on = None
