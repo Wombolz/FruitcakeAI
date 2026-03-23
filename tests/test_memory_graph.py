@@ -85,18 +85,32 @@ async def test_memory_graph_entity_relation_observation_flow(client):
     assert observation.json()["source_memory_id"] == memory_id
     assert observation.json()["content"] is None
 
+    listed = await client.get("/memories/graph/entities", headers=headers)
+    assert listed.status_code == 200
+    listed_data = listed.json()
+    assert len(listed_data) == 2
+    james_row = next(item for item in listed_data if item["name"] == "James")
+    assert james_row["relation_count"] == 1
+    assert james_row["observation_count"] == 1
+
     search = await client.get("/memories/graph/search", params={"q": "jim"}, headers=headers)
     assert search.status_code == 200
     data = search.json()
     assert len(data) == 1
     assert data[0]["name"] == "James"
+    assert data[0]["relation_count"] == 1
+    assert data[0]["observation_count"] == 1
 
     opened = await client.get(f"/memories/graph/entities/{person_id}", headers=headers)
     assert opened.status_code == 200
     node = opened.json()
     assert node["entity"]["name"] == "James"
+    assert node["relation_count"] == 1
+    assert node["observation_count"] == 1
     assert len(node["relations"]) == 1
     assert node["relations"][0]["relation_type"] == "works_at"
+    assert node["relations"][0]["from_entity"]["name"] == "James"
+    assert node["relations"][0]["to_entity"]["name"] == "Acme Corp"
     assert len(node["observations"]) == 1
     assert node["observations"][0]["source_memory_id"] == memory_id
 

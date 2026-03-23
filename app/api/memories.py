@@ -20,7 +20,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import and_, desc, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
@@ -128,10 +128,21 @@ class MemoryEntityOut(BaseModel):
         )
 
 
+class MemoryEntitySummaryOut(BaseModel):
+    id: int
+    name: str
+    entity_type: str
+
+
+class MemoryEntityListOut(MemoryEntityOut):
+    relation_count: int = 0
+    observation_count: int = 0
+
+
 class MemoryRelationOut(BaseModel):
     id: int
-    from_entity_id: int
-    to_entity_id: int
+    from_entity: MemoryEntitySummaryOut
+    to_entity: MemoryEntitySummaryOut
     relation_type: str
     confidence: float
     source_memory_id: Optional[int]
@@ -158,6 +169,8 @@ class MemoryObservationOut(BaseModel):
 
 class MemoryGraphNodeOut(BaseModel):
     entity: MemoryEntityOut
+    relation_count: int
+    observation_count: int
     relations: List[MemoryRelationOut]
     observations: List[MemoryObservationOut]
 
@@ -300,7 +313,12 @@ async def create_graph_relation(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    return MemoryRelationOut.model_validate(relation)
+    entity_lookup = await _load_entity_lookup(
+        db,
+        current_user.id,
+        {relation.from_entity_id, relation.to_entity_id},
+    )
+    return _serialize_relation(relation, entity_lookup)
 
 
 @router.post("/memories/graph/observations", response_model=MemoryObservationOut, status_code=status.HTTP_201_CREATED)
@@ -327,7 +345,36 @@ async def add_graph_observation(
     return MemoryObservationOut.model_validate(observation)
 
 
-@router.get("/memories/graph/search", response_model=List[MemoryEntityOut])
+@router.get("/memories/graph/entities", response_model=List[MemoryEntityListOut])
+async def list_graph_entities(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    limit: int = 20,
+    include_inactive: bool = False,
+):
+    filters = [MemoryEntity.user_id == current_user.id]
+    if not include_inactive:
+        filters.append(MemoryEntity.is_active == True)
+
+    result = await db.execute(
+        select(MemoryEntity)
+        .where(and_(*filters))
+        .order_by(desc(MemoryEntity.confidence), desc(MemoryEntity.created_at))
+        .limit(max(1, min(limit, 100)))
+    )
+    entities = list(result.scalars().all())
+    counts = await _load_graph_counts(db, current_user.id, [entity.id for entity in entities])
+    return [
+        MemoryEntityListOut(
+            **MemoryEntityOut.from_orm(entity).model_dump(),
+            relation_count=counts["relations"].get(entity.id, 0),
+            observation_count=counts["observations"].get(entity.id, 0),
+        )
+        for entity in entities
+    ]
+
+
+@router.get("/memories/graph/search", response_model=List[MemoryEntityListOut])
 async def search_graph_entities(
     q: str,
     current_user: User = Depends(get_current_user),
@@ -336,7 +383,15 @@ async def search_graph_entities(
 ):
     svc = get_graph_memory_service()
     entities = await svc.search_entities(db=db, user_id=current_user.id, query=q, limit=limit)
-    return [MemoryEntityOut.from_orm(entity) for entity in entities]
+    counts = await _load_graph_counts(db, current_user.id, [entity.id for entity in entities])
+    return [
+        MemoryEntityListOut(
+            **MemoryEntityOut.from_orm(entity).model_dump(),
+            relation_count=counts["relations"].get(entity.id, 0),
+            observation_count=counts["observations"].get(entity.id, 0),
+        )
+        for entity in entities
+    ]
 
 
 @router.get("/memories/graph/entities/{entity_id}", response_model=MemoryGraphNodeOut)
@@ -350,9 +405,16 @@ async def open_graph_entity(
         graph = await svc.open_entity_graph(db=db, user_id=current_user.id, entity_id=entity_id)
     except ValueError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory entity not found")
+    entity_ids = {graph["entity"].id}
+    for rel in graph["relations"]:
+        entity_ids.add(rel.from_entity_id)
+        entity_ids.add(rel.to_entity_id)
+    entity_lookup = await _load_entity_lookup(db, current_user.id, entity_ids)
     return MemoryGraphNodeOut(
         entity=MemoryEntityOut.from_orm(graph["entity"]),
-        relations=[MemoryRelationOut.model_validate(item) for item in graph["relations"]],
+        relation_count=len(graph["relations"]),
+        observation_count=len(graph["observations"]),
+        relations=[_serialize_relation(item, entity_lookup) for item in graph["relations"]],
         observations=[MemoryObservationOut.model_validate(item) for item in graph["observations"]],
     )
 
@@ -367,3 +429,88 @@ async def _get_owned_memory(memory_id: int, user_id: int, db: AsyncSession) -> M
     if m is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found")
     return m
+
+
+async def _load_entity_lookup(
+    db: AsyncSession,
+    user_id: int,
+    entity_ids: set[int],
+) -> dict[int, MemoryEntity]:
+    if not entity_ids:
+        return {}
+    result = await db.execute(
+        select(MemoryEntity).where(
+            and_(MemoryEntity.user_id == user_id, MemoryEntity.id.in_(sorted(entity_ids)))
+        )
+    )
+    return {entity.id: entity for entity in result.scalars().all()}
+
+
+async def _load_graph_counts(
+    db: AsyncSession,
+    user_id: int,
+    entity_ids: list[int],
+) -> dict[str, dict[int, int]]:
+    if not entity_ids:
+        return {"relations": {}, "observations": {}}
+
+    observation_counts_result = await db.execute(
+        select(MemoryObservation.entity_id, func.count(MemoryObservation.id))
+        .where(
+            and_(
+                MemoryObservation.user_id == user_id,
+                MemoryObservation.entity_id.in_(entity_ids),
+            )
+        )
+        .group_by(MemoryObservation.entity_id)
+    )
+    observation_counts = {int(entity_id): int(count) for entity_id, count in observation_counts_result.all()}
+
+    relation_counts_result = await db.execute(
+        select(MemoryRelation.from_entity_id, MemoryRelation.to_entity_id)
+        .where(
+            and_(
+                MemoryRelation.user_id == user_id,
+                or_(
+                    MemoryRelation.from_entity_id.in_(entity_ids),
+                    MemoryRelation.to_entity_id.in_(entity_ids),
+                ),
+            )
+        )
+    )
+    relation_counts = {entity_id: 0 for entity_id in entity_ids}
+    for from_entity_id, to_entity_id in relation_counts_result.all():
+        if from_entity_id in relation_counts:
+            relation_counts[int(from_entity_id)] += 1
+        if to_entity_id in relation_counts:
+            relation_counts[int(to_entity_id)] += 1
+
+    return {"relations": relation_counts, "observations": observation_counts}
+
+
+def _serialize_relation(
+    relation: MemoryRelation,
+    entity_lookup: dict[int, MemoryEntity],
+) -> MemoryRelationOut:
+    from_entity = entity_lookup.get(relation.from_entity_id)
+    to_entity = entity_lookup.get(relation.to_entity_id)
+    if from_entity is None or to_entity is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Memory graph relation integrity error")
+    return MemoryRelationOut(
+        id=relation.id,
+        from_entity=MemoryEntitySummaryOut(
+            id=from_entity.id,
+            name=from_entity.name,
+            entity_type=from_entity.entity_type,
+        ),
+        to_entity=MemoryEntitySummaryOut(
+            id=to_entity.id,
+            name=to_entity.name,
+            entity_type=to_entity.entity_type,
+        ),
+        relation_type=relation.relation_type,
+        confidence=relation.confidence,
+        source_memory_id=relation.source_memory_id,
+        source_session_id=relation.source_session_id,
+        source_task_id=relation.source_task_id,
+    )
