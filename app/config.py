@@ -94,6 +94,7 @@ class Settings(BaseSettings):
     upload_max_size_mb: int = 50
     filesystem_mcp_max_read_bytes: int = 100_000
     filesystem_mcp_max_write_bytes: int = 100_000
+    filesystem_mcp_max_search_results: int = 50
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:5173"]

@@ -12,8 +12,17 @@ from app.mcp.servers.filesystem import call_tool, get_tools
 def test_filesystem_server_exposes_read_and_write_tools():
     tool_names = [tool["name"] for tool in get_tools()]
     assert "list_directory" in tool_names
+    assert "find_files" in tool_names
     assert "read_file" in tool_names
     assert "write_file" in tool_names
+
+
+def test_filesystem_tool_descriptions_distinguish_workspace_from_library():
+    tools = {tool["name"]: tool for tool in get_tools()}
+    for tool_name in ("list_directory", "find_files", "read_file", "write_file"):
+        description = tools[tool_name]["description"].lower()
+        assert "workspace" in description
+        assert "library" in description
 
 
 @pytest.mark.asyncio
@@ -52,6 +61,23 @@ async def test_write_and_read_file_inside_user_workspace(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_find_files_returns_bounded_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "filesystem_mcp_max_search_results", 2)
+    user_root = Path(tmp_path) / "5"
+    (user_root / "notes").mkdir(parents=True)
+    (user_root / "archive").mkdir(parents=True)
+    (user_root / "notes" / "meeting-notes.md").write_text("one")
+    (user_root / "archive" / "old-notes.md").write_text("two")
+    (user_root / "notes" / "notes-summary.txt").write_text("three")
+    user_context = UserContext(user_id=5, username="tester", role="parent")
+
+    result = await call_tool("find_files", {"query": "notes"}, user_context)
+    assert "Matches for 'notes' in ." in result
+    assert "(Result limit reached: 2)" in result
+
+
+@pytest.mark.asyncio
 async def test_read_file_blocks_path_escape(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
     user_context = UserContext(user_id=3, username="tester", role="parent")
@@ -61,6 +87,9 @@ async def test_read_file_blocks_path_escape(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="within the user's workspace"):
         await call_tool("list_directory", {"path": "../outside"}, user_context)
+
+    with pytest.raises(ValueError, match="within the user's workspace"):
+        await call_tool("find_files", {"path": "../outside", "query": "x"}, user_context)
 
 
 @pytest.mark.asyncio

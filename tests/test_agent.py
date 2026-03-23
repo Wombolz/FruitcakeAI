@@ -74,6 +74,14 @@ def test_list_library_documents_schema_fields():
     assert "scope_filter" in props
 
 
+def test_list_library_documents_description_distinguishes_uploaded_library_docs():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "list_library_documents")
+    description = schema["function"]["description"].lower()
+    assert "uploaded" in description
+    assert "library" in description
+    assert "workspace" in description
+
+
 def test_create_task_plan_schema_has_required_fields():
     schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_task_plan")
     props = schema["function"]["parameters"]["properties"]
@@ -172,6 +180,7 @@ def test_family_assistant_sees_filesystem_mcp_tools_when_registry_ready():
     ctx = _make_context(persona="family_assistant", blocked=[])
     fake_mcp_tools = [
         {"type": "function", "function": {"name": "list_directory", "description": "", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "find_files", "description": "", "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "read_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "write_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
     ]
@@ -184,6 +193,7 @@ def test_family_assistant_sees_filesystem_mcp_tools_when_registry_ready():
 
     names = [t["function"]["name"] for t in tools]
     assert "list_directory" in names
+    assert "find_files" in names
     assert "read_file" in names
     assert "write_file" in names
 

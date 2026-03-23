@@ -3,6 +3,7 @@ FruitcakeAI v5 — Filesystem MCP server (internal_python)
 
 Phase 7.1 starts with a narrow, user-scoped workspace contract:
 - list_directory
+- find_files
 - read_file
 - write_file
 
@@ -26,8 +27,9 @@ def get_tools() -> List[Dict[str, Any]]:
         {
             "name": "list_directory",
             "description": (
-                "List files and folders inside the current user's workspace. "
-                "Use this before reading or writing when the exact path is unknown."
+                "List files and folders inside the current user's sandbox workspace. "
+                "Use this before reading or writing workspace files when the exact path is unknown. "
+                "Do not use this for uploaded document-library items; use list_library_documents instead."
             ),
             "inputSchema": {
                 "type": "object",
@@ -44,10 +46,40 @@ def get_tools() -> List[Dict[str, Any]]:
             },
         },
         {
+            "name": "find_files",
+            "description": (
+                "Search for files and folders inside the current user's sandbox workspace by "
+                "filename or relative path segment. Use this when the workspace is too "
+                "large to inspect one directory at a time. "
+                "Do not use this for uploaded document-library items; use list_library_documents instead."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Case-insensitive filename or path fragment to search for.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional relative directory to search within. Defaults to the workspace root.",
+                        "default": ".",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum matches to return.",
+                        "default": 20,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        {
             "name": "read_file",
             "description": (
-                "Read a text file from the current user's workspace. "
-                "Only files inside the user's sandboxed workspace are allowed."
+                "Read a text file from the current user's sandbox workspace. "
+                "Only files inside the user's sandboxed workspace are allowed. "
+                "Do not use this to access uploaded document-library files."
             ),
             "inputSchema": {
                 "type": "object",
@@ -67,9 +99,10 @@ def get_tools() -> List[Dict[str, Any]]:
         {
             "name": "write_file",
             "description": (
-                "Write or overwrite a text file in the current user's workspace. "
+                "Write or overwrite a text file in the current user's sandbox workspace. "
                 "Creates parent directories when needed. Only paths inside the user's "
-                "sandboxed workspace are allowed."
+                "sandboxed workspace are allowed. "
+                "This writes workspace files, not uploaded library documents."
             ),
             "inputSchema": {
                 "type": "object",
@@ -92,6 +125,8 @@ def get_tools() -> List[Dict[str, Any]]:
 async def call_tool(tool_name: str, arguments: Dict[str, Any], user_context: Any) -> str:
     if tool_name == "list_directory":
         return _list_directory(arguments, user_context)
+    if tool_name == "find_files":
+        return _find_files(arguments, user_context)
     if tool_name == "read_file":
         return _read_file(arguments, user_context)
     if tool_name == "write_file":
@@ -177,6 +212,46 @@ def _list_directory(arguments: Dict[str, Any], user_context: Any) -> str:
         kind = "dir" if entry.is_dir() else "file"
         suffix = "/" if entry.is_dir() else ""
         lines.append(f"- [{kind}] {rel_path}{suffix}")
+    return "\n".join(lines)
+
+
+def _find_files(arguments: Dict[str, Any], user_context: Any) -> str:
+    workspace_root, path = _resolve_workspace_path(arguments.get("path", ".") or ".", user_context)
+    if not path.exists():
+        return f"Directory not found: {arguments.get('path', '.')}"
+    if not path.is_dir():
+        return f"Not a directory: {arguments.get('path', '.')}"
+
+    query = (arguments.get("query") or "").strip().lower()
+    if not query:
+        raise ValueError("Query is required")
+
+    try:
+        requested_limit = int(arguments.get("max_results", 20))
+    except Exception:
+        requested_limit = 20
+    limit = max(1, min(requested_limit, settings.filesystem_mcp_max_search_results))
+
+    matches = []
+    for entry in path.rglob("*"):
+        rel_path = entry.relative_to(workspace_root)
+        haystack = str(rel_path).lower()
+        if query in haystack:
+            kind = "dir" if entry.is_dir() else "file"
+            suffix = "/" if entry.is_dir() else ""
+            matches.append(f"- [{kind}] {rel_path}{suffix}")
+        if len(matches) >= limit:
+            break
+
+    if not matches:
+        return f"No files found matching '{arguments.get('query', '')}'."
+
+    rel_dir = path.relative_to(workspace_root)
+    display_dir = "." if str(rel_dir) == "." else str(rel_dir)
+    lines = [f"Matches for '{arguments.get('query', '')}' in {display_dir}:"]
+    lines.extend(matches)
+    if len(matches) == limit:
+        lines.append(f"(Result limit reached: {limit})")
     return "\n".join(lines)
 
 
