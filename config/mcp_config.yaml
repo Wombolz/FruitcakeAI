@@ -30,7 +30,7 @@ mcp_servers:
   shell:
     type: docker_stdio
     image: fruitcake/mcp-shell
-    enabled: false
+    enabled: true
     timeout: 30
     docker_run_args:
       - --network
