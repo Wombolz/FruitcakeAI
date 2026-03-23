@@ -162,6 +162,11 @@ curl http://localhost:30417/health
 
 Use `./scripts/doctor.sh` whenever setup looks wrong. It reports required failures separately from optional degraded components like the shell MCP image or APNs config.
 
+Health semantics:
+- `PASS`: required backend dependencies are ready
+- `DEGRADED`: backend is usable, but optional components are missing
+- `FAIL`: one or more required backend dependencies are not ready
+
 Default users — **change these passwords before running on a shared network:**
 
 | Username | Password | Role |

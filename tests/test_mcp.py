@@ -227,6 +227,50 @@ async def test_registry_get_status(fake_config: Path):
     assert "status_tool" in tool_names
 
 
+def test_admin_check_mcp_reports_optional_docker_servers_as_degraded():
+    from app.api.admin import _check_mcp
+
+    mock_registry = MagicMock()
+    mock_registry.get_status.return_value = {"ready": True, "tool_count": 4}
+    mock_registry.get_diagnostics.return_value = {
+        "ready": True,
+        "tool_count": 4,
+        "servers": [
+            {"server": "filesystem", "type": "internal_python", "enabled": True, "status": "loaded"},
+            {"server": "shell", "type": "docker_stdio", "enabled": True, "status": "not_connected"},
+        ],
+    }
+
+    with patch("app.mcp.registry.get_mcp_registry", return_value=mock_registry):
+        result = _check_mcp()
+
+    assert result["status"] == "degraded"
+    assert result["required_unavailable_servers"] == []
+    assert result["optional_unavailable_servers"] == ["shell"]
+
+
+def test_admin_check_mcp_reports_internal_server_failures_as_error():
+    from app.api.admin import _check_mcp
+
+    mock_registry = MagicMock()
+    mock_registry.get_status.return_value = {"ready": True, "tool_count": 2}
+    mock_registry.get_diagnostics.return_value = {
+        "ready": True,
+        "tool_count": 2,
+        "servers": [
+            {"server": "filesystem", "type": "internal_python", "enabled": True, "status": "error"},
+            {"server": "shell", "type": "docker_stdio", "enabled": True, "status": "connected"},
+        ],
+    }
+
+    with patch("app.mcp.registry.get_mcp_registry", return_value=mock_registry):
+        result = _check_mcp()
+
+    assert result["status"] == "error"
+    assert result["required_unavailable_servers"] == ["filesystem"]
+    assert result["optional_unavailable_servers"] == []
+
+
 @pytest.mark.asyncio
 async def test_stdio_reader_waits_for_matching_response_id():
     client = MCPClient(server_name="test", command="docker", args=["run", "fake"])

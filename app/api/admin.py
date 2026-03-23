@@ -257,7 +257,9 @@ async def admin_health(
     skills_status = await _check_skills(db)
 
     overall = "ok"
-    if any(s.get("status") == "error" for s in [db_status, llm_status, rag_status]):
+    if any(s.get("status") == "error" for s in [db_status, llm_status, rag_status, mcp_status]):
+        overall = "degraded"
+    elif any(s.get("status") == "degraded" for s in [mcp_status]):
         overall = "degraded"
 
     return {
@@ -303,8 +305,38 @@ def _check_rag() -> Dict[str, Any]:
 
 def _check_mcp() -> Dict[str, Any]:
     from app.mcp.registry import get_mcp_registry
-    s = get_mcp_registry().get_status()
-    return {"status": "ok" if s["ready"] else "not_ready", "tool_count": s["tool_count"]}
+    registry = get_mcp_registry()
+    status = registry.get_status()
+    diagnostics = registry.get_diagnostics()
+
+    enabled_servers = [server for server in diagnostics.get("servers", []) if server.get("enabled")]
+    required_unavailable = [
+        server["server"]
+        for server in enabled_servers
+        if server.get("type") == "internal_python"
+        and server.get("status") not in ("loaded", "connected")
+    ]
+    optional_unavailable = [
+        server["server"]
+        for server in enabled_servers
+        if server.get("type") == "docker_stdio"
+        and server.get("status") not in ("connected",)
+    ]
+
+    health = "ok"
+    if not status.get("ready") or required_unavailable:
+        health = "error"
+    elif optional_unavailable:
+        health = "degraded"
+
+    return {
+        "status": health,
+        "ready": status["ready"],
+        "tool_count": status["tool_count"],
+        "enabled_server_count": len(enabled_servers),
+        "required_unavailable_servers": required_unavailable,
+        "optional_unavailable_servers": optional_unavailable,
+    }
 
 
 def _check_llm_dispatch_gate() -> Dict[str, Any]:
