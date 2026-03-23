@@ -161,6 +161,133 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "create_memory_entities",
+            "description": (
+                "Create one or more graph-memory entities for durable relationship structure. "
+                "Use this for named people, places, organizations, projects, or concepts that should participate in a memory graph. "
+                "This does not replace normal flat memories."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entities": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "entity_type": {"type": "string"},
+                                "aliases": {"type": "array", "items": {"type": "string"}},
+                                "confidence": {"type": "number", "default": 0.5},
+                            },
+                            "required": ["name"],
+                        },
+                    }
+                },
+                "required": ["entities"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_memory_relations",
+            "description": (
+                "Create one or more graph-memory relations between existing memory entities. "
+                "Use this to record explicit relationships without changing flat memory recall."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "relations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from_entity_id": {"type": "integer"},
+                                "to_entity_id": {"type": "integer"},
+                                "relation_type": {"type": "string"},
+                                "confidence": {"type": "number", "default": 0.5},
+                                "source_memory_id": {"type": "integer"},
+                                "source_task_id": {"type": "integer"},
+                            },
+                            "required": ["from_entity_id", "to_entity_id", "relation_type"],
+                        },
+                    }
+                },
+                "required": ["relations"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_memory_observations",
+            "description": (
+                "Add one or more graph-memory observations to an existing entity. "
+                "Prefer referencing a source memory when the observation comes from existing flat memory."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "observations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "entity_id": {"type": "integer"},
+                                "content": {"type": "string"},
+                                "observed_at": {"type": "string"},
+                                "confidence": {"type": "number", "default": 0.5},
+                                "source_memory_id": {"type": "integer"},
+                                "source_task_id": {"type": "integer"},
+                            },
+                            "required": ["entity_id"],
+                        },
+                    }
+                },
+                "required": ["observations"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memory_graph",
+            "description": (
+                "Search graph-memory entities by name or alias. "
+                "Use this when the user asks how known people, places, or projects relate."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "default": 10},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_memory_graph_nodes",
+            "description": (
+                "Open one graph-memory entity and return its relations and observations. "
+                "Use after search_memory_graph or when the entity id is already known."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_id": {"type": "integer"},
+                },
+                "required": ["entity_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_task_plan",
             "description": (
                 "Create an ordered step-by-step plan for an existing task. "
@@ -413,6 +540,21 @@ async def _call_tool(
 
     if name == "create_memory":
         return await _create_memory(arguments, user_context)
+
+    if name == "create_memory_entities":
+        return await _create_memory_entities(arguments, user_context)
+
+    if name == "create_memory_relations":
+        return await _create_memory_relations(arguments, user_context)
+
+    if name == "add_memory_observations":
+        return await _add_memory_observations(arguments, user_context)
+
+    if name == "search_memory_graph":
+        return await _search_memory_graph(arguments, user_context)
+
+    if name == "open_memory_graph_nodes":
+        return await _open_memory_graph_nodes(arguments, user_context)
 
     if name == "search_library":
         return await _search_library(arguments, user_context)
@@ -719,6 +861,163 @@ async def _create_memory(
         memory_id = result.id  # capture before session closes to avoid DetachedInstanceError
 
     return f"Memory saved (id={memory_id}, type={memory_type})."
+
+
+async def _create_memory_entities(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from app.db.session import AsyncSessionLocal
+    from app.memory.graph_service import get_graph_memory_service
+
+    entities = arguments.get("entities") or []
+    if not isinstance(entities, list) or not entities:
+        return "entities is required."
+
+    svc = get_graph_memory_service()
+    created: list[str] = []
+    async with AsyncSessionLocal() as db:
+        for item in entities:
+            try:
+                entity, is_new = await svc.find_or_create_entity(
+                    db=db,
+                    user_id=user_context.user_id,
+                    name=str(item.get("name", "")).strip(),
+                    entity_type=str(item.get("entity_type", "unknown")).strip() or "unknown",
+                    aliases=item.get("aliases") or [],
+                    confidence=float(item.get("confidence", 0.5)),
+                )
+            except Exception as exc:
+                await db.rollback()
+                return f"Failed to create memory entities: {exc}"
+            created.append(f"{entity.name} (id={entity.id}, {'created' if is_new else 'existing'})")
+        await db.commit()
+    return "Memory graph entities: " + "; ".join(created)
+
+
+async def _create_memory_relations(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from app.db.session import AsyncSessionLocal
+    from app.memory.graph_service import get_graph_memory_service
+
+    relations = arguments.get("relations") or []
+    if not isinstance(relations, list) or not relations:
+        return "relations is required."
+
+    svc = get_graph_memory_service()
+    created_ids: list[str] = []
+    async with AsyncSessionLocal() as db:
+        for item in relations:
+            try:
+                relation = await svc.create_relation(
+                    db=db,
+                    user_id=user_context.user_id,
+                    from_entity_id=int(item.get("from_entity_id")),
+                    to_entity_id=int(item.get("to_entity_id")),
+                    relation_type=str(item.get("relation_type", "")).strip(),
+                    confidence=float(item.get("confidence", 0.5)),
+                    source_memory_id=item.get("source_memory_id"),
+                    source_session_id=user_context.session_id,
+                    source_task_id=item.get("source_task_id"),
+                )
+            except Exception as exc:
+                await db.rollback()
+                return f"Failed to create memory relations: {exc}"
+            created_ids.append(str(relation.id))
+        await db.commit()
+    return "Memory graph relations created: " + ", ".join(created_ids)
+
+
+async def _add_memory_observations(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from datetime import datetime, timezone
+    from app.db.session import AsyncSessionLocal
+    from app.memory.graph_service import get_graph_memory_service
+
+    observations = arguments.get("observations") or []
+    if not isinstance(observations, list) or not observations:
+        return "observations is required."
+
+    svc = get_graph_memory_service()
+    created_ids: list[str] = []
+    async with AsyncSessionLocal() as db:
+        for item in observations:
+            observed_at = None
+            if item.get("observed_at"):
+                try:
+                    dt = datetime.fromisoformat(str(item["observed_at"]))
+                    observed_at = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    return f"Invalid observed_at format: '{item['observed_at']}'. Use ISO 8601."
+            try:
+                observation = await svc.add_observation(
+                    db=db,
+                    user_id=user_context.user_id,
+                    entity_id=int(item.get("entity_id")),
+                    content=item.get("content"),
+                    observed_at=observed_at,
+                    confidence=float(item.get("confidence", 0.5)),
+                    source_memory_id=item.get("source_memory_id"),
+                    source_session_id=user_context.session_id,
+                    source_task_id=item.get("source_task_id"),
+                )
+            except Exception as exc:
+                await db.rollback()
+                return f"Failed to add memory observations: {exc}"
+            created_ids.append(str(observation.id))
+        await db.commit()
+    return "Memory graph observations created: " + ", ".join(created_ids)
+
+
+async def _search_memory_graph(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from app.db.session import AsyncSessionLocal
+    from app.memory.graph_service import get_graph_memory_service
+
+    query = str(arguments.get("query", "")).strip()
+    if not query:
+        return "query is required."
+
+    svc = get_graph_memory_service()
+    async with AsyncSessionLocal() as db:
+        entities = await svc.search_entities(
+            db=db,
+            user_id=user_context.user_id,
+            query=query,
+            limit=int(arguments.get("limit", 10)),
+        )
+    if not entities:
+        return f"No memory graph entities found for '{query}'."
+    lines = [f"- id={entity.id} | {entity.name} ({entity.entity_type})" for entity in entities]
+    return "Memory graph search results:\n" + "\n".join(lines)
+
+
+async def _open_memory_graph_nodes(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from app.db.session import AsyncSessionLocal
+    from app.memory.graph_service import get_graph_memory_service
+
+    try:
+        entity_id = int(arguments.get("entity_id"))
+    except Exception:
+        return "entity_id is required."
+
+    svc = get_graph_memory_service()
+    async with AsyncSessionLocal() as db:
+        try:
+            graph = await svc.open_entity_graph(db=db, user_id=user_context.user_id, entity_id=entity_id)
+        except Exception as exc:
+            return f"Failed to open memory graph node: {exc}"
+
+    entity = graph["entity"]
+    relations = graph["relations"]
+    observations = graph["observations"]
+    lines = [f"Entity: {entity.name} (id={entity.id}, type={entity.entity_type})"]
+    if relations:
+        lines.append("Relations:")
+        for rel in relations:
+            direction = "outgoing" if rel.from_entity_id == entity.id else "incoming"
+            other_id = rel.to_entity_id if direction == "outgoing" else rel.from_entity_id
+            lines.append(f"- {direction}: {rel.relation_type} -> entity_id={other_id} (confidence={rel.confidence:.2f})")
+    if observations:
+        lines.append("Observations:")
+        for obs in observations[:10]:
+            content = obs.content or f"(linked to memory_id={obs.source_memory_id})"
+            lines.append(f"- {content}")
+    return "\n".join(lines)
 
 
 async def _create_task_plan(
