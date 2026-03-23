@@ -1526,6 +1526,12 @@ These items are intentionally tracked outside the sprint list because they are r
   - Decision needed later: whether to add a Swift admin/debug view or keep inspection API-only.
   - Earliest likely sprint: after more soak confirms the payload shape is stable.
 
+- **Filesystem MCP expansion beyond Phase 7.1**
+  - Why it matters: the current workspace tool surface now covers discovery, inspection, reading, writing, and directory creation, but some real workflows may later want a few more file operations.
+  - Current status: `Phase 7.1` intentionally stops at `list_directory`, `find_files`, `stat_file`, `read_file`, `write_file`, and `make_directory` to keep the workspace contract narrow and trustworthy.
+  - Decision needed later: whether to add selective helpers like `append_file`, `read_multiple_files`, or carefully-scoped rename/move support without drifting into a general-purpose file manager.
+  - Earliest likely sprint: after real workspace usage shows repeated friction that the current tool set cannot handle cleanly.
+
 - **Chat responsiveness optimization**
   - Why it matters: local chat still feels slower than direct model interaction, especially once memory, tools, and grounding are layered in.
   - Current status: a `5.6.13` branch tried heuristic tool/memory/history gating to improve perceived speed, but it regressed response quality and caused brittle tool-access failures; those changes were rolled back. The safe pieces kept from that work are stage latency instrumentation plus grounded library summary and PDF ingest fixes.

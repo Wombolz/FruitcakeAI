@@ -323,3 +323,4 @@ async def test_registry_loads_filesystem_server_from_config(tmp_path: Path):
     assert "stat_file" in tools
     assert "read_file" in tools
     assert "write_file" in tools
+    assert "make_directory" in tools

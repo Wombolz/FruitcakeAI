@@ -7,6 +7,7 @@ Phase 7.1 starts with a narrow, user-scoped workspace contract:
 - stat_file
 - read_file
 - write_file
+- make_directory
 
 All file access is constrained to settings.workspace_dir / {user_id}.
 """
@@ -139,6 +140,24 @@ def get_tools() -> List[Dict[str, Any]]:
                 "required": ["path", "content"],
             },
         },
+        {
+            "name": "make_directory",
+            "description": (
+                "Create a directory in the current user's sandbox workspace. "
+                "Creates parent directories when needed and succeeds if the directory "
+                "already exists. Do not use this for uploaded document-library items."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative directory path inside the user's workspace.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
     ]
 
 
@@ -153,6 +172,8 @@ async def call_tool(tool_name: str, arguments: Dict[str, Any], user_context: Any
         return _read_file(arguments, user_context)
     if tool_name == "write_file":
         return _write_file(arguments, user_context)
+    if tool_name == "make_directory":
+        return _make_directory(arguments, user_context)
     return f"Unknown filesystem tool: {tool_name}"
 
 
@@ -306,6 +327,15 @@ def _write_file(arguments: Dict[str, Any], user_context: Any) -> str:
     path.write_text(content, encoding="utf-8")
     log.info("Workspace file written", user_id=_user_id_from_context(user_context), path=str(path))
     return f"Wrote {len(encoded)} bytes to {path.name}"
+
+
+def _make_directory(arguments: Dict[str, Any], user_context: Any) -> str:
+    _, path = _resolve_workspace_path(arguments.get("path", ""), user_context)
+    if path.exists() and not path.is_dir():
+        return f"Cannot create directory because a file already exists at: {arguments.get('path', '')}"
+    path.mkdir(parents=True, exist_ok=True)
+    log.info("Workspace directory ensured", user_id=_user_id_from_context(user_context), path=str(path))
+    return f"Directory ready: {path.name}"
 
 
 def _format_entry_line(entry: Path, workspace_root: Path) -> str:

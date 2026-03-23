@@ -16,11 +16,12 @@ def test_filesystem_server_exposes_read_and_write_tools():
     assert "stat_file" in tool_names
     assert "read_file" in tool_names
     assert "write_file" in tool_names
+    assert "make_directory" in tool_names
 
 
 def test_filesystem_tool_descriptions_distinguish_workspace_from_library():
     tools = {tool["name"]: tool for tool in get_tools()}
-    for tool_name in ("list_directory", "find_files", "stat_file", "read_file", "write_file"):
+    for tool_name in ("list_directory", "find_files", "stat_file", "read_file", "write_file", "make_directory"):
         description = tools[tool_name]["description"].lower()
         assert "workspace" in description
         assert "library" in description
@@ -60,6 +61,20 @@ async def test_write_and_read_file_inside_user_workspace(tmp_path, monkeypatch):
 
     read_result = await call_tool("read_file", {"path": "notes/today.md"}, user_context)
     assert read_result == "hello workspace"
+
+
+@pytest.mark.asyncio
+async def test_make_directory_creates_parents_and_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    user_context = UserContext(user_id=10, username="tester", role="parent")
+
+    first = await call_tool("make_directory", {"path": "projects/phase7/notes"}, user_context)
+    second = await call_tool("make_directory", {"path": "projects/phase7/notes"}, user_context)
+
+    target = Path(tmp_path) / "10" / "projects" / "phase7" / "notes"
+    assert target.is_dir()
+    assert "Directory ready: notes" in first
+    assert "Directory ready: notes" in second
 
 
 @pytest.mark.asyncio
@@ -114,6 +129,9 @@ async def test_read_file_blocks_path_escape(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="within the user's workspace"):
         await call_tool("stat_file", {"path": "../outside.txt"}, user_context)
 
+    with pytest.raises(ValueError, match="within the user's workspace"):
+        await call_tool("make_directory", {"path": "../outside"}, user_context)
+
 
 @pytest.mark.asyncio
 async def test_write_file_blocks_cross_user_absolute_path(tmp_path, monkeypatch):
@@ -150,3 +168,15 @@ async def test_read_file_respects_size_limit(tmp_path, monkeypatch):
 
     result = await call_tool("read_file", {"path": "big.txt"}, user_context)
     assert "too large to read safely" in result
+
+
+@pytest.mark.asyncio
+async def test_make_directory_rejects_existing_file_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    user_root = Path(tmp_path) / "12"
+    user_root.mkdir(parents=True, exist_ok=True)
+    (user_root / "taken.txt").write_text("hello")
+    user_context = UserContext(user_id=12, username="tester", role="parent")
+
+    result = await call_tool("make_directory", {"path": "taken.txt"}, user_context)
+    assert "file already exists" in result

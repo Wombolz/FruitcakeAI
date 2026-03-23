@@ -18,6 +18,7 @@ Initial tool surface:
 - `stat_file`
 - `read_file`
 - `write_file`
+- `make_directory`
 
 Workspace rule:
 - all filesystem access is constrained to `workspace/{user_id}/`
@@ -53,6 +54,7 @@ Workspace rule:
 - `stat_file`
 - `read_file`
 - `write_file`
+- `make_directory`
 - path traversal prevention
 - basic read/write byte caps
 - MCP registry wiring
@@ -98,6 +100,12 @@ Workspace rule:
 - exposes type, size, modified time, and file extension when applicable
 - gives the agent a safer inspection step before reading or overwriting content
 
+#### `make_directory`
+- creates a directory path inside the user's workspace
+- creates parent directories when needed
+- succeeds if the directory already exists
+- refuses paths outside the workspace or paths that collide with existing files
+
 #### `write_file`
 - writes UTF-8 text to a file inside the current user's workspace
 - creates parent directories as needed
@@ -129,7 +137,7 @@ This is the right first step for Phase 7.
 
 ## Acceptance Criteria
 
-1. MCP registry exposes `list_directory`, `find_files`, `stat_file`, `read_file`, and `write_file`.
+1. MCP registry exposes `list_directory`, `find_files`, `stat_file`, `read_file`, `write_file`, and `make_directory`.
 2. Files are always resolved under `workspace/{user_id}/`.
 3. Path traversal and cross-user path access are blocked.
 4. The agent can discover files before attempting reads.

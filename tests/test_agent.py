@@ -184,6 +184,7 @@ def test_family_assistant_sees_filesystem_mcp_tools_when_registry_ready():
         {"type": "function", "function": {"name": "stat_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "read_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "write_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "make_directory", "description": "", "parameters": {"type": "object", "properties": {}}}},
     ]
     mock_registry = MagicMock()
     mock_registry._is_ready = True
@@ -198,6 +199,7 @@ def test_family_assistant_sees_filesystem_mcp_tools_when_registry_ready():
     assert "stat_file" in names
     assert "read_file" in names
     assert "write_file" in names
+    assert "make_directory" in names
 
 
 # ── Dispatch tests ─────────────────────────────────────────────────────────────
