@@ -66,6 +66,9 @@ class User(Base):
     tasks = relationship("Task", back_populates="user", cascade="all, delete-orphan")
     device_tokens = relationship("DeviceToken", back_populates="user", cascade="all, delete-orphan")
     memories = relationship("Memory", back_populates="user", cascade="all, delete-orphan")
+    memory_entities = relationship("MemoryEntity", back_populates="user", cascade="all, delete-orphan")
+    memory_relations = relationship("MemoryRelation", back_populates="user", cascade="all, delete-orphan")
+    memory_observations = relationship("MemoryObservation", back_populates="user", cascade="all, delete-orphan")
     webhook_configs = relationship("WebhookConfig", back_populates="user", cascade="all, delete-orphan")
     rss_sources = relationship("RSSSource", back_populates="user", cascade="all, delete-orphan")
     rss_user_state = relationship("RSSUserState", back_populates="user", uselist=False, cascade="all, delete-orphan")
@@ -334,6 +337,88 @@ class Memory(Base):
 
     def __repr__(self):
         return f"<Memory(user_id={self.user_id}, type='{self.memory_type}', importance={self.importance})>"
+
+
+class MemoryEntity(Base):
+    __tablename__ = "memory_entities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    normalized_name = Column(String(255), nullable=False, index=True)
+    entity_type = Column(String(100), nullable=False, default="unknown")
+    aliases = Column(Text, default="[]", nullable=False)
+    confidence = Column(Float, default=0.5, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User", back_populates="memory_entities")
+    outgoing_relations = relationship(
+        "MemoryRelation",
+        back_populates="from_entity",
+        cascade="all, delete-orphan",
+        foreign_keys="MemoryRelation.from_entity_id",
+    )
+    incoming_relations = relationship(
+        "MemoryRelation",
+        back_populates="to_entity",
+        cascade="all, delete-orphan",
+        foreign_keys="MemoryRelation.to_entity_id",
+    )
+    observations = relationship("MemoryObservation", back_populates="entity", cascade="all, delete-orphan")
+
+    @property
+    def aliases_list(self) -> list[str]:
+        return json.loads(self.aliases or "[]")
+
+    @aliases_list.setter
+    def aliases_list(self, value: list[str]):
+        self.aliases = json.dumps(value)
+
+
+class MemoryRelation(Base):
+    __tablename__ = "memory_relations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    from_entity_id = Column(Integer, ForeignKey("memory_entities.id"), nullable=False, index=True)
+    to_entity_id = Column(Integer, ForeignKey("memory_entities.id"), nullable=False, index=True)
+    relation_type = Column(String(100), nullable=False)
+    confidence = Column(Float, default=0.5, nullable=False)
+    source_memory_id = Column(Integer, ForeignKey("memories.id"), nullable=True, index=True)
+    source_session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=True, index=True)
+    source_task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="memory_relations")
+    from_entity = relationship("MemoryEntity", back_populates="outgoing_relations", foreign_keys=[from_entity_id])
+    to_entity = relationship("MemoryEntity", back_populates="incoming_relations", foreign_keys=[to_entity_id])
+    source_memory = relationship("Memory", foreign_keys=[source_memory_id])
+    source_session = relationship("ChatSession", foreign_keys=[source_session_id])
+    source_task = relationship("Task", foreign_keys=[source_task_id])
+
+
+class MemoryObservation(Base):
+    __tablename__ = "memory_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    entity_id = Column(Integer, ForeignKey("memory_entities.id"), nullable=False, index=True)
+    content = Column(Text, nullable=True)
+    observed_at = Column(DateTime(timezone=True), nullable=True)
+    confidence = Column(Float, default=0.5, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    source_memory_id = Column(Integer, ForeignKey("memories.id"), nullable=True, index=True)
+    source_session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=True, index=True)
+    source_task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="memory_observations")
+    entity = relationship("MemoryEntity", back_populates="observations")
+    source_memory = relationship("Memory", foreign_keys=[source_memory_id])
+    source_session = relationship("ChatSession", foreign_keys=[source_session_id])
+    source_task = relationship("Task", foreign_keys=[source_task_id])
 
 
 class Task(Base):

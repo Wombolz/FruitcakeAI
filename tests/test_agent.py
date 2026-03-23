@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from app.agent.context import UserContext
-from app.agent.tools import TOOL_SCHEMAS, get_tools_for_user
+from app.agent.tools import TOOL_SCHEMAS, _parse_iso_datetime, get_tools_for_user
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -89,6 +89,33 @@ def test_system_prompt_prefers_available_shell_tool_over_generic_refusal():
     assert "do not claim a tool is unavailable" in prompt
     assert "shell_exec" in prompt
     assert "let the shell tool enforce what is blocked" in prompt
+
+
+def test_system_prompt_includes_narrow_memory_capture_guidance():
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    prompt = ctx.to_system_prompt().lower()
+    assert "stable user fact" in prompt
+    assert "durable preference" in prompt
+    assert "recurring household procedure" in prompt
+    assert "do not create memories for trivial one-off chatter" in prompt
+
+
+def test_parse_iso_datetime_accepts_z_suffix():
+    dt = _parse_iso_datetime("2026-04-01T00:00:00Z")
+    assert dt.isoformat() == "2026-04-01T00:00:00+00:00"
+
+
+def test_parse_iso_datetime_assumes_utc_for_naive_values():
+    dt = _parse_iso_datetime("2026-04-01T00:00:00")
+    assert dt.isoformat() == "2026-04-01T00:00:00+00:00"
+
+
+def test_create_memory_schema_discourages_trivial_chatter():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_memory")
+    description = schema["function"]["description"].lower()
+    assert "stable personal facts" in description
+    assert "durable preferences" in description
+    assert "trivial one-off chatter" in description
 
 
 def test_create_task_plan_schema_has_required_fields():

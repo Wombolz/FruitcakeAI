@@ -22,17 +22,30 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import desc, func, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import require_admin
 from app.auth.jwt import hash_password
 from app.autonomy.push import get_apns_pusher
 from app.config import settings
-from app.db.models import AuditLog, DeviceToken, RSSSource, RSSSourceCandidate, Skill, Task, TaskRun, User
+from app.db.models import (
+    AuditLog,
+    DeviceToken,
+    MemoryEntity,
+    MemoryObservation,
+    MemoryRelation,
+    RSSSource,
+    RSSSourceCandidate,
+    Skill,
+    Task,
+    TaskRun,
+    User,
+)
 from app.db.models import TaskRunArtifact
 from app.db.session import get_db
 from app.metrics import metrics
+from app.memory.graph_service import get_graph_memory_service
 from app.skills.service import (
     SkillConflictError,
     SkillNotFoundError,
@@ -156,6 +169,55 @@ class SkillInjectionPreviewOut(BaseModel):
     selection_mode: str
 
 
+class MemoryGraphEntityAdminOut(BaseModel):
+    id: int
+    user_id: int
+    name: str
+    entity_type: str
+    aliases: List[str]
+    confidence: float
+    is_active: bool
+    relation_count: int
+    observation_count: int
+
+
+class MemoryGraphDiagnosticsOut(BaseModel):
+    total_entities: int
+    total_relations: int
+    total_observations: int
+    entities: List[MemoryGraphEntityAdminOut]
+
+
+class MemoryGraphRelationAdminOut(BaseModel):
+    id: int
+    relation_type: str
+    confidence: float
+    from_entity_id: int
+    from_entity_name: str
+    to_entity_id: int
+    to_entity_name: str
+    source_memory_id: Optional[int]
+    source_session_id: Optional[int]
+    source_task_id: Optional[int]
+
+
+class MemoryGraphObservationAdminOut(BaseModel):
+    id: int
+    content: Optional[str]
+    observed_at: Optional[datetime]
+    confidence: float
+    is_active: bool
+    source_memory_id: Optional[int]
+    source_session_id: Optional[int]
+    source_task_id: Optional[int]
+
+
+class MemoryGraphEntityInspectOut(BaseModel):
+    entity: MemoryGraphEntityAdminOut
+    relations: List[MemoryGraphRelationAdminOut]
+    observations: List[MemoryGraphObservationAdminOut]
+
+
 _ARTIFACT_ORDER = {
     "prepared_dataset": 0,
     "draft_output": 1,
@@ -270,6 +332,51 @@ async def _check_skills(db: AsyncSession) -> Dict[str, Any]:
         "active_count": int(active or 0),
         "selection_mode": service.relevance_mode(),
     }
+
+
+async def _admin_load_graph_counts(
+    db: AsyncSession,
+    entity_ids: List[int],
+) -> Dict[str, Dict[int, int]]:
+    if not entity_ids:
+        return {"relations": {}, "observations": {}}
+
+    observation_counts_result = await db.execute(
+        select(MemoryObservation.entity_id, func.count(MemoryObservation.id))
+        .where(and_(MemoryObservation.entity_id.in_(entity_ids), MemoryObservation.is_active == True))
+        .group_by(MemoryObservation.entity_id)
+    )
+    observation_counts = {
+        int(entity_id): int(count) for entity_id, count in observation_counts_result.all()
+    }
+
+    relation_counts_result = await db.execute(
+        select(MemoryRelation.from_entity_id, MemoryRelation.to_entity_id)
+        .where(
+            or_(
+                MemoryRelation.from_entity_id.in_(entity_ids),
+                MemoryRelation.to_entity_id.in_(entity_ids),
+            )
+        )
+    )
+    relation_counts = {entity_id: 0 for entity_id in entity_ids}
+    for from_entity_id, to_entity_id in relation_counts_result.all():
+        if from_entity_id in relation_counts:
+            relation_counts[int(from_entity_id)] += 1
+        if to_entity_id in relation_counts:
+            relation_counts[int(to_entity_id)] += 1
+
+    return {"relations": relation_counts, "observations": observation_counts}
+
+
+async def _admin_load_entity_lookup(
+    db: AsyncSession,
+    entity_ids: set[int],
+) -> Dict[int, MemoryEntity]:
+    if not entity_ids:
+        return {}
+    result = await db.execute(select(MemoryEntity).where(MemoryEntity.id.in_(sorted(entity_ids))))
+    return {entity.id: entity for entity in result.scalars().all()}
 
 
 # ── GET /admin/tools ──────────────────────────────────────────────────────────
@@ -641,6 +748,136 @@ async def mcp_diagnostics(
         },
     }
     return diagnostics
+
+
+@router.get("/memory-graph/diagnostics", response_model=MemoryGraphDiagnosticsOut)
+async def memory_graph_diagnostics(
+    user_id: Optional[int] = Query(None),
+    q: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> MemoryGraphDiagnosticsOut:
+    entity_filters = []
+    relation_filters = []
+    observation_filters = []
+    if user_id is not None:
+        entity_filters.append(MemoryEntity.user_id == user_id)
+        relation_filters.append(MemoryRelation.user_id == user_id)
+        observation_filters.append(MemoryObservation.user_id == user_id)
+    observation_filters.append(MemoryObservation.is_active == True)
+    if q:
+        entity_filters.append(func.lower(MemoryEntity.name).like(f"%{q.strip().lower()}%"))
+
+    entities_stmt = (
+        select(MemoryEntity)
+        .order_by(desc(MemoryEntity.confidence), desc(MemoryEntity.created_at))
+        .limit(limit)
+    )
+    if entity_filters:
+        entities_stmt = entities_stmt.where(and_(*entity_filters))
+    entities = list((await db.execute(entities_stmt)).scalars().all())
+
+    total_entities_stmt = select(func.count()).select_from(MemoryEntity)
+    total_relations_stmt = select(func.count()).select_from(MemoryRelation)
+    total_observations_stmt = select(func.count()).select_from(MemoryObservation)
+    if entity_filters:
+        total_entities_stmt = total_entities_stmt.where(and_(*entity_filters))
+    if relation_filters:
+        total_relations_stmt = total_relations_stmt.where(and_(*relation_filters))
+    if observation_filters:
+        total_observations_stmt = total_observations_stmt.where(and_(*observation_filters))
+
+    total_entities = int((await db.execute(total_entities_stmt)).scalar_one() or 0)
+    total_relations = int((await db.execute(total_relations_stmt)).scalar_one() or 0)
+    total_observations = int((await db.execute(total_observations_stmt)).scalar_one() or 0)
+    counts = await _admin_load_graph_counts(db, [entity.id for entity in entities])
+
+    return MemoryGraphDiagnosticsOut(
+        total_entities=total_entities,
+        total_relations=total_relations,
+        total_observations=total_observations,
+        entities=[
+            MemoryGraphEntityAdminOut(
+                id=entity.id,
+                user_id=entity.user_id,
+                name=entity.name,
+                entity_type=entity.entity_type,
+                aliases=entity.aliases_list,
+                confidence=entity.confidence,
+                is_active=entity.is_active,
+                relation_count=counts["relations"].get(entity.id, 0),
+                observation_count=counts["observations"].get(entity.id, 0),
+            )
+            for entity in entities
+        ],
+    )
+
+
+@router.get("/memory-graph/entities/{entity_id}", response_model=MemoryGraphEntityInspectOut)
+async def inspect_memory_graph_entity(
+    entity_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> MemoryGraphEntityInspectOut:
+    entity = await db.get(MemoryEntity, entity_id)
+    if entity is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory graph entity not found")
+
+    svc = get_graph_memory_service()
+    try:
+        graph = await svc.open_entity_graph(db=db, user_id=entity.user_id, entity_id=entity_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory graph entity not found")
+
+    relation_entity_ids = {entity_id}
+    for rel in graph["relations"]:
+        relation_entity_ids.add(rel.from_entity_id)
+        relation_entity_ids.add(rel.to_entity_id)
+    entity_lookup = await _admin_load_entity_lookup(db, relation_entity_ids)
+    counts = await _admin_load_graph_counts(db, [entity_id])
+
+    return MemoryGraphEntityInspectOut(
+        entity=MemoryGraphEntityAdminOut(
+            id=entity.id,
+            user_id=entity.user_id,
+            name=entity.name,
+            entity_type=entity.entity_type,
+            aliases=entity.aliases_list,
+            confidence=entity.confidence,
+            is_active=entity.is_active,
+            relation_count=counts["relations"].get(entity.id, 0),
+            observation_count=counts["observations"].get(entity.id, 0),
+        ),
+        relations=[
+            MemoryGraphRelationAdminOut(
+                id=rel.id,
+                relation_type=rel.relation_type,
+                confidence=rel.confidence,
+                from_entity_id=rel.from_entity_id,
+                from_entity_name=entity_lookup[rel.from_entity_id].name,
+                to_entity_id=rel.to_entity_id,
+                to_entity_name=entity_lookup[rel.to_entity_id].name,
+                source_memory_id=rel.source_memory_id,
+                source_session_id=rel.source_session_id,
+                source_task_id=rel.source_task_id,
+            )
+            for rel in graph["relations"]
+        ],
+        observations=[
+            MemoryGraphObservationAdminOut(
+                id=obs.id,
+                content=obs.content,
+                observed_at=obs.observed_at,
+                confidence=obs.confidence,
+                is_active=obs.is_active,
+                source_memory_id=obs.source_memory_id,
+                source_session_id=obs.source_session_id,
+                source_task_id=obs.source_task_id,
+            )
+            for obs in graph["observations"]
+        ],
+    )
 
 
 @router.post("/push/test")
