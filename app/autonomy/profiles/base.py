@@ -39,6 +39,7 @@ class TaskExecutionProfile(ABC):
         *,
         db,
         user_id: int,
+        task_id: int,
         task_run_id: Optional[int],
     ) -> Dict[str, Any]:
         return {}
@@ -94,3 +95,14 @@ class TaskExecutionProfile(ABC):
         run_debug: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         return []
+
+    async def persist_run_records(
+        self,
+        *,
+        db,
+        task,
+        run,
+        final_markdown: str,
+        run_debug: Dict[str, Any],
+    ) -> None:
+        return None

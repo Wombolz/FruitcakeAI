@@ -822,6 +822,24 @@ class RSSItem(Base):
         return f"<RSSItem(source_id={self.source_id}, title='{self.title[:40]}')>"
 
 
+class RSSPublishedItem(Base):
+    """Per-task publication history for RSS Newspaper freshness control."""
+    __tablename__ = "rss_published_items"
+    __table_args__ = (
+        UniqueConstraint("task_run_id", "rss_item_id", name="uq_rss_published_items_run_item"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    task_run_id = Column(Integer, ForeignKey("task_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    rss_item_id = Column(Integer, ForeignKey("rss_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    url_canonical = Column(Text, nullable=False, index=True)
+    published_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    def __repr__(self):
+        return f"<RSSPublishedItem(task_id={self.task_id}, rss_item_id={self.rss_item_id})>"
+
+
 class RSSUserState(Base):
     """Per-user RSS cursor state for incremental listing flows."""
     __tablename__ = "rss_user_state"

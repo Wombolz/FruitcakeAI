@@ -19,11 +19,12 @@ from app.autonomy.profiles.news_magazine import (
     _drop_unlinked_item_blocks,
     _inject_missing_links_from_dataset,
     _inject_missing_links_from_dataset_with_report,
+    _select_edition_items,
     _trim_summary,
 )
 from app.autonomy.profiles.spec_loader import load_profile_spec_text
 from app.config import settings
-from app.db.models import RSSItem, RSSSource
+from app.db.models import RSSItem, RSSPublishedItem, RSSSource
 from tests.conftest import TestSessionLocal
 
 
@@ -69,6 +70,7 @@ async def test_build_magazine_dataset_dedupes_and_buckets_without_refresh():
         out = await build_magazine_dataset(
             db,
             user_id=1,
+            task_id=48,
             run_id=9001,
             refresh=False,
             window_hours=24,
@@ -175,6 +177,58 @@ def test_pick_balanced_items_applies_per_source_cap():
     assert by_source == {1: 3, 2: 3}
 
 
+@pytest.mark.asyncio
+async def test_build_magazine_dataset_marks_previously_published_items():
+    now = datetime.now(timezone.utc)
+    async with TestSessionLocal() as db:
+        src = RSSSource(
+            user_id=1,
+            name="Feed",
+            url="https://example.com/feed.xml",
+            url_canonical="https://example.com/feed.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(src)
+        await db.flush()
+        item = RSSItem(
+            source_id=src.id,
+            item_uid="item-1",
+            title="Story One",
+            link="https://example.com/story-1",
+            summary="Summary",
+            published_at=now,
+        )
+        db.add(item)
+        await db.flush()
+        db.add(
+            RSSPublishedItem(
+                task_id=48,
+                task_run_id=9000,
+                rss_item_id=item.id,
+                url_canonical="https://example.com/story-1",
+                published_at=now,
+            )
+        )
+        await db.commit()
+
+        out = await build_magazine_dataset(
+            db,
+            user_id=1,
+            task_id=48,
+            run_id=9001,
+            refresh=False,
+            window_hours=24,
+            max_items=20,
+        )
+
+    assert out["stats"]["previously_published_candidate_count"] == 1
+    assert out["stats"]["unseen_candidate_count"] == 0
+    assert out["items"][0]["previously_published"] is True
+
+
 def test_rss_newspaper_profile_loads_externalized_spec():
     spec = load_profile_spec_text("rss_newspaper")
     assert "Fruitcake News" in spec
@@ -201,6 +255,75 @@ def test_rss_newspaper_prompt_assembly_uses_externalized_spec():
 def test_profile_spec_loader_fails_clearly_for_missing_spec():
     with pytest.raises(FileNotFoundError, match="Profile spec file not found"):
         load_profile_spec_text("does_not_exist")
+
+
+def test_rss_newspaper_validate_finalize_rejects_section_label_as_headline():
+    profile = NewsMagazineExecutionProfile()
+    dataset = {
+        "run_id": 103,
+        "items": [
+            {
+                "article_id": 7,
+                "title": "Actual Story Title",
+                "url": "https://example.com/actual",
+                "source": "Example Wire",
+                "summary": "Actual summary.",
+                "published_at": "2026-03-19T12:00:00+00:00",
+                "section": "World",
+            }
+        ],
+    }
+    run_context = {
+        "dataset": dataset,
+        "dataset_prompt": "URL: https://example.com/actual\n",
+        "dataset_stats": {"unseen_candidate_count": 1, "previously_published_candidate_count": 0},
+    }
+    source = (
+        "## Top Stories\n"
+        "- **Headline:** World\n"
+        "**Source:** Example Wire\n"
+        "**Published at:** 2026-03-19T12:00:00+00:00\n"
+        "**Summary:** Actual summary.\n"
+        "[Read More](https://example.com/actual)\n"
+    )
+    cleaned, report = profile.validate_finalize(
+        result=source,
+        prior_full_outputs=[],
+        run_context=run_context,
+        is_final_step=True,
+    )
+    assert "Actual Story Title" in cleaned
+    assert "- **Headline:** World" not in cleaned
+    assert report is not None
+    assert report["published_items"][0]["title"] == "Actual Story Title"
+
+
+def test_select_edition_items_prefers_unseen_then_falls_back_to_reuse():
+    items = [
+        {
+            "article_id": 1,
+            "title": "Fresh Story",
+            "url": "https://example.com/fresh",
+            "published_at": "2026-03-24T12:00:00+00:00",
+            "section": "World",
+            "score": 0.9,
+            "previously_published": False,
+        },
+        {
+            "article_id": 2,
+            "title": "Reused Story",
+            "url": "https://example.com/reused",
+            "published_at": "2026-03-24T11:00:00+00:00",
+            "section": "Politics",
+            "score": 0.8,
+            "previously_published": True,
+        },
+    ]
+    selected, freshness = _select_edition_items(items, block_by_url={}, desired_count=2)
+    assert [item["title"] for item in selected] == ["Fresh Story", "Reused Story"]
+    assert freshness["selected_unseen_count"] == 1
+    assert freshness["selected_reused_count"] == 1
+    assert freshness["reuse_fallback_triggered"] is True
 
 
 def test_dedupe_output_by_url_keeps_first_item_per_url():

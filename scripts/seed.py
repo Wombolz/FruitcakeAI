@@ -18,7 +18,7 @@ from sqlalchemy import select
 # Make sure the project root is on the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from app.db.session import AsyncSessionLocal, engine, Base
+from app.db.session import AsyncSessionLocal
 from app.db.models import User
 from app.auth.jwt import hash_password
 
@@ -26,10 +26,6 @@ from app.auth.jwt import hash_password
 async def seed():
     config_path = Path(__file__).parent.parent / "config" / "users.yaml"
     users_config = yaml.safe_load(config_path.read_text())
-
-    # Ensure tables exist
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
 
     async with AsyncSessionLocal() as db:
         created = 0

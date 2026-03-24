@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.config import settings
-from app.db.session import engine, Base
+from app.db.session import engine
 from app.metrics import metrics
 
 log = structlog.get_logger(__name__)
@@ -24,12 +24,11 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
     log.info("FruitcakeAI v5 starting up", version=settings.app_version)
 
-    # Create all tables if they don't exist yet (Alembic handles production migrations)
+    # Keep startup schema-safe; Alembic owns table creation/migration.
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        await conn.run_sync(Base.metadata.create_all)
 
-    log.info("Database tables ready")
+    log.info("Database extension check complete")
 
     # Initialize RAG service (loads embedding model + connects to pgvector)
     from app.rag.service import get_rag_service

@@ -787,12 +787,20 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
 def _strip_html(text: str) -> str:
     if not text:
         return ""
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    # Avoid sending plain URLs/plain text through BeautifulSoup; it emits
+    # locator warnings and adds no value when there is no markup to parse.
+    if "<" not in stripped and ">" not in stripped:
+        return stripped
     try:
         from bs4 import BeautifulSoup
 
-        return BeautifulSoup(text, "html.parser").get_text(separator=" ").strip()
+        cleaned = BeautifulSoup(stripped, "html.parser").get_text(separator=" ").strip()
     except Exception:
-        return re.sub(r"<[^>]+>", " ", text).strip()
+        cleaned = re.sub(r"<[^>]+>", " ", stripped).strip()
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _meaningful_query_terms(query: str) -> List[str]:

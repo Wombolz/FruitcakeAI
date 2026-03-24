@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from datetime import timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,6 +16,7 @@ from app.autonomy.newspaper_export import export_newspaper_edition, normalize_ma
 
 from app.autonomy.profiles.base import TaskExecutionProfile
 from app.autonomy.profiles.spec_loader import load_profile_spec_text
+from app.db.models import RSSPublishedItem
 
 _MIN_EDITION_STORIES = 10
 _TARGET_EDITION_STORIES = 12
@@ -28,6 +30,7 @@ _SECTION_DISPLAY = {
 
 @dataclass
 class EditionStory:
+    rss_item_id: int
     title: str
     source: str
     published_at: str
@@ -36,6 +39,7 @@ class EditionStory:
     section: str
     tier: str
     from_model: bool
+    reused: bool
 
 
 @dataclass
@@ -49,6 +53,10 @@ class FinalizedEdition:
     section_count: int
     sections: List[str]
     auto_filled_story_count: int
+    selected_unseen_count: int
+    selected_reused_count: int
+    reuse_fallback_triggered: bool
+    published_items: List[Dict[str, Any]]
 
 
 class NewsMagazineExecutionProfile(TaskExecutionProfile):
@@ -86,6 +94,7 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
         *,
         db,
         user_id: int,
+        task_id: int,
         task_run_id: Optional[int],
     ) -> Dict[str, Any]:
         if not task_run_id:
@@ -93,6 +102,7 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
         dataset = await build_magazine_dataset(
             db,
             user_id=user_id,
+            task_id=task_id,
             run_id=task_run_id,
             refresh=True,
             window_hours=24,
@@ -178,8 +188,21 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
                     "section_count": edition.section_count,
                     "sections": edition.sections,
                     "auto_filled_story_count": edition.auto_filled_story_count,
+                    "selected_unseen_count": edition.selected_unseen_count,
+                    "selected_reused_count": edition.selected_reused_count,
+                    "reuse_fallback_triggered": edition.reuse_fallback_triggered,
                     "target_story_count": min(_TARGET_EDITION_STORIES, available_item_count),
                 },
+                "freshness": {
+                    "selected_unseen_count": edition.selected_unseen_count,
+                    "selected_reused_count": edition.selected_reused_count,
+                    "reuse_fallback_triggered": edition.reuse_fallback_triggered,
+                    "unseen_candidate_count": (run_context.get("dataset_stats") or {}).get("unseen_candidate_count", 0),
+                    "previously_published_candidate_count": (run_context.get("dataset_stats") or {}).get("previously_published_candidate_count", 0),
+                },
+                "published_items": [
+                    dict(item) for item in edition.published_items
+                ],
             }
         )
         if strict_report.get("invalid_urls"):
@@ -272,6 +295,37 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
                 "content_json": manifest,
             }
         ]
+
+    async def persist_run_records(
+        self,
+        *,
+        db,
+        task,
+        run,
+        final_markdown: str,
+        run_debug: Dict[str, Any],
+    ) -> None:
+        del final_markdown
+        grounding = run_debug.get("grounding_report")
+        if not isinstance(grounding, dict) or grounding.get("fatal"):
+            return
+        published_items = grounding.get("published_items") or []
+        for item in published_items:
+            if not isinstance(item, dict):
+                continue
+            rss_item_id = item.get("rss_item_id")
+            url_canonical = str(item.get("url_canonical") or "").strip()
+            if not rss_item_id or not url_canonical:
+                continue
+            db.add(
+                RSSPublishedItem(
+                    task_id=task.id,
+                    task_run_id=run.id,
+                    rss_item_id=int(rss_item_id),
+                    url_canonical=url_canonical,
+                    published_at=run.finished_at or datetime.now(timezone.utc),
+                )
+            )
 
 
 def _extract_urls(text: str) -> set[str]:
@@ -562,7 +616,11 @@ def _finalize_edition(text: str, *, dataset: Dict[str, Any]) -> FinalizedEdition
     if desired_count <= 0:
         desired_count = len(block_by_url)
 
-    selected_items = _select_edition_items(dataset_items, block_by_url=block_by_url, desired_count=desired_count)
+    selected_items, freshness = _select_edition_items(
+        dataset_items,
+        block_by_url=block_by_url,
+        desired_count=desired_count,
+    )
     stories = _build_edition_stories(selected_items, block_by_url=block_by_url)
     sections = []
     seen_sections = set()
@@ -584,6 +642,19 @@ def _finalize_edition(text: str, *, dataset: Dict[str, Any]) -> FinalizedEdition
         section_count=len({story.section for story in stories}),
         sections=sections,
         auto_filled_story_count=auto_filled_story_count,
+        selected_unseen_count=int(freshness["selected_unseen_count"]),
+        selected_reused_count=int(freshness["selected_reused_count"]),
+        reuse_fallback_triggered=bool(freshness["reuse_fallback_triggered"]),
+        published_items=[
+            {
+                "rss_item_id": story.rss_item_id,
+                "url_canonical": story.url,
+                "section": story.section,
+                "title": story.title,
+                "reused": story.reused,
+            }
+            for story in stories
+        ],
     )
 
 
@@ -648,13 +719,29 @@ def _select_edition_items(
     *,
     block_by_url: Dict[str, Dict[str, str]],
     desired_count: int,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, int | bool]]:
     if not dataset_items or desired_count <= 0:
-        return []
-    preferred_urls = list(block_by_url.keys())
-    preferred = [item for item in dataset_items if str(item.get("url") or "") in preferred_urls]
-    remaining = [item for item in dataset_items if str(item.get("url") or "") not in block_by_url]
-    ordered = preferred + remaining
+        return [], {"selected_unseen_count": 0, "selected_reused_count": 0, "reuse_fallback_triggered": False}
+
+    def _rank(item: Dict[str, Any]) -> tuple[int, float, str]:
+        model_bonus = 1 if str(item.get("url") or "") in block_by_url else 0
+        return (
+            model_bonus,
+            float(item.get("score") or 0.0),
+            str(item.get("published_at") or ""),
+        )
+
+    unseen_items = sorted(
+        [item for item in dataset_items if not item.get("previously_published")],
+        key=_rank,
+        reverse=True,
+    )
+    reused_items = sorted(
+        [item for item in dataset_items if item.get("previously_published")],
+        key=_rank,
+        reverse=True,
+    )
+    ordered = list(unseen_items)
 
     selected: List[Dict[str, Any]] = []
     selected_urls: set[str] = set()
@@ -709,7 +796,50 @@ def _select_edition_items(
         selected.append(item)
         selected_urls.add(url)
 
-    return selected[: min(desired_count, _MAX_EDITION_STORIES)]
+    reuse_fallback_triggered = False
+    if len(selected) < desired_count and reused_items:
+        reuse_fallback_triggered = True
+        ordered = reused_items
+        available_sections = {str(item.get("section") or "Other") for item in reused_items}
+        if section_goal:
+            section_priority = ["World", "Politics", "Business", "Tech", "Science", "Culture", "Other"]
+            remaining_sections = [section for section in section_priority if section in available_sections]
+            remaining_sections.extend(sorted(available_sections - set(remaining_sections)))
+            for section in remaining_sections:
+                if len(selected) >= desired_count:
+                    break
+                candidate = next(
+                    (
+                        item
+                        for item in ordered
+                        if str(item.get("section") or "Other") == section
+                        and str(item.get("url") or "")
+                        and str(item.get("url") or "") not in selected_urls
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    continue
+                url = str(candidate.get("url") or "")
+                selected.append(candidate)
+                selected_urls.add(url)
+        for item in ordered:
+            if len(selected) >= desired_count:
+                break
+            url = str(item.get("url") or "")
+            if not url or url in selected_urls:
+                continue
+            selected.append(item)
+            selected_urls.add(url)
+
+    selected = selected[: min(desired_count, _MAX_EDITION_STORIES)]
+    selected_unseen_count = sum(1 for item in selected if not item.get("previously_published"))
+    selected_reused_count = sum(1 for item in selected if item.get("previously_published"))
+    return selected, {
+        "selected_unseen_count": selected_unseen_count,
+        "selected_reused_count": selected_reused_count,
+        "reuse_fallback_triggered": reuse_fallback_triggered,
+    }
 
 
 def _build_edition_stories(
@@ -738,6 +868,7 @@ def _build_edition_stories(
         summary_limit = 260 if tier == "featured" else 180
         stories.append(
             EditionStory(
+                rss_item_id=int(item.get("article_id") or 0),
                 title=block_title if use_block_title else dataset_title,
                 source=block_source if use_block_source else dataset_source,
                 published_at=block_published if use_block_published else dataset_published,
@@ -746,6 +877,7 @@ def _build_edition_stories(
                 section=str(item.get("section") or "Other"),
                 tier=tier,
                 from_model=use_block_summary,
+                reused=bool(item.get("previously_published")),
             )
         )
     return stories
@@ -923,7 +1055,25 @@ def _extract_embedded_field(text: str, label: str) -> Optional[str]:
 
 
 def _looks_malformed_title(value: str) -> bool:
-    return (not value) or value.startswith("[Read More](") or value.startswith("**")
+    normalized = re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+    placeholders = {
+        "top stories",
+        "world",
+        "politics",
+        "business",
+        "tech",
+        "technology",
+        "science",
+        "culture",
+        "other",
+        "read next",
+    }
+    return (
+        (not value)
+        or value.startswith("[Read More](")
+        or value.startswith("**")
+        or normalized in placeholders
+    )
 
 
 def _looks_malformed_field(value: str) -> bool:

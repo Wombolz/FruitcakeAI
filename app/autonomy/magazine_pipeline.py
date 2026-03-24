@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import RSSItem, RSSSource
+from app.db.models import RSSItem, RSSPublishedItem, RSSSource
 from app.mcp.services import rss_sources
 
 _SECTION_ORDER = ["Top", "World", "Politics", "Tech", "Business", "Culture", "Science", "Other"]
@@ -166,6 +166,7 @@ async def build_magazine_dataset(
     db: AsyncSession,
     *,
     user_id: int,
+    task_id: int,
     run_id: int,
     refresh: bool = True,
     window_hours: int = 24,
@@ -197,9 +198,17 @@ async def build_magazine_dataset(
         )
     ).all()
 
+    published_rows = (
+        await db.execute(
+            select(RSSPublishedItem.url_canonical).where(RSSPublishedItem.task_id == task_id)
+        )
+    ).all()
+    previously_published_urls = {str(row[0]) for row in published_rows if row[0]}
+
     prepared: list[Dict[str, Any]] = []
     for item, source in rows:
         published_at = item.published_at or item.fetched_at
+        canonical_url = rss_sources.canonicalize_url(item.link or "") or (item.link or "")
         prepared.append(
             {
                 "article_id": item.id,
@@ -209,12 +218,14 @@ async def build_magazine_dataset(
                 "title": item.title,
                 "summary": (item.summary or "")[:420],
                 "url": item.link or "",
+                "url_canonical": canonical_url,
                 "published_at": published_at.isoformat() if published_at else "",
                 "score": _score_item(
                     published_at=published_at,
                     source_name=source.name,
                     title=item.title,
                 ),
+                "previously_published": canonical_url in previously_published_urls if canonical_url else False,
             }
         )
 
@@ -259,6 +270,7 @@ async def build_magazine_dataset(
     return {
         "schema_version": 1,
         "run_id": run_id,
+        "task_id": task_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "window_hours": window_hours,
         "refresh": {
@@ -272,6 +284,8 @@ async def build_magazine_dataset(
             "candidate_count": len(prepared),
             "selected_count": len(selected),
             "unique_url_count": len({i.get("url_canonical") for i in selected if i.get("url_canonical")}),
+            "previously_published_candidate_count": sum(1 for i in prepared if i.get("previously_published")),
+            "unseen_candidate_count": sum(1 for i in prepared if not i.get("previously_published")),
             "section_counts": dict(section_counts),
             "unique_sources_per_section": {k: len(v) for k, v in sources_by_section.items()},
             "per_source_cap": _PER_SOURCE_CAP,

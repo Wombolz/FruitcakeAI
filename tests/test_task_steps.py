@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import select
 
 from app.config import settings
-from app.db.models import AuditLog, ChatSession, RSSItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
+from app.db.models import AuditLog, ChatSession, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
 from app.autonomy.profiles.news_magazine import _ground_output
 from app.autonomy.runner import _format_result_for_inbox, _persist_run_artifacts
 from tests.conftest import TestSessionLocal
@@ -1092,7 +1092,13 @@ async def test_magazine_run_persists_dataset_and_grounding_artifacts(client):
             select(TaskRunArtifact).where(TaskRunArtifact.task_run_id == latest.id)
         )
         by_type = {a.artifact_type: a for a in artifacts.scalars().all()}
+        published = await db.execute(
+            select(RSSPublishedItem).where(RSSPublishedItem.task_id == task_id)
+        )
+        published_rows = published.scalars().all()
         assert "prepared_dataset" in by_type
         assert "final_output" in by_type
         assert "validation_report" in by_type
         assert "run_diagnostics" in by_type
+        assert len(published_rows) == 1
+        assert published_rows[0].url_canonical == "https://mag.example/story-1"

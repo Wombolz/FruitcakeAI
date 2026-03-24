@@ -8,6 +8,7 @@ from app.db.models import RSSItem, RSSSource
 from app.db.session import Base
 from app.mcp.servers.rss import _looks_like_placeholder_feed, _normalize_feed_url, call_tool, get_tools
 from app.mcp.services.rss_sources import (
+    _strip_html,
     get_recent_list_cursor,
     list_recent_items,
     search_cached_items,
@@ -54,6 +55,15 @@ def test_rss_server_exposes_new_tool_schemas():
     assert "refresh_rss_cache" in names
     assert "search_my_feeds" in names
     assert "list_recent_feed_items" in names
+
+
+def test_strip_html_returns_plain_url_without_parsing_warning_path():
+    url = "https://example.com/story"
+    assert _strip_html(url) == url
+
+
+def test_strip_html_still_extracts_text_from_markup():
+    assert _strip_html("<p>Hello <b>world</b></p>") == "Hello world"
 
 
 def test_search_my_feeds_schema_requires_non_empty_query():

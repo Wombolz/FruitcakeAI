@@ -478,6 +478,7 @@ class TaskRunner:
                 run_context = await task_profile.prepare_run_context(
                     db=db,
                     user_id=user_id,
+                    task_id=task_id,
                     task_run_id=task_run_id,
                 )
                 await db.commit()
@@ -1109,6 +1110,13 @@ async def _persist_run_artifacts(
                 final_markdown=final_markdown,
                 run_debug=run_debug,
             )
+        )
+        await profile.persist_run_records(
+            db=db,
+            task=task,
+            run=run,
+            final_markdown=final_markdown,
+            run_debug=run_debug,
         )
 
     # Replace previous artifacts for this run/type to keep data deterministic.
