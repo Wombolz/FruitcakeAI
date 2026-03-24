@@ -14,6 +14,8 @@ class TaskExecutionProfile(ABC):
         self,
         *,
         goal: str,
+        user_id: int,
+        task_id: int,
         task_instruction: str,
         max_steps: int,
         notes: str,
@@ -23,6 +25,8 @@ class TaskExecutionProfile(ABC):
     ) -> List[Dict[str, Any]]:
         return await default_planner(
             goal=goal,
+            user_id=user_id,
+            task_id=task_id,
             task_instruction=task_instruction,
             max_steps=max_steps,
             notes=notes,

@@ -704,6 +704,7 @@ async def _summarize_document(
     from app.config import settings
     from app.db.session import AsyncSessionLocal
     from app.db.models import Document
+    from app.llm_usage import record_llm_usage_event
     from sqlalchemy import select, text as sql_text
 
     # Max chunks to feed through map-reduce (keeps total LLM calls ≤ ~9)
@@ -798,6 +799,13 @@ async def _summarize_document(
             model=settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             **_litellm_kwargs(),
+        )
+        await record_llm_usage_event(
+            resp,
+            user_id=user_context.user_id,
+            source="tool_document_summary",
+            stage="tool_document_summary",
+            model=settings.llm_model,
         )
         return resp.choices[0].message.content.strip()
 

@@ -39,6 +39,7 @@ from app.auth.dependencies import get_current_user
 from app.config import settings
 from app.db.models import ChatMessage, ChatSession, User
 from app.db.session import get_db
+from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
 from app.memory.service import get_memory_service
 from app.skills.service import hydrate_user_context
@@ -357,8 +358,14 @@ async def send_message(
     else:
         metrics.inc_chat_complexity_simple_count()
 
+    usage_token = None
     try:
         record_token = reset_tool_execution_records()
+        usage_token = bind_llm_usage_context(
+            user_id=current_user.id,
+            session_id=session_id,
+            source="chat_rest",
+        )
         stage_started = time.perf_counter()
         reply = await _execute_chat_turn(
             execution_history,
@@ -382,6 +389,11 @@ async def send_message(
             restore_tool_execution_records(record_token)
         except Exception:
             pass
+        if usage_token is not None:
+            try:
+                reset_llm_usage_context(usage_token)
+            except Exception:
+                pass
 
     # Store assistant reply
     assistant_msg = ChatMessage(session_id=session_id, role="assistant", content=reply)
@@ -588,6 +600,11 @@ async def chat_websocket(
                         metrics.inc_chat_complexity_simple_count()
                     if effective_complex:
                         record_token = reset_tool_execution_records()
+                        usage_token = bind_llm_usage_context(
+                            user_id=current_user.id,
+                            session_id=session_id,
+                            source="chat_websocket",
+                        )
                         stage_started = time.perf_counter()
                         complete = await _execute_chat_turn(
                             execution_history,
@@ -609,6 +626,11 @@ async def chat_websocket(
                         complete = "".join(full_response)
                     else:
                         record_token = reset_tool_execution_records()
+                        usage_token = bind_llm_usage_context(
+                            user_id=current_user.id,
+                            session_id=session_id,
+                            source="chat_websocket",
+                        )
                         started = time.perf_counter()
                         async for token_chunk in stream_agent(
                             execution_history,
@@ -629,6 +651,7 @@ async def chat_websocket(
                             get_tool_execution_records(),
                         )
                     restore_tool_execution_records(record_token)
+                    reset_llm_usage_context(usage_token)
 
                     # Store assistant reply
                     assistant_msg = ChatMessage(

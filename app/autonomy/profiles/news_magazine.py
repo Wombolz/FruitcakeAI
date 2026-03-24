@@ -57,6 +57,8 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
         self,
         *,
         goal: str,
+        user_id: int,
+        task_id: int,
         task_instruction: str,
         max_steps: int,
         notes: str,

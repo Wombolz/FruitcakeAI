@@ -278,6 +278,32 @@ class AuditLog(Base):
         return f"<AuditLog(user_id={self.user_id}, tool='{self.tool}')>"
 
 
+class LLMUsageEvent(Base):
+    """Per-call LLM usage accounting for chats, tasks, planners, and tools."""
+    __tablename__ = "llm_usage_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="SET NULL"), index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="SET NULL"), index=True)
+    task_run_id = Column(Integer, ForeignKey("task_runs.id", ondelete="SET NULL"), index=True)
+
+    source = Column(String(50), nullable=False, index=True)
+    stage = Column(String(80), nullable=True, index=True)
+    model = Column(String(120), nullable=False)
+    provider = Column(String(50), nullable=True)
+
+    prompt_tokens = Column(Integer, nullable=False, default=0)
+    completion_tokens = Column(Integer, nullable=False, default=0)
+    total_tokens = Column(Integer, nullable=False, default=0)
+    estimated_cost_usd = Column(Float, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    def __repr__(self):
+        return f"<LLMUsageEvent(user_id={self.user_id}, source='{self.source}', model='{self.model}')>"
+
+
 # ---------------------------------------------------------------------------
 # Phase 4 models
 # ---------------------------------------------------------------------------

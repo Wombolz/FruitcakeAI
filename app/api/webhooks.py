@@ -27,6 +27,7 @@ from app.autonomy.model_routing import resolve_task_model_profile
 from app.auth.dependencies import get_current_user
 from app.db.models import ChatMessage, ChatSession, User, WebhookConfig
 from app.db.session import AsyncSessionLocal, get_db
+from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
 from app.skills.service import hydrate_user_context
 
@@ -240,6 +241,11 @@ async def _execute_webhook(webhook_id: int, payload: Dict[str, Any]) -> None:
     )
 
     fallback_used = False
+    usage_token = bind_llm_usage_context(
+        user_id=user_id,
+        session_id=session_id,
+        source="webhook_execution",
+    )
     try:
         try:
             metrics.inc_task_model_execution_small_calls()
@@ -270,6 +276,8 @@ async def _execute_webhook(webhook_id: int, payload: Dict[str, Any]) -> None:
             metrics.inc_task_model_fallback_failure_count()
         log.error("webhook.execution_failed", webhook_id=webhook_id, error=str(exc), exc_info=True)
         result = f"Webhook execution failed: {exc}"
+    finally:
+        reset_llm_usage_context(usage_token)
 
     # Persist execution transcript in the isolated session
     async with AsyncSessionLocal() as db:

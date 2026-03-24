@@ -15,6 +15,7 @@ import structlog
 from app.agent.context import UserContext
 from app.agent.tools import dispatch_tool_calls, get_tools_for_user
 from app.config import settings
+from app.llm_usage import record_llm_usage_event, stream_usage_enabled
 from app.metrics import metrics
 
 log = structlog.get_logger(__name__)
@@ -86,11 +87,15 @@ async def _stream_final_response(
     emitted = False
 
     try:
+        stream_kwargs: Dict[str, Any] = {}
+        if stream_usage_enabled():
+            stream_kwargs["stream_options"] = {"include_usage": True}
         response = await litellm.acompletion(
             model=selected_model,
             messages=_build_messages(history, user_context),
             stream=True,
             **extra,
+            **stream_kwargs,
         )
     except Exception as e:
         log.error(
@@ -102,7 +107,16 @@ async def _stream_final_response(
         )
         raise
 
+    stream_usage_recorded = False
     async for chunk in response:
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            await record_llm_usage_event(
+                chunk,
+                stage=f"{stage}_stream" if stage else "stream_final",
+                model=selected_model,
+            )
+            stream_usage_recorded = True
         choices = getattr(chunk, "choices", None) or []
         if not choices:
             continue
@@ -116,6 +130,13 @@ async def _stream_final_response(
     if not emitted:
         log.warning(
             "LLM streaming completed without token content",
+            model=selected_model,
+            mode="chat",
+            stage=stage,
+        )
+    if stream_usage_enabled() and not stream_usage_recorded:
+        log.info(
+            "LLM streaming usage not included in stream response",
             model=selected_model,
             mode="chat",
             stage=stage,
@@ -160,6 +181,7 @@ async def run_agent(
         except Exception as e:
             log.error("LLM call failed", error=str(e), model=selected_model, mode=mode, stage=stage)
             raise
+        await record_llm_usage_event(response, stage=stage, model=selected_model)
 
         message = response.choices[0].message
         finish_reason = response.choices[0].finish_reason
@@ -229,6 +251,11 @@ async def stream_agent(
                 stage=stage,
             )
             raise
+        await record_llm_usage_event(
+            response,
+            stage=f"{stage}_probe" if stage else "stream_probe",
+            model=selected_model,
+        )
 
         message = response.choices[0].message
 

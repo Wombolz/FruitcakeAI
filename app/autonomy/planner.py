@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.core import _litellm_kwargs
 from app.config import settings
 from app.db.models import Task, TaskStep
+from app.llm_usage import record_llm_usage_event
 from app.metrics import metrics
 from app.autonomy.profiles import resolve_task_profile
 
@@ -42,6 +43,8 @@ async def create_task_plan_for_user(
     profile = resolve_task_profile(task)
     steps = await profile.plan_steps(
         goal=resolved_goal,
+        user_id=user_id,
+        task_id=task_id,
         task_instruction=task.instruction,
         max_steps=bounded_steps,
         notes=notes.strip(),
@@ -85,6 +88,8 @@ async def create_task_plan_for_user(
 async def _generate_plan_steps(
     *,
     goal: str,
+    user_id: int,
+    task_id: int,
     task_instruction: str,
     max_steps: int,
     notes: str,
@@ -117,6 +122,14 @@ async def _generate_plan_steps(
             tools=None,
             tool_choice=None,
             **_litellm_kwargs(),
+        )
+        await record_llm_usage_event(
+            resp,
+            user_id=user_id,
+            task_id=task_id,
+            source="task_planner",
+            stage="task_planner",
+            model=selected_model,
         )
         raw = (resp.choices[0].message.content or "").strip()
         parsed = json.loads(raw)
@@ -159,4 +172,3 @@ def _fallback_steps(goal: str, task_instruction: str, max_steps: int) -> List[Di
         {"title": "Summarize result", "instruction": "Provide a concise final summary and next actions.", "requires_approval": False},
     ]
     return steps[:max_steps]
-

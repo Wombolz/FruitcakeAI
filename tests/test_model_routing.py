@@ -70,6 +70,8 @@ async def test_generate_plan_steps_prefers_large_model_when_enabled(monkeypatch)
     with patch("app.autonomy.planner.litellm.acompletion", new=AsyncMock(return_value=fake_resp)) as mocked:
         rows = await _generate_plan_steps(
             goal="G",
+            user_id=1,
+            task_id=1,
             task_instruction="I",
             max_steps=3,
             notes="",

@@ -32,6 +32,7 @@ from app.autonomy.profiles import resolve_task_profile, resolve_task_profile_by_
 from app.autonomy.scheduler import compute_next_run_at
 from app.config import settings
 from app.db.models import Task, TaskRun, TaskRunArtifact, TaskStep
+from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
 
 log = structlog.get_logger(__name__)
@@ -396,6 +397,13 @@ class TaskRunner:
 
         arm_approval = task_requires_approval and not pre_approved
         token = _approval_armed.set(arm_approval)
+        usage_token = bind_llm_usage_context(
+            user_id=task_user_id,
+            session_id=session_id,
+            task_id=task_id,
+            task_run_id=task_run_id,
+            source="task_runner",
+        )
         try:
             result = await run_agent(
                 [{"role": "user", "content": "\n\n".join(parts)}],
@@ -421,6 +429,7 @@ class TaskRunner:
                 await svc.mark_accessed(sorted(recalled_memory_ids), mode="task_materialized")
             return result, run_debug
         finally:
+            reset_llm_usage_context(usage_token)
             _approval_armed.reset(token)
 
     @staticmethod
@@ -586,6 +595,8 @@ class TaskRunner:
                 result = await self._run_step_with_model_policy(
                     prompt="\n\n".join(prompt_parts),
                     user_context=step_context,
+                    task_id=task_id,
+                    task_run_id=task_run_id,
                     primary_model=primary_model,
                     final_model=model_profile.final_synthesis_model,
                     stage=stage,
@@ -694,6 +705,8 @@ class TaskRunner:
         *,
         prompt: str,
         user_context,
+        task_id: int,
+        task_run_id: int | None,
         primary_model: str,
         final_model: str,
         stage: str,
@@ -722,13 +735,23 @@ class TaskRunner:
                 used_fallback = True
 
             try:
-                result = await run_agent(
-                    [{"role": "user", "content": prompt}],
-                    user_context,
-                    mode="task",
-                    model_override=model,
-                    stage=stage,
+                usage_token = bind_llm_usage_context(
+                    user_id=user_context.user_id,
+                    session_id=getattr(user_context, "session_id", None),
+                    task_id=task_id,
+                    task_run_id=task_run_id,
+                    source="task_runner",
                 )
+                try:
+                    result = await run_agent(
+                        [{"role": "user", "content": prompt}],
+                        user_context,
+                        mode="task",
+                        model_override=model,
+                        stage=stage,
+                    )
+                finally:
+                    reset_llm_usage_context(usage_token)
                 if not (result or "").strip():
                     raise ValueError("Empty model output")
                 if used_fallback:
