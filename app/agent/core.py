@@ -57,15 +57,22 @@ def _normalize_tool_calls(message: Dict[str, Any]) -> Dict[str, Any]:
     return {**message, "tool_calls": fixed}
 
 
-def _litellm_kwargs() -> Dict[str, Any]:
-    """Build extra kwargs for litellm based on the configured backend."""
+def _normalized_local_api_base() -> str:
+    base = settings.local_api_base.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base
+
+
+def _litellm_kwargs(model: str | None = None) -> Dict[str, Any]:
+    """Build extra kwargs for litellm based on the selected model/provider."""
     kwargs: Dict[str, Any] = {}
+    selected_model = str(model or settings.llm_model or "")
+    if selected_model.startswith(("ollama/", "ollama_chat/")):
+        kwargs["api_base"] = _normalized_local_api_base()
+        return kwargs
     if settings.llm_backend in ("ollama", "openai_compat"):
-        # Strip /v1 suffix — LiteLLM adds the correct path itself
-        base = settings.local_api_base.rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-        kwargs["api_base"] = base
+        kwargs["api_base"] = _normalized_local_api_base()
     return kwargs
 
 
@@ -83,7 +90,7 @@ async def _stream_final_response(
     loop after the non-streaming probe determined the turn is a plain text
     response.
     """
-    extra = _litellm_kwargs()
+    extra = _litellm_kwargs(selected_model)
     emitted = False
 
     try:
@@ -166,8 +173,8 @@ async def run_agent(
     tools = get_tools_for_user(user_context)
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
-    extra = _litellm_kwargs()
     selected_model = model_override or settings.llm_model
+    extra = _litellm_kwargs(selected_model)
 
     for turn in range(max_turns):
         try:
@@ -228,8 +235,8 @@ async def stream_agent(
     tools = get_tools_for_user(user_context)
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
-    extra = _litellm_kwargs()
     selected_model = model_override or settings.llm_model
+    extra = _litellm_kwargs(selected_model)
 
     for turn in range(max_turns):
         # Probe turn non-streaming so intermediate tool turns stay internal.
