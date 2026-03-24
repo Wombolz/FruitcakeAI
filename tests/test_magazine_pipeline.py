@@ -21,6 +21,7 @@ from app.autonomy.profiles.news_magazine import (
     _inject_missing_links_from_dataset_with_report,
     _trim_summary,
 )
+from app.autonomy.profiles.spec_loader import load_profile_spec_text
 from app.config import settings
 from app.db.models import RSSItem, RSSSource
 from tests.conftest import TestSessionLocal
@@ -172,6 +173,34 @@ def test_pick_balanced_items_applies_per_source_cap():
     for item in picked:
         by_source[item["source_id"]] = by_source.get(item["source_id"], 0) + 1
     assert by_source == {1: 3, 2: 3}
+
+
+def test_rss_newspaper_profile_loads_externalized_spec():
+    spec = load_profile_spec_text("rss_newspaper")
+    assert "Fruitcake News" in spec
+    assert "prepared dataset" in spec
+    assert "[Read More](FULL_URL)" in spec
+
+
+def test_rss_newspaper_prompt_assembly_uses_externalized_spec():
+    profile = NewsMagazineExecutionProfile()
+    prompt_parts: list[str] = []
+
+    profile.augment_prompt(
+        prompt_parts=prompt_parts,
+        run_context={"dataset_prompt": "Story A https://example.com/a"},
+        is_final_step=False,
+    )
+
+    joined = "\n".join(prompt_parts)
+    assert "Fruitcake News" in joined
+    assert "prepared dataset" in joined
+    assert "Prepared dataset (authoritative source list):" in joined
+
+
+def test_profile_spec_loader_fails_clearly_for_missing_spec():
+    with pytest.raises(FileNotFoundError, match="Profile spec file not found"):
+        load_profile_spec_text("does_not_exist")
 
 
 def test_dedupe_output_by_url_keeps_first_item_per_url():

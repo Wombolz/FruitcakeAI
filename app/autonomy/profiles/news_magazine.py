@@ -14,6 +14,7 @@ from app.autonomy.magazine_pipeline import (
 from app.autonomy.newspaper_export import export_newspaper_edition, normalize_magazine_markdown
 
 from app.autonomy.profiles.base import TaskExecutionProfile
+from app.autonomy.profiles.spec_loader import load_profile_spec_text
 
 _MIN_EDITION_STORIES = 10
 _TARGET_EDITION_STORIES = 12
@@ -124,29 +125,7 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
         run_context: Dict[str, Any],
         is_final_step: bool,
     ) -> None:
-        prompt_parts.append(
-            "News magazine profile policy: use only prepared dataset content; do not call retrieval tools."
-        )
-        prompt_parts.append(
-            "Never call any library/memory tools for this task "
-            "(search_library, summarize_document, create_memory)."
-        )
-        prompt_parts.append(
-            "Formatting contract: every article entry MUST include a direct markdown link line "
-            "in this exact form: [Read More](FULL_URL). "
-            "If an item lacks a valid URL from dataset, omit that item."
-        )
-        prompt_parts.append(
-            "If you cannot provide a valid dataset URL for an item, omit that item."
-        )
-        prompt_parts.append(
-            "Edition contract: produce a publishable hourly newspaper branded as Fruitcake News "
-            "with 10 to 14 linked stories when enough dataset items are available."
-        )
-        prompt_parts.append(
-            "Story structure: 2 to 3 featured stories in Top Stories, then concise briefs across "
-            "multiple sections. Keep summaries short and concrete."
-        )
+        prompt_parts.append(load_profile_spec_text(self.name))
         prepared = (run_context.get("dataset_prompt") or "").strip()
         if prepared:
             prompt_parts.append(f"Prepared dataset (authoritative source list):\n{prepared[:18000]}")
