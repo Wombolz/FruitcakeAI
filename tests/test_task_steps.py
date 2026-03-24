@@ -84,7 +84,7 @@ async def test_magazine_plan_uses_deterministic_steps_without_approval(client):
         json={
             "title": "Daily News Magazine",
             "instruction": "Create a daily magazine from prepared data",
-            "profile": "news_magazine",
+            "profile": "rss_newspaper",
         },
         headers=headers,
     )
@@ -521,12 +521,12 @@ async def test_create_and_patch_task_profile_validation(client):
         json={
             "title": "Magazine",
             "instruction": "Build periodic magazine",
-            "profile": "news_magazine",
+            "profile": "rss_newspaper",
         },
         headers=headers,
     )
     assert created.status_code == 201
-    assert created.json()["profile"] == "news_magazine"
+    assert created.json()["profile"] == "rss_newspaper"
 
     patch = await client.patch(
         f"/tasks/{created.json()['id']}",
@@ -554,7 +554,7 @@ async def test_admin_task_run_inspect_returns_ordered_payloads_and_diagnostics(c
         json={
             "title": "Inspect me",
             "instruction": "Build debug payload",
-            "profile": "news_magazine",
+            "profile": "rss_newspaper",
         },
         headers=owner_headers,
     )
@@ -637,7 +637,7 @@ async def test_admin_task_run_inspect_returns_ordered_payloads_and_diagnostics(c
     assert payload["run"]["id"] == run_id
     assert payload["run"]["duration_seconds"] == 300.0
     assert payload["task"]["id"] == task_id
-    assert payload["task"]["profile"] == "news_magazine"
+    assert payload["task"]["profile"] == "rss_newspaper"
     assert payload["execution"]["active_skills"] == ["rss-grounded-briefing"]
     assert payload["execution"]["refresh_stats"] == {"sources_refreshed": 9}
     assert [row["tool"] for row in payload["tool_timeline"]] == [
@@ -705,7 +705,7 @@ async def test_admin_task_run_edition_pdf_download_returns_file(client, tmp_path
 
     task_resp = await client.post(
         "/tasks",
-        json={"title": "Edition download", "instruction": "Publish magazine", "profile": "news_magazine"},
+        json={"title": "Edition download", "instruction": "Publish magazine", "profile": "rss_newspaper"},
         headers=owner_headers,
     )
     task_id = task_resp.json()["id"]
@@ -749,7 +749,7 @@ async def test_persist_run_artifacts_exports_full_news_magazine_edition(tmp_path
             user_id=1,
             title="Hourly paper",
             instruction="Publish hourly paper",
-            profile="news_magazine",
+            profile="rss_newspaper",
             status="completed",
         )
         db.add(task)
@@ -775,7 +775,7 @@ async def test_persist_run_artifacts_exports_full_news_magazine_edition(tmp_path
             "[Read More](https://example.com/one)\n"
         )
         run_debug = {
-            "profile": "news_magazine",
+            "profile": "rss_newspaper",
             "grounding_report": {"publish_mode": "partial", "fatal": False},
             "dataset_stats": {"selected_count": 100},
             "refresh_stats": {"sources_refreshed": 137},
@@ -1025,7 +1025,7 @@ async def test_magazine_run_persists_dataset_and_grounding_artifacts(client):
         json={
             "title": "Daily News Magazine",
             "instruction": "Build a daily news magazine from prepared sources",
-            "profile": "news_magazine",
+            "profile": "rss_newspaper",
             "task_type": "one_shot",
             "deliver": False,
         },

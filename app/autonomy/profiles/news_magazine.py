@@ -51,7 +51,7 @@ class FinalizedEdition:
 
 
 class NewsMagazineExecutionProfile(TaskExecutionProfile):
-    name = "news_magazine"
+    name = "rss_newspaper"
 
     async def plan_steps(
         self,

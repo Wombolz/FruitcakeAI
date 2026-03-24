@@ -621,7 +621,7 @@ class TaskRunner:
             except Exception as exc:
                 _approval_armed.reset(token)
                 if (
-                    getattr(task_profile, "name", "default") == "news_magazine"
+                    getattr(task_profile, "name", "default") == "rss_newspaper"
                     and not is_final_step
                     and _is_suppressed_tool_failure_error(exc)
                 ):

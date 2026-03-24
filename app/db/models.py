@@ -461,7 +461,7 @@ class Task(Base):
     instruction = Column(Text, nullable=False)  # natural language prompt for the agent
     # Optional per-task persona override/resolution target.
     persona = Column(String(100), nullable=True)
-    # Optional task execution profile (default, news_magazine)
+    # Optional task execution profile (default, rss_newspaper)
     profile = Column(String(50), nullable=True)
 
     # "one_shot" | "recurring"
