@@ -263,8 +263,8 @@ FruitcakeAI/
 | [Adding MCP Tools](Docs/ADDING_MCP_TOOLS.md) | How to extend the system with new tools |
 | [Persona System](Docs/PERSONA_SYSTEM.md) | Configuring users, roles, and personas |
 | [LLM Backends](Docs/LLM_BACKENDS.md) | Switching between Ollama, Claude, OpenAI |
-| [Roadmap](Docs/FruitcakeAi%20Roadmap.md) | Where development is now and where it's going |
-| [Repo Realignment Runbook](Docs/repo_realignment_runbook.md) | Release-prep rename, rollback, and validation checklist |
+| [RSS Newspaper Example](Docs/RSS_Newspaper_Example.md) | Example of a structured built-in task profile |
+| [Pre-Alpha Troubleshooting](Docs/PreAlpha_Troubleshooting.md) | Common install and recovery fixes |
 
 ---
 

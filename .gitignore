@@ -54,6 +54,7 @@ htmlcov/
 .DS_Store
 .claude/
 Docs/_internal_soak/
+Docs/_internal/
 
 # IDE
 .vscode/

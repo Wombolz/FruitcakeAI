@@ -4,8 +4,6 @@
 
 **Audience**: Contributors, adopters, anyone asking "why is it built this way?"  
 **Last Updated**: March 2026  
-**Roadmap**: [FruitcakeAI Roadmap](FruitcakeAi Roadmap.md)
-
 ---
 
 ## The Mental Model
@@ -166,10 +164,10 @@ What you add, and why, is up to you.
 ## Further Reading
 
 - [README](../README.md) — what's shipped and how to run it
-- [Roadmap](FruitcakeAi Roadmap.md) — where development is now and where it's going
 - [Adding MCP Tools](ADDING_MCP_TOOLS.md) — how to extend the system
 - [Persona System](PERSONA_SYSTEM.md) — configuring users, roles, and access
 - [LLM Backends](LLM_BACKENDS.md) — switching between Ollama, Claude, OpenAI
+- [RSS Newspaper Example](RSS_Newspaper_Example.md) — example of a structured built-in task profile
 
 ---
 
