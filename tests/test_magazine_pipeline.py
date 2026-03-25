@@ -229,6 +229,75 @@ async def test_build_magazine_dataset_marks_previously_published_items():
     assert out["items"][0]["previously_published"] is True
 
 
+@pytest.mark.asyncio
+async def test_build_magazine_dataset_penalizes_same_source_similar_title_repeat():
+    now = datetime.now(timezone.utc)
+    async with TestSessionLocal() as db:
+        src = RSSSource(
+            user_id=1,
+            name="Reuters",
+            url="https://example.com/reuters.xml",
+            url_canonical="https://example.com/reuters.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(src)
+        await db.flush()
+        old_item = RSSItem(
+            source_id=src.id,
+            item_uid="old-1",
+            title="OpenAI changes checkout plans in ChatGPT shopping push",
+            link="https://example.com/story-old",
+            summary="Old summary",
+            published_at=now - timedelta(days=2),
+            first_seen_at=now - timedelta(days=2),
+            last_seen_at=now - timedelta(days=2),
+            fetched_at=now - timedelta(days=2),
+        )
+        new_item = RSSItem(
+            source_id=src.id,
+            item_uid="new-1",
+            title="OpenAI changes checkout plans in ChatGPT shopping initiative",
+            link="https://example.com/story-new",
+            summary="New summary",
+            published_at=now,
+            first_seen_at=now - timedelta(days=3),
+            last_seen_at=now,
+            fetched_at=now,
+        )
+        db.add_all([old_item, new_item])
+        await db.flush()
+        db.add(
+            RSSPublishedItem(
+                task_id=48,
+                task_run_id=9000,
+                rss_item_id=old_item.id,
+                url_canonical="https://example.com/story-old",
+                published_at=now - timedelta(days=2),
+            )
+        )
+        await db.commit()
+
+        out = await build_magazine_dataset(
+            db,
+            user_id=1,
+            task_id=48,
+            run_id=9001,
+            refresh=False,
+            window_hours=96,
+            max_items=20,
+        )
+
+    repeated = next(item for item in out["items"] if item["url"] == "https://example.com/story-new")
+    assert repeated["looks_like_repeat"] is True
+    assert repeated["similar_repeat_penalty"] > 0
+    assert repeated["resurfaced_penalty"] > 0
+    assert out["stats"]["similar_repeat_candidate_count"] >= 1
+    assert out["stats"]["resurfaced_candidate_count"] >= 1
+
+
 def test_rss_newspaper_profile_loads_externalized_spec():
     spec = load_profile_spec_text("rss_newspaper")
     assert "Fruitcake News" in spec
@@ -296,6 +365,45 @@ def test_rss_newspaper_validate_finalize_rejects_section_label_as_headline():
     assert "- **Headline:** World" not in cleaned
     assert report is not None
     assert report["published_items"][0]["title"] == "Actual Story Title"
+
+
+def test_rss_newspaper_validate_finalize_falls_back_from_polluted_published_field():
+    profile = NewsMagazineExecutionProfile()
+    dataset = {
+        "run_id": 104,
+        "items": [
+            {
+                "article_id": 8,
+                "title": "OpenAI changes checkout plans",
+                "url": "https://example.com/openai",
+                "source": "TechCrunch",
+                "summary": "Checkout is being deprioritized.",
+                "published_at": "2026-03-24T19:27:56+00:00",
+                "section": "Tech",
+            }
+        ],
+    }
+    run_context = {
+        "dataset": dataset,
+        "dataset_prompt": "URL: https://example.com/openai\n",
+        "dataset_stats": {"unseen_candidate_count": 1, "previously_published_candidate_count": 0},
+    }
+    source = (
+        "## Top Stories\n"
+        "- **Headline:** OpenAI's plans to make ChatGPT more like Amazon aren't going so well\n"
+        "**Source:** TechCrunch\n"
+        "**Published at:** 2026-03-24T19:27:56+00:00_ OpenAI is moving away from Instant Checkout. 2. **Another story**\n"
+        "**Summary:** Checkout is being deprioritized.\n"
+        "[Read More](https://example.com/openai)\n"
+    )
+    cleaned, _ = profile.validate_finalize(
+        result=source,
+        prior_full_outputs=[],
+        run_context=run_context,
+        is_final_step=True,
+    )
+    assert "**Published at:** 2026-03-24T19:27:56+00:00" in cleaned
+    assert "Instant Checkout" not in cleaned.split("**Published at:**", 1)[1].split("**Summary:**", 1)[0]
 
 
 def test_select_edition_items_prefers_unseen_then_falls_back_to_reuse():

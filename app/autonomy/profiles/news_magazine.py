@@ -697,7 +697,7 @@ def _parse_story_blocks(text: str) -> List[Dict[str, str]]:
         embedded_published = _extract_embedded_field(raw_summary, "Published")
         title = _sanitize_title(title or embedded_title or "")
         source = _sanitize_field(source)
-        published_at = _sanitize_field(published_at or embedded_published or "")
+        published_at = _sanitize_published_at(published_at or embedded_published or "")
         summary = _sanitize_summary(raw_summary)
         if (not title or title.startswith("[Read More](")) and embedded_title:
             title = _sanitize_title(embedded_title)
@@ -854,11 +854,11 @@ def _build_edition_stories(
         tier = "featured" if idx < _FEATURED_STORY_COUNT else "brief"
         dataset_title = str(item.get("title") or "").strip()
         dataset_source = str(item.get("source") or "").strip()
-        dataset_published = str(item.get("published_at") or "").strip()
+        dataset_published = _sanitize_published_at(str(item.get("published_at") or "").strip())
         dataset_summary = str(item.get("summary") or "").strip()
         block_title = _sanitize_title(str(block.get("title") or ""))
         block_source = _sanitize_field(str(block.get("source") or ""))
-        block_published = _sanitize_field(str(block.get("published_at") or ""))
+        block_published = _sanitize_published_at(str(block.get("published_at") or ""))
         block_summary = _sanitize_summary(str(block.get("summary") or ""))
         use_block_title = bool(block_title) and not _looks_malformed_title(block_title)
         use_block_source = bool(block_source) and not _looks_malformed_field(block_source)
@@ -919,7 +919,7 @@ def _render_edition_markdown(stories: List[EditionStory], *, editor_note: str) -
 def _render_story_block(story: EditionStory) -> List[str]:
     title = _sanitize_title(story.title)
     source = _sanitize_field(story.source)
-    published_at = _sanitize_field(story.published_at)
+    published_at = _sanitize_published_at(story.published_at)
     summary = _sanitize_summary(story.summary)
     return [
         f"- **Headline:** {title}",
@@ -1042,6 +1042,22 @@ def _sanitize_summary(value: str) -> str:
             ).strip()
     text = re.sub(r"\s*---\s*", " ", text)
     return _sanitize_field(re.sub(r"\s+", " ", text).strip())
+
+
+def _sanitize_published_at(value: str) -> str:
+    text = _sanitize_field(value)
+    if not text:
+        return ""
+    iso_match = re.search(
+        r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b",
+        text,
+    )
+    if iso_match:
+        return iso_match.group(0)
+    date_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+    if date_match:
+        return date_match.group(0)
+    return ""
 
 
 def _extract_embedded_field(text: str, label: str) -> Optional[str]:

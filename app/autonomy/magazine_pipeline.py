@@ -4,6 +4,7 @@ import json
 import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import difflib
 from typing import Any, Dict, List
 
 from sqlalchemy import select
@@ -15,6 +16,7 @@ from app.mcp.services import rss_sources
 _SECTION_ORDER = ["Top", "World", "Politics", "Tech", "Business", "Culture", "Science", "Other"]
 _TOP_COUNT = 8
 _PER_SOURCE_CAP = 3
+_SIMILAR_REPEAT_THRESHOLD = 0.80
 _SECTION_MINIMUMS: Dict[str, int] = {
     "World": 4,
     "Politics": 3,
@@ -42,6 +44,20 @@ def _score_item(*, published_at: datetime | None, source_name: str, title: str) 
 
     title_bias = 0.05 if len((title or "").split()) > 4 else 0.0
     return round(recency + source_bias + title_bias, 4)
+
+
+def _normalize_title(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (value or "").lower())).strip()
+
+
+def _title_similarity(left: str, right: str) -> float:
+    a = _normalize_title(left)
+    b = _normalize_title(right)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    return difflib.SequenceMatcher(a=a, b=b).ratio()
 
 
 def _choose_section(title: str, summary: str, source_name: str, source_category: str | None = None) -> str:
@@ -204,11 +220,44 @@ async def build_magazine_dataset(
         )
     ).all()
     previously_published_urls = {str(row[0]) for row in published_rows if row[0]}
+    historical_rows = (
+        await db.execute(
+            select(RSSItem.title, RSSSource.name)
+            .join(RSSPublishedItem, RSSPublishedItem.rss_item_id == RSSItem.id)
+            .join(RSSSource, RSSSource.id == RSSItem.source_id)
+            .where(RSSPublishedItem.task_id == task_id)
+        )
+    ).all()
+    historical_titles_by_source: dict[str, list[str]] = {}
+    for title, source_name in historical_rows:
+        source_key = str(source_name or "").strip().lower()
+        if not source_key or not title:
+            continue
+        historical_titles_by_source.setdefault(source_key, []).append(str(title))
 
     prepared: list[Dict[str, Any]] = []
     for item, source in rows:
         published_at = item.published_at or item.fetched_at
         canonical_url = rss_sources.canonicalize_url(item.link or "") or (item.link or "")
+        base_score = _score_item(
+            published_at=published_at,
+            source_name=source.name,
+            title=item.title,
+        )
+        historical_titles = historical_titles_by_source.get((source.name or "").strip().lower(), [])
+        title_repeat_similarity = max((_title_similarity(item.title, old) for old in historical_titles), default=0.0)
+        resurfaced_penalty = 0.0
+        similar_repeat_penalty = 0.0
+        if title_repeat_similarity >= _SIMILAR_REPEAT_THRESHOLD:
+            similar_repeat_penalty = 0.75
+        if item.first_seen_at and published_at:
+            first_seen = item.first_seen_at if item.first_seen_at.tzinfo else item.first_seen_at.replace(tzinfo=timezone.utc)
+            published_dt = published_at if published_at.tzinfo else published_at.replace(tzinfo=timezone.utc)
+            age_since_first_seen_hours = max(0.0, (datetime.now(timezone.utc) - first_seen).total_seconds() / 3600.0)
+            freshness_lag_hours = max(0.0, (published_dt - first_seen).total_seconds() / 3600.0)
+            if age_since_first_seen_hours >= 48.0 and freshness_lag_hours >= 24.0:
+                resurfaced_penalty = 0.25
+        final_score = round(max(0.0, base_score - similar_repeat_penalty - resurfaced_penalty), 4)
         prepared.append(
             {
                 "article_id": item.id,
@@ -220,11 +269,13 @@ async def build_magazine_dataset(
                 "url": item.link or "",
                 "url_canonical": canonical_url,
                 "published_at": published_at.isoformat() if published_at else "",
-                "score": _score_item(
-                    published_at=published_at,
-                    source_name=source.name,
-                    title=item.title,
-                ),
+                "first_seen_at": item.first_seen_at.isoformat() if item.first_seen_at else "",
+                "score": final_score,
+                "base_score": base_score,
+                "similar_repeat_penalty": similar_repeat_penalty,
+                "resurfaced_penalty": resurfaced_penalty,
+                "title_repeat_similarity": round(title_repeat_similarity, 3),
+                "looks_like_repeat": title_repeat_similarity >= _SIMILAR_REPEAT_THRESHOLD,
                 "previously_published": canonical_url in previously_published_urls if canonical_url else False,
             }
         )
@@ -286,6 +337,8 @@ async def build_magazine_dataset(
             "unique_url_count": len({i.get("url_canonical") for i in selected if i.get("url_canonical")}),
             "previously_published_candidate_count": sum(1 for i in prepared if i.get("previously_published")),
             "unseen_candidate_count": sum(1 for i in prepared if not i.get("previously_published")),
+            "similar_repeat_candidate_count": sum(1 for i in prepared if i.get("looks_like_repeat")),
+            "resurfaced_candidate_count": sum(1 for i in prepared if float(i.get("resurfaced_penalty") or 0) > 0),
             "section_counts": dict(section_counts),
             "unique_sources_per_section": {k: len(v) for k, v in sources_by_section.items()},
             "per_source_cap": _PER_SOURCE_CAP,
