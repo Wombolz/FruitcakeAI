@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from sqlalchemy import and_, desc, or_, select
 
 from app.autonomy.magazine_pipeline import build_magazine_dataset
 from app.autonomy.profiles.base import TaskExecutionProfile
 from app.autonomy.profiles.spec_loader import load_profile_spec_text
-from app.db.models import MemoryProposal, RSSPublishedItem, Task
+from app.db.models import Memory, MemoryProposal, RSSPublishedItem, Task
 from app.mcp.services import rss_sources
 
 _NOTHING_NEW = "NOTHING_NEW"
@@ -44,6 +46,20 @@ _THEME_KEYWORDS = {
     "nuclear developments": {"enrichment", "nuclear", "uranium"},
     "sanctions and economic pressure": {"sanction", "sanctions"},
     "government and leadership changes": {"minister", "president"},
+}
+_TOPIC_MEMORY_WINDOW_DAYS = 30
+_TOPIC_MEMORY_MAX_ITEMS = 8
+_TOPIC_MEMORY_SUMMARY_MAX_BULLETS = 6
+_TOPIC_MEMORY_SUMMARY_MAX_CHARS = 1200
+_TOPIC_ALIAS_MAP = {
+    "iran": {"iran", "iranian", "tehran"},
+    "israel": {"israel", "israeli", "jerusalem"},
+    "gaza": {"gaza", "gazan"},
+    "ukraine": {"ukraine", "ukrainian", "kyiv", "kiev"},
+    "russia": {"russia", "russian", "moscow", "kremlin"},
+    "china": {"china", "chinese", "beijing"},
+    "taiwan": {"taiwan", "taiwanese", "taipei"},
+    "syria": {"syria", "syrian", "damascus"},
 }
 
 
@@ -104,11 +120,26 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             ]
             if not items and before:
                 warnings.append("Configured sources filter excluded all prepared RSS items.")
+        topic = str(config.get("topic") or "")
+        topic_filtered_items, topic_match_stats = _filter_topic_items(
+            items,
+            topic=topic,
+            threshold=threshold,
+        )
+        if items and not topic_filtered_items:
+            warnings.append("Prepared RSS dataset contained no strong topical matches for this watcher.")
+        items = topic_filtered_items
         source_inventory = _build_source_inventory(effective_sources, source_filters)
         if not source_inventory["active_sources"]:
             warnings.append("No active RSS sources are currently configured for this watcher.")
         if source_filters and not source_inventory["matching_active_sources"]:
             warnings.append("Configured source filters do not match any active RSS sources.")
+        topic_memory_history = await _load_topic_memory_history(
+            db,
+            user_id=user_id,
+            topic=str(config.get("topic") or ""),
+        )
+        topic_memory_timeline_summary = _format_topic_memory_timeline_summary(topic_memory_history)
         items, reuse_fallback_triggered = _select_topic_items(items, threshold=threshold)
         prepared_dataset = {
             "topic": config.get("topic", ""),
@@ -116,6 +147,9 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             "sources": source_filters,
             "notes": config.get("notes", ""),
             "source_inventory": source_inventory,
+            "topic_match_stats": topic_match_stats,
+            "topic_memory_history": topic_memory_history,
+            "topic_memory_timeline_summary": topic_memory_timeline_summary,
             "rss_items": items,
             "reuse_fallback_triggered": reuse_fallback_triggered,
         }
@@ -124,12 +158,21 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             "config_warnings": warnings + list(config.get("warnings") or []),
             "dataset": prepared_dataset,
             "dataset_prompt": _format_topic_prompt_dataset(prepared_dataset),
+            "topic_memory_history": topic_memory_history,
+            "topic_memory_timeline_summary": topic_memory_timeline_summary,
             "dataset_stats": {
                 "rss_count": len(items),
+                "topic_match_candidate_count": topic_match_stats["topic_match_candidate_count"],
+                "topic_match_selected_count": topic_match_stats["topic_match_selected_count"],
+                "topic_match_fallback_used": topic_match_stats["topic_match_fallback_used"],
+                "top_topic_match_titles": topic_match_stats["top_topic_match_titles"],
                 "active_source_count": len(source_inventory["active_sources"]),
                 "matching_active_source_count": len(source_inventory["matching_active_sources"]),
                 "reused_available_count": sum(1 for item in items if item.get("previously_published")),
                 "reuse_fallback_triggered": reuse_fallback_triggered,
+                "topic_memory_count": len(topic_memory_history),
+                "topic_memory_window_days": _TOPIC_MEMORY_WINDOW_DAYS,
+                "topic_memory_summary_used": bool(topic_memory_timeline_summary),
                 "rss_dataset_stats": dataset.get("stats", {}),
             },
             "refresh_stats": dataset.get("refresh", {}),
@@ -169,6 +212,15 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
         prepared = (run_context.get("dataset_prompt") or "").strip()
         if prepared:
             prompt_parts.append(f"Prepared topic watcher dataset:\n{prepared[:18000]}")
+        topic_memory_timeline_summary = str(run_context.get("topic_memory_timeline_summary") or "").strip()
+        if topic_memory_timeline_summary:
+            prompt_parts.append(
+                "Approved topic memory timeline:\n"
+                f"{topic_memory_timeline_summary}\n\n"
+                "Use this prior approved topic context to judge whether current items are genuinely new, "
+                "continuations, or repetitions. Do not cite memories as sources; source grounding must come "
+                "only from the prepared RSS dataset."
+            )
 
     def validate_finalize(
         self,
@@ -284,11 +336,21 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             threshold=threshold,
             selected_items=selected_items,
             result_text=text,
+            prior_topic_memories=list(run_context.get("topic_memory_history") or []),
         )
-        if memory_candidates:
+        suppressed_candidate_reasons = [
+            str(candidate.get("suppressed_reason") or "").strip()
+            for candidate in memory_candidates
+            if isinstance(candidate, dict) and candidate.get("suppressed_reason")
+        ]
+        published_memory_candidates = [
+            candidate for candidate in memory_candidates
+            if isinstance(candidate, dict) and not candidate.get("suppressed")
+        ]
+        if published_memory_candidates:
             text = _append_memory_candidates(
                 text,
-                [str(candidate.get("content") or "") for candidate in memory_candidates],
+                [str(candidate.get("content") or "") for candidate in published_memory_candidates],
             )
 
         report = {
@@ -300,13 +362,16 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             "threshold": threshold,
             "topic": topic,
             "published_items": selected_items,
-            "memory_candidate_emitted": bool(memory_candidates),
-            "memory_candidate_type": (memory_candidates[0] if memory_candidates else {}).get("memory_type"),
-            "memory_candidate_confidence": float(((memory_candidates[0] if memory_candidates else {}) or {}).get("confidence") or 0.0),
-            "memory_candidate_reason": ((memory_candidates[0] if memory_candidates else {}) or {}).get("reason"),
-            "memory_candidate_support_count": len(((memory_candidates[0] if memory_candidates else {}) or {}).get("supporting_urls") or []),
-            "memory_candidate": memory_candidates[0] if memory_candidates else None,
-            "memory_candidates": memory_candidates,
+            "memory_candidate_emitted": bool(published_memory_candidates),
+            "memory_candidate_type": (published_memory_candidates[0] if published_memory_candidates else {}).get("memory_type"),
+            "memory_candidate_confidence": float(((published_memory_candidates[0] if published_memory_candidates else {}) or {}).get("confidence") or 0.0),
+            "memory_candidate_reason": ((published_memory_candidates[0] if published_memory_candidates else {}) or {}).get("reason"),
+            "memory_candidate_support_count": len(((published_memory_candidates[0] if published_memory_candidates else {}) or {}).get("supporting_urls") or []),
+            "memory_candidate": published_memory_candidates[0] if published_memory_candidates else None,
+            "memory_candidates": published_memory_candidates,
+            "topic_memory_context_considered": bool(run_context.get("topic_memory_history")),
+            "topic_memory_duplicate_suppressed_count": sum(1 for candidate in memory_candidates if isinstance(candidate, dict) and candidate.get("suppressed")),
+            "suppressed_candidate_reasons": [reason for reason in suppressed_candidate_reasons if reason],
             "suppress_push": False,
         }
         return text, report
@@ -407,6 +472,7 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
                 "source_names": list(candidate.get("source_names") or []),
                 "reason": str(candidate.get("reason") or "").strip(),
                 "confidence": float(candidate.get("confidence") or 0.0),
+                "expires_at": str(candidate.get("expires_at") or "").strip(),
                 "proposal_key": proposal_key,
             }
             db.add(proposal)
@@ -516,12 +582,22 @@ def _format_topic_prompt_dataset(dataset: Dict[str, Any]) -> str:
         f"Topic: {dataset.get('topic')}",
         f"Threshold: {dataset.get('threshold')}",
     ]
+    topic_match_stats = dataset.get("topic_match_stats") or {}
+    if topic_match_stats:
+        lines.append(f"Topic match candidate count: {topic_match_stats.get('topic_match_candidate_count', 0)}")
+        lines.append(f"Topic match selected count: {topic_match_stats.get('topic_match_selected_count', 0)}")
+        lines.append(f"Topic match fallback used: {bool(topic_match_stats.get('topic_match_fallback_used'))}")
     sources = list(dataset.get("sources") or [])
     if sources:
         lines.append(f"Source filters: {', '.join(sources)}")
     notes = str(dataset.get("notes") or "").strip()
     if notes:
         lines.append(f"Notes: {notes}")
+    timeline_summary = str(dataset.get("topic_memory_timeline_summary") or "").strip()
+    if timeline_summary:
+        lines.append("")
+        lines.append("Approved topic memory timeline:")
+        lines.append(timeline_summary)
     inventory = dataset.get("source_inventory") or {}
     active_sources = list(inventory.get("active_sources") or [])
     matching_sources = list(inventory.get("matching_active_sources") or [])
@@ -544,7 +620,7 @@ def _format_topic_prompt_dataset(dataset: Dict[str, Any]) -> str:
     else:
         for item in items:
             lines.append(
-                f"- source={item.get('source')} section={item.get('section')} score={item.get('score')} title={item.get('title')} url={item.get('url')} previously_published={item.get('previously_published')}"
+                f"- source={item.get('source')} section={item.get('section')} score={item.get('score')} topic_match_score={item.get('topic_match_score')} title={item.get('title')} url={item.get('url')} previously_published={item.get('previously_published')}"
             )
     return "\n".join(lines)
 
@@ -563,6 +639,7 @@ def _build_memory_candidates(
     threshold: str,
     selected_items: List[Dict[str, Any]],
     result_text: str,
+    prior_topic_memories: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     if not selected_items:
         return []
@@ -604,6 +681,13 @@ def _build_memory_candidates(
             result_text=result_text,
         )
         if candidate:
+            duplicate_reason = _topic_memory_duplicate_reason(
+                candidate=candidate,
+                prior_topic_memories=prior_topic_memories,
+            )
+            if duplicate_reason:
+                candidate["suppressed"] = True
+                candidate["suppressed_reason"] = duplicate_reason
             candidates.append(candidate)
         if len(candidates) >= 3:
             break
@@ -648,7 +732,8 @@ def _build_cluster_memory_candidate(
     memory_date = _normalize_memory_candidate_date(published_values) or datetime.now(timezone.utc).date().isoformat()
     source_clause = ", ".join(source_names[:3]) if source_names else "multiple sources"
     confidence = min(0.95, 0.65 + (0.1 * min(consequential_hits, 2)) + (0.05 * min(distinct_source_count, 2)))
-    memory_type = "semantic" if theme != "notable developments" and consequential_hits >= 2 else "episodic"
+    memory_type = "episodic"
+    expires_at = _memory_candidate_expiry(memory_date)
     reason = f"Strong {threshold}-threshold watcher hit for {theme} with {consequential_hits} consequential signals across {distinct_source_count} source(s)."
     content = f"On {memory_date}, reports about {topic} indicated {theme}, based on coverage from {source_clause}."
     proposal_key = hashlib.sha256(
@@ -663,6 +748,7 @@ def _build_cluster_memory_candidate(
         "source_names": source_names,
         "reason": reason,
         "confidence": round(confidence, 2),
+        "expires_at": expires_at,
         "status": "pending",
         "approved_memory_id": None,
         "approved_at": None,
@@ -690,3 +776,180 @@ def _normalize_memory_candidate_date(values: List[str]) -> str:
         if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
             return value
     return ""
+
+
+def _memory_candidate_expiry(memory_date: str) -> str:
+    try:
+        base_date = datetime.strptime(memory_date, "%Y-%m-%d").date()
+    except ValueError:
+        base_date = datetime.now(timezone.utc).date()
+    expires_at = datetime.combine(base_date, time.min, tzinfo=timezone.utc) + timedelta(days=30)
+    return expires_at.isoformat()
+
+
+def _topic_slug(topic: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (topic or "").strip().lower()).strip("_")
+
+
+def _topic_terms(topic: str) -> List[str]:
+    normalized = _normalize_candidate_text(topic)
+    if not normalized:
+        return []
+    terms = {term for term in normalized.split() if len(term) > 2}
+    slug = _topic_slug(topic)
+    terms.update(_TOPIC_ALIAS_MAP.get(slug, set()))
+    return sorted(terms)
+
+
+def _topic_match_score(item: Dict[str, Any], *, topic: str) -> float:
+    terms = _topic_terms(topic)
+    if not terms:
+        return 0.0
+    title = str(item.get("title") or "").lower()
+    summary = str(item.get("summary") or "").lower()
+    source = str(item.get("source") or "").lower()
+    section = str(item.get("section") or "").lower()
+    score = 0.0
+    exact_topic = _normalize_candidate_text(topic)
+    haystack = f"{title} {summary} {source} {section}"
+    if exact_topic and exact_topic in _normalize_candidate_text(haystack):
+        score += 1.0
+    for term in terms:
+        if term in title:
+            score += 1.5
+        elif term in summary:
+            score += 0.8
+        elif term in section or term in source:
+            score += 0.2
+    return round(score, 3)
+
+
+def _filter_topic_items(
+    items: List[Dict[str, Any]],
+    *,
+    topic: str,
+    threshold: str,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    scored: List[Dict[str, Any]] = []
+    for item in items:
+        enriched = dict(item)
+        enriched["topic_match_score"] = _topic_match_score(item, topic=topic)
+        scored.append(enriched)
+    scored.sort(
+        key=lambda item: (
+            -float(item.get("topic_match_score") or 0.0),
+            -float(item.get("score") or 0.0),
+        )
+    )
+    if threshold == "high":
+        minimum_score = 1.5
+    elif threshold == "medium":
+        minimum_score = 1.0
+    else:
+        minimum_score = 0.8
+    matched = [item for item in scored if float(item.get("topic_match_score") or 0.0) >= minimum_score]
+    fallback_used = False
+    if not matched:
+        fallback_threshold = 0.5 if threshold == "low" else 0.8
+        matched = [item for item in scored if float(item.get("topic_match_score") or 0.0) >= fallback_threshold]
+        fallback_used = bool(matched)
+    return matched[:12], {
+        "topic_match_candidate_count": sum(1 for item in scored if float(item.get("topic_match_score") or 0.0) > 0.0),
+        "topic_match_selected_count": len(matched[:12]),
+        "topic_match_fallback_used": fallback_used,
+        "top_topic_match_titles": [str(item.get("title") or "").strip() for item in scored[:5] if str(item.get("title") or "").strip()],
+    }
+
+
+async def _load_topic_memory_history(
+    db,
+    *,
+    user_id: int,
+    topic: str,
+) -> List[Dict[str, Any]]:
+    topic_slug = _topic_slug(topic)
+    if not topic_slug:
+        return []
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=_TOPIC_MEMORY_WINDOW_DAYS)
+    result = await db.execute(
+        select(Memory)
+        .where(
+            and_(
+                Memory.user_id == user_id,
+                Memory.is_active == True,
+                Memory.tags.like('%"topic_watcher"%'),
+                Memory.tags.like(f'%"{topic_slug}"%'),
+                Memory.created_at >= cutoff,
+                or_(Memory.expires_at == None, Memory.expires_at > now),
+            )
+        )
+        .order_by(desc(Memory.created_at))
+        .limit(_TOPIC_MEMORY_MAX_ITEMS)
+    )
+    rows = result.scalars().all()
+    history: List[Dict[str, Any]] = []
+    for memory in rows:
+        history.append(
+            {
+                "id": memory.id,
+                "content": str(memory.content or "").strip(),
+                "memory_type": str(memory.memory_type or "").strip(),
+                "created_at": memory.created_at.isoformat() if memory.created_at else None,
+                "expires_at": memory.expires_at.isoformat() if memory.expires_at else None,
+                "tags": memory.tags_list,
+            }
+        )
+    return history
+
+
+def _format_topic_memory_timeline_summary(history: List[Dict[str, Any]]) -> str:
+    if not history:
+        return ""
+    bullets: List[str] = []
+    for item in history[:_TOPIC_MEMORY_SUMMARY_MAX_BULLETS]:
+        content = re.sub(r"\s+", " ", str(item.get("content") or "").strip())
+        if not content:
+            continue
+        created_at = str(item.get("created_at") or "").strip()
+        date = created_at.split("T", 1)[0] if "T" in created_at else created_at[:10]
+        prefix = f"- {date}: " if date else "- "
+        bullets.append(f"{prefix}{content}")
+    summary = "\n".join(bullets).strip()
+    if len(summary) > _TOPIC_MEMORY_SUMMARY_MAX_CHARS:
+        summary = summary[: _TOPIC_MEMORY_SUMMARY_MAX_CHARS].rstrip() + "..."
+    return summary
+
+
+def _normalize_candidate_text(value: str) -> str:
+    text = re.sub(r"[^a-z0-9\s]+", " ", (value or "").lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _token_overlap_ratio(a: str, b: str) -> float:
+    a_tokens = {token for token in _normalize_candidate_text(a).split() if len(token) > 2}
+    b_tokens = {token for token in _normalize_candidate_text(b).split() if len(token) > 2}
+    if not a_tokens or not b_tokens:
+        return 0.0
+    return len(a_tokens & b_tokens) / float(len(a_tokens | b_tokens))
+
+
+def _topic_memory_duplicate_reason(
+    *,
+    candidate: Dict[str, Any],
+    prior_topic_memories: List[Dict[str, Any]],
+) -> Optional[str]:
+    candidate_content = str(candidate.get("content") or "").strip()
+    if not candidate_content:
+        return None
+    for memory in prior_topic_memories:
+        prior_content = str(memory.get("content") or "").strip()
+        if not prior_content:
+            continue
+        overlap = _token_overlap_ratio(candidate_content, prior_content)
+        if overlap >= 0.7:
+            return f"Suppressed duplicate topic memory candidate due to high similarity with approved topic memory {memory.get('id')}."
+        prior_date = str(memory.get("created_at") or "").split("T", 1)[0]
+        if prior_date and prior_date in candidate_content and overlap >= 0.55:
+            return f"Suppressed duplicate topic memory candidate due to repeated same-day development already captured in approved topic memory {memory.get('id')}."
+    return None

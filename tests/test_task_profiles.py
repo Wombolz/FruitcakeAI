@@ -17,7 +17,7 @@ from app.autonomy.profiles.topic_watcher import (
     _parse_topic_watcher_instruction,
 )
 from app.autonomy.runner import TaskRunner
-from app.db.models import MemoryProposal, RSSPublishedItem, Task
+from app.db.models import Memory, MemoryProposal, RSSPublishedItem, Task
 from tests.conftest import TestSessionLocal
 
 
@@ -252,6 +252,131 @@ def test_topic_watcher_blocks_runtime_source_and_memory_management_tools():
     assert "search_my_feeds" in blocked
 
 
+@pytest.mark.asyncio
+async def test_topic_watcher_prepare_run_context_loads_same_topic_memory_history():
+    profile = TopicWatcherExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(user_id=1, title="Iran Watch", instruction="topic: Iran\nthreshold: medium", profile="topic_watcher")
+        db.add(task)
+        await db.flush()
+        recent_same_topic = Memory(
+            user_id=1,
+            memory_type="episodic",
+            content="On 2026-03-24, reports about Iran indicated renewed diplomatic talks.",
+            importance=0.65,
+        )
+        recent_same_topic.tags_list = ["topic_watcher", "iran"]
+        recent_same_topic.created_at = datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc)
+        other_topic = Memory(
+            user_id=1,
+            memory_type="episodic",
+            content="On 2026-03-24, reports about China indicated trade friction.",
+            importance=0.65,
+        )
+        other_topic.tags_list = ["topic_watcher", "china"]
+        other_topic.created_at = datetime(2026, 3, 24, 13, 0, tzinfo=timezone.utc)
+        expired_same_topic = Memory(
+            user_id=1,
+            memory_type="episodic",
+            content="Old Iran development.",
+            importance=0.65,
+            expires_at=datetime(2026, 3, 1, 0, 0, tzinfo=timezone.utc),
+        )
+        expired_same_topic.tags_list = ["topic_watcher", "iran"]
+        expired_same_topic.created_at = datetime(2026, 2, 20, 12, 0, tzinfo=timezone.utc)
+        db.add_all([recent_same_topic, other_topic, expired_same_topic])
+        await db.commit()
+        with patch("app.autonomy.profiles.topic_watcher.rss_sources.list_effective_sources", new=AsyncMock(return_value=[])):
+            with patch(
+                "app.autonomy.profiles.topic_watcher.build_magazine_dataset",
+                new=AsyncMock(return_value={"items": [], "stats": {}, "refresh": {}}),
+            ):
+                out = await profile.prepare_run_context(
+                    db=db,
+                    user_id=1,
+                    task_id=task.id,
+                    task_run_id=1,
+                )
+
+    assert out["dataset_stats"]["topic_memory_count"] == 1
+    assert out["dataset_stats"]["topic_memory_window_days"] == 30
+    assert out["dataset_stats"]["topic_memory_summary_used"] is True
+    history = out["dataset"]["topic_memory_history"]
+    assert len(history) == 1
+    assert "Iran" in out["topic_memory_timeline_summary"]
+    assert "China" not in out["topic_memory_timeline_summary"]
+
+
+@pytest.mark.asyncio
+async def test_topic_watcher_prepare_run_context_prefilters_to_topic_matches():
+    profile = TopicWatcherExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(user_id=1, title="Iran Watch", instruction="topic: Iran\nthreshold: medium", profile="topic_watcher")
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        with patch("app.autonomy.profiles.topic_watcher.rss_sources.list_effective_sources", new=AsyncMock(return_value=[])):
+            with patch(
+                "app.autonomy.profiles.topic_watcher.build_magazine_dataset",
+                new=AsyncMock(
+                    return_value={
+                        "items": [
+                            {
+                                "title": "US-Iran talks resume after sanctions warning",
+                                "summary": "Renewed negotiations and sanctions pressure mark a notable diplomatic shift.",
+                                "source": "Reuters",
+                                "section": "World",
+                                "url": "https://example.com/iran",
+                                "score": 1.11,
+                            },
+                            {
+                                "title": "Meta and Google found liable in landmark social media addiction trial",
+                                "summary": "The verdict marks the end of a five-week trial on social media addiction.",
+                                "source": "BBC News",
+                                "section": "Tech",
+                                "url": "https://example.com/meta",
+                                "score": 1.19,
+                            },
+                        ],
+                        "stats": {"selected_count": 2},
+                        "refresh": {"sources_refreshed": 2},
+                    }
+                ),
+            ):
+                out = await profile.prepare_run_context(
+                    db=db,
+                    user_id=1,
+                    task_id=task.id,
+                    task_run_id=101,
+                )
+
+    titles = [item["title"] for item in out["dataset"]["rss_items"]]
+    assert titles == ["US-Iran talks resume after sanctions warning"]
+    assert out["dataset_stats"]["topic_match_candidate_count"] >= 1
+    assert out["dataset_stats"]["topic_match_selected_count"] == 1
+    assert out["dataset_stats"]["topic_match_fallback_used"] is False
+
+
+def test_topic_watcher_augment_prompt_includes_topic_memory_timeline_summary():
+    profile = TopicWatcherExecutionProfile()
+    prompt_parts: list[str] = []
+
+    profile.augment_prompt(
+        prompt_parts=prompt_parts,
+        run_context={
+            "dataset_prompt": "Prepared dataset body",
+            "topic_memory_timeline_summary": "- 2026-03-24: On 2026-03-24, reports about Iran indicated renewed diplomatic talks.",
+        },
+        is_final_step=True,
+    )
+
+    joined = "\n\n".join(prompt_parts)
+    assert "Approved topic memory timeline" in joined
+    assert "Do not cite memories as sources" in joined
+
+
 def test_topic_watcher_validate_finalize_skips_memory_candidate_for_weak_update():
     profile = TopicWatcherExecutionProfile()
     result, report = profile.validate_finalize(
@@ -272,6 +397,7 @@ def test_topic_watcher_validate_finalize_skips_memory_candidate_for_weak_update(
                     }
                 ]
             },
+            "topic_memory_history": [],
         },
         is_final_step=True,
     )
@@ -316,17 +442,74 @@ def test_topic_watcher_validate_finalize_appends_memory_candidate_for_strong_upd
                     },
                 ]
             },
+            "topic_memory_history": [],
         },
         is_final_step=True,
     )
     assert report is not None
     assert report["memory_candidate_emitted"] is True
-    assert report["memory_candidate_type"] in {"episodic", "semantic"}
+    assert report["memory_candidate_type"] == "episodic"
     assert report["memory_candidate_support_count"] == 2
     assert "## Memory candidates" in result
     assert "On 2026-03-25" in result
     assert len(report["memory_candidates"]) >= 1
     assert report["memory_candidates"][0]["proposal_key"]
+    assert report["memory_candidates"][0]["expires_at"].startswith("2026-04-24T00:00:00")
+
+
+def test_topic_watcher_validate_finalize_suppresses_duplicate_memory_candidate_from_topic_history():
+    profile = TopicWatcherExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "**Iran - New developments**\n\n"
+            "- **US-Iran talks resume after sanctions warning** — Reuters — [Read More](https://example.com/1)\n"
+            "Renewed negotiations and sanctions pressure mark a notable diplomatic shift.\n\n"
+            "- **Regional officials warn of missile strike risk** — BBC — [Read More](https://example.com/2)\n"
+            "Military warnings suggest escalating regional pressure around Iran."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "watcher_config": {"topic": "Iran", "threshold": "medium"},
+            "dataset": {
+                "rss_items": [
+                    {
+                        "article_id": 1,
+                        "url": "https://example.com/1",
+                        "title": "US-Iran talks resume after sanctions warning",
+                        "source": "Reuters",
+                        "summary": "Renewed negotiations and sanctions pressure mark a notable diplomatic shift.",
+                        "published_at": "2026-03-25T01:00:00+00:00",
+                        "previously_published": False,
+                    },
+                    {
+                        "article_id": 2,
+                        "url": "https://example.com/2",
+                        "title": "Regional officials warn of missile strike risk",
+                        "source": "BBC",
+                        "summary": "Military warnings suggest escalating regional pressure around Iran.",
+                        "published_at": "2026-03-25T01:10:00+00:00",
+                        "previously_published": False,
+                    },
+                ]
+            },
+            "topic_memory_history": [
+                {
+                    "id": 44,
+                    "content": "On 2026-03-25, reports about Iran indicated diplomatic talks, based on coverage from Reuters, BBC.",
+                    "memory_type": "episodic",
+                    "created_at": "2026-03-25T02:00:00+00:00",
+                }
+            ],
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fired"] is True
+    assert report["memory_candidate_emitted"] is False
+    assert report["topic_memory_context_considered"] is True
+    assert report["topic_memory_duplicate_suppressed_count"] >= 1
+    assert report["memory_candidates"] == []
+    assert "## Memory candidates" not in result
 
 
 def test_topic_watcher_artifact_payloads_include_memory_candidates():
@@ -351,6 +534,7 @@ def test_topic_watcher_artifact_payloads_include_memory_candidates():
                         "source_names": ["Reuters"],
                         "reason": "Strong medium-threshold watcher hit.",
                         "confidence": 0.8,
+                        "expires_at": "2026-04-24T00:00:00+00:00",
                         "status": "pending",
                     }
                 ],
@@ -390,6 +574,7 @@ async def test_topic_watcher_persist_run_records_writes_selected_items():
                             "source_names": ["Reuters"],
                             "reason": "Strong watcher hit.",
                             "confidence": 0.8,
+                            "expires_at": "2026-04-24T00:00:00+00:00",
                             "status": "pending",
                         }
                     ],
@@ -406,6 +591,7 @@ async def test_topic_watcher_persist_run_records_writes_selected_items():
     assert len(proposals) == 1
     assert proposals[0].source_type == "topic_watcher"
     assert proposals[0].status == "pending"
+    assert proposals[0].proposal_payload["expires_at"] == "2026-04-24T00:00:00+00:00"
 
 
 @pytest.mark.asyncio

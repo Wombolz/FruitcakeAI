@@ -831,6 +831,7 @@ async def test_approve_topic_watcher_memory_candidate_creates_memory_and_updates
                                 "source_names": ["Reuters", "BBC"],
                                 "reason": "Strong medium-threshold watcher hit.",
                                 "confidence": 0.8,
+                                "expires_at": "2026-04-24T00:00:00+00:00",
                                 "status": "pending",
                                 "approved_memory_id": None,
                                 "approved_at": None,
@@ -857,6 +858,7 @@ async def test_approve_topic_watcher_memory_candidate_creates_memory_and_updates
     assert payload["candidate"]["approved_by_user_id"] is not None
     assert payload["memory"]["memory_type"] == "episodic"
     assert payload["memory"]["content"].startswith("On 2026-03-25")
+    assert payload["memory"]["expires_at"] == "2026-04-24T00:00:00Z"
     assert "topic_watcher" in payload["memory"]["tags"]
     assert "iran" in payload["memory"]["tags"]
 
@@ -915,6 +917,7 @@ async def test_approve_topic_watcher_memory_candidate_rejects_duplicate_approval
                                 "source_names": ["Reuters"],
                                 "reason": "Strong watcher hit.",
                                 "confidence": 0.82,
+                                "expires_at": "2026-04-24T00:00:00+00:00",
                                 "status": "approved",
                                 "approved_memory_id": 99,
                                 "approved_at": "2026-03-25T02:00:00+00:00",
@@ -966,6 +969,7 @@ async def test_approve_topic_watcher_memory_candidate_rejects_other_users_run(cl
                                 "source_names": ["BBC"],
                                 "reason": "Strong watcher hit.",
                                 "confidence": 0.8,
+                                "expires_at": "2026-04-24T00:00:00+00:00",
                                 "status": "pending",
                                 "approved_memory_id": None,
                                 "approved_at": None,
@@ -1045,6 +1049,7 @@ async def test_memory_review_list_and_approve_proposal(client):
             "source_names": ["Reuters"],
             "reason": "Strong watcher hit.",
             "confidence": 0.8,
+            "expires_at": "2026-04-24T00:00:00+00:00",
         }
         db.add(proposal)
         db.add(
@@ -1092,6 +1097,7 @@ async def test_memory_review_list_and_approve_proposal(client):
     payload = approve.json()
     assert payload["proposal"]["status"] == "approved"
     assert payload["memory"]["memory_type"] == "episodic"
+    assert payload["memory"]["expires_at"] == "2026-04-24T00:00:00"
     assert "topic_watcher" in payload["memory"]["tags"]
 
     async with TestSessionLocal() as db:
@@ -1144,6 +1150,7 @@ async def test_memory_review_reject_updates_status_without_creating_memory(clien
             "source_names": ["Reuters"],
             "reason": "Strong watcher hit.",
             "confidence": 0.72,
+            "expires_at": "2026-04-24T00:00:00+00:00",
         }
         db.add(proposal)
         await db.commit()
@@ -1188,6 +1195,7 @@ async def test_memory_review_rejects_duplicate_approval(client):
             "source_names": [],
             "reason": "Strong watcher hit.",
             "confidence": 0.7,
+            "expires_at": "2026-04-24T00:00:00+00:00",
         }
         db.add(proposal)
         await db.commit()
@@ -1222,6 +1230,7 @@ async def test_memory_review_scopes_proposals_to_current_user(client):
             "source_names": [],
             "reason": "Strong watcher hit.",
             "confidence": 0.6,
+            "expires_at": "2026-04-24T00:00:00+00:00",
         }
         db.add(proposal)
         await db.commit()

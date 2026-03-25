@@ -3,9 +3,11 @@ Evaluate the prepared RSS dataset for the configured topic and threshold.
 Rules:
 - Use only the prepared dataset.
 - Start from the prepared source inventory and prepared RSS dataset.
+- Treat any approved topic memory timeline as continuity context only.
 - Do not manage RSS sources during this task run.
 - Do not call retrieval or memory tools; the watcher must decide from prepared context only.
 - Prefer silence over marginal relevance.
+- Do not cite memories as sources; source grounding must come only from the prepared RSS dataset.
 - If there are no clearly relevant items, output exactly:
   `NOTHING_NEW`
 
