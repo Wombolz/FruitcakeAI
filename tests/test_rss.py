@@ -4,11 +4,15 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from unittest.mock import AsyncMock
 
+from sqlalchemy import select
+
 from app.db.models import RSSItem, RSSSource
 from app.db.session import Base
 from app.mcp.servers.rss import _looks_like_placeholder_feed, _normalize_feed_url, call_tool, get_tools
 from app.mcp.services.rss_sources import (
     _strip_html,
+    add_source,
+    equivalent_canonical_urls,
     get_recent_list_cursor,
     list_recent_items,
     search_cached_items,
@@ -64,6 +68,14 @@ def test_strip_html_returns_plain_url_without_parsing_warning_path():
 
 def test_strip_html_still_extracts_text_from_markup():
     assert _strip_html("<p>Hello <b>world</b></p>") == "Hello world"
+
+
+def test_equivalent_canonical_urls_include_scheme_and_www_variants():
+    variants = equivalent_canonical_urls("https://example.com/feed.xml?utm_source=rss")
+    assert "https://example.com/feed.xml" in variants
+    assert "http://example.com/feed.xml" in variants
+    assert "https://www.example.com/feed.xml" in variants
+    assert "http://www.example.com/feed.xml" in variants
 
 
 def test_search_my_feeds_schema_requires_non_empty_query():
@@ -423,3 +435,74 @@ async def test_list_recent_items_source_include_filter():
         )
         assert len(rows) == 1
         assert rows[0]["title"] == "From A"
+
+
+@pytest.mark.asyncio
+async def test_add_source_updates_equivalent_user_feed_instead_of_inserting_duplicate():
+    async with TestSessionLocal() as db:
+        existing = RSSSource(
+            user_id=7,
+            name="BBC Old",
+            url="http://feeds.bbci.co.uk/news/rss.xml",
+            url_canonical="http://feeds.bbci.co.uk/news/rss.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(existing)
+        await db.commit()
+        existing_id = existing.id
+
+    async with TestSessionLocal() as db:
+        row = await add_source(
+            db,
+            user_id=7,
+            name="BBC News",
+            url="https://feeds.bbci.co.uk/news/rss.xml",
+            category="news",
+            update_interval_minutes=60,
+            active=True,
+        )
+        await db.commit()
+        rows = (await db.execute(select(RSSSource).where(RSSSource.user_id == 7))).scalars().all()
+
+    assert row.id == existing_id
+    assert len(rows) == 1
+    assert rows[0].url == "https://feeds.bbci.co.uk/news/rss.xml"
+    assert rows[0].url_canonical == "https://feeds.bbci.co.uk/news/rss.xml"
+
+
+@pytest.mark.asyncio
+async def test_add_source_reuses_equivalent_global_feed_without_user_duplicate():
+    async with TestSessionLocal() as db:
+        global_row = RSSSource(
+            user_id=None,
+            name="Global Feed",
+            url="https://www.example.com/feed.xml",
+            url_canonical="https://www.example.com/feed.xml",
+            category="news",
+            active=True,
+            trust_level="seed",
+            update_interval_minutes=60,
+        )
+        db.add(global_row)
+        await db.commit()
+        global_id = global_row.id
+
+    async with TestSessionLocal() as db:
+        row = await add_source(
+            db,
+            user_id=8,
+            name="Example Feed",
+            url="http://example.com/feed.xml",
+            category="news",
+            update_interval_minutes=60,
+            active=True,
+        )
+        await db.commit()
+        user_rows = (await db.execute(select(RSSSource).where(RSSSource.user_id == 8))).scalars().all()
+
+    assert row.id == global_id
+    assert row.user_id is None
+    assert user_rows == []

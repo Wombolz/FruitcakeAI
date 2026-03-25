@@ -84,6 +84,40 @@ def canonicalize_url(raw: str) -> str:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+def equivalent_canonical_urls(raw: str) -> List[str]:
+    canonical = canonicalize_url(raw)
+    if not canonical:
+        return []
+
+    try:
+        parsed = urlsplit(canonical)
+    except Exception:
+        return [canonical]
+
+    variants = {canonical}
+    host = parsed.hostname or ""
+    path = parsed.path or "/"
+    query = parsed.query
+
+    def _variant(scheme: str, variant_host: str) -> str:
+        return urlunsplit((scheme, variant_host, path, query, ""))
+
+    other_scheme = "https" if parsed.scheme == "http" else "http"
+    variants.add(_variant(other_scheme, host))
+
+    if host.startswith("www."):
+        bare_host = host[4:]
+        if bare_host:
+            variants.add(_variant(parsed.scheme, bare_host))
+            variants.add(_variant(other_scheme, bare_host))
+    elif "." in host:
+        www_host = f"www.{host}"
+        variants.add(_variant(parsed.scheme, www_host))
+        variants.add(_variant(other_scheme, www_host))
+
+    return sorted(variants)
+
+
 def extract_domain(url: str) -> str:
     try:
         return (urlsplit(url).hostname or "").lower()
@@ -157,6 +191,7 @@ async def add_source(
     canonical = canonicalize_url(url)
     if not canonical:
         raise ValueError("Invalid RSS/Atom URL.")
+    equivalents = equivalent_canonical_urls(url)
 
     existing = await db.execute(
         select(RSSSource).where(RSSSource.user_id == user_id, RSSSource.url_canonical == canonical)
@@ -171,6 +206,35 @@ async def add_source(
         row.active = active
         row.updated_at = datetime.now(timezone.utc)
         await db.flush()
+        return row
+
+    equivalent_user = await db.execute(
+        select(RSSSource)
+        .where(RSSSource.user_id == user_id, RSSSource.url_canonical.in_(equivalents))
+        .order_by(RSSSource.id.asc())
+        .limit(1)
+    )
+    row = equivalent_user.scalar_one_or_none()
+    if row is not None:
+        row.name = name
+        row.url = url
+        row.url_canonical = canonical
+        row.category = category
+        row.update_interval_minutes = max(5, min(int(update_interval_minutes), 1440))
+        row.trust_level = trust_level
+        row.active = active
+        row.updated_at = datetime.now(timezone.utc)
+        await db.flush()
+        return row
+
+    existing_global = await db.execute(
+        select(RSSSource)
+        .where(RSSSource.user_id.is_(None), RSSSource.url_canonical.in_(equivalents))
+        .order_by(RSSSource.id.asc())
+        .limit(1)
+    )
+    row = existing_global.scalar_one_or_none()
+    if row is not None:
         return row
 
     row = RSSSource(
