@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.autonomy.profiles.default import DefaultTaskExecutionProfile
+from app.autonomy.profiles.maintenance import MaintenanceExecutionProfile
 from app.autonomy.profiles.morning_briefing import MorningBriefingExecutionProfile
 from app.autonomy.profiles.news_magazine import NewsMagazineExecutionProfile
 from app.autonomy.profiles.topic_watcher import TopicWatcherExecutionProfile
@@ -10,6 +11,7 @@ ALLOWED_TASK_PROFILES = {
     "default",
     "rss_newspaper",
     "news_magazine",
+    "maintenance",
     "morning_briefing",
     "topic_watcher",
 }
@@ -28,6 +30,8 @@ def resolve_task_profile_by_name(value: str | None):
         return MorningBriefingExecutionProfile()
     if value == "topic_watcher":
         return TopicWatcherExecutionProfile()
+    if value == "maintenance":
+        return MaintenanceExecutionProfile()
     return DefaultTaskExecutionProfile()
 
 
@@ -38,7 +42,11 @@ def normalize_task_profile(value: str | None) -> str | None:
     if not v:
         return None
     if v not in ALLOWED_TASK_PROFILES:
-        raise ValueError(f"Unknown profile '{value}'. Allowed: default, rss_newspaper, news_magazine")
+        raise ValueError(
+            "Unknown profile "
+            f"'{value}'. Allowed: default, rss_newspaper, news_magazine, maintenance, "
+            "morning_briefing, topic_watcher"
+        )
     if v in _RSS_NEWSPAPER_ALIASES:
         return "rss_newspaper"
     return v

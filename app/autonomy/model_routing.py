@@ -24,11 +24,23 @@ class TaskModelProfile:
 
 
 def resolve_task_model_profile(task, user) -> TaskModelProfile:
-    del task, user  # v1: config-only routing
+    del user  # v1: config-only routing
 
     routing_enabled = bool(settings.task_model_routing_enabled)
     small_model = settings.task_small_model or settings.llm_model
     large_model = settings.task_large_model or settings.llm_model
+    task_profile = (getattr(task, "profile", None) or "").strip().lower()
+
+    if task_profile == "maintenance":
+        chosen = small_model if routing_enabled else settings.llm_model
+        return TaskModelProfile(
+            planning_model=chosen,
+            execution_model=chosen,
+            final_synthesis_model=chosen,
+            routing_enabled=routing_enabled,
+            large_retry_enabled=False,
+            large_retry_max_attempts=0,
+        )
 
     planning_model = large_model if settings.task_force_large_for_planning else small_model
     final_model = large_model if settings.task_force_large_for_final_synthesis else small_model

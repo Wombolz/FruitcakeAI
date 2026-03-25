@@ -21,6 +21,7 @@ from sqlalchemy import desc, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import json
+import re
 
 from app.agent.persona_loader import list_personas, persona_exists
 from app.agent.persona_router import infer_persona_for_task
@@ -28,8 +29,9 @@ from app.autonomy.planner import create_task_plan_for_user
 from app.autonomy.profiles import normalize_task_profile
 from app.auth.dependencies import get_current_user
 from app.config import settings
-from app.db.models import AuditLog, Task, TaskRun, TaskStep, User
+from app.db.models import AuditLog, Task, TaskRun, TaskRunArtifact, TaskStep, User
 from app.db.session import get_db
+from app.memory.service import get_memory_service
 
 router = APIRouter()
 
@@ -93,6 +95,24 @@ class TaskOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ApprovedMemoryOut(BaseModel):
+    id: int
+    memory_type: str
+    content: str
+    importance: float
+    tags: List[str]
+    expires_at: Optional[datetime]
+    created_at: Optional[datetime]
+
+
+class MemoryCandidateApprovalOut(BaseModel):
+    task_id: int
+    run_id: int
+    candidate_index: int
+    candidate: Dict[str, Any]
+    memory: ApprovedMemoryOut
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -547,6 +567,82 @@ async def create_task_plan(
     return TaskPlanOut(**out)
 
 
+@router.post(
+    "/tasks/{task_id}/runs/{run_id}/memory-candidates/{candidate_index}/approve",
+    response_model=MemoryCandidateApprovalOut,
+)
+async def approve_task_run_memory_candidate(
+    task_id: int,
+    run_id: int,
+    candidate_index: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    task = await _get_owned_task(task_id, current_user.id, db)
+    run = await _get_owned_task_run(task_id, run_id, current_user.id, db)
+    artifact = await _get_memory_candidate_artifact(run.id, db)
+    payload = _decode_memory_candidate_artifact(artifact)
+    candidates = payload.get("candidates") or []
+    if candidate_index < 0 or candidate_index >= len(candidates):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory candidate not found")
+
+    candidate = candidates[candidate_index]
+    if not isinstance(candidate, dict):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Memory candidate payload is malformed")
+
+    status_value = str(candidate.get("status") or "pending").strip().lower()
+    if status_value == "approved":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Memory candidate already approved")
+    if status_value != "pending":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Memory candidate is not approvable (status={status_value})")
+
+    memory_type = str(candidate.get("memory_type") or "").strip()
+    content = str(candidate.get("content") or "").strip()
+    if memory_type not in {"semantic", "procedural", "episodic"} or not content:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Memory candidate payload is malformed")
+
+    expires_at = candidate.get("expires_at")
+    if expires_at is not None and not isinstance(expires_at, str):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Memory candidate payload is malformed")
+
+    svc = get_memory_service()
+    result = await svc.create(
+        db=db,
+        user_id=current_user.id,
+        memory_type=memory_type,
+        content=content,
+        importance=0.65,
+        tags=_topic_watcher_candidate_tags(candidate),
+        expires_at=_parse_optional_iso_datetime(expires_at) if expires_at else None,
+    )
+    if isinstance(result, str):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result)
+
+    approved_at = datetime.now(timezone.utc)
+    candidate["status"] = "approved"
+    candidate["approved_memory_id"] = int(result.id)
+    candidate["approved_at"] = approved_at.isoformat()
+    candidate["approved_by_user_id"] = int(current_user.id)
+    artifact.content_json = json.dumps(payload)
+    await db.flush()
+
+    return MemoryCandidateApprovalOut(
+        task_id=task.id,
+        run_id=run.id,
+        candidate_index=candidate_index,
+        candidate=candidate,
+        memory=ApprovedMemoryOut(
+            id=result.id,
+            memory_type=result.memory_type,
+            content=result.content,
+            importance=result.importance,
+            tags=result.tags_list,
+            expires_at=result.expires_at,
+            created_at=result.created_at,
+        ),
+    )
+
+
 # ── Internal helper ───────────────────────────────────────────────────────────
 
 async def _get_owned_task(task_id: int, user_id: int, db: AsyncSession) -> Task:
@@ -557,6 +653,65 @@ async def _get_owned_task(task_id: int, user_id: int, db: AsyncSession) -> Task:
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
     return task
+
+
+async def _get_owned_task_run(task_id: int, run_id: int, user_id: int, db: AsyncSession) -> TaskRun:
+    result = await db.execute(
+        select(TaskRun)
+        .join(Task, TaskRun.task_id == Task.id)
+        .where(TaskRun.id == run_id, TaskRun.task_id == task_id, Task.user_id == user_id)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+    return run
+
+
+async def _get_memory_candidate_artifact(task_run_id: int, db: AsyncSession) -> TaskRunArtifact:
+    result = await db.execute(
+        select(TaskRunArtifact)
+        .where(TaskRunArtifact.task_run_id == task_run_id, TaskRunArtifact.artifact_type == "memory_candidates")
+        .order_by(desc(TaskRunArtifact.id))
+        .limit(1)
+    )
+    artifact = result.scalar_one_or_none()
+    if artifact is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory candidates not found for task run")
+    return artifact
+
+
+def _decode_memory_candidate_artifact(artifact: TaskRunArtifact) -> Dict[str, Any]:
+    try:
+        payload = json.loads(artifact.content_json or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Memory candidate payload is malformed",
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("candidates"), list):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Memory candidate payload is malformed")
+    return payload
+
+
+def _topic_watcher_candidate_tags(candidate: Dict[str, Any]) -> List[str]:
+    tags = ["topic_watcher"]
+    topic = str(candidate.get("topic") or "").strip().lower()
+    if topic:
+        slug = re.sub(r"[^a-z0-9]+", "_", topic).strip("_")
+        if slug:
+            tags.append(slug)
+    return tags
+
+
+def _parse_optional_iso_datetime(raw: str | None) -> Optional[datetime]:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Memory candidate payload is malformed") from exc
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def _to_task_out(task: Task, current_step: Optional[TaskStep]) -> TaskOut:

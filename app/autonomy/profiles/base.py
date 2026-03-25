@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 
 DefaultPlannerFn = Callable[..., Awaitable[List[Dict[str, Any]]]]
@@ -46,6 +46,9 @@ class TaskExecutionProfile(ABC):
 
     def effective_blocked_tools(self, *, run_context: Dict[str, Any]) -> set[str]:
         return set()
+
+    def effective_allowed_tools(self, *, run_context: Dict[str, Any]) -> Optional[Set[str]]:
+        return None
 
     def augment_prompt(
         self,

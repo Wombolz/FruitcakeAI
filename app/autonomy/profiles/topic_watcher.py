@@ -8,9 +8,42 @@ from app.autonomy.magazine_pipeline import build_magazine_dataset
 from app.autonomy.profiles.base import TaskExecutionProfile
 from app.autonomy.profiles.spec_loader import load_profile_spec_text
 from app.db.models import RSSPublishedItem, Task
+from app.mcp.services import rss_sources
 
 _NOTHING_NEW = "NOTHING_NEW"
 _VALID_THRESHOLDS = {"low", "medium", "high"}
+_CONSEQUENTIAL_KEYWORDS = {
+    "agreement",
+    "attack",
+    "ceasefire",
+    "conflict",
+    "deal",
+    "diplomatic",
+    "diplomacy",
+    "enrichment",
+    "missile",
+    "military",
+    "minister",
+    "negotiation",
+    "negotiations",
+    "nuclear",
+    "president",
+    "sanction",
+    "sanctions",
+    "strike",
+    "summit",
+    "talk",
+    "talks",
+    "uranium",
+    "warning",
+}
+_THEME_KEYWORDS = {
+    "diplomatic talks": {"agreement", "ceasefire", "deal", "diplomatic", "diplomacy", "negotiation", "negotiations", "summit", "talk", "talks"},
+    "military activity": {"attack", "conflict", "military", "missile", "strike", "warning"},
+    "nuclear developments": {"enrichment", "nuclear", "uranium"},
+    "sanctions and economic pressure": {"sanction", "sanctions"},
+    "government and leadership changes": {"minister", "president"},
+}
 
 
 class TopicWatcherExecutionProfile(TaskExecutionProfile):
@@ -48,6 +81,7 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
     ) -> Dict[str, Any]:
         task = await db.get(Task, task_id)
         config = _parse_topic_watcher_instruction(getattr(task, "instruction", ""))
+        effective_sources = await rss_sources.list_effective_sources(db, user_id=user_id, active_only=True)
         dataset = await build_magazine_dataset(
             db,
             user_id=user_id,
@@ -69,12 +103,18 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             ]
             if not items and before:
                 warnings.append("Configured sources filter excluded all prepared RSS items.")
+        source_inventory = _build_source_inventory(effective_sources, source_filters)
+        if not source_inventory["active_sources"]:
+            warnings.append("No active RSS sources are currently configured for this watcher.")
+        if source_filters and not source_inventory["matching_active_sources"]:
+            warnings.append("Configured source filters do not match any active RSS sources.")
         items, reuse_fallback_triggered = _select_topic_items(items, threshold=threshold)
         prepared_dataset = {
             "topic": config.get("topic", ""),
             "threshold": threshold,
             "sources": source_filters,
             "notes": config.get("notes", ""),
+            "source_inventory": source_inventory,
             "rss_items": items,
             "reuse_fallback_triggered": reuse_fallback_triggered,
         }
@@ -85,6 +125,8 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             "dataset_prompt": _format_topic_prompt_dataset(prepared_dataset),
             "dataset_stats": {
                 "rss_count": len(items),
+                "active_source_count": len(source_inventory["active_sources"]),
+                "matching_active_source_count": len(source_inventory["matching_active_sources"]),
                 "reused_available_count": sum(1 for item in items if item.get("previously_published")),
                 "reuse_fallback_triggered": reuse_fallback_triggered,
                 "rss_dataset_stats": dataset.get("stats", {}),
@@ -95,6 +137,8 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
     def effective_blocked_tools(self, *, run_context: Dict[str, Any]) -> set[str]:
         del run_context
         return {
+            "list_rss_sources",
+            "add_rss_source",
             "get_feed_items",
             "search_feeds",
             "search_my_feeds",
@@ -105,6 +149,11 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             "web_search",
             "fetch_page",
             "create_memory",
+            "create_memory_entities",
+            "create_memory_relations",
+            "add_memory_observations",
+            "search_memory_graph",
+            "open_memory_graph_nodes",
         }
 
     def augment_prompt(
@@ -156,6 +205,11 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
                 "reuse_fallback_triggered": False,
                 "threshold": threshold,
                 "topic": topic,
+                "memory_candidate_emitted": False,
+                "memory_candidate_type": None,
+                "memory_candidate_confidence": 0.0,
+                "memory_candidate_reason": None,
+                "memory_candidate_support_count": 0,
                 "suppress_push": True,
             }
 
@@ -177,19 +231,32 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
                 "threshold": threshold,
                 "topic": topic,
                 "invalid_urls": invalid_urls,
+                "memory_candidate_emitted": False,
+                "memory_candidate_type": None,
+                "memory_candidate_confidence": 0.0,
+                "memory_candidate_reason": None,
+                "memory_candidate_support_count": 0,
                 "suppress_push": True,
                 "collapsed_to_nothing_new": True,
             }
 
         reused_urls = {str(item.get("url") or "").strip() for item in rss_items if item.get("previously_published")}
+        selected_by_url = {
+            str(item.get("url") or "").strip(): item
+            for item in rss_items
+            if str(item.get("url") or "").strip() in deduped_urls
+        }
         selected_items = [
             {
                 "rss_item_id": int(item.get("article_id") or 0),
                 "url_canonical": str(item.get("url") or "").strip(),
+                "title": str(item.get("title") or "").strip(),
+                "source": str(item.get("source") or "").strip(),
+                "summary": str(item.get("summary") or "").strip(),
+                "published_at": str(item.get("published_at") or "").strip(),
                 "reused": str(item.get("url") or "").strip() in reused_urls,
             }
-            for item in rss_items
-            if str(item.get("url") or "").strip() in deduped_urls
+            for item in selected_by_url.values()
         ]
         reused_count = sum(1 for item in selected_items if item["reused"])
         reuse_fallback_triggered = bool(dataset.get("reuse_fallback_triggered")) or reused_count > 0
@@ -202,9 +269,23 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
                 "reuse_fallback_triggered": False,
                 "threshold": threshold,
                 "topic": topic,
+                "memory_candidate_emitted": False,
+                "memory_candidate_type": None,
+                "memory_candidate_confidence": 0.0,
+                "memory_candidate_reason": None,
+                "memory_candidate_support_count": 0,
                 "suppress_push": True,
                 "collapsed_to_nothing_new": True,
             }
+
+        memory_candidate = _build_memory_candidate(
+            topic=topic,
+            threshold=threshold,
+            selected_items=selected_items,
+            result_text=text,
+        )
+        if memory_candidate:
+            text = _append_memory_candidate(text, memory_candidate["content"])
 
         report = {
             "fatal": False,
@@ -215,6 +296,12 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             "threshold": threshold,
             "topic": topic,
             "published_items": selected_items,
+            "memory_candidate_emitted": bool(memory_candidate),
+            "memory_candidate_type": (memory_candidate or {}).get("memory_type"),
+            "memory_candidate_confidence": float((memory_candidate or {}).get("confidence") or 0.0),
+            "memory_candidate_reason": (memory_candidate or {}).get("reason"),
+            "memory_candidate_support_count": len((memory_candidate or {}).get("supporting_urls") or []),
+            "memory_candidate": memory_candidate,
             "suppress_push": False,
         }
         return text, report
@@ -240,6 +327,14 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             out.append({"artifact_type": "final_output", "content_text": final_markdown})
         if isinstance(grounding, dict):
             out.append({"artifact_type": "validation_report", "content_json": grounding})
+            memory_candidate = grounding.get("memory_candidate")
+            if isinstance(memory_candidate, dict):
+                out.append(
+                    {
+                        "artifact_type": "memory_candidates",
+                        "content_json": {"candidates": [memory_candidate]},
+                    }
+                )
         out.append({"artifact_type": "run_diagnostics", "content_json": diagnostics})
         return out
 
@@ -330,6 +425,31 @@ def _select_topic_items(items: List[Dict[str, Any]], *, threshold: str) -> tuple
     return unseen + reused, True
 
 
+def _build_source_inventory(effective_sources: List[Dict[str, Any]], source_filters: List[str]) -> Dict[str, Any]:
+    active_sources = []
+    matching_active_sources = []
+    for row in effective_sources:
+        if not bool(row.get("active")):
+            continue
+        entry = {
+            "id": row.get("id"),
+            "name": str(row.get("name") or "").strip(),
+            "url": str(row.get("url") or "").strip(),
+            "category": str(row.get("category") or "").strip(),
+            "scope": str(row.get("scope") or "").strip(),
+        }
+        active_sources.append(entry)
+        if not source_filters or _matches_source_filter(
+            {"source": entry["name"], "source_category": entry["category"]},
+            source_filters,
+        ):
+            matching_active_sources.append(entry)
+    return {
+        "active_sources": active_sources,
+        "matching_active_sources": matching_active_sources,
+    }
+
+
 def _format_topic_prompt_dataset(dataset: Dict[str, Any]) -> str:
     lines = [
         f"Topic: {dataset.get('topic')}",
@@ -341,6 +461,20 @@ def _format_topic_prompt_dataset(dataset: Dict[str, Any]) -> str:
     notes = str(dataset.get("notes") or "").strip()
     if notes:
         lines.append(f"Notes: {notes}")
+    inventory = dataset.get("source_inventory") or {}
+    active_sources = list(inventory.get("active_sources") or [])
+    matching_sources = list(inventory.get("matching_active_sources") or [])
+    lines.append(f"Active source count: {len(active_sources)}")
+    if matching_sources:
+        lines.append("Matching active sources:")
+        for src in matching_sources[:12]:
+            lines.append(
+                f"- {src.get('name')} [{src.get('category')}] scope={src.get('scope')} url={src.get('url')}"
+            )
+    elif active_sources:
+        lines.append("Active sources do not currently match the configured source filters.")
+    else:
+        lines.append("No active RSS sources are currently configured.")
     lines.append("")
     lines.append("Prepared RSS items:")
     items = list(dataset.get("rss_items") or [])
@@ -352,3 +486,91 @@ def _format_topic_prompt_dataset(dataset: Dict[str, Any]) -> str:
                 f"- source={item.get('source')} section={item.get('section')} score={item.get('score')} title={item.get('title')} url={item.get('url')} previously_published={item.get('previously_published')}"
             )
     return "\n".join(lines)
+
+
+def _append_memory_candidate(text: str, content: str) -> str:
+    body = (text or "").rstrip()
+    candidate = (content or "").strip()
+    if not candidate:
+        return body
+    return f"{body}\n\n## Memory candidate\n- {candidate}"
+
+
+def _build_memory_candidate(
+    *,
+    topic: str,
+    threshold: str,
+    selected_items: List[Dict[str, Any]],
+    result_text: str,
+) -> Optional[Dict[str, Any]]:
+    if not selected_items:
+        return None
+
+    combined_text = " ".join(
+        [
+            result_text,
+            *[str(item.get("title") or "") for item in selected_items],
+            *[str(item.get("summary") or "") for item in selected_items],
+        ]
+    ).lower()
+    consequential_hits = sum(1 for word in _CONSEQUENTIAL_KEYWORDS if word in combined_text)
+    source_names = sorted({str(item.get("source") or "").strip() for item in selected_items if item.get("source")})
+    distinct_source_count = len(source_names)
+    support_urls = [
+        str(item.get("url_canonical") or "").strip()
+        for item in selected_items
+        if str(item.get("url_canonical") or "").strip()
+    ][:5]
+
+    strong_update = False
+    if threshold == "high":
+        strong_update = consequential_hits >= 1 and distinct_source_count >= 1
+    elif threshold == "medium":
+        strong_update = consequential_hits >= 2 or (consequential_hits >= 1 and distinct_source_count >= 2)
+    else:
+        strong_update = consequential_hits >= 2 and distinct_source_count >= 2
+    if not strong_update:
+        return None
+
+    themes = [
+        theme
+        for theme, keywords in _THEME_KEYWORDS.items()
+        if any(keyword in combined_text for keyword in keywords)
+    ]
+    if not themes:
+        themes = ["notable developments"]
+
+    published_values = [str(item.get("published_at") or "").strip() for item in selected_items if item.get("published_at")]
+    memory_date = _normalize_memory_candidate_date(published_values) or datetime.now(timezone.utc).date().isoformat()
+    primary_theme = " and ".join(themes[:2])
+    source_clause = ", ".join(source_names[:3]) if source_names else "multiple sources"
+    confidence = min(0.95, 0.65 + (0.1 * min(consequential_hits, 2)) + (0.05 * min(distinct_source_count, 2)))
+    memory_type = "semantic" if any(theme != "notable developments" for theme in themes) and consequential_hits >= 2 else "episodic"
+    reason = f"Strong {threshold}-threshold watcher hit with {consequential_hits} consequential signals across {distinct_source_count} source(s)."
+    content = (
+        f"On {memory_date}, reports about {topic} indicated {primary_theme}, based on coverage from {source_clause}."
+    )
+    return {
+        "memory_type": memory_type,
+        "content": content,
+        "topic": topic,
+        "supporting_urls": support_urls,
+        "source_names": source_names,
+        "reason": reason,
+        "confidence": round(confidence, 2),
+        "status": "pending",
+        "approved_memory_id": None,
+        "approved_at": None,
+        "approved_by_user_id": None,
+    }
+
+
+def _normalize_memory_candidate_date(values: List[str]) -> str:
+    for value in values:
+        if not value:
+            continue
+        if "T" in value:
+            return value.split("T", 1)[0]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+            return value
+    return ""

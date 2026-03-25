@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import select
 
 from app.config import settings
-from app.db.models import AuditLog, ChatSession, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
+from app.db.models import AuditLog, ChatSession, Memory, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
 from app.autonomy.profiles.news_magazine import _ground_output
 from app.autonomy.runner import _format_result_for_inbox, _persist_run_artifacts
 from tests.conftest import TestSessionLocal
@@ -102,6 +102,34 @@ async def test_magazine_plan_uses_deterministic_steps_without_approval(client):
     rows = steps.json()
     assert rows[0]["title"] == "Draft Magazine from Dataset"
     assert rows[-1]["title"] == "Final Dedupe and Publish"
+    assert all(row["requires_approval"] is False for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_maintenance_plan_uses_single_deterministic_step(client):
+    headers = await _headers(client, "maintplanowner")
+    task = await client.post(
+        "/tasks",
+        json={
+            "title": "Refresh RSS cache",
+            "instruction": 'tool: refresh_rss_cache\nargs: {"max_items_per_source": 20}',
+            "profile": "maintenance",
+        },
+        headers=headers,
+    )
+    task_id = task.json()["id"]
+
+    planned = await client.post(
+        f"/tasks/{task_id}/plan",
+        json={"goal": "Refresh RSS cache", "max_steps": 5},
+        headers=headers,
+    )
+    assert planned.status_code == 200
+    assert planned.json()["steps_created"] == 1
+
+    steps = await client.get(f"/tasks/{task_id}/steps", headers=headers)
+    rows = steps.json()
+    assert [row["title"] for row in rows] == ["Execute Maintenance Action"]
     assert all(row["requires_approval"] is False for row in rows)
 
 
@@ -552,6 +580,18 @@ async def test_create_and_patch_task_profile_validation(client):
     assert watcher.status_code == 201
     assert watcher.json()["profile"] == "topic_watcher"
 
+    maintenance = await client.post(
+        "/tasks",
+        json={
+            "title": "Maintenance",
+            "instruction": "tool: refresh_rss_cache",
+            "profile": "maintenance",
+        },
+        headers=headers,
+    )
+    assert maintenance.status_code == 201
+    assert maintenance.json()["profile"] == "maintenance"
+
     patch = await client.patch(
         f"/tasks/{created.json()['id']}",
         json={"profile": "default"},
@@ -566,6 +606,76 @@ async def test_create_and_patch_task_profile_validation(client):
         headers=headers,
     )
     assert invalid.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_maintenance_profile_runner_requires_exact_tool_output(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "maintowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Maintenance task: refresh RSS cache.",
+            "instruction": 'tool: refresh_rss_cache\nargs: {"max_items_per_source": 20}',
+            "profile": "maintenance",
+            "task_type": "one_shot",
+            "deliver": False,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    plan_resp = await client.post(
+        f"/tasks/{task_id}/plan",
+        json={"goal": "Refresh RSS cache", "max_steps": 5},
+        headers=headers,
+    )
+    assert plan_resp.status_code == 200
+
+    runner = TaskRunner()
+    task_ref = type("TaskRef", (), {"id": task_id})()
+    tool_records = [
+        {
+            "tool": "refresh_rss_cache",
+            "result_summary": "sources_refreshed=12 items_cached=150",
+        }
+    ]
+
+    with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+        with patch("app.autonomy.runner._preflight_llm_dispatch", new=AsyncMock(return_value=None)):
+            with patch(
+                "app.autonomy.runner.get_tool_execution_records",
+                side_effect=[tool_records],
+            ):
+                with patch("app.autonomy.runner.reset_tool_execution_records", return_value=object()):
+                    with patch("app.autonomy.runner.restore_tool_execution_records", return_value=None):
+                        with patch(
+                            "app.autonomy.runner.TaskRunner._run_step_with_model_policy",
+                            new=AsyncMock(return_value="sources_refreshed=12 items_cached=150"),
+                        ):
+                            await runner.execute(task_ref)
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "completed"
+        assert task.result == "sources_refreshed=12 items_cached=150"
+        run_rows = await db.execute(
+            select(TaskRun).where(TaskRun.task_id == task_id).order_by(TaskRun.started_at.desc())
+        )
+        run = run_rows.scalars().first()
+        assert run is not None
+        artifacts = await db.execute(
+            select(TaskRunArtifact).where(TaskRunArtifact.task_run_id == run.id)
+        )
+        validation = next(
+            artifact for artifact in artifacts.scalars().all() if artifact.artifact_type == "validation_report"
+        )
+        payload = json.loads(validation.content_json)
+        assert payload["declared_tool"] == "refresh_rss_cache"
+        assert payload["declared_tool_called"] is True
+        assert payload["exact_output_match"] is True
 
 
 @pytest.mark.asyncio
@@ -678,6 +788,225 @@ async def test_admin_task_run_inspect_returns_ordered_payloads_and_diagnostics(c
     assert payload["diagnostics"]["active_skills"] == ["rss-grounded-briefing"]
     assert payload["diagnostics"]["validation_report"]["publish_mode"] == "full"
     assert payload["execution"]["edition_export"]["pdf_relative_path"].endswith("edition.pdf")
+
+
+@pytest.mark.asyncio
+async def test_approve_topic_watcher_memory_candidate_creates_memory_and_updates_artifact(client):
+    headers = await _headers(client, "memorycandidateowner")
+    admin_headers = await _admin_headers(client, "memorycandidateadmin")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={
+            "title": "Iran Watch",
+            "instruction": "topic: Iran\nthreshold: medium",
+            "profile": "topic_watcher",
+        },
+        headers=headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    async with TestSessionLocal() as db:
+        run = TaskRun(
+            task_id=task_id,
+            status="completed",
+            summary="Watcher fired",
+            started_at=datetime(2026, 3, 25, 1, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 3, 25, 1, 2, tzinfo=timezone.utc),
+        )
+        db.add(run)
+        await db.flush()
+        db.add(
+            TaskRunArtifact(
+                task_run_id=run.id,
+                artifact_type="memory_candidates",
+                content_json=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "memory_type": "episodic",
+                                "content": "On 2026-03-25, reports about Iran indicated renewed diplomatic talks and sanctions pressure.",
+                                "topic": "Iran",
+                                "supporting_urls": ["https://example.com/1", "https://example.com/2"],
+                                "source_names": ["Reuters", "BBC"],
+                                "reason": "Strong medium-threshold watcher hit.",
+                                "confidence": 0.8,
+                                "status": "pending",
+                                "approved_memory_id": None,
+                                "approved_at": None,
+                                "approved_by_user_id": None,
+                            }
+                        ]
+                    }
+                ),
+            )
+        )
+        await db.commit()
+        run_id = run.id
+
+    approve = await client.post(
+        f"/tasks/{task_id}/runs/{run_id}/memory-candidates/0/approve",
+        headers=headers,
+    )
+    assert approve.status_code == 200
+    payload = approve.json()
+    assert payload["task_id"] == task_id
+    assert payload["run_id"] == run_id
+    assert payload["candidate_index"] == 0
+    assert payload["candidate"]["status"] == "approved"
+    assert payload["candidate"]["approved_by_user_id"] is not None
+    assert payload["memory"]["memory_type"] == "episodic"
+    assert payload["memory"]["content"].startswith("On 2026-03-25")
+    assert "topic_watcher" in payload["memory"]["tags"]
+    assert "iran" in payload["memory"]["tags"]
+
+    async with TestSessionLocal() as db:
+        memories = (await db.execute(select(Memory).order_by(Memory.id.desc()))).scalars().all()
+        assert len(memories) == 1
+        assert memories[0].content == payload["memory"]["content"]
+        artifact = (
+            await db.execute(
+                select(TaskRunArtifact).where(
+                    TaskRunArtifact.task_run_id == run_id,
+                    TaskRunArtifact.artifact_type == "memory_candidates",
+                )
+            )
+        ).scalar_one()
+        artifact_payload = json.loads(artifact.content_json)
+        assert artifact_payload["candidates"][0]["status"] == "approved"
+        assert artifact_payload["candidates"][0]["approved_memory_id"] == memories[0].id
+
+    inspect = await client.get(f"/admin/task-runs/{run_id}/inspect", headers=admin_headers)
+    assert inspect.status_code == 200
+    inspect_payload = inspect.json()
+    candidate_artifact = next(
+        row for row in inspect_payload["artifacts"] if row["artifact_type"] == "memory_candidates"
+    )
+    assert candidate_artifact["content_json"]["candidates"][0]["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_approve_topic_watcher_memory_candidate_rejects_duplicate_approval(client):
+    headers = await _headers(client, "memoryduplicateowner")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Watcher", "instruction": "topic: AI", "profile": "topic_watcher"},
+        headers=headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    async with TestSessionLocal() as db:
+        run = TaskRun(task_id=task_id, status="completed", summary="done")
+        db.add(run)
+        await db.flush()
+        db.add(
+            TaskRunArtifact(
+                task_run_id=run.id,
+                artifact_type="memory_candidates",
+                content_json=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "memory_type": "semantic",
+                                "content": "AI regulation entered a new review phase.",
+                                "topic": "AI regulation",
+                                "supporting_urls": ["https://example.com/ai"],
+                                "source_names": ["Reuters"],
+                                "reason": "Strong watcher hit.",
+                                "confidence": 0.82,
+                                "status": "approved",
+                                "approved_memory_id": 99,
+                                "approved_at": "2026-03-25T02:00:00+00:00",
+                                "approved_by_user_id": 1,
+                            }
+                        ]
+                    }
+                ),
+            )
+        )
+        await db.commit()
+        run_id = run.id
+
+    approve = await client.post(
+        f"/tasks/{task_id}/runs/{run_id}/memory-candidates/0/approve",
+        headers=headers,
+    )
+    assert approve.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_approve_topic_watcher_memory_candidate_rejects_other_users_run(client):
+    owner_headers = await _headers(client, "memoryowner")
+    other_headers = await _headers(client, "memoryother")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Watcher", "instruction": "topic: Iran", "profile": "topic_watcher"},
+        headers=owner_headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    async with TestSessionLocal() as db:
+        run = TaskRun(task_id=task_id, status="completed", summary="done")
+        db.add(run)
+        await db.flush()
+        db.add(
+            TaskRunArtifact(
+                task_run_id=run.id,
+                artifact_type="memory_candidates",
+                content_json=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "memory_type": "episodic",
+                                "content": "On 2026-03-25, reports about Iran indicated renewed diplomatic talks.",
+                                "topic": "Iran",
+                                "supporting_urls": ["https://example.com/iran"],
+                                "source_names": ["BBC"],
+                                "reason": "Strong watcher hit.",
+                                "confidence": 0.8,
+                                "status": "pending",
+                                "approved_memory_id": None,
+                                "approved_at": None,
+                                "approved_by_user_id": None,
+                            }
+                        ]
+                    }
+                ),
+            )
+        )
+        await db.commit()
+        run_id = run.id
+
+    approve = await client.post(
+        f"/tasks/{task_id}/runs/{run_id}/memory-candidates/0/approve",
+        headers=other_headers,
+    )
+    assert approve.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_approve_topic_watcher_memory_candidate_returns_404_without_artifact(client):
+    headers = await _headers(client, "memorymissingartifact")
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Watcher", "instruction": "topic: Iran", "profile": "topic_watcher"},
+        headers=headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    async with TestSessionLocal() as db:
+        run = TaskRun(task_id=task_id, status="completed", summary="done")
+        db.add(run)
+        await db.commit()
+        run_id = run.id
+
+    approve = await client.post(
+        f"/tasks/{task_id}/runs/{run_id}/memory-candidates/0/approve",
+        headers=headers,
+    )
+    assert approve.status_code == 404
 
 
 @pytest.mark.asyncio

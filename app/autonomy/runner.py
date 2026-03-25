@@ -34,6 +34,11 @@ from app.config import settings
 from app.db.models import Task, TaskRun, TaskRunArtifact, TaskStep
 from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
+from app.agent.tools import (
+    get_tool_execution_records,
+    reset_tool_execution_records,
+    restore_tool_execution_records,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -491,7 +496,18 @@ class TaskRunner:
                         run_debug[key] = run_context[key]
             blocked = set(step_user_context.blocked_tools or [])
             blocked.update(task_profile.effective_blocked_tools(run_context=run_context))
-            step_user_context = replace(step_user_context, blocked_tools=sorted(blocked))
+            allowed_cap = list(step_user_context.allowed_tool_cap or [])
+            profile_allowed = task_profile.effective_allowed_tools(run_context=run_context)
+            if profile_allowed is not None:
+                if allowed_cap:
+                    allowed_cap = sorted(set(allowed_cap).intersection(profile_allowed))
+                else:
+                    allowed_cap = sorted(profile_allowed)
+            step_user_context = replace(
+                step_user_context,
+                blocked_tools=sorted(blocked),
+                allowed_tool_cap=allowed_cap,
+            )
 
         async with AsyncSessionLocal() as db:
             task = await db.get(Task, task_id)
@@ -595,6 +611,7 @@ class TaskRunner:
                 model_profile.final_synthesis_model if is_final_step else model_profile.execution_model
             )
             token = _approval_armed.set(arm_approval)
+            tool_record_token = reset_tool_execution_records()
             try:
                 result = await self._run_step_with_model_policy(
                     prompt="\n\n".join(prompt_parts),
@@ -611,7 +628,10 @@ class TaskRunner:
                     repeated_error_counts=repeated_error_counts,
                     suppression_events=suppression_events,
                 )
+                tool_records = get_tool_execution_records()
             except ApprovalRequired as exc:
+                tool_records = get_tool_execution_records()
+                restore_tool_execution_records(tool_record_token)
                 _approval_armed.reset(token)
                 async with AsyncSessionLocal() as db:
                     task = await db.get(Task, task_id)
@@ -623,6 +643,8 @@ class TaskRunner:
                     await db.commit()
                 raise
             except Exception as exc:
+                tool_records = get_tool_execution_records()
+                restore_tool_execution_records(tool_record_token)
                 _approval_armed.reset(token)
                 if (
                     getattr(task_profile, "name", "default") == "rss_newspaper"
@@ -646,9 +668,12 @@ class TaskRunner:
                     await db.commit()
                 raise
             else:
+                restore_tool_execution_records(tool_record_token)
                 _approval_armed.reset(token)
 
             if task_profile:
+                if isinstance(run_context, dict):
+                    run_context["last_tool_records"] = tool_records
                 cleaned, grounding_report = task_profile.validate_finalize(
                     result=result,
                     prior_full_outputs=prior_full_outputs,

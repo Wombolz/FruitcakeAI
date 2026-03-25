@@ -2,7 +2,9 @@ Evaluate the prepared RSS dataset for the configured topic and threshold.
 
 Rules:
 - Use only the prepared dataset.
-- Do not call retrieval tools.
+- Start from the prepared source inventory and prepared RSS dataset.
+- Do not manage RSS sources during this task run.
+- Do not call retrieval or memory tools; the watcher must decide from prepared context only.
 - Prefer silence over marginal relevance.
 - If there are no clearly relevant items, output exactly:
   `NOTHING_NEW`
@@ -16,6 +18,10 @@ When firing:
   followed by one sentence explaining why it matters to the topic.
 - Use only URLs from the prepared dataset.
 - Do not invent sources, titles, URLs, or relevance.
+- If the developments are clearly consequential and durable, append:
+  `## Memory candidate`
+  with one concise topic-level timeline statement.
+- Do not output a memory candidate for weak, noisy, or routine updates.
 
 Threshold guidance:
 - `high`: only direct developments about the topic
