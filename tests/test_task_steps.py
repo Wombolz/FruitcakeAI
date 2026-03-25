@@ -528,6 +528,30 @@ async def test_create_and_patch_task_profile_validation(client):
     assert created.status_code == 201
     assert created.json()["profile"] == "rss_newspaper"
 
+    morning = await client.post(
+        "/tasks",
+        json={
+            "title": "Morning briefing",
+            "instruction": "Brief me on my day",
+            "profile": "morning_briefing",
+        },
+        headers=headers,
+    )
+    assert morning.status_code == 201
+    assert morning.json()["profile"] == "morning_briefing"
+
+    watcher = await client.post(
+        "/tasks",
+        json={
+            "title": "Watcher",
+            "instruction": "topic: AI regulation",
+            "profile": "topic_watcher",
+        },
+        headers=headers,
+    )
+    assert watcher.status_code == 201
+    assert watcher.json()["profile"] == "topic_watcher"
+
     patch = await client.patch(
         f"/tasks/{created.json()['id']}",
         json={"profile": "default"},

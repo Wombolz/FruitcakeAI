@@ -203,7 +203,10 @@ class TaskRunner:
             log.info("task.completed", task_id=task_id, result_len=len(result or ""))
 
             # Phase 7: Deliver result (APNs stub — real push wired in Sprint 4.3)
-            if task_deliver and result:
+            suppress_push = bool((run_debug.get("grounding_report") or {}).get("suppress_push"))
+            if not suppress_push and str(run_debug.get("profile") or "") == "topic_watcher":
+                suppress_push = (result or "").strip() == "NOTHING_NEW"
+            if task_deliver and result and not suppress_push:
                 await self._push(task_id, result)
 
         except asyncio.CancelledError:
@@ -483,7 +486,7 @@ class TaskRunner:
                 )
                 await db.commit()
             if isinstance(run_context, dict):
-                for key in ("dataset", "dataset_stats", "refresh_stats"):
+                for key in ("dataset", "dataset_stats", "refresh_stats", "watcher_config", "config_warnings"):
                     if key in run_context:
                         run_debug[key] = run_context[key]
             blocked = set(step_user_context.blocked_tools or [])
