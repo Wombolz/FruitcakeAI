@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import select
 
 from app.config import settings
-from app.db.models import AuditLog, ChatSession, Memory, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
+from app.db.models import AuditLog, ChatSession, Memory, MemoryProposal, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
 from app.autonomy.profiles.news_magazine import _ground_output
 from app.autonomy.runner import _format_result_for_inbox, _persist_run_artifacts
 from tests.conftest import TestSessionLocal
@@ -1007,6 +1007,236 @@ async def test_approve_topic_watcher_memory_candidate_returns_404_without_artifa
         headers=headers,
     )
     assert approve.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_memory_review_list_and_approve_proposal(client):
+    headers = await _headers(client, "reviewowner")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Watcher", "instruction": "topic: Iran", "profile": "topic_watcher"},
+        headers=headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    async with TestSessionLocal() as db:
+        run = TaskRun(task_id=task_id, status="completed", summary="done")
+        db.add(run)
+        await db.flush()
+        proposal = MemoryProposal(
+            proposal_key="proposal-review-1",
+            user_id=1,
+            proposal_type="flat_memory_create",
+            source_type="topic_watcher",
+            status="pending",
+            task_id=task_id,
+            task_run_id=run.id,
+            content="On 2026-03-25, reports about Iran indicated renewed diplomatic talks.",
+            confidence=0.8,
+            reason="Strong watcher hit.",
+        )
+        proposal.proposal_payload = {
+            "proposal_key": "proposal-review-1",
+            "memory_type": "episodic",
+            "content": "On 2026-03-25, reports about Iran indicated renewed diplomatic talks.",
+            "topic": "Iran",
+            "supporting_urls": ["https://example.com/iran-1"],
+            "source_names": ["Reuters"],
+            "reason": "Strong watcher hit.",
+            "confidence": 0.8,
+        }
+        db.add(proposal)
+        db.add(
+            TaskRunArtifact(
+                task_run_id=run.id,
+                artifact_type="memory_candidates",
+                content_json=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "proposal_key": "proposal-review-1",
+                                "memory_type": "episodic",
+                                "content": "On 2026-03-25, reports about Iran indicated renewed diplomatic talks.",
+                                "topic": "Iran",
+                                "supporting_urls": ["https://example.com/iran-1"],
+                                "source_names": ["Reuters"],
+                                "reason": "Strong watcher hit.",
+                                "confidence": 0.8,
+                                "status": "pending",
+                                "proposal_id": None,
+                            }
+                        ]
+                    }
+                ),
+            )
+        )
+        await db.commit()
+        proposal_id = proposal.id
+        run_id = run.id
+
+    listing = await client.get("/memories/review", headers=headers)
+    assert listing.status_code == 200
+    items = listing.json()
+    assert len(items) == 1
+    assert items[0]["id"] == proposal_id
+    assert items[0]["status"] == "pending"
+    assert items[0]["proposal"]["topic"] == "Iran"
+
+    detail = await client.get(f"/memories/review/{proposal_id}", headers=headers)
+    assert detail.status_code == 200
+    assert detail.json()["id"] == proposal_id
+
+    approve = await client.post(f"/memories/review/{proposal_id}/approve", headers=headers)
+    assert approve.status_code == 200
+    payload = approve.json()
+    assert payload["proposal"]["status"] == "approved"
+    assert payload["memory"]["memory_type"] == "episodic"
+    assert "topic_watcher" in payload["memory"]["tags"]
+
+    async with TestSessionLocal() as db:
+        proposal = await db.get(MemoryProposal, proposal_id)
+        assert proposal is not None
+        assert proposal.status == "approved"
+        assert proposal.approved_memory_id is not None
+        artifact = (
+            await db.execute(
+                select(TaskRunArtifact).where(
+                    TaskRunArtifact.task_run_id == run_id,
+                    TaskRunArtifact.artifact_type == "memory_candidates",
+                )
+            )
+        ).scalar_one()
+        artifact_payload = json.loads(artifact.content_json)
+        assert artifact_payload["candidates"][0]["status"] == "approved"
+        assert artifact_payload["candidates"][0]["proposal_id"] == proposal_id
+
+
+@pytest.mark.asyncio
+async def test_memory_review_reject_updates_status_without_creating_memory(client):
+    headers = await _headers(client, "reviewrejectowner")
+
+    async with TestSessionLocal() as db:
+        task = Task(user_id=1, title="Watcher", instruction="topic: AI", profile="topic_watcher")
+        db.add(task)
+        await db.flush()
+        run = TaskRun(task_id=task.id, status="completed", summary="done")
+        db.add(run)
+        await db.flush()
+        proposal = MemoryProposal(
+            proposal_key="proposal-review-reject",
+            user_id=1,
+            proposal_type="flat_memory_create",
+            source_type="topic_watcher",
+            status="pending",
+            task_id=task.id,
+            task_run_id=run.id,
+            content="AI regulation entered a new review phase.",
+            confidence=0.72,
+            reason="Strong watcher hit.",
+        )
+        proposal.proposal_payload = {
+            "proposal_key": "proposal-review-reject",
+            "memory_type": "semantic",
+            "content": "AI regulation entered a new review phase.",
+            "topic": "AI regulation",
+            "supporting_urls": ["https://example.com/ai-1"],
+            "source_names": ["Reuters"],
+            "reason": "Strong watcher hit.",
+            "confidence": 0.72,
+        }
+        db.add(proposal)
+        await db.commit()
+        proposal_id = proposal.id
+
+    reject = await client.post(f"/memories/review/{proposal_id}/reject", headers=headers)
+    assert reject.status_code == 200
+    assert reject.json()["status"] == "rejected"
+
+    async with TestSessionLocal() as db:
+        proposal = await db.get(MemoryProposal, proposal_id)
+        assert proposal is not None
+        assert proposal.status == "rejected"
+        memories = (await db.execute(select(Memory))).scalars().all()
+        assert memories == []
+
+
+@pytest.mark.asyncio
+async def test_memory_review_rejects_duplicate_approval(client):
+    headers = await _headers(client, "reviewduplicateowner")
+
+    async with TestSessionLocal() as db:
+        proposal = MemoryProposal(
+            proposal_key="proposal-review-duplicate",
+            user_id=1,
+            proposal_type="flat_memory_create",
+            source_type="topic_watcher",
+            status="approved",
+            content="Duplicate proposal",
+            confidence=0.7,
+            reason="Strong watcher hit.",
+            approved_memory_id=99,
+            resolved_by_user_id=1,
+            resolved_at=datetime(2026, 3, 25, 4, 0, tzinfo=timezone.utc),
+        )
+        proposal.proposal_payload = {
+            "proposal_key": "proposal-review-duplicate",
+            "memory_type": "semantic",
+            "content": "Duplicate proposal",
+            "topic": "Iran",
+            "supporting_urls": [],
+            "source_names": [],
+            "reason": "Strong watcher hit.",
+            "confidence": 0.7,
+        }
+        db.add(proposal)
+        await db.commit()
+        proposal_id = proposal.id
+
+    approve = await client.post(f"/memories/review/{proposal_id}/approve", headers=headers)
+    assert approve.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_memory_review_scopes_proposals_to_current_user(client):
+    owner_headers = await _headers(client, "reviewscopeowner")
+    other_headers = await _headers(client, "reviewscopeother")
+
+    async with TestSessionLocal() as db:
+        proposal = MemoryProposal(
+            proposal_key="proposal-scope-1",
+            user_id=1,
+            proposal_type="flat_memory_create",
+            source_type="topic_watcher",
+            status="pending",
+            content="Scoped proposal",
+            confidence=0.6,
+            reason="Strong watcher hit.",
+        )
+        proposal.proposal_payload = {
+            "proposal_key": "proposal-scope-1",
+            "memory_type": "semantic",
+            "content": "Scoped proposal",
+            "topic": "Iran",
+            "supporting_urls": [],
+            "source_names": [],
+            "reason": "Strong watcher hit.",
+            "confidence": 0.6,
+        }
+        db.add(proposal)
+        await db.commit()
+        proposal_id = proposal.id
+
+    own_list = await client.get("/memories/review", headers=owner_headers)
+    assert own_list.status_code == 200
+    assert len(own_list.json()) == 1
+
+    other_list = await client.get("/memories/review", headers=other_headers)
+    assert other_list.status_code == 200
+    assert other_list.json() == []
+
+    other_detail = await client.get(f"/memories/review/{proposal_id}", headers=other_headers)
+    assert other_detail.status_code == 404
 
 
 @pytest.mark.asyncio

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
@@ -31,9 +31,14 @@ from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
-from app.db.models import Memory, MemoryEntity, MemoryObservation, MemoryRelation, User
+from app.db.models import Memory, MemoryEntity, MemoryObservation, MemoryProposal, MemoryRelation, User
 from app.db.session import get_db
 from app.memory.graph_service import get_graph_memory_service
+from app.memory.review_service import (
+    create_flat_memory_from_proposal,
+    decode_proposal_payload,
+    sync_artifact_candidate_status,
+)
 from app.memory.service import get_memory_service
 
 router = APIRouter()
@@ -203,6 +208,28 @@ class MemoryGraphNodeOut(BaseModel):
     observations: List[MemoryObservationOut]
 
 
+class MemoryProposalOut(BaseModel):
+    id: int
+    proposal_type: str
+    source_type: str
+    status: str
+    task_id: Optional[int]
+    task_run_id: Optional[int]
+    content: str
+    confidence: float
+    reason: Optional[str]
+    created_at: Optional[datetime]
+    resolved_at: Optional[datetime]
+    resolved_by_user_id: Optional[int]
+    approved_memory_id: Optional[int]
+    proposal: Dict[str, Any]
+
+
+class MemoryProposalApprovalOut(BaseModel):
+    proposal: MemoryProposalOut
+    memory: MemoryOut
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get("/memories", response_model=List[MemoryOut])
@@ -255,6 +282,89 @@ async def create_memory(
         )
 
     return MemoryOut.from_orm(result)
+
+
+@router.get("/memories/review", response_model=List[MemoryProposalOut])
+async def list_memory_review_proposals(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    status_filter: Optional[str] = None,
+    source_type: Optional[str] = None,
+):
+    query = (
+        select(MemoryProposal)
+        .where(MemoryProposal.user_id == current_user.id)
+        .order_by(
+            MemoryProposal.status.asc(),
+            desc(MemoryProposal.created_at),
+            desc(MemoryProposal.id),
+        )
+    )
+    if status_filter:
+        query = query.where(MemoryProposal.status == status_filter)
+    if source_type:
+        query = query.where(MemoryProposal.source_type == source_type)
+    result = await db.execute(query)
+    proposals = result.scalars().all()
+    return [_memory_proposal_out(proposal) for proposal in proposals]
+
+
+@router.get("/memories/review/{proposal_id}", response_model=MemoryProposalOut)
+async def get_memory_review_proposal(
+    proposal_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    proposal = await _get_owned_memory_proposal(db=db, proposal_id=proposal_id, user_id=current_user.id)
+    return _memory_proposal_out(proposal)
+
+
+@router.post("/memories/review/{proposal_id}/approve", response_model=MemoryProposalApprovalOut)
+async def approve_memory_review_proposal(
+    proposal_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    proposal = await _get_owned_memory_proposal(db=db, proposal_id=proposal_id, user_id=current_user.id)
+    if proposal.status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Memory proposal has already been resolved",
+        )
+    memory = await create_flat_memory_from_proposal(db, proposal=proposal, user_id=current_user.id)
+    proposal.status = "approved"
+    proposal.approved_memory_id = memory.id
+    proposal.resolved_by_user_id = current_user.id
+    proposal.resolved_at = datetime.now(timezone.utc)
+    await sync_artifact_candidate_status(db, proposal=proposal)
+    await db.commit()
+    await db.refresh(proposal)
+    await db.refresh(memory)
+    return MemoryProposalApprovalOut(
+        proposal=_memory_proposal_out(proposal),
+        memory=MemoryOut.from_orm(memory),
+    )
+
+
+@router.post("/memories/review/{proposal_id}/reject", response_model=MemoryProposalOut)
+async def reject_memory_review_proposal(
+    proposal_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    proposal = await _get_owned_memory_proposal(db=db, proposal_id=proposal_id, user_id=current_user.id)
+    if proposal.status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Memory proposal has already been resolved",
+        )
+    proposal.status = "rejected"
+    proposal.resolved_by_user_id = current_user.id
+    proposal.resolved_at = datetime.now(timezone.utc)
+    await sync_artifact_candidate_status(db, proposal=proposal)
+    await db.commit()
+    await db.refresh(proposal)
+    return _memory_proposal_out(proposal)
 
 
 @router.get("/memories/export")
@@ -610,6 +720,46 @@ async def _get_owned_memory(memory_id: int, user_id: int, db: AsyncSession) -> M
     if m is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found")
     return m
+
+
+async def _get_owned_memory_proposal(
+    *,
+    db: AsyncSession,
+    proposal_id: int,
+    user_id: int,
+) -> MemoryProposal:
+    result = await db.execute(
+        select(MemoryProposal).where(
+            MemoryProposal.id == proposal_id,
+            MemoryProposal.user_id == user_id,
+        )
+    )
+    proposal = result.scalar_one_or_none()
+    if proposal is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Memory proposal not found",
+        )
+    return proposal
+
+
+def _memory_proposal_out(proposal: MemoryProposal) -> MemoryProposalOut:
+    return MemoryProposalOut(
+        id=proposal.id,
+        proposal_type=proposal.proposal_type,
+        source_type=proposal.source_type,
+        status=proposal.status,
+        task_id=proposal.task_id,
+        task_run_id=proposal.task_run_id,
+        content=proposal.content,
+        confidence=float(proposal.confidence or 0.0),
+        reason=proposal.reason,
+        created_at=proposal.created_at,
+        resolved_at=proposal.resolved_at,
+        resolved_by_user_id=proposal.resolved_by_user_id,
+        approved_memory_id=proposal.approved_memory_id,
+        proposal=decode_proposal_payload(proposal.proposal_json),
+    )
 
 
 async def _load_entity_lookup(

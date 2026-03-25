@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -7,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.autonomy.magazine_pipeline import build_magazine_dataset
 from app.autonomy.profiles.base import TaskExecutionProfile
 from app.autonomy.profiles.spec_loader import load_profile_spec_text
-from app.db.models import RSSPublishedItem, Task
+from app.db.models import MemoryProposal, RSSPublishedItem, Task
 from app.mcp.services import rss_sources
 
 _NOTHING_NEW = "NOTHING_NEW"
@@ -278,14 +279,17 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
                 "collapsed_to_nothing_new": True,
             }
 
-        memory_candidate = _build_memory_candidate(
+        memory_candidates = _build_memory_candidates(
             topic=topic,
             threshold=threshold,
             selected_items=selected_items,
             result_text=text,
         )
-        if memory_candidate:
-            text = _append_memory_candidate(text, memory_candidate["content"])
+        if memory_candidates:
+            text = _append_memory_candidates(
+                text,
+                [str(candidate.get("content") or "") for candidate in memory_candidates],
+            )
 
         report = {
             "fatal": False,
@@ -296,12 +300,13 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             "threshold": threshold,
             "topic": topic,
             "published_items": selected_items,
-            "memory_candidate_emitted": bool(memory_candidate),
-            "memory_candidate_type": (memory_candidate or {}).get("memory_type"),
-            "memory_candidate_confidence": float((memory_candidate or {}).get("confidence") or 0.0),
-            "memory_candidate_reason": (memory_candidate or {}).get("reason"),
-            "memory_candidate_support_count": len((memory_candidate or {}).get("supporting_urls") or []),
-            "memory_candidate": memory_candidate,
+            "memory_candidate_emitted": bool(memory_candidates),
+            "memory_candidate_type": (memory_candidates[0] if memory_candidates else {}).get("memory_type"),
+            "memory_candidate_confidence": float(((memory_candidates[0] if memory_candidates else {}) or {}).get("confidence") or 0.0),
+            "memory_candidate_reason": ((memory_candidates[0] if memory_candidates else {}) or {}).get("reason"),
+            "memory_candidate_support_count": len(((memory_candidates[0] if memory_candidates else {}) or {}).get("supporting_urls") or []),
+            "memory_candidate": memory_candidates[0] if memory_candidates else None,
+            "memory_candidates": memory_candidates,
             "suppress_push": False,
         }
         return text, report
@@ -327,12 +332,15 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             out.append({"artifact_type": "final_output", "content_text": final_markdown})
         if isinstance(grounding, dict):
             out.append({"artifact_type": "validation_report", "content_json": grounding})
-            memory_candidate = grounding.get("memory_candidate")
-            if isinstance(memory_candidate, dict):
+            memory_candidates = [
+                candidate for candidate in (grounding.get("memory_candidates") or [])
+                if isinstance(candidate, dict)
+            ]
+            if memory_candidates:
                 out.append(
                     {
                         "artifact_type": "memory_candidates",
-                        "content_json": {"candidates": [memory_candidate]},
+                        "content_json": {"candidates": memory_candidates},
                     }
                 )
         out.append({"artifact_type": "run_diagnostics", "content_json": diagnostics})
@@ -355,6 +363,7 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
             return
         if grounding.get("reuse_fallback_triggered") and threshold != "low":
             return
+        created_proposals: list[dict[str, Any]] = []
         for item in grounding.get("published_items") or []:
             if not isinstance(item, dict):
                 continue
@@ -371,6 +380,58 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
                     published_at=run.finished_at or datetime.now(timezone.utc),
                 )
             )
+        for candidate in grounding.get("memory_candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            proposal_key = str(candidate.get("proposal_key") or candidate.get("candidate_key") or "").strip()
+            content = str(candidate.get("content") or "").strip()
+            if not proposal_key or not content:
+                continue
+            proposal = MemoryProposal(
+                proposal_key=proposal_key,
+                user_id=task.user_id,
+                proposal_type="flat_memory_create",
+                source_type="topic_watcher",
+                status="pending",
+                task_id=task.id,
+                task_run_id=run.id,
+                content=content,
+                confidence=float(candidate.get("confidence") or 0.0),
+                reason=str(candidate.get("reason") or "").strip() or None,
+            )
+            proposal.proposal_payload = {
+                "memory_type": str(candidate.get("memory_type") or "").strip(),
+                "content": content,
+                "topic": str(candidate.get("topic") or "").strip(),
+                "supporting_urls": list(candidate.get("supporting_urls") or []),
+                "source_names": list(candidate.get("source_names") or []),
+                "reason": str(candidate.get("reason") or "").strip(),
+                "confidence": float(candidate.get("confidence") or 0.0),
+                "proposal_key": proposal_key,
+            }
+            db.add(proposal)
+            await db.flush()
+            candidate["proposal_id"] = proposal.id
+            created_proposals.append(
+                {
+                    "proposal_id": proposal.id,
+                    "proposal_key": proposal_key,
+                    "status": proposal.status,
+                    "content": content,
+                }
+            )
+        if created_proposals:
+            grounding["memory_candidates"] = list(grounding.get("memory_candidates") or [])
+            for candidate in grounding["memory_candidates"]:
+                if not isinstance(candidate, dict):
+                    continue
+                key = str(candidate.get("proposal_key") or candidate.get("candidate_key") or "").strip()
+                for created in created_proposals:
+                    if created["proposal_key"] == key:
+                        candidate["proposal_id"] = created["proposal_id"]
+                        candidate["status"] = created["status"]
+                        break
+            grounding["memory_candidate"] = grounding["memory_candidates"][0]
 
 
 def _parse_topic_watcher_instruction(instruction: str) -> Dict[str, Any]:
@@ -488,24 +549,75 @@ def _format_topic_prompt_dataset(dataset: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _append_memory_candidate(text: str, content: str) -> str:
+def _append_memory_candidates(text: str, contents: List[str]) -> str:
     body = (text or "").rstrip()
-    candidate = (content or "").strip()
-    if not candidate:
+    lines = [f"- {(content or '').strip()}" for content in contents if str(content or "").strip()]
+    if not lines:
         return body
-    return f"{body}\n\n## Memory candidate\n- {candidate}"
+    return f"{body}\n\n## Memory candidates\n" + "\n".join(lines)
 
 
-def _build_memory_candidate(
+def _build_memory_candidates(
     *,
     topic: str,
     threshold: str,
     selected_items: List[Dict[str, Any]],
     result_text: str,
-) -> Optional[Dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     if not selected_items:
-        return None
+        return []
 
+    result_text_lower = (result_text or "").lower()
+    clusters: dict[str, List[Dict[str, Any]]] = {}
+    for item in selected_items:
+        item_text = " ".join(
+            [
+                result_text_lower,
+                str(item.get("title") or "").lower(),
+                str(item.get("summary") or "").lower(),
+            ]
+        )
+        matched_themes = [
+            theme
+            for theme, keywords in _THEME_KEYWORDS.items()
+            if any(keyword in item_text for keyword in keywords)
+        ]
+        cluster_key = matched_themes[0] if matched_themes else "notable developments"
+        clusters.setdefault(cluster_key, []).append(item)
+
+    ranked_clusters = sorted(
+        clusters.items(),
+        key=lambda pair: (
+            -_consequential_hits_for_items(pair[1], result_text=result_text),
+            -len({str(item.get("source") or "").strip() for item in pair[1] if item.get("source")}),
+            -len(pair[1]),
+            pair[0],
+        ),
+    )
+    candidates: List[Dict[str, Any]] = []
+    for theme, items in ranked_clusters:
+        candidate = _build_cluster_memory_candidate(
+            topic=topic,
+            threshold=threshold,
+            theme=theme,
+            selected_items=items,
+            result_text=result_text,
+        )
+        if candidate:
+            candidates.append(candidate)
+        if len(candidates) >= 3:
+            break
+    return candidates
+
+
+def _build_cluster_memory_candidate(
+    *,
+    topic: str,
+    threshold: str,
+    theme: str,
+    selected_items: List[Dict[str, Any]],
+    result_text: str,
+) -> Optional[Dict[str, Any]]:
     combined_text = " ".join(
         [
             result_text,
@@ -513,7 +625,7 @@ def _build_memory_candidate(
             *[str(item.get("summary") or "") for item in selected_items],
         ]
     ).lower()
-    consequential_hits = sum(1 for word in _CONSEQUENTIAL_KEYWORDS if word in combined_text)
+    consequential_hits = _consequential_hits_for_items(selected_items, result_text=result_text)
     source_names = sorted({str(item.get("source") or "").strip() for item in selected_items if item.get("source")})
     distinct_source_count = len(source_names)
     support_urls = [
@@ -532,25 +644,18 @@ def _build_memory_candidate(
     if not strong_update:
         return None
 
-    themes = [
-        theme
-        for theme, keywords in _THEME_KEYWORDS.items()
-        if any(keyword in combined_text for keyword in keywords)
-    ]
-    if not themes:
-        themes = ["notable developments"]
-
     published_values = [str(item.get("published_at") or "").strip() for item in selected_items if item.get("published_at")]
     memory_date = _normalize_memory_candidate_date(published_values) or datetime.now(timezone.utc).date().isoformat()
-    primary_theme = " and ".join(themes[:2])
     source_clause = ", ".join(source_names[:3]) if source_names else "multiple sources"
     confidence = min(0.95, 0.65 + (0.1 * min(consequential_hits, 2)) + (0.05 * min(distinct_source_count, 2)))
-    memory_type = "semantic" if any(theme != "notable developments" for theme in themes) and consequential_hits >= 2 else "episodic"
-    reason = f"Strong {threshold}-threshold watcher hit with {consequential_hits} consequential signals across {distinct_source_count} source(s)."
-    content = (
-        f"On {memory_date}, reports about {topic} indicated {primary_theme}, based on coverage from {source_clause}."
-    )
+    memory_type = "semantic" if theme != "notable developments" and consequential_hits >= 2 else "episodic"
+    reason = f"Strong {threshold}-threshold watcher hit for {theme} with {consequential_hits} consequential signals across {distinct_source_count} source(s)."
+    content = f"On {memory_date}, reports about {topic} indicated {theme}, based on coverage from {source_clause}."
+    proposal_key = hashlib.sha256(
+        "|".join([topic, theme, content, *support_urls]).encode("utf-8")
+    ).hexdigest()
     return {
+        "proposal_key": proposal_key,
         "memory_type": memory_type,
         "content": content,
         "topic": topic,
@@ -563,6 +668,17 @@ def _build_memory_candidate(
         "approved_at": None,
         "approved_by_user_id": None,
     }
+
+
+def _consequential_hits_for_items(selected_items: List[Dict[str, Any]], *, result_text: str) -> int:
+    combined_text = " ".join(
+        [
+            result_text,
+            *[str(item.get("title") or "") for item in selected_items],
+            *[str(item.get("summary") or "") for item in selected_items],
+        ]
+    ).lower()
+    return sum(1 for word in _CONSEQUENTIAL_KEYWORDS if word in combined_text)
 
 
 def _normalize_memory_candidate_date(values: List[str]) -> str:

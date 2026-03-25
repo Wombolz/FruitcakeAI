@@ -66,6 +66,12 @@ class User(Base):
     tasks = relationship("Task", back_populates="user", cascade="all, delete-orphan")
     device_tokens = relationship("DeviceToken", back_populates="user", cascade="all, delete-orphan")
     memories = relationship("Memory", back_populates="user", cascade="all, delete-orphan")
+    memory_proposals = relationship("MemoryProposal", back_populates="user", foreign_keys="MemoryProposal.user_id", cascade="all, delete-orphan")
+    resolved_memory_proposals = relationship(
+        "MemoryProposal",
+        back_populates="resolver",
+        foreign_keys="MemoryProposal.resolved_by_user_id",
+    )
     memory_entities = relationship("MemoryEntity", back_populates="user", cascade="all, delete-orphan")
     memory_relations = relationship("MemoryRelation", back_populates="user", cascade="all, delete-orphan")
     memory_observations = relationship("MemoryObservation", back_populates="user", cascade="all, delete-orphan")
@@ -363,6 +369,49 @@ class Memory(Base):
 
     def __repr__(self):
         return f"<Memory(user_id={self.user_id}, type='{self.memory_type}', importance={self.importance})>"
+
+
+class MemoryProposal(Base):
+    __tablename__ = "memory_proposals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    proposal_key = Column(String(64), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    proposal_type = Column(String(50), nullable=False, index=True)
+    source_type = Column(String(50), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True)
+    task_run_id = Column(Integer, ForeignKey("task_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    content = Column(Text, nullable=False)
+    proposal_json = Column(Text, default="{}", nullable=False)
+    confidence = Column(Float, default=0.5, nullable=False)
+    reason = Column(Text)
+    approved_memory_id = Column(Integer, ForeignKey("memories.id", ondelete="SET NULL"), nullable=True, index=True)
+    resolved_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    resolved_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User", back_populates="memory_proposals", foreign_keys=[user_id])
+    resolver = relationship("User", back_populates="resolved_memory_proposals", foreign_keys=[resolved_by_user_id])
+    task = relationship("Task", foreign_keys=[task_id])
+    task_run = relationship("TaskRun", foreign_keys=[task_run_id])
+    approved_memory = relationship("Memory", foreign_keys=[approved_memory_id])
+
+    @property
+    def proposal_payload(self) -> dict:
+        try:
+            value = json.loads(self.proposal_json or "{}")
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @proposal_payload.setter
+    def proposal_payload(self, value: dict):
+        self.proposal_json = json.dumps(value or {})
+
+    def __repr__(self):
+        return f"<MemoryProposal(user_id={self.user_id}, type='{self.proposal_type}', status='{self.status}')>"
 
 
 class MemoryEntity(Base):

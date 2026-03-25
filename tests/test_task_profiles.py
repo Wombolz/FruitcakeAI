@@ -17,7 +17,7 @@ from app.autonomy.profiles.topic_watcher import (
     _parse_topic_watcher_instruction,
 )
 from app.autonomy.runner import TaskRunner
-from app.db.models import RSSPublishedItem, Task
+from app.db.models import MemoryProposal, RSSPublishedItem, Task
 from tests.conftest import TestSessionLocal
 
 
@@ -278,7 +278,7 @@ def test_topic_watcher_validate_finalize_skips_memory_candidate_for_weak_update(
     assert report is not None
     assert report["fired"] is True
     assert report["memory_candidate_emitted"] is False
-    assert "## Memory candidate" not in result
+    assert "## Memory candidates" not in result
 
 
 def test_topic_watcher_validate_finalize_appends_memory_candidate_for_strong_update():
@@ -323,14 +323,16 @@ def test_topic_watcher_validate_finalize_appends_memory_candidate_for_strong_upd
     assert report["memory_candidate_emitted"] is True
     assert report["memory_candidate_type"] in {"episodic", "semantic"}
     assert report["memory_candidate_support_count"] == 2
-    assert "## Memory candidate" in result
+    assert "## Memory candidates" in result
     assert "On 2026-03-25" in result
+    assert len(report["memory_candidates"]) >= 1
+    assert report["memory_candidates"][0]["proposal_key"]
 
 
 def test_topic_watcher_artifact_payloads_include_memory_candidates():
     profile = TopicWatcherExecutionProfile()
     artifacts = profile.artifact_payloads(
-        final_markdown="**Iran - New developments**\n\n## Memory candidate\n- On 2026-03-25, reports about Iran indicated diplomatic talks.",
+        final_markdown="**Iran - New developments**\n\n## Memory candidates\n- On 2026-03-25, reports about Iran indicated diplomatic talks.",
         run_debug={
             "dataset": {"topic": "Iran"},
             "watcher_config": {"topic": "Iran", "threshold": "medium"},
@@ -339,15 +341,19 @@ def test_topic_watcher_artifact_payloads_include_memory_candidates():
             "refresh_stats": {},
             "grounding_report": {
                 "fired": True,
-                "memory_candidate": {
-                    "memory_type": "episodic",
-                    "content": "On 2026-03-25, reports about Iran indicated diplomatic talks.",
-                    "topic": "Iran",
-                    "supporting_urls": ["https://example.com/1"],
-                    "source_names": ["Reuters"],
-                    "reason": "Strong medium-threshold watcher hit.",
-                    "confidence": 0.8,
-                },
+                "memory_candidates": [
+                    {
+                        "proposal_key": "proposal-1",
+                        "memory_type": "episodic",
+                        "content": "On 2026-03-25, reports about Iran indicated diplomatic talks.",
+                        "topic": "Iran",
+                        "supporting_urls": ["https://example.com/1"],
+                        "source_names": ["Reuters"],
+                        "reason": "Strong medium-threshold watcher hit.",
+                        "confidence": 0.8,
+                        "status": "pending",
+                    }
+                ],
             },
         },
     )
@@ -359,7 +365,7 @@ def test_topic_watcher_artifact_payloads_include_memory_candidates():
 async def test_topic_watcher_persist_run_records_writes_selected_items():
     profile = TopicWatcherExecutionProfile()
     async with TestSessionLocal() as db:
-        task = SimpleNamespace(id=48)
+        task = SimpleNamespace(id=48, user_id=1)
         run = SimpleNamespace(id=9001, finished_at=datetime.now(timezone.utc))
         await profile.persist_run_records(
             db=db,
@@ -374,15 +380,32 @@ async def test_topic_watcher_persist_run_records_writes_selected_items():
                     "published_items": [
                         {"rss_item_id": 7, "url_canonical": "https://example.com/item-7", "reused": False}
                     ],
+                    "memory_candidates": [
+                        {
+                            "proposal_key": "proposal-1",
+                            "memory_type": "episodic",
+                            "content": "On 2026-03-25, reports about Iran indicated renewed diplomatic talks.",
+                            "topic": "Iran",
+                            "supporting_urls": ["https://example.com/item-7"],
+                            "source_names": ["Reuters"],
+                            "reason": "Strong watcher hit.",
+                            "confidence": 0.8,
+                            "status": "pending",
+                        }
+                    ],
                 },
             },
         )
         await db.commit()
         rows = await db.execute(select(RSSPublishedItem))
         saved = rows.scalars().all()
+        proposals = (await db.execute(select(MemoryProposal))).scalars().all()
     assert len(saved) == 1
     assert saved[0].task_id == 48
     assert saved[0].url_canonical == "https://example.com/item-7"
+    assert len(proposals) == 1
+    assert proposals[0].source_type == "topic_watcher"
+    assert proposals[0].status == "pending"
 
 
 @pytest.mark.asyncio
