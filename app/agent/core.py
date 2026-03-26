@@ -30,6 +30,12 @@ TURN_LIMITS: Dict[str, int] = {
     "chat_orchestrated": 12,
 }
 
+REPEATED_FAILED_SEARCH_TURN_THRESHOLD = 3
+FAILED_SEARCH_PREFIXES = (
+    "no results found for:",
+    "tool web_search failed:",
+)
+
 
 def _build_messages(
     history: List[Dict[str, Any]],
@@ -74,6 +80,34 @@ def _litellm_kwargs(model: str | None = None) -> Dict[str, Any]:
     if settings.llm_backend in ("ollama", "openai_compat"):
         kwargs["api_base"] = _normalized_local_api_base()
     return kwargs
+
+
+def _tool_call_name(call: Any) -> str:
+    if isinstance(call, dict):
+        return str(((call.get("function") or {}).get("name") or "")).strip()
+    return str(getattr(getattr(call, "function", None), "name", "") or "").strip()
+
+
+def _is_failed_search_turn(tool_calls: List[Any], tool_results: List[Dict[str, Any]]) -> bool:
+    if not tool_calls or not tool_results or len(tool_calls) != len(tool_results):
+        return False
+
+    for call, result in zip(tool_calls, tool_results):
+        tool_name = _tool_call_name(call)
+        if tool_name != "web_search":
+            return False
+        content = str(result.get("content", "")).strip().lower()
+        if not any(content.startswith(prefix) for prefix in FAILED_SEARCH_PREFIXES):
+            return False
+
+    return True
+
+
+def _repeated_failed_search_message() -> str:
+    return (
+        "I couldn't reliably find enough matching results for that lookup after several search attempts. "
+        "Try narrowing the request or giving me one restaurant at a time."
+    )
 
 
 async def _stream_final_response(
@@ -175,6 +209,7 @@ async def run_agent(
     max_turns = TURN_LIMITS.get(mode, 8)
     selected_model = model_override or settings.llm_model
     extra = _litellm_kwargs(selected_model)
+    consecutive_failed_search_turns = 0
 
     for turn in range(max_turns):
         try:
@@ -203,10 +238,23 @@ async def run_agent(
             tool_results = await dispatch_tool_calls(message.tool_calls, user_context)
             history.extend(tool_results)
             metrics.inc_tool_calls(len(message.tool_calls))
+            if _is_failed_search_turn(message.tool_calls, tool_results):
+                consecutive_failed_search_turns += 1
+                if consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
+                    log.info(
+                        "Stopping repeated failed search loop",
+                        turn=turn + 1,
+                        model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                    )
+                    return _repeated_failed_search_message()
+            else:
+                consecutive_failed_search_turns = 0
             log.info(
                 "Tool calls executed",
                 turn=turn + 1,
-                tools=[tc.function.name for tc in message.tool_calls],
+                tools=[_tool_call_name(tc) for tc in message.tool_calls],
                 model=selected_model,
                 mode=mode,
                 stage=stage,
@@ -237,6 +285,7 @@ async def stream_agent(
     max_turns = TURN_LIMITS.get(mode, 8)
     selected_model = model_override or settings.llm_model
     extra = _litellm_kwargs(selected_model)
+    consecutive_failed_search_turns = 0
 
     for turn in range(max_turns):
         # Probe turn non-streaming so intermediate tool turns stay internal.
@@ -271,10 +320,17 @@ async def stream_agent(
             tool_results = await dispatch_tool_calls(message.tool_calls, user_context)
             history.extend(tool_results)
             metrics.inc_tool_calls(len(message.tool_calls))
+            if _is_failed_search_turn(message.tool_calls, tool_results):
+                consecutive_failed_search_turns += 1
+                if consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
+                    yield _repeated_failed_search_message()
+                    return
+            else:
+                consecutive_failed_search_turns = 0
             log.info(
                 "Tool calls executed (streaming turn)",
                 turn=turn + 1,
-                tools=[tc.function.name for tc in message.tool_calls],
+                tools=[_tool_call_name(tc) for tc in message.tool_calls],
                 model=selected_model,
                 mode=mode,
                 stage=stage,

@@ -43,6 +43,38 @@ def _fake_response(*, content: str, model: str = "gpt-4o", prompt_tokens: int = 
     )
 
 
+def _fake_tool_response(
+    *,
+    tool_name: str,
+    model: str = "gpt-4o",
+    prompt_tokens: int = 100,
+    completion_tokens: int = 25,
+):
+    return SimpleNamespace(
+        model=model,
+        usage=SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+        choices=[
+            SimpleNamespace(
+                message=_FakeMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": "{}"},
+                        }
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+    )
+
+
 async def _fake_stream_with_usage(*parts: str):
     for part in parts:
         yield SimpleNamespace(
@@ -184,3 +216,30 @@ async def test_planner_records_usage_event():
     assert usage_rows[0].user_id == user_id
     assert usage_rows[0].task_id == task_id
     assert usage_rows[0].total_tokens == 75
+
+
+@pytest.mark.asyncio
+async def test_run_agent_stops_repeated_failed_search_loop_gracefully():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    failing = _fake_tool_response(tool_name="web_search")
+
+    async def _fake_dispatch(_tool_calls, _user_context):
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "No results found for: Buffalo Wild Wings Statesboro GA",
+            }
+        ]
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=[failing, failing, failing])),
+        patch("app.agent.core.dispatch_tool_calls", side_effect=_fake_dispatch),
+    ):
+        result = await run_agent([{"role": "user", "content": "Find addresses in Statesboro, GA"}], user_context)
+
+    assert result == (
+        "I couldn't reliably find enough matching results for that lookup after several search attempts. "
+        "Try narrowing the request or giving me one restaurant at a time."
+    )

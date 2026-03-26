@@ -32,6 +32,17 @@ TOOL_HEAVY_KEYWORDS = {
     "analyze",
 }
 
+LOCATION_LOOKUP_KEYWORDS = {
+    "address",
+    "addresses",
+    "location",
+    "locations",
+    "hours",
+    "phone",
+    "directions",
+    "nearby",
+}
+
 MULTI_STEP_MARKERS = {
     "step by step",
     "plan",
@@ -83,6 +94,16 @@ def classify_chat_complexity(
     if sum(1 for k in TOOL_HEAVY_KEYWORDS if k in lowered) >= 2:
         score += 1
         reasons.append("tool_heavy")
+
+    has_location_lookup = any(k in lowered for k in LOCATION_LOOKUP_KEYWORDS)
+    has_place_constraint = bool(
+        re.search(r"\b[a-z .'-]+,\s*[a-z]{2}\b", lowered)
+        or re.search(r"\b\d{5}(?:-\d{4})?\b", lowered)
+        or "near me" in lowered
+    )
+    if has_location_lookup and has_place_constraint:
+        score += 2
+        reasons.append("location_lookup")
 
     if any(m in lowered for m in MULTI_STEP_MARKERS):
         score += 1
