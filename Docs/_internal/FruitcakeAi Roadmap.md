@@ -6,7 +6,7 @@
 **Build Location**: `fruitcake_v5/`  
 **Last Updated**: March 26, 2026  
 **Checkpoint Note**: North Star direction remains the decision filter. Phase 6 is no longer purely deferred: targeted routing/accounting groundwork is now in `main`, while broader cloud judgment rollout and shared memory review remain gated behind measured need and product hardening.
-**Phase 6 Planned Additions**: first-class per-chat and per-task model selection is planned as part of hybrid-judgment productization, using one credential per provider, a backend-configured selectable model registry, and no changes to the underlying Ollama setup in v1.
+**Phase 6 Latest Additions**: first-class per-chat model selection and user-visible reasoning controls have landed, using a backend-configured selectable model registry, one credential per provider, and no changes to the underlying Ollama setup in v1.
 **Latest Capability Note**: normal chat can now create, inspect, and update persistent tasks through first-class task tools instead of only building one-shot plan scaffolds. Chat mutation validation now prevents it from claiming a task was created or updated unless the matching task tool explicitly confirmed success.
 
 ---
@@ -1398,7 +1398,9 @@ Current note:
   - LLM usage accounting,
   - model-policy seams that let maintenance and recurring profiles stay explicit,
   - user-visible token usage inspection,
-  - first routing-quality hardening for search-heavy chat requests.
+  - first routing-quality hardening for search-heavy chat requests,
+  - per-chat model selection with a configured model registry,
+  - user-visible reasoning effort controls in the client.
 - Remaining Phase 6 work is no longer “build the plumbing,” but “decide where cloud judgment is actually justified and roll it out narrowly.”
 
 ## Phase 6 — Cloud Judgment Routing (as needed)
@@ -1413,6 +1415,10 @@ Recent evidence:
 - The first Phase 6 hardening slice has already landed:
   - address/location lookup requests now classify as complex earlier,
   - repeated failed `web_search` churn now stops with a graceful narrowing prompt instead of routinely dying on the simple-chat turn cap.
+- User-visible hybrid controls have also landed:
+  - chat sessions can select from configured models,
+  - the client now exposes inline `Reasoning` controls for `Automatic`, `Fast`, and `Deep`,
+  - token usage inspection makes the selected model path auditable.
 
 **Trigger**: A user requests it, or local judgment quality on heartbeats is demonstrably causing missed-important / false-alarm patterns in daily use.
 
@@ -1439,6 +1445,24 @@ judgment:
 The `ContextSanitizer` and `JudgmentRouter` classes are built in this phase, not Phase 4. They solve a problem that requires real-world data to scope correctly.
 
 Phase 6 now includes not just cloud-routing policy, but routing-quality work around when chat should escalate out of simple local execution into deeper orchestration or stronger judgment.
+
+### Sprint 6.y — Structured JSON/API Integration
+
+This sprint turns structured external API access into a first-class backend capability instead of making chat/tasks improvise through generic web search.
+
+Planned scope:
+
+- land the trusted backend-owned JSON/API execution path
+- use the new secrets capability for auth injection where needed
+- support deterministic JSON field extraction and validation
+- add small per-task dedupe state for API-backed polling tasks
+- prove the substrate with a concrete structured lookup use case such as maps/geocoding, weather, or ISS data
+
+Not in this sprint:
+
+- queued notifications / derived-event scheduling
+- generic model-visible arbitrary API calling
+- broad provider-specific integration abstractions beyond the first proving cases
 
 ### Sprint 6.x — Client Context Integration (Apple additive, platform-neutral)
 
