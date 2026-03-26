@@ -119,6 +119,41 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "api_request",
+            "description": (
+                "Call an approved backend-owned JSON API integration. "
+                "Use this for structured external API workflows instead of shell or web search. "
+                "Current supported service/endpoint combinations: n2yo + iss_visual_passes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {"type": "string", "description": "Approved service name, for example 'n2yo'."},
+                    "endpoint": {"type": "string", "description": "Approved endpoint name, for example 'iss_visual_passes'."},
+                    "query_params": {
+                        "type": "object",
+                        "description": "Service-specific query parameters for the approved endpoint.",
+                    },
+                    "secret_name": {
+                        "type": "string",
+                        "description": "Optional secret name for auth, for example 'n2yo_api_key'.",
+                    },
+                    "auth_mode": {
+                        "type": "string",
+                        "description": "Optional auth mode hint. Current adapters ignore unsupported values.",
+                    },
+                    "response_mode": {
+                        "type": "string",
+                        "description": "Optional response hint. Current adapters return normalized text output.",
+                    },
+                },
+                "required": ["service", "endpoint", "query_params"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_places",
             "description": (
                 "Look up structured place and address results using a maps/geocoding data source. "
@@ -670,6 +705,9 @@ async def _call_tool(
     if name == "search_library":
         return await _search_library(arguments, user_context)
 
+    if name == "api_request":
+        return await _api_request(arguments, user_context)
+
     if name == "search_places":
         return await _search_places(arguments, user_context)
 
@@ -764,6 +802,55 @@ async def _search_library(
         lines.append("")
 
     return "\n".join(lines)
+
+
+async def _api_request(
+    arguments: Dict[str, Any], user_context: UserContext
+) -> str:
+    from app.api_service import APIRequestError, execute_api_request
+    from app.db.session import AsyncSessionLocal
+
+    service = str(arguments.get("service", "") or "").strip()
+    endpoint = str(arguments.get("endpoint", "") or "").strip()
+    query_params = arguments.get("query_params") or {}
+    secret_name = str(arguments.get("secret_name", "") or "").strip()
+    response_mode = str(arguments.get("response_mode", "") or "").strip()
+
+    if not service:
+        return "service is required."
+    if not endpoint:
+        return "endpoint is required."
+    if not isinstance(query_params, dict):
+        return "query_params must be an object."
+
+    async with AsyncSessionLocal() as db:
+        try:
+            result = await execute_api_request(
+                db,
+                user_id=user_context.user_id,
+                service=service,
+                endpoint=endpoint,
+                query_params=query_params,
+                secret_name=secret_name or None,
+                response_mode=response_mode or None,
+                task_id=getattr(user_context, "task_id", None),
+            )
+            await db.commit()
+            return result
+        except APIRequestError as exc:
+            await db.rollback()
+            return str(exc)
+        except Exception as exc:
+            await db.rollback()
+            log.warning(
+                "api_request failed",
+                user_id=user_context.user_id,
+                task_id=getattr(user_context, "task_id", None),
+                service=service,
+                endpoint=endpoint,
+                error=str(exc),
+            )
+            return "API request failed."
 
 
 async def _search_places(

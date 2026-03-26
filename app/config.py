@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     anthropic_models: str = ""
     gemini_models: str = ""
     local_models: str = ""
+    secrets_master_key: str = ""
     # For Ollama / llama.cpp (openai_compat)
     local_api_base: str = "http://localhost:11434/v1"
     local_api_key: str = "sk-local"

@@ -37,6 +37,7 @@ class UserContext:
     skill_injection_details: List[dict] = field(default_factory=list)
     content_filter: str = ""           # "" | "strict"
     session_id: Optional[int] = None   # set by chat.py for audit logging
+    task_id: Optional[int] = None      # set by task runner for task-scoped tool state
     timezone: Optional[str] = None     # IANA tz string, e.g. "America/Chicago"
 
     @classmethod

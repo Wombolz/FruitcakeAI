@@ -366,6 +366,7 @@ class TaskRunner:
                 query=(task_instruction or task_title or ""),
             )
         user_context.session_id = session_id
+        user_context.task_id = task_id
 
         # Planned mode: execute TaskStep graph.
         if has_plan:

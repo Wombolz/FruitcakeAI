@@ -161,6 +161,17 @@ def test_search_places_schema_has_required_query():
     assert required == ["query"]
 
 
+def test_api_request_schema_has_required_fields():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "api_request")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "service" in props
+    assert "endpoint" in props
+    assert "query_params" in props
+    assert "secret_name" in props
+    assert required == ["service", "endpoint", "query_params"]
+
+
 def test_update_task_schema_has_required_fields():
     schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "update_task")
     props = schema["function"]["parameters"]["properties"]
@@ -403,6 +414,35 @@ async def test_search_places_tool_uses_backend_json_service():
 
     assert "Place search results for: Chili's near Statesboro, GA" in result
     assert "701 Northside Drive E" in result
+
+
+@pytest.mark.asyncio
+async def test_api_request_tool_uses_backend_api_service():
+    import app.agent.tools as tools_module
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        with patch("app.api_service.execute_api_request", new=AsyncMock(return_value="ISS visible pass results:\n\n[1] start_utc=2026-03-27T02:30:00+00:00 | duration_seconds=348 | max_elevation_deg=67.0")) as mocked:
+            result = await tools_module._api_request(
+                {
+                    "service": "n2yo",
+                    "endpoint": "iss_visual_passes",
+                    "query_params": {
+                        "satellite_id": 25544,
+                        "lat": 32.4485,
+                        "lon": -81.7832,
+                        "alt_meters": 60,
+                        "days": 1,
+                        "min_visibility_seconds": 120,
+                    },
+                    "secret_name": "n2yo_api_key",
+                },
+                ctx,
+            )
+
+    assert "ISS visible pass results" in result
+    mocked.assert_awaited_once()
 
 
 @pytest.mark.asyncio

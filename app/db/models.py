@@ -81,6 +81,7 @@ class User(Base):
     memory_entities = relationship("MemoryEntity", back_populates="user", cascade="all, delete-orphan")
     memory_relations = relationship("MemoryRelation", back_populates="user", cascade="all, delete-orphan")
     memory_observations = relationship("MemoryObservation", back_populates="user", cascade="all, delete-orphan")
+    secrets = relationship("Secret", back_populates="user", cascade="all, delete-orphan")
     webhook_configs = relationship("WebhookConfig", back_populates="user", cascade="all, delete-orphan")
     rss_sources = relationship("RSSSource", back_populates="user", cascade="all, delete-orphan")
     rss_user_state = relationship("RSSUserState", back_populates="user", uselist=False, cascade="all, delete-orphan")
@@ -170,6 +171,28 @@ class Document(Base):
 
     def __repr__(self):
         return f"<Document(filename='{self.filename}', scope='{self.scope}')>"
+
+
+class Secret(Base):
+    __tablename__ = "secrets"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_secrets_user_name"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(100), nullable=False, index=True)
+    provider = Column(String(100), default="", nullable=False)
+    ciphertext = Column(Text, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    last_used_at = Column(DateTime(timezone=True))
+
+    user = relationship("User", back_populates="secrets")
+
+    def __repr__(self):
+        return f"<Secret(user_id={self.user_id}, name='{self.name}', provider='{self.provider}')>"
 
 
 class DocumentIngestJob(Base):
@@ -579,6 +602,12 @@ class Task(Base):
         cascade="all, delete-orphan",
         order_by="TaskRun.started_at.desc()",
     )
+    api_states = relationship(
+        "TaskAPIState",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TaskAPIState.updated_at.desc()",
+    )
 
     def __repr__(self):
         return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"
@@ -681,6 +710,24 @@ class TaskRun(Base):
 
     def __repr__(self):
         return f"<TaskRun(task_id={self.task_id}, status='{self.status}')>"
+
+
+class TaskAPIState(Base):
+    __tablename__ = "task_api_states"
+    __table_args__ = (
+        UniqueConstraint("task_id", "state_key", name="uq_task_api_states_task_key"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    state_key = Column(String(100), nullable=False, index=True)
+    value_json = Column(Text, default="{}", nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, onupdate=func.now())
+
+    task = relationship("Task", back_populates="api_states")
+
+    def __repr__(self):
+        return f"<TaskAPIState(task_id={self.task_id}, key='{self.state_key}')>"
 
 
 class TaskRunArtifact(Base):
