@@ -119,6 +119,25 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "search_places",
+            "description": (
+                "Look up structured place and address results using a maps/geocoding data source. "
+                "Use this for business addresses, place names, geocoding, and direct location lookups instead of web_search when the user wants addresses or locations."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Business or place name to look up."},
+                    "near": {"type": "string", "description": "Optional city, state, ZIP, or region to narrow the lookup."},
+                    "limit": {"type": "integer", "description": "Maximum number of results to return (default 5, max 8).", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_memory",
             "description": (
                 "Store a piece of information about the user or their preferences for future sessions. "
@@ -651,6 +670,9 @@ async def _call_tool(
     if name == "search_library":
         return await _search_library(arguments, user_context)
 
+    if name == "search_places":
+        return await _search_places(arguments, user_context)
+
     if name == "summarize_document":
         return await _summarize_document(arguments, user_context)
 
@@ -742,6 +764,34 @@ async def _search_library(
         lines.append("")
 
     return "\n".join(lines)
+
+
+async def _search_places(
+    arguments: Dict[str, Any], user_context: UserContext
+) -> str:
+    from app.json_api import JsonApiError, search_places
+
+    query = str(arguments.get("query", "") or "").strip()
+    near = str(arguments.get("near", "") or "").strip()
+    try:
+        limit = int(arguments.get("limit", 5))
+    except Exception:
+        limit = 5
+
+    if not query:
+        return "No place query provided."
+
+    try:
+        return await search_places(query=query, near=near or None, limit=limit)
+    except JsonApiError as exc:
+        log.warning(
+            "search_places failed",
+            user_id=user_context.user_id,
+            query=query,
+            near=near or None,
+            error=str(exc),
+        )
+        return str(exc)
 
 
 async def _list_library_documents(

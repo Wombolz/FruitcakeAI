@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app.agent.context import UserContext
 from app.agent.tools import TOOL_SCHEMAS, _parse_iso_datetime, get_tools_for_user
@@ -149,6 +149,16 @@ def test_create_task_schema_has_required_fields():
     assert "task_type" in props
     assert "deliver" in props
     assert set(["title", "instruction", "task_type", "deliver"]).issubset(set(required))
+
+
+def test_search_places_schema_has_required_query():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "search_places")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "query" in props
+    assert "near" in props
+    assert "limit" in props
+    assert required == ["query"]
 
 
 def test_update_task_schema_has_required_fields():
@@ -370,6 +380,29 @@ async def test_call_tool_routes_generic_search_to_web_search():
         {"query": "ap headlines", "max_results": 3},
         ctx,
     )
+
+
+@pytest.mark.asyncio
+async def test_search_places_tool_uses_backend_json_service():
+    import app.agent.tools as tools_module
+
+    ctx = _make_context()
+
+    with patch("app.json_api.fetch_json", new=AsyncMock(return_value=[
+        {
+            "name": "Chili's Grill & Bar",
+            "display_name": "Chili's Grill & Bar, 701 Northside Drive E, Statesboro, Georgia 30458, United States",
+            "lat": "32.4481",
+            "lon": "-81.7830",
+        }
+    ])):
+        result = await tools_module._search_places(
+            {"query": "Chili's", "near": "Statesboro, GA", "limit": 3},
+            ctx,
+        )
+
+    assert "Place search results for: Chili's near Statesboro, GA" in result
+    assert "701 Northside Drive E" in result
 
 
 @pytest.mark.asyncio
