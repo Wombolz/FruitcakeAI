@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     llm_model: str = "ollama_chat/qwen2.5:32b"
     anthropic_api_key: str = ""
     openai_api_key: str = ""
+    gemini_api_key: str = ""
+    openai_models: str = ""
+    anthropic_models: str = ""
+    gemini_models: str = ""
+    local_models: str = ""
     # For Ollama / llama.cpp (openai_compat)
     local_api_base: str = "http://localhost:11434/v1"
     local_api_key: str = "sk-local"

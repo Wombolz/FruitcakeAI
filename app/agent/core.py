@@ -27,10 +27,10 @@ litellm.suppress_debug_info = True
 TURN_LIMITS: Dict[str, int] = {
     "chat": 8,
     "task": 16,
-    "chat_orchestrated": 12,
+    "chat_orchestrated": 15,
 }
 
-REPEATED_FAILED_SEARCH_TURN_THRESHOLD = 3
+REPEATED_FAILED_SEARCH_TURN_THRESHOLD = 5
 FAILED_SEARCH_PREFIXES = (
     "no results found for:",
     "tool web_search failed:",

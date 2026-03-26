@@ -234,7 +234,7 @@ async def test_run_agent_stops_repeated_failed_search_loop_gracefully():
 
     with (
         patch("app.agent.core.get_tools_for_user", return_value=[]),
-        patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=[failing, failing, failing])),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=[failing, failing, failing, failing, failing])),
         patch("app.agent.core.dispatch_tool_calls", side_effect=_fake_dispatch),
     ):
         result = await run_agent([{"role": "user", "content": "Find addresses in Statesboro, GA"}], user_context)

@@ -184,6 +184,7 @@ async def test_create_and_list_sessions(client):
     create = await client.post("/chat/sessions", json={"title": "My Session"}, headers=headers)
     assert create.status_code == 201
     session_id = create.json()["id"]
+    assert create.json()["llm_model"] is not None
 
     sessions = await client.get("/chat/sessions", headers=headers)
     assert sessions.status_code == 200
@@ -219,6 +220,68 @@ async def test_chat_send_message_honors_deep_routing_preference(client):
     assert execute_mock.await_count == 1
     assert execute_mock.await_args.kwargs["mode"] == "chat_orchestrated"
     assert execute_mock.await_args.kwargs["stage"] == "chat_complex"
+
+
+@pytest.mark.asyncio
+async def test_list_llm_models_returns_configured_models(client, monkeypatch):
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-openai-key")
+    monkeypatch.setattr("app.config.settings.openai_models", "gpt-5,gpt-5-mini")
+    monkeypatch.setattr("app.config.settings.anthropic_api_key", "")
+    monkeypatch.setattr("app.config.settings.anthropic_models", "claude-sonnet-4-6")
+    monkeypatch.setattr("app.config.settings.local_models", "ollama_chat/qwen2.5:14b")
+
+    await client.post("/auth/register", json={
+        "username": "modeluser",
+        "email": "model@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "modeluser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.get("/llm/models", headers=headers)
+    assert resp.status_code == 200
+    ids = [item["id"] for item in resp.json()["models"]]
+    assert "gpt-5" in ids
+    assert "gpt-5-mini" in ids
+    assert "ollama_chat/qwen2.5:14b" in ids
+    assert "claude-sonnet-4-6" not in ids
+
+
+@pytest.mark.asyncio
+async def test_update_chat_session_model_and_use_override(client, monkeypatch):
+    monkeypatch.setattr("app.config.settings.openai_api_key", "test-openai-key")
+    monkeypatch.setattr("app.config.settings.openai_models", "gpt-5,gpt-5-mini")
+
+    await client.post("/auth/register", json={
+        "username": "chatmodeluser",
+        "email": "chatmodel@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatmodeluser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Model Session"}, headers=headers)
+    session_id = create.json()["id"]
+
+    update = await client.patch(
+        f"/chat/sessions/{session_id}/model",
+        json={"llm_model": "gpt-5"},
+        headers=headers,
+    )
+    assert update.status_code == 200
+    assert update.json()["llm_model"] == "gpt-5"
+
+    with patch("app.api.chat._execute_chat_turn", new=AsyncMock(return_value="ok")) as execute_mock:
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "Hello there"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert execute_mock.await_args.kwargs["model_override"] == "gpt-5"
 
 
 @pytest.mark.asyncio

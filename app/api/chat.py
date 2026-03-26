@@ -39,6 +39,7 @@ from app.auth.dependencies import get_current_user
 from app.config import settings
 from app.db.models import ChatMessage, ChatSession, User
 from app.db.session import get_db
+from app.llm_registry import available_llm_models, is_configured_model
 from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
 from app.memory.service import get_memory_service
@@ -74,6 +75,10 @@ class RenameSessionRequest(BaseModel):
 
 class UpdateSessionPersonaRequest(BaseModel):
     persona: str = Field(min_length=1, max_length=100)
+
+
+class UpdateSessionModelRequest(BaseModel):
+    llm_model: str = Field(min_length=1, max_length=200)
 
 
 class MessageOut(BaseModel):
@@ -130,6 +135,14 @@ async def list_tools(
         "tools": names,
         "blocked_tools": sorted(set(user_context.blocked_tools)),
     }
+
+
+@router.get("/models")
+async def list_models(
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    del current_user
+    return {"models": available_llm_models()}
 
 
 # ── POST /chat/sessions ───────────────────────────────────────────────────────
@@ -246,6 +259,24 @@ async def update_session_persona(
 
     session = await _get_session_or_404(session_id, current_user.id, db)
     session.persona = persona_name
+    await db.flush()
+    await db.refresh(session)
+    return session
+
+
+@router.patch("/sessions/{session_id}/model", response_model=SessionOut)
+async def update_session_model(
+    session_id: int,
+    body: UpdateSessionModelRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChatSession:
+    requested = body.llm_model.strip()
+    if not is_configured_model(requested):
+        raise HTTPException(status_code=400, detail=f"Unknown or unavailable model '{requested}'")
+
+    session = await _get_session_or_404(session_id, current_user.id, db)
+    session.llm_model = requested
     await db.flush()
     await db.refresh(session)
     return session
@@ -374,6 +405,7 @@ async def send_message(
             user_context,
             user_prompt=body.content,
             mode=execution_mode,
+            model_override=session.llm_model,
             stage="chat_complex" if effective_complex else "chat_simple",
             enable_validation=effective_complex,
         )
@@ -615,6 +647,7 @@ async def chat_websocket(
                             user_context,
                             user_prompt=user_message,
                             mode=execution_mode,
+                            model_override=session.llm_model,
                             stage="chat_complex",
                             enable_validation=effective_complex,
                         )
@@ -640,6 +673,7 @@ async def chat_websocket(
                             execution_history,
                             user_context,
                             mode=execution_mode,
+                            model_override=session.llm_model,
                             stage="chat_simple",
                         ):
                             full_response.append(token_chunk)
@@ -824,6 +858,7 @@ async def _execute_chat_turn(
     *,
     user_prompt: str,
     mode: str,
+    model_override: str | None,
     stage: str,
     enable_validation: bool,
 ) -> str:
@@ -832,6 +867,7 @@ async def _execute_chat_turn(
         history,
         user_context,
         mode=mode,
+        model_override=model_override,
         stage=stage,
     )
     if not (enable_validation and settings.chat_validation_enabled):
@@ -883,6 +919,7 @@ async def _execute_chat_turn(
             retry_history,
             user_context,
             mode=mode,
+            model_override=model_override,
             stage=f"{stage}_retry",
         )
 
