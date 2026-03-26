@@ -289,6 +289,97 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_tasks",
+            "description": (
+                "List the current user's tasks with enough detail to inspect schedules, profiles, delivery, and active hours. "
+                "Use this to verify what tasks exist before creating a new one or to confirm the result of a task update."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "default": 20},
+                    "status": {"type": "string", "description": "Optional status filter."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_task",
+            "description": (
+                "Get one task owned by the current user with its current schedule, profile, delivery settings, and active hours. "
+                "Use this after create_task or update_task when you need to verify the exact saved state."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_task",
+            "description": (
+                "Create a real persistent task for the current user. "
+                "Use this only after the user has explicitly confirmed the task details. "
+                "Use it for recurring watchers, briefings, maintenance tasks, or one-shot tasks the user wants saved. "
+                "This creates the task row only; plan it afterward with create_task_plan unless the task is already deterministic."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "task_type": {"type": "string", "enum": ["one_shot", "recurring"], "default": "one_shot"},
+                    "schedule": {"type": "string", "description": "Optional schedule like every:2h, cron, or ISO timestamp."},
+                    "deliver": {"type": "boolean", "default": True},
+                    "profile": {"type": "string", "description": "Optional built-in task profile name."},
+                    "persona": {"type": "string", "description": "Optional persona override."},
+                    "requires_approval": {"type": "boolean", "default": False},
+                    "active_hours_start": {"type": "string"},
+                    "active_hours_end": {"type": "string"},
+                    "active_hours_tz": {"type": "string"},
+                },
+                "required": ["title", "instruction", "task_type", "deliver"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_task",
+            "description": (
+                "Update an existing task owned by the current user. "
+                "Use this after the user explicitly confirms a task change such as schedule, instruction, profile, or delivery settings. "
+                "If the updated fields materially change execution, regenerate the plan afterward with create_task_plan."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "schedule": {"type": "string"},
+                    "deliver": {"type": "boolean"},
+                    "profile": {"type": "string"},
+                    "persona": {"type": "string"},
+                    "requires_approval": {"type": "boolean"},
+                    "active_hours_start": {"type": "string"},
+                    "active_hours_end": {"type": "string"},
+                    "active_hours_tz": {"type": "string"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_task_plan",
             "description": (
                 "Create an ordered step-by-step plan for an existing task. "
@@ -571,6 +662,18 @@ async def _call_tool(
 
     if name == "create_and_run_task_plan":
         return await _create_and_run_task_plan(arguments, user_context)
+
+    if name == "create_task":
+        return await _create_task(arguments, user_context)
+
+    if name == "update_task":
+        return await _update_task(arguments, user_context)
+
+    if name == "list_tasks":
+        return await _list_tasks(arguments, user_context)
+
+    if name == "get_task":
+        return await _get_task(arguments, user_context)
 
     # Route all other tool calls through the MCP registry
     from app.mcp.registry import get_mcp_registry
@@ -1045,6 +1148,200 @@ async def _create_and_run_task_plan(
     arguments: Dict[str, Any], user_context: UserContext
 ) -> str:
     return await _plan_task_common(arguments, user_context, run_after=True)
+
+
+async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from app.db.session import AsyncSessionLocal
+    from app.task_service import TaskValidationError, create_task_record
+
+    title = str(arguments.get("title", "") or "").strip()
+    instruction = str(arguments.get("instruction", "") or "").strip()
+    task_type = str(arguments.get("task_type", "one_shot") or "one_shot").strip()
+
+    if not title:
+        return "title is required."
+    if not instruction:
+        return "instruction is required."
+    if task_type not in {"one_shot", "recurring"}:
+        return "task_type must be one_shot or recurring."
+
+    async with AsyncSessionLocal() as db:
+        try:
+            task = await create_task_record(
+                db,
+                user_id=user_context.user_id,
+                title=title,
+                instruction=instruction,
+                persona=arguments.get("persona"),
+                profile=arguments.get("profile"),
+                task_type=task_type,
+                schedule=arguments.get("schedule"),
+                deliver=bool(arguments.get("deliver", True)),
+                requires_approval=bool(arguments.get("requires_approval", False)),
+                active_hours_start=arguments.get("active_hours_start"),
+                active_hours_end=arguments.get("active_hours_end"),
+                active_hours_tz=arguments.get("active_hours_tz"),
+            )
+            await db.commit()
+        except TaskValidationError as exc:
+            await db.rollback()
+            return str(exc)
+
+    return json.dumps(
+        {
+            "created": True,
+            "task_id": task.id,
+            "title": task.title,
+            "instruction": task.instruction,
+            "persona": task.persona,
+            "profile": task.profile,
+            "task_type": task.task_type,
+            "schedule": task.schedule,
+            "deliver": task.deliver,
+            "requires_approval": task.requires_approval,
+            "next_run_at": task.next_run_at.isoformat() if task.next_run_at is not None else None,
+        }
+    )
+
+
+async def _update_task(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from app.db.models import Task
+    from app.db.session import AsyncSessionLocal
+    from app.task_service import TaskValidationError, UNSET, update_task_record
+
+    task_id_raw = arguments.get("task_id")
+    try:
+        task_id = int(task_id_raw)
+    except Exception:
+        return "Invalid task_id."
+
+    async with AsyncSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        if task is None or int(task.user_id) != int(user_context.user_id):
+            return "Task not found."
+
+        try:
+            update_result = await update_task_record(
+                db,
+                task,
+                title=arguments["title"] if "title" in arguments else UNSET,
+                instruction=arguments["instruction"] if "instruction" in arguments else UNSET,
+                persona=arguments["persona"] if "persona" in arguments else UNSET,
+                profile=arguments["profile"] if "profile" in arguments else UNSET,
+                schedule=arguments["schedule"] if "schedule" in arguments else UNSET,
+                deliver=arguments["deliver"] if "deliver" in arguments else UNSET,
+                requires_approval=arguments["requires_approval"] if "requires_approval" in arguments else UNSET,
+                active_hours_start=arguments["active_hours_start"] if "active_hours_start" in arguments else UNSET,
+                active_hours_end=arguments["active_hours_end"] if "active_hours_end" in arguments else UNSET,
+                active_hours_tz=arguments["active_hours_tz"] if "active_hours_tz" in arguments else UNSET,
+            )
+            await db.commit()
+        except TaskValidationError as exc:
+            await db.rollback()
+            return str(exc)
+
+    return json.dumps(
+        {
+            "updated": True,
+            "task_id": task.id,
+            "title": task.title,
+            "instruction": task.instruction,
+            "persona": task.persona,
+            "profile": task.profile,
+            "task_type": task.task_type,
+            "schedule": task.schedule,
+            "deliver": task.deliver,
+            "requires_approval": task.requires_approval,
+            "next_run_at": task.next_run_at.isoformat() if task.next_run_at is not None else None,
+            "plan_inputs_changed": update_result.plan_inputs_changed,
+        }
+    )
+
+
+async def _list_tasks(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from sqlalchemy import desc, select
+
+    from app.db.models import Task
+    from app.db.session import AsyncSessionLocal
+
+    try:
+        limit = max(1, min(100, int(arguments.get("limit", 20))))
+    except Exception:
+        limit = 20
+    status_filter = str(arguments.get("status", "") or "").strip()
+
+    async with AsyncSessionLocal() as db:
+        query = (
+            select(Task)
+            .where(Task.user_id == user_context.user_id)
+            .order_by(desc(Task.created_at))
+            .limit(limit)
+        )
+        if status_filter:
+            query = query.where(Task.status == status_filter)
+        rows = await db.execute(query)
+        tasks = rows.scalars().all()
+
+    return json.dumps(
+        {
+            "count": len(tasks),
+            "tasks": [
+                {
+                    "id": task.id,
+                    "title": task.title,
+                    "profile": task.profile,
+                    "task_type": task.task_type,
+                    "status": task.status,
+                    "schedule": task.schedule,
+                    "deliver": task.deliver,
+                    "requires_approval": task.requires_approval,
+                    "active_hours_start": task.active_hours_start,
+                    "active_hours_end": task.active_hours_end,
+                    "active_hours_tz": task.active_hours_tz,
+                    "created_at": task.created_at.isoformat() if task.created_at is not None else None,
+                    "next_run_at": task.next_run_at.isoformat() if task.next_run_at is not None else None,
+                }
+                for task in tasks
+            ],
+        }
+    )
+
+
+async def _get_task(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from app.db.models import Task
+    from app.db.session import AsyncSessionLocal
+
+    task_id_raw = arguments.get("task_id")
+    try:
+        task_id = int(task_id_raw)
+    except Exception:
+        return "Invalid task_id."
+
+    async with AsyncSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        if task is None or int(task.user_id) != int(user_context.user_id):
+            return "Task not found."
+
+    return json.dumps(
+        {
+            "id": task.id,
+            "title": task.title,
+            "instruction": task.instruction,
+            "persona": task.persona,
+            "profile": task.profile,
+            "task_type": task.task_type,
+            "status": task.status,
+            "schedule": task.schedule,
+            "deliver": task.deliver,
+            "requires_approval": task.requires_approval,
+            "active_hours_start": task.active_hours_start,
+            "active_hours_end": task.active_hours_end,
+            "active_hours_tz": task.active_hours_tz,
+            "created_at": task.created_at.isoformat() if task.created_at is not None else None,
+            "last_run_at": task.last_run_at.isoformat() if task.last_run_at is not None else None,
+            "next_run_at": task.next_run_at.isoformat() if task.next_run_at is not None else None,
+        }
+    )
 
 
 async def _plan_task_common(

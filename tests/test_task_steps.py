@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import select
 
 from app.config import settings
-from app.db.models import AuditLog, ChatSession, Memory, MemoryProposal, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
+from app.db.models import AuditLog, ChatSession, LLMUsageEvent, Memory, MemoryProposal, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
 from app.autonomy.profiles.news_magazine import _ground_output
 from app.autonomy.runner import _format_result_for_inbox, _persist_run_artifacts
 from tests.conftest import TestSessionLocal
@@ -1246,6 +1246,80 @@ async def test_memory_review_scopes_proposals_to_current_user(client):
 
     other_detail = await client.get(f"/memories/review/{proposal_id}", headers=other_headers)
     assert other_detail.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_memories_usage_returns_latest_user_scoped_events(client):
+    owner_headers = await _headers(client, "usageowner")
+    other_headers = await _headers(client, "usageother")
+
+    async with TestSessionLocal() as db:
+        db.add_all(
+            [
+                LLMUsageEvent(
+                    user_id=1,
+                    task_id=53,
+                    task_run_id=941,
+                    source="task_runner",
+                    stage="task_final",
+                    model="gpt-4o",
+                    prompt_tokens=120,
+                    completion_tokens=30,
+                    total_tokens=150,
+                    estimated_cost_usd=0.012,
+                    created_at=datetime(2026, 3, 25, 18, 0, tzinfo=timezone.utc),
+                ),
+                LLMUsageEvent(
+                    user_id=1,
+                    session_id=188,
+                    source="chat_rest",
+                    stage="chat_simple",
+                    model="qwen2.5:32b",
+                    prompt_tokens=80,
+                    completion_tokens=20,
+                    total_tokens=100,
+                    estimated_cost_usd=0.0,
+                    created_at=datetime(2026, 3, 25, 17, 0, tzinfo=timezone.utc),
+                ),
+                LLMUsageEvent(
+                    user_id=2,
+                    task_id=99,
+                    source="task_runner",
+                    stage="task_final",
+                    model="gpt-4o-mini",
+                    prompt_tokens=10,
+                    completion_tokens=5,
+                    total_tokens=15,
+                    estimated_cost_usd=0.001,
+                    created_at=datetime(2026, 3, 25, 19, 0, tzinfo=timezone.utc),
+                ),
+            ]
+        )
+        await db.commit()
+
+    resp = await client.get("/memories/usage", headers=owner_headers)
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 2
+    assert rows[0]["scope_label"] == "task:53"
+    assert rows[0]["task_id"] == 53
+    assert rows[0]["task_run_id"] == 941
+    assert rows[0]["stage"] == "task_final"
+    assert rows[0]["model"] == "gpt-4o"
+    assert rows[0]["total_tokens"] == 150
+    assert rows[1]["scope_label"] == "chat:188"
+    assert rows[1]["session_id"] == 188
+    assert rows[1]["source"] == "chat_rest"
+
+    limited = await client.get("/memories/usage?limit=1", headers=owner_headers)
+    assert limited.status_code == 200
+    assert len(limited.json()) == 1
+    assert limited.json()[0]["scope_label"] == "task:53"
+
+    other = await client.get("/memories/usage", headers=other_headers)
+    assert other.status_code == 200
+    assert len(other.json()) == 1
+    assert other.json()[0]["scope_label"] == "task:99"
 
 
 @pytest.mark.asyncio

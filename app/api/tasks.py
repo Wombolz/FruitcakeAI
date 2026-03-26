@@ -23,15 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import json
 import re
 
-from app.agent.persona_loader import list_personas, persona_exists
-from app.agent.persona_router import infer_persona_for_task
 from app.autonomy.planner import create_task_plan_for_user
-from app.autonomy.profiles import normalize_task_profile
 from app.auth.dependencies import get_current_user
 from app.config import settings
 from app.db.models import AuditLog, Task, TaskRun, TaskRunArtifact, TaskStep, User
 from app.db.session import get_db
 from app.memory.service import get_memory_service
+from app.task_service import TaskValidationError, UNSET, create_task_record, update_task_record
 
 router = APIRouter()
 
@@ -117,45 +115,6 @@ class MemoryCandidateApprovalOut(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _compute_next_run_at(schedule: str | None) -> datetime | None:
-    """
-    Parse a schedule expression and return the next run time.
-    Accepts: "every:30m", cron expression, or ISO 8601 timestamp.
-    Defers to app.autonomy.scheduler when that module is available.
-    """
-    if not schedule:
-        return None
-    try:
-        from app.autonomy.scheduler import compute_next_run_at
-        return compute_next_run_at(schedule)
-    except ImportError:
-        # Scheduler not yet wired (Sprint 4.2) — fall back to basic interval parsing
-        return _simple_next_run(schedule)
-
-
-def _simple_next_run(schedule: str) -> datetime | None:
-    """Minimal fallback: handle 'every:Xs/m/h/d' and ISO timestamps."""
-    now = datetime.now(timezone.utc)
-    if schedule.startswith("every:"):
-        expr = schedule[6:].strip()
-        multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-        unit = expr[-1].lower()
-        if unit in multipliers:
-            try:
-                n = int(expr[:-1])
-                from datetime import timedelta
-                return now + timedelta(seconds=n * multipliers[unit])
-            except ValueError:
-                pass
-    # Try ISO timestamp
-    try:
-        dt = datetime.fromisoformat(schedule)
-        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-    except ValueError:
-        pass
-    return None
-
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.post("/tasks", response_model=TaskOut, status_code=status.HTTP_201_CREATED)
@@ -164,29 +123,24 @@ async def create_task(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    resolved_persona = _resolve_task_persona(
-        title=body.title,
-        instruction=body.instruction,
-        requested_persona=body.persona,
-    )
-    task = Task(
-        user_id=current_user.id,
-        title=body.title,
-        instruction=body.instruction,
-        persona=resolved_persona,
-        profile=_resolve_task_profile(body.profile),
-        task_type=body.task_type,
-        status="pending",
-        schedule=body.schedule,
-        deliver=body.deliver,
-        requires_approval=body.requires_approval,
-        active_hours_start=body.active_hours_start,
-        active_hours_end=body.active_hours_end,
-        active_hours_tz=body.active_hours_tz,
-        next_run_at=_compute_next_run_at(body.schedule),
-    )
-    db.add(task)
-    await db.flush()
+    try:
+        task = await create_task_record(
+            db,
+            user_id=current_user.id,
+            title=body.title,
+            instruction=body.instruction,
+            persona=body.persona,
+            profile=body.profile,
+            task_type=body.task_type,
+            schedule=body.schedule,
+            deliver=body.deliver,
+            requires_approval=body.requires_approval,
+            active_hours_start=body.active_hours_start,
+            active_hours_end=body.active_hours_end,
+            active_hours_tz=body.active_hours_tz,
+        )
+    except TaskValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return _to_task_out(task, None)
 
 
@@ -224,9 +178,6 @@ async def update_task(
     db: AsyncSession = Depends(get_db),
 ):
     task = await _get_owned_task(task_id, current_user.id, db)
-    title_changed = False
-    instruction_changed = False
-
     # Approval flow
     if body.approved is not None:
         if task.status != "waiting_approval":
@@ -243,37 +194,23 @@ async def update_task(
         step_lookup = await _load_current_steps(db, [task])
         return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
 
-    # Field updates
-    if body.title is not None:
-        task.title = body.title
-        title_changed = True
-    if body.instruction is not None:
-        task.instruction = body.instruction
-        instruction_changed = True
-    if body.persona is not None:
-        task.persona = _resolve_task_persona(
-            title=task.title,
-            instruction=task.instruction,
-            requested_persona=body.persona,
+    try:
+        await update_task_record(
+            db,
+            task,
+            title=body.title if body.title is not None else UNSET,
+            instruction=body.instruction if body.instruction is not None else UNSET,
+            persona=body.persona if body.persona is not None else UNSET,
+            profile=body.profile if body.profile is not None else UNSET,
+            schedule=body.schedule if body.schedule is not None else UNSET,
+            deliver=body.deliver if body.deliver is not None else UNSET,
+            requires_approval=body.requires_approval if body.requires_approval is not None else UNSET,
+            active_hours_start=body.active_hours_start if body.active_hours_start is not None else UNSET,
+            active_hours_end=body.active_hours_end if body.active_hours_end is not None else UNSET,
+            active_hours_tz=body.active_hours_tz if body.active_hours_tz is not None else UNSET,
         )
-    if body.profile is not None:
-        task.profile = _resolve_task_profile(body.profile)
-    if body.deliver is not None:
-        task.deliver = body.deliver
-    if body.requires_approval is not None:
-        task.requires_approval = body.requires_approval
-    if body.active_hours_start is not None:
-        task.active_hours_start = body.active_hours_start
-    if body.active_hours_end is not None:
-        task.active_hours_end = body.active_hours_end
-    if body.active_hours_tz is not None:
-        task.active_hours_tz = body.active_hours_tz
-    if body.schedule is not None:
-        task.schedule = body.schedule
-        task.next_run_at = _compute_next_run_at(body.schedule)
-    if body.persona is None and (title_changed or instruction_changed) and not task.persona:
-        inferred, _, _ = infer_persona_for_task(task.title, task.instruction)
-        task.persona = inferred
+    except TaskValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     step_lookup = await _load_current_steps(db, [task])
     return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
@@ -745,28 +682,6 @@ def _to_task_out(task: Task, current_step: Optional[TaskStep]) -> TaskOut:
         last_run_at=task.last_run_at,
         next_run_at=task.next_run_at,
     )
-
-
-def _resolve_task_persona(*, title: str, instruction: str, requested_persona: Optional[str]) -> str:
-    explicit = (requested_persona or "").strip()
-    if explicit:
-        if not persona_exists(explicit):
-            available = ", ".join(list_personas().keys())
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown persona '{explicit}'. Available: {available}",
-            )
-        return explicit
-
-    inferred, _, _ = infer_persona_for_task(title, instruction)
-    return inferred
-
-
-def _resolve_task_profile(requested_profile: Optional[str]) -> Optional[str]:
-    try:
-        return normalize_task_profile(requested_profile)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
 async def _load_current_steps(db: AsyncSession, tasks: List[Task]) -> Dict[tuple[int, int], TaskStep]:

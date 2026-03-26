@@ -45,6 +45,7 @@ def test_build_retry_instruction_has_reason_specific_text():
     assert "grounded sources" in build_chat_retry_instruction("missing_links").lower()
     assert "invalid/placeholder links" in build_chat_retry_instruction("invalid_links").lower()
     assert "calendar" in build_chat_retry_instruction("calendar_mutation_unconfirmed").lower()
+    assert "task or watcher" in build_chat_retry_instruction("task_mutation_unconfirmed").lower()
 
 
 def test_validate_chat_response_flags_unconfirmed_calendar_mutation_claim():
@@ -56,6 +57,33 @@ def test_validate_chat_response_flags_unconfirmed_calendar_mutation_claim():
     assert out.mutation_unconfirmed is True
     assert out.should_retry is True
     assert out.retry_reason == "calendar_mutation_unconfirmed"
+
+
+def test_validate_chat_response_flags_unconfirmed_task_mutation_claim():
+    out = validate_chat_response(
+        "Create a task to watch Iran every 2 hours",
+        "I created the task and set it to run every 2 hours.",
+        executed_tools=[],
+    )
+    assert out.task_mutation_unconfirmed is True
+    assert out.should_retry is True
+    assert out.retry_reason == "task_create_unconfirmed"
+
+
+def test_validate_chat_response_flags_claimed_update_when_only_create_task_ran():
+    out = validate_chat_response(
+        "Change the World Cup watcher to only run between 7am and 9pm",
+        "I updated the World Cup topic watcher to only run between 7:00 AM and 9:00 PM.",
+        executed_tools=[
+            {
+                "tool": "create_task",
+                "result_summary": '{"created": true, "task_id": 55, "title": "World Cup Topic Watcher"}',
+            }
+        ],
+    )
+    assert out.task_mutation_unconfirmed is True
+    assert out.should_retry is True
+    assert out.retry_reason == "task_update_unconfirmed"
 
 
 @pytest.mark.asyncio

@@ -31,7 +31,7 @@ from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
-from app.db.models import Memory, MemoryEntity, MemoryObservation, MemoryProposal, MemoryRelation, User
+from app.db.models import LLMUsageEvent, Memory, MemoryEntity, MemoryObservation, MemoryProposal, MemoryRelation, User
 from app.db.session import get_db
 from app.memory.graph_service import get_graph_memory_service
 from app.memory.review_service import (
@@ -230,6 +230,19 @@ class MemoryProposalApprovalOut(BaseModel):
     memory: MemoryOut
 
 
+class LLMUsageEventOut(BaseModel):
+    scope_label: str
+    task_id: Optional[int]
+    session_id: Optional[int]
+    task_run_id: Optional[int]
+    source: str
+    stage: Optional[str]
+    model: str
+    total_tokens: int
+    estimated_cost_usd: Optional[float]
+    created_at: Optional[datetime]
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get("/memories", response_model=List[MemoryOut])
@@ -249,6 +262,23 @@ async def list_memories(
     )
     memories = result.scalars().all()
     return [MemoryOut.from_orm(m) for m in memories]
+
+
+@router.get("/memories/usage", response_model=List[LLMUsageEventOut])
+async def list_llm_usage_events(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    limit: int = 20,
+):
+    bounded_limit = max(1, min(int(limit or 20), 100))
+    result = await db.execute(
+        select(LLMUsageEvent)
+        .where(LLMUsageEvent.user_id == current_user.id)
+        .order_by(desc(LLMUsageEvent.created_at), desc(LLMUsageEvent.id))
+        .limit(bounded_limit)
+    )
+    rows = result.scalars().all()
+    return [_llm_usage_event_out(row) for row in rows]
 
 
 @router.post("/memories", response_model=MemoryOut, status_code=status.HTTP_201_CREATED)
@@ -759,6 +789,29 @@ def _memory_proposal_out(proposal: MemoryProposal) -> MemoryProposalOut:
         resolved_by_user_id=proposal.resolved_by_user_id,
         approved_memory_id=proposal.approved_memory_id,
         proposal=decode_proposal_payload(proposal.proposal_json),
+    )
+
+
+def _llm_usage_scope_label(event: LLMUsageEvent) -> str:
+    if event.task_id is not None:
+        return f"task:{event.task_id}"
+    if event.session_id is not None:
+        return f"chat:{event.session_id}"
+    return f"source:{event.source}"
+
+
+def _llm_usage_event_out(event: LLMUsageEvent) -> LLMUsageEventOut:
+    return LLMUsageEventOut(
+        scope_label=_llm_usage_scope_label(event),
+        task_id=event.task_id,
+        session_id=event.session_id,
+        task_run_id=event.task_run_id,
+        source=event.source,
+        stage=event.stage,
+        model=event.model,
+        total_tokens=event.total_tokens,
+        estimated_cost_usd=event.estimated_cost_usd,
+        created_at=event.created_at,
     )
 
 

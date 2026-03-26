@@ -131,6 +131,22 @@ Agent Execution
 
 Decisions that feel ambiguous usually become clear when you ask which layer they belong to. A question about tone belongs in Persona. A question about which documents are accessible belongs in Identity/Profile. A question about whether a tool can be called belongs in Capability Profile.
 
+For built-in task automation, there is one more boundary worth keeping explicit:
+
+- **Persona** owns identity, tone, broad safety, and the general permission envelope.
+- **Task profile/spec** owns the task contract — required inputs, output shape, and task-specific execution rules.
+- **Code** owns anything deterministic or enforceable — data preparation, validation, persistence, and approvals.
+
+This prevents prompt-layer duplication. Personas should not become task templates, and task specs should not become personality systems.
+
+There is a related boundary on the chat side now as well:
+
+- **Chat** may act as a task setup and task-operator surface.
+- **Task tools** own persistent task mutation and inspection.
+- **Validation** must reject claims that a task was created or updated unless the matching task tool actually confirmed success.
+
+That means chat is allowed to become operational, but it must not operate blind. If chat can mutate persistent task state, it also needs read-side task inspection so it can verify what exists before claiming success.
+
 ---
 
 ## What Gets Dropped and Why

@@ -14,10 +14,14 @@ tool-registry level using mock UserContext objects.
 
 from __future__ import annotations
 
+import json
+
 import pytest
+from unittest.mock import patch
 
 from app.agent.context import UserContext
 from app.agent.tools import TOOL_SCHEMAS, _parse_iso_datetime, get_tools_for_user
+from tests.conftest import TestSessionLocal
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -134,6 +138,40 @@ def test_create_and_run_task_plan_schema_has_required_fields():
     assert "task_id" in props
     assert "goal" in props
     assert "goal" in required
+
+
+def test_create_task_schema_has_required_fields():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_task")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "title" in props
+    assert "instruction" in props
+    assert "task_type" in props
+    assert "deliver" in props
+    assert set(["title", "instruction", "task_type", "deliver"]).issubset(set(required))
+
+
+def test_update_task_schema_has_required_fields():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "update_task")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "task_id" in props
+    assert required == ["task_id"]
+
+
+def test_list_tasks_schema_fields():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "list_tasks")
+    props = schema["function"]["parameters"]["properties"]
+    assert "limit" in props
+    assert "status" in props
+
+
+def test_get_task_schema_has_required_task_id():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "get_task")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "task_id" in props
+    assert required == ["task_id"]
 
 
 # ── Persona / blocked-tools filtering ─────────────────────────────────────────
@@ -332,3 +370,108 @@ async def test_call_tool_routes_generic_search_to_web_search():
         {"query": "ap headlines", "max_results": 3},
         ctx,
     )
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_persists_recurring_task():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Iran Watch",
+                "instruction": "topic: Iran\nthreshold: medium",
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+                "profile": "topic_watcher",
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["task_type"] == "recurring"
+    assert payload["profile"] == "topic_watcher"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.schedule == "every:2h"
+        assert task.profile == "topic_watcher"
+
+
+@pytest.mark.asyncio
+async def test_update_task_tool_updates_schedule_and_marks_plan_change():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        created = json.loads(
+            await tools_module._create_task(
+                {
+                    "title": "Morning Briefing",
+                    "instruction": "Prepare a morning briefing for today using my calendar and current headlines.",
+                    "task_type": "recurring",
+                    "schedule": "every:1d",
+                    "deliver": True,
+                    "profile": "morning_briefing",
+                },
+                ctx,
+            )
+        )
+
+        updated = json.loads(
+            await tools_module._update_task(
+                {"task_id": created["task_id"], "schedule": "every:2h"},
+                ctx,
+            )
+        )
+
+    assert updated["updated"] is True
+    assert updated["schedule"] == "every:2h"
+    assert updated["plan_inputs_changed"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, created["task_id"])
+        assert task is not None
+        assert task.schedule == "every:2h"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_and_get_task_return_owned_task_state():
+    import app.agent.tools as tools_module
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        created = json.loads(
+            await tools_module._create_task(
+                {
+                    "title": "World Cup Topic Watcher",
+                    "instruction": "topic: World Cup\nthreshold: medium",
+                    "task_type": "recurring",
+                    "schedule": "every:8h",
+                    "deliver": True,
+                    "profile": "topic_watcher",
+                    "active_hours_start": "07:00",
+                    "active_hours_end": "21:00",
+                    "active_hours_tz": "America/New_York",
+                },
+                ctx,
+            )
+        )
+        listed = json.loads(await tools_module._list_tasks({"limit": 10}, ctx))
+        fetched = json.loads(await tools_module._get_task({"task_id": created["task_id"]}, ctx))
+
+    assert listed["count"] >= 1
+    assert any(task["id"] == created["task_id"] for task in listed["tasks"])
+    assert fetched["id"] == created["task_id"]
+    assert fetched["schedule"] == "every:8h"
+    assert fetched["active_hours_start"] == "07:00"
+    assert fetched["active_hours_tz"] == "America/New_York"

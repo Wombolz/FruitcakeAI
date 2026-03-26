@@ -14,6 +14,7 @@ FruitcakeAI is not a chat UI wrapper. It's an agent platform with a full working
 
 - The **agent** reasons over your memory, documents, and tools — not just the current message
 - The **task engine** plans and executes multi-step work autonomously, on a schedule, or triggered by webhooks
+- The **chat layer** can now create, inspect, and update real persistent tasks instead of only acting as a one-shot Q&A surface
 - The **memory system** persists what matters across sessions, with 3-tier retrieval and semantic search
 - The **RAG pipeline** ingests your documents and makes them queryable with hybrid BM25 + vector retrieval
 - The **MCP layer** lets you drop in any tool server via a config file — no code changes required
@@ -76,6 +77,11 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - 3-tier retrieval: procedural rules → importance-ranked facts → pgvector semantic search
 - Memory injected into every task prompt and heartbeat evaluation
 - Immutable history — memories are deactivated, never overwritten
+- Shared memory review flow for proposed memories:
+  - pending review queue
+  - approve / reject from the client
+  - proposals retained separately from task-run provenance
+- Graph memory foundation for entities, relations, and observations
 
 **Document library**
 - Upload and ingest PDFs and documents into a personal or shared library
@@ -93,6 +99,24 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - Active-hours windows prevent off-hours autonomous action
 - Approval gate for irreversible actions — task pauses, pushes a notification, waits
 - Exponential retry on transient failures
+- Built-in task profiles for common recurring work:
+  - `rss_newspaper`
+  - `morning_briefing`
+  - `topic_watcher`
+  - `maintenance`
+- Topic watchers can:
+  - monitor prepared RSS data for a topic
+  - suppress repeats across runs
+  - propose memory candidates for approval
+
+**Chat task operations**
+- Chat can create, inspect, and update real persistent tasks
+- Task creation/update in chat uses the same persona/profile/schedule resolution path as the REST task API
+- Chat validation rejects claims that a task was created or updated unless the matching task tool actually confirmed success
+
+**Visibility and review**
+- LLM usage events are recorded per chat/task/tool stage with estimated token cost
+- The client exposes memory review and token-usage views so operator-facing state is no longer API-only
 
 **Integrations**
 - Calendar — Google Calendar and Apple Calendar
@@ -215,7 +239,6 @@ FruitcakeAI also supports admin-managed knowledge skills. Skills do not add new 
 ```bash
 source .venv/bin/activate
 pytest tests/
-# 139 passed — no running database required
 ```
 
 ---
@@ -244,7 +267,7 @@ FruitcakeAI/
 │   ├── mcp_config.yaml     MCP server definitions
 │   ├── personas.yaml       Persona definitions
 │   └── users.yaml          Seed users
-├── tests/              139 tests, SQLite in-memory
+├── tests/              API, agent, task, memory, and integration coverage
 ├── scripts/
 │   ├── start.sh        One-command startup
 │   ├── stop.sh         Stop local services

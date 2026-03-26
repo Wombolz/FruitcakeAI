@@ -109,7 +109,7 @@ class UserContext:
             "- Do not create memories for trivial one-off chatter, temporary reasoning steps, or facts already captured in the visible memory context.",
             "- Always cite the source document name when using search_library results.",
             f"- Only surface documents within the user's permitted scopes: {self.library_scopes}.",
-            "- Be helpful, concise, and privacy-conscious.",
+            "- Be helpful and privacy-conscious.",
             "- If you don't find relevant information in the library, say so clearly.",
             "- For shell requests, use shell_exec when it is available for local workspace commands or explicit shell-policy tests. Let the shell tool enforce what is blocked, timed out, or refused, then report that tool result clearly.",
         ]
