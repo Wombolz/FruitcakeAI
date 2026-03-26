@@ -77,6 +77,30 @@ async def test_create_plan_and_list_steps(client):
 
 
 @pytest.mark.asyncio
+async def test_task_create_and_patch_support_llm_model_override(client):
+    headers = await _headers(client, "taskmodelowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Model-bound task",
+            "instruction": "Use a specific model",
+            "llm_model_override": "gpt-5-mini",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["llm_model_override"] == "gpt-5-mini"
+
+    updated = await client.patch(
+        f"/tasks/{created.json()['id']}",
+        json={"llm_model_override": "ollama_chat/qwen2.5:14b"},
+        headers=headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["llm_model_override"] == "ollama_chat/qwen2.5:14b"
+
+
+@pytest.mark.asyncio
 async def test_magazine_plan_uses_deterministic_steps_without_approval(client):
     headers = await _headers(client, "magplanowner")
     task = await client.post(

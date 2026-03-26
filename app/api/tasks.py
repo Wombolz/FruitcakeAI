@@ -41,6 +41,7 @@ class TaskCreate(BaseModel):
     instruction: str
     persona: Optional[str] = None
     profile: Optional[str] = None
+    llm_model_override: Optional[str] = None
     task_type: str = "one_shot"          # "one_shot" | "recurring"
     schedule: Optional[str] = None       # "every:30m" | cron | ISO timestamp
     deliver: bool = True
@@ -55,6 +56,7 @@ class TaskPatch(BaseModel):
     instruction: Optional[str] = None
     persona: Optional[str] = None
     profile: Optional[str] = None
+    llm_model_override: Optional[str] = None
     schedule: Optional[str] = None
     deliver: Optional[bool] = None
     requires_approval: Optional[bool] = None
@@ -71,6 +73,7 @@ class TaskOut(BaseModel):
     instruction: str
     persona: Optional[str]
     profile: Optional[str]
+    llm_model_override: Optional[str]
     task_type: str
     status: str
     schedule: Optional[str]
@@ -131,6 +134,7 @@ async def create_task(
             instruction=body.instruction,
             persona=body.persona,
             profile=body.profile,
+            llm_model_override=body.llm_model_override,
             task_type=body.task_type,
             schedule=body.schedule,
             deliver=body.deliver,
@@ -202,6 +206,7 @@ async def update_task(
             instruction=body.instruction if body.instruction is not None else UNSET,
             persona=body.persona if body.persona is not None else UNSET,
             profile=body.profile if body.profile is not None else UNSET,
+            llm_model_override=body.llm_model_override if body.llm_model_override is not None else UNSET,
             schedule=body.schedule if body.schedule is not None else UNSET,
             deliver=body.deliver if body.deliver is not None else UNSET,
             requires_approval=body.requires_approval if body.requires_approval is not None else UNSET,
@@ -662,6 +667,7 @@ def _to_task_out(task: Task, current_step: Optional[TaskStep]) -> TaskOut:
         instruction=task.instruction,
         persona=task.persona,
         profile=task.profile,
+        llm_model_override=task.llm_model_override,
         task_type=task.task_type,
         status=task.status,
         schedule=task.schedule,

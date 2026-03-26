@@ -541,6 +541,8 @@ class Task(Base):
     persona = Column(String(100), nullable=True)
     # Optional task execution profile (default, rss_newspaper)
     profile = Column(String(50), nullable=True)
+    # Optional explicit model override for all LLM stages of this task.
+    llm_model_override = Column(String(200), nullable=True)
 
     # "one_shot" | "recurring"
     task_type = Column(String(20), nullable=False, default="one_shot")

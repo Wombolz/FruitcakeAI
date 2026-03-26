@@ -26,6 +26,17 @@ class TaskModelProfile:
 def resolve_task_model_profile(task, user) -> TaskModelProfile:
     del user  # v1: config-only routing
 
+    task_override = (getattr(task, "llm_model_override", None) or "").strip()
+    if task_override:
+        return TaskModelProfile(
+            planning_model=task_override,
+            execution_model=task_override,
+            final_synthesis_model=task_override,
+            routing_enabled=False,
+            large_retry_enabled=False,
+            large_retry_max_attempts=0,
+        )
+
     routing_enabled = bool(settings.task_model_routing_enabled)
     small_model = settings.task_small_model or settings.llm_model
     large_model = settings.task_large_model or settings.llm_model

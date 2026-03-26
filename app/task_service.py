@@ -86,6 +86,7 @@ async def create_task_record(
     instruction: str,
     persona: Optional[str] = None,
     profile: Optional[str] = None,
+    llm_model_override: Optional[str] = None,
     task_type: str = "one_shot",
     schedule: Optional[str] = None,
     deliver: bool = True,
@@ -107,6 +108,7 @@ async def create_task_record(
         instruction=instruction,
         persona=resolved_persona,
         profile=resolve_task_profile(profile),
+        llm_model_override=(str(llm_model_override).strip() or None) if llm_model_override is not None else None,
         task_type=task_type,
         status="pending",
         schedule=schedule,
@@ -130,6 +132,7 @@ async def update_task_record(
     instruction=UNSET,
     persona=UNSET,
     profile=UNSET,
+    llm_model_override=UNSET,
     schedule=UNSET,
     deliver=UNSET,
     requires_approval=UNSET,
@@ -160,6 +163,9 @@ async def update_task_record(
         plan_inputs_changed = True
     if profile is not UNSET:
         task.profile = resolve_task_profile(profile)
+        plan_inputs_changed = True
+    if llm_model_override is not UNSET:
+        task.llm_model_override = (str(llm_model_override).strip() or None) if llm_model_override is not None else None
         plan_inputs_changed = True
     if deliver is not UNSET:
         task.deliver = bool(deliver)

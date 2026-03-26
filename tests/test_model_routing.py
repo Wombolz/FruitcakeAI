@@ -51,6 +51,21 @@ def test_resolve_task_model_profile_uses_env_defaults(monkeypatch):
     assert profile.large_retry_max_attempts == 1
 
 
+def test_resolve_task_model_profile_prefers_task_override(monkeypatch):
+    monkeypatch.setattr(settings, "task_model_routing_enabled", True)
+    monkeypatch.setattr(settings, "task_small_model", "ollama_chat/qwen2.5:7b")
+    monkeypatch.setattr(settings, "task_large_model", "ollama_chat/qwen2.5:14b")
+
+    task = _fake_task()
+    task.llm_model_override = "gpt-5-mini"
+
+    profile = resolve_task_model_profile(task, _fake_user())
+    assert profile.planning_model == "gpt-5-mini"
+    assert profile.execution_model == "gpt-5-mini"
+    assert profile.final_synthesis_model == "gpt-5-mini"
+    assert profile.large_retry_enabled is False
+
+
 @pytest.mark.asyncio
 async def test_generate_plan_steps_prefers_large_model_when_enabled(monkeypatch):
     monkeypatch.setattr(settings, "task_model_routing_enabled", True)
