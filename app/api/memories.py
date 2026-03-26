@@ -37,6 +37,7 @@ from app.memory.graph_service import get_graph_memory_service
 from app.memory.review_service import (
     create_flat_memory_from_proposal,
     decode_proposal_payload,
+    find_existing_memory_for_proposal,
     sync_artifact_candidate_status,
 )
 from app.memory.service import get_memory_service
@@ -356,6 +357,15 @@ async def approve_memory_review_proposal(
     db: AsyncSession = Depends(get_db),
 ):
     proposal = await _get_owned_memory_proposal(db=db, proposal_id=proposal_id, user_id=current_user.id)
+    if proposal.status == "approved" and proposal.approved_memory_id is not None:
+        memory = await db.get(Memory, proposal.approved_memory_id)
+        if memory is None or memory.user_id != current_user.id:
+            memory = await find_existing_memory_for_proposal(db, user_id=current_user.id, proposal=proposal)
+        if memory is not None:
+            return MemoryProposalApprovalOut(
+                proposal=_memory_proposal_out(proposal),
+                memory=MemoryOut.from_orm(memory),
+            )
     if proposal.status != "pending":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

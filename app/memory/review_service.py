@@ -6,10 +6,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, status
-from sqlalchemy import desc, select
+from sqlalchemy import and_, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import MemoryProposal, TaskRunArtifact
+from app.db.models import Memory, MemoryProposal, TaskRunArtifact
 from app.memory.service import get_memory_service
 
 
@@ -57,6 +57,36 @@ def parse_optional_iso_datetime(raw: str | None) -> Optional[datetime]:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
+async def find_existing_memory_for_proposal(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    proposal: MemoryProposal,
+) -> Optional[Memory]:
+    payload = decode_proposal_payload(proposal.proposal_json)
+    memory_type = str(payload.get("memory_type") or "").strip()
+    content = str(payload.get("content") or "").strip()
+    if memory_type not in {"semantic", "procedural", "episodic"} or not content:
+        return None
+
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(Memory)
+        .where(
+            and_(
+                Memory.user_id == user_id,
+                Memory.is_active == True,
+                Memory.memory_type == memory_type,
+                Memory.content == content,
+                (Memory.expires_at.is_(None) | (Memory.expires_at >= now)),
+            )
+        )
+        .order_by(desc(Memory.created_at), desc(Memory.id))
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def create_flat_memory_from_proposal(
     db: AsyncSession,
     *,
@@ -74,6 +104,10 @@ async def create_flat_memory_from_proposal(
 
     expires_at = payload.get("expires_at")
     topic = str(payload.get("topic") or "").strip()
+    existing = await find_existing_memory_for_proposal(db, user_id=user_id, proposal=proposal)
+    if existing is not None:
+        return existing
+
     svc = get_memory_service()
     result = await svc.create(
         db=db,
@@ -85,6 +119,9 @@ async def create_flat_memory_from_proposal(
         expires_at=parse_optional_iso_datetime(expires_at) if expires_at else None,
     )
     if isinstance(result, str):
+        existing = await find_existing_memory_for_proposal(db, user_id=user_id, proposal=proposal)
+        if existing is not None:
+            return existing
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result)
     return result
 

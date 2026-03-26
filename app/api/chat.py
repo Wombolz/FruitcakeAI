@@ -342,7 +342,10 @@ async def send_message(
         threshold=settings.chat_complexity_threshold,
         routing_enabled=settings.chat_complexity_routing_enabled,
     )
-    execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
+    execution_mode, effective_complex = _resolve_chat_execution(
+        auto_complex=(decision.is_complex or library_intent),
+        preference=getattr(current_user, "chat_routing_preference", None),
+    )
     stage_started = time.perf_counter()
     execution_history = build_orchestrated_chat_history(
         history,
@@ -350,7 +353,6 @@ async def send_message(
         max_steps=settings.chat_orchestration_max_steps,
     )
     _record_chat_stage_timing(stage_timings_ms, "orchestration_build", stage_started)
-    effective_complex = (decision.is_complex or library_intent) and execution_mode == "chat_orchestrated"
     if decision.is_complex:
         metrics.inc_chat_complexity_complex_count()
         if effective_complex:
@@ -583,7 +585,10 @@ async def chat_websocket(
                         threshold=settings.chat_complexity_threshold,
                         routing_enabled=settings.chat_complexity_routing_enabled,
                     )
-                    execution_mode = _resolve_chat_mode(decision.is_complex or library_intent)
+                    execution_mode, effective_complex = _resolve_chat_execution(
+                        auto_complex=(decision.is_complex or library_intent),
+                        preference=getattr(current_user, "chat_routing_preference", None),
+                    )
                     stage_started = time.perf_counter()
                     execution_history = build_orchestrated_chat_history(
                         history,
@@ -591,7 +596,6 @@ async def chat_websocket(
                         max_steps=settings.chat_orchestration_max_steps,
                     )
                     _record_chat_stage_timing(stage_timings_ms, "orchestration_build", stage_started)
-                    effective_complex = (decision.is_complex or library_intent) and execution_mode == "chat_orchestrated"
                     if decision.is_complex:
                         metrics.inc_chat_complexity_complex_count()
                         if effective_complex:
@@ -790,6 +794,28 @@ def _resolve_chat_mode(is_complex: bool) -> str:
         metrics.inc_chat_orchestration_kill_switch_suppressed_count()
         return "chat"
     return "chat_orchestrated" if is_complex else "chat"
+
+
+def _normalize_chat_routing_preference(value: str | None) -> str:
+    lowered = str(value or "").strip().lower()
+    if lowered in {"auto", "fast", "deep"}:
+        return lowered
+    return "auto"
+
+
+def _resolve_chat_execution(
+    *,
+    auto_complex: bool,
+    preference: str | None,
+) -> tuple[str, bool]:
+    normalized = _normalize_chat_routing_preference(preference)
+    if normalized == "fast":
+        return "chat", False
+    if normalized == "deep":
+        mode = _resolve_chat_mode(True)
+        return mode, mode == "chat_orchestrated"
+    mode = _resolve_chat_mode(auto_complex)
+    return mode, auto_complex and mode == "chat_orchestrated"
 
 
 async def _execute_chat_turn(

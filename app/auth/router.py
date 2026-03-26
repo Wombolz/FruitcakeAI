@@ -1,10 +1,10 @@
 """
 FruitcakeAI v5 — Auth router
-POST /auth/login, POST /auth/register, GET /auth/me
+POST /auth/login, POST /auth/register, GET /auth/me, PATCH /auth/me/preferences
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr
@@ -53,11 +53,16 @@ class UserResponse(BaseModel):
     full_name: Optional[str]
     role: str
     persona: str
+    chat_routing_preference: str
     library_scopes: List[str]
     is_active: bool
 
     class Config:
         from_attributes = True
+
+
+class UpdatePreferencesRequest(BaseModel):
+    chat_routing_preference: Literal["auto", "fast", "deep"]
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -118,4 +123,17 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
 @router.get("/me", response_model=UserResponse)
 async def me(current_user: User = Depends(get_current_user)):
     """Return the currently authenticated user's profile."""
+    return current_user
+
+
+@router.patch("/me/preferences", response_model=UserResponse)
+async def update_preferences(
+    body: UpdatePreferencesRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update the authenticated user's routing preferences."""
+    current_user.chat_routing_preference = body.chat_routing_preference
+    await db.flush()
+    await db.refresh(current_user)
     return current_user

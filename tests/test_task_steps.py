@@ -1169,10 +1169,20 @@ async def test_memory_review_reject_updates_status_without_creating_memory(clien
 
 
 @pytest.mark.asyncio
-async def test_memory_review_rejects_duplicate_approval(client):
+async def test_memory_review_approve_is_idempotent_for_already_approved_proposal(client):
     headers = await _headers(client, "reviewduplicateowner")
 
     async with TestSessionLocal() as db:
+        memory = Memory(
+            user_id=1,
+            memory_type="semantic",
+            content="Duplicate proposal",
+            importance=0.65,
+            tags=json.dumps(["topic_watcher", "iran"]),
+            is_active=True,
+        )
+        db.add(memory)
+        await db.flush()
         proposal = MemoryProposal(
             proposal_key="proposal-review-duplicate",
             user_id=1,
@@ -1182,7 +1192,7 @@ async def test_memory_review_rejects_duplicate_approval(client):
             content="Duplicate proposal",
             confidence=0.7,
             reason="Strong watcher hit.",
-            approved_memory_id=99,
+            approved_memory_id=memory.id,
             resolved_by_user_id=1,
             resolved_at=datetime(2026, 3, 25, 4, 0, tzinfo=timezone.utc),
         )
@@ -1202,7 +1212,59 @@ async def test_memory_review_rejects_duplicate_approval(client):
         proposal_id = proposal.id
 
     approve = await client.post(f"/memories/review/{proposal_id}/approve", headers=headers)
-    assert approve.status_code == 409
+    assert approve.status_code == 200
+    payload = approve.json()
+    assert payload["proposal"]["status"] == "approved"
+    assert payload["memory"]["content"] == "Duplicate proposal"
+
+
+@pytest.mark.asyncio
+async def test_memory_review_approve_links_existing_duplicate_memory(client):
+    headers = await _headers(client, "reviewexistingmemoryowner")
+
+    async with TestSessionLocal() as db:
+        memory = Memory(
+            user_id=1,
+            memory_type="episodic",
+            content="On 2026-03-25, reports about Iran indicated renewed diplomatic talks.",
+            importance=0.65,
+            tags=json.dumps(["topic_watcher", "iran"]),
+            is_active=True,
+        )
+        db.add(memory)
+        await db.flush()
+        proposal = MemoryProposal(
+            proposal_key="proposal-review-existing-memory",
+            user_id=1,
+            proposal_type="flat_memory_create",
+            source_type="topic_watcher",
+            status="pending",
+            content="On 2026-03-25, reports about Iran indicated renewed diplomatic talks.",
+            confidence=0.8,
+            reason="Strong watcher hit.",
+        )
+        proposal.proposal_payload = {
+            "proposal_key": "proposal-review-existing-memory",
+            "memory_type": "episodic",
+            "content": "On 2026-03-25, reports about Iran indicated renewed diplomatic talks.",
+            "topic": "Iran",
+            "supporting_urls": ["https://example.com/iran-1"],
+            "source_names": ["Reuters"],
+            "reason": "Strong watcher hit.",
+            "confidence": 0.8,
+            "expires_at": "2026-04-24T00:00:00+00:00",
+        }
+        db.add(proposal)
+        await db.commit()
+        proposal_id = proposal.id
+        memory_id = memory.id
+
+    approve = await client.post(f"/memories/review/{proposal_id}/approve", headers=headers)
+    assert approve.status_code == 200
+    payload = approve.json()
+    assert payload["proposal"]["status"] == "approved"
+    assert payload["proposal"]["approved_memory_id"] == memory_id
+    assert payload["memory"]["id"] == memory_id
 
 
 @pytest.mark.asyncio

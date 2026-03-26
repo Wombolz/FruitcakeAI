@@ -66,6 +66,7 @@ async def test_register(client):
     data = resp.json()
     assert data["username"] == "alice"
     assert data["role"] == "parent"
+    assert data["chat_routing_preference"] == "auto"
 
 
 @pytest.mark.asyncio
@@ -117,6 +118,23 @@ async def test_me(client):
     resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     assert resp.json()["username"] == "eve"
+    assert resp.json()["chat_routing_preference"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_update_my_chat_routing_preference(client):
+    await client.post("/auth/register", json={
+        "username": "prefuser",
+        "email": "pref@example.com",
+        "password": "pass123",
+    })
+    login_resp = await client.post("/auth/login", json={"username": "prefuser", "password": "pass123"})
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.patch("/auth/me/preferences", json={"chat_routing_preference": "deep"}, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["chat_routing_preference"] == "deep"
 
 
 @pytest.mark.asyncio
@@ -171,6 +189,36 @@ async def test_create_and_list_sessions(client):
     assert sessions.status_code == 200
     ids = [s["id"] for s in sessions.json()]
     assert session_id in ids
+
+
+@pytest.mark.asyncio
+async def test_chat_send_message_honors_deep_routing_preference(client):
+    await client.post("/auth/register", json={
+        "username": "deepuser",
+        "email": "deep@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "deepuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    pref = await client.patch("/auth/me/preferences", json={"chat_routing_preference": "deep"}, headers=headers)
+    assert pref.status_code == 200
+
+    create = await client.post("/chat/sessions", json={"title": "Routing"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with patch("app.api.chat._execute_chat_turn", new=AsyncMock(return_value="ok")) as execute_mock:
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "What's the weather today?"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert execute_mock.await_count == 1
+    assert execute_mock.await_args.kwargs["mode"] == "chat_orchestrated"
+    assert execute_mock.await_args.kwargs["stage"] == "chat_complex"
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,7 @@ class UserOut(BaseModel):
     full_name: Optional[str]
     role: str
     persona: str
+    chat_routing_preference: str
     library_scopes: List[str]
     calendar_access: List[str]
     is_active: bool
@@ -81,6 +82,7 @@ class CreateUserRequest(BaseModel):
     full_name: Optional[str] = None
     role: str = "parent"
     persona: str = "family_assistant"
+    chat_routing_preference: str = "auto"
     library_scopes: List[str] = ["family_docs"]
     calendar_access: List[str] = []
 
@@ -88,6 +90,7 @@ class CreateUserRequest(BaseModel):
 class UpdateUserRequest(BaseModel):
     role: Optional[str] = None
     persona: Optional[str] = None
+    chat_routing_preference: Optional[str] = None
     library_scopes: Optional[List[str]] = None
     calendar_access: Optional[List[str]] = None
     is_active: Optional[bool] = None
@@ -1001,6 +1004,7 @@ async def create_user(
         full_name=body.full_name,
         role=body.role,
         persona=body.persona,
+        chat_routing_preference=body.chat_routing_preference,
     )
     user.library_scopes = body.library_scopes
     user.calendar_access = body.calendar_access
@@ -1037,6 +1041,14 @@ async def update_user(
                 detail=f"Unknown persona '{body.persona}'. Available: {', '.join(list_personas())}",
             )
         user.persona = body.persona
+
+    if body.chat_routing_preference is not None:
+        if body.chat_routing_preference not in {"auto", "fast", "deep"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="chat_routing_preference must be one of: auto, fast, deep",
+            )
+        user.chat_routing_preference = body.chat_routing_preference
 
     if body.library_scopes is not None:
         user.library_scopes = body.library_scopes

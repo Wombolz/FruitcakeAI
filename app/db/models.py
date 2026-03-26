@@ -46,6 +46,12 @@ class User(Base):
 
     # v5: persona + access scopes (stored as JSON strings)
     persona = Column(String(100), default="family_assistant")
+    chat_routing_preference = Column(
+        String(20),
+        default="auto",
+        server_default="auto",
+        nullable=False,
+    )
     _library_scopes = Column("library_scopes", Text, default='["family_docs"]')
     _calendar_access = Column("calendar_access", Text, default='[]')
 
