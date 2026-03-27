@@ -132,6 +132,7 @@ class Document(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    linked_source_id = Column(Integer, ForeignKey("linked_sources.id", ondelete="SET NULL"), nullable=True, index=True)
 
     filename = Column(String(255), nullable=False)
     original_filename = Column(String(255), nullable=False)
@@ -156,11 +157,16 @@ class Document(Base):
     error_message = Column(Text)
     processing_started_at = Column(DateTime(timezone=True), nullable=True)
     processing_completed_at = Column(DateTime(timezone=True), nullable=True)
+    source_mode = Column(String(20), default="imported", nullable=False)
+    source_sync_status = Column(String(30), default="synced", nullable=False)
+    source_modified_at = Column(DateTime(timezone=True), nullable=True)
+    source_last_seen_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     owner = relationship("User", back_populates="documents")
+    linked_source = relationship("LinkedSource", back_populates="documents")
     chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
     ingest_job = relationship(
         "DocumentIngestJob",
@@ -171,6 +177,30 @@ class Document(Base):
 
     def __repr__(self):
         return f"<Document(filename='{self.filename}', scope='{self.scope}')>"
+
+
+class LinkedSource(Base):
+    __tablename__ = "linked_sources"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    name = Column(String(255), nullable=False)
+    source_type = Column(String(20), nullable=False)  # file | folder
+    root_path = Column(Text, nullable=False)
+    scope = Column(String(50), default="personal", nullable=False)
+    sync_status = Column(String(30), default="pending", nullable=False)
+    last_scanned_at = Column(DateTime(timezone=True), nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    owner = relationship("User")
+    documents = relationship("Document", back_populates="linked_source")
+
+    def __repr__(self):
+        return f"<LinkedSource(name='{self.name}', type='{self.source_type}', root='{self.root_path}')>"
 
 
 class Secret(Base):

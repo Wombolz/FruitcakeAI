@@ -1427,6 +1427,11 @@ Recent evidence:
 - Routing/trust-boundary cleanup has also advanced:
   - README now states the current chat/task routing policy explicitly,
   - the trust boundary around cloud models, server-side secret resolution, and backend-owned API adapters is now documented in one place.
+- Structured external integration work has also landed:
+  - a first-class backend-owned JSON/API execution substrate now exists,
+  - user-owned encrypted secrets are now available for authenticated integrations,
+  - the first authenticated API-backed proving path is live through the ISS/N2YO watcher,
+  - small task-local dedupe state now prevents repeated API-backed alerts when nothing changed.
 - Graceful failure behavior for research-heavy chat has also been tightened:
   - repeated failed search loops now return a bounded explanation with recent tool outcomes,
   - max-turn failures now return a tool-aware narrowing message instead of the generic fallback.
@@ -1464,21 +1469,43 @@ Phase 6 now includes not just cloud-routing policy, but routing-quality work aro
 
 ### Sprint 6.y — Structured JSON/API Integration
 
-This sprint turns structured external API access into a first-class backend capability instead of making chat/tasks improvise through generic web search.
+This sprint is now substantially landed. Structured external API access is no longer a plan-only item; it is a first-class backend capability rather than something chat/tasks must improvise through generic web search or shell workflows.
 
-Planned scope:
+Landed scope:
 
-- land the trusted backend-owned JSON/API execution path
-- use the new secrets capability for auth injection where needed
-- support deterministic JSON field extraction and validation
-- add small per-task dedupe state for API-backed polling tasks
-- prove the substrate with a concrete structured lookup use case such as maps/geocoding, weather, or ISS data
+- trusted backend-owned JSON/API execution path
+- user-owned encrypted secrets for authenticated integrations
+- deterministic JSON normalization/validation through approved adapters
+- small task-local dedupe state for API-backed polling tasks
+- first proving implementations:
+  - structured place lookup
+  - authenticated ISS/N2YO watcher flow
 
-Not in this sprint:
+Still out of scope for this sprint:
 
 - queued notifications / derived-event scheduling
 - generic model-visible arbitrary API calling
 - broad provider-specific integration abstractions beyond the first proving cases
+
+### Sprint 6.z — Linked Source Indexing And Codebase Awareness
+
+Planned scope:
+
+- first-class linked file and linked folder sources alongside imported library files
+- manual rescan/reindex of linked sources with incremental change detection
+- extracted text, summaries, and embeddings cached in Fruitcake while source files remain in place
+- expanded plain-text extraction for Fruitcake's own code/config/document formats, including Python and other repo-relevant source files
+- codebase-aware retrieval over linked repositories and external folders/drives
+
+Deferred from this sprint:
+
+- filesystem watching / automatic live sync
+- large structured archive ingest such as Wikipedia/Kiwix `.zim` files or OpenStreetMap bulk downloads
+- dedicated dataset parsers for non-document knowledge archives
+
+Reference:
+
+- `Docs/_internal/linked_source_indexing_and_codebase_awareness_plan.md`
 
 ### Sprint 6.x — Client Context Integration (Apple additive, platform-neutral)
 

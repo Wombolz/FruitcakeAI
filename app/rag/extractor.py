@@ -54,16 +54,54 @@ class ExtractionError(Exception):
 
 
 class DocumentExtractor:
+    _TEXT_EXTENSIONS = {
+        ".txt": "txt",
+        ".md": "md",
+        ".py": "code",
+        ".yaml": "config",
+        ".yml": "config",
+        ".json": "config",
+        ".toml": "config",
+        ".swift": "code",
+        ".js": "code",
+        ".ts": "code",
+        ".jsx": "code",
+        ".tsx": "code",
+        ".html": "html",
+        ".css": "code",
+        ".sh": "code",
+        ".sql": "code",
+        ".xml": "config",
+        ".ini": "config",
+        ".env": "config",
+    }
+    _SPECIAL_TEXT_FILENAMES = {
+        "dockerfile": "config",
+        "makefile": "config",
+        "justfile": "config",
+        "agents.md": "md",
+        "skill.md": "md",
+    }
+
+    def supports(self, file_path: Path) -> bool:
+        try:
+            self.content_type_from_extension(file_path)
+            return True
+        except ExtractionError:
+            return False
+
     def content_type_from_extension(self, file_path: Path) -> str:
+        special = self._SPECIAL_TEXT_FILENAMES.get(file_path.name.lower())
+        if special:
+            return special
         suffix = file_path.suffix.lower()
         if suffix == ".pdf":
             return "pdf"
         if suffix == ".docx":
             return "docx"
-        if suffix == ".md":
-            return "md"
-        if suffix == ".txt":
-            return "txt"
+        mapped = self._TEXT_EXTENSIONS.get(suffix)
+        if mapped:
+            return mapped
         raise ExtractionError(f"Unsupported file format: {suffix or '<none>'}")
 
     def extract(self, file_path: Path) -> tuple[str, str]:
@@ -77,7 +115,7 @@ class DocumentExtractor:
             return self._extract_docx(file_path)
         if content_type == "md":
             return self._extract_markdown(file_path)
-        if content_type == "txt":
+        if content_type in {"txt", "code", "config", "html"}:
             return self._extract_plaintext(file_path)
         raise ExtractionError(f"Unsupported content type: {content_type}")
 

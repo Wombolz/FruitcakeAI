@@ -16,14 +16,61 @@ from sqlalchemy.orm import selectinload
 
 from app.auth.dependencies import get_current_user
 from app.config import settings
-from app.db.models import Document, User
+from app.db.models import Document, LinkedSource, User
 from app.db.session import get_db
+from app.library_sources import create_linked_source, get_linked_source, list_linked_sources, rescan_linked_source
+from app.rag.extractor import ExtractionError
 from app.rag.job_runner import enqueue_document_ingest
 from app.rag.service import get_rag_service
 
 router = APIRouter()
 
 _ALLOWED_SCOPES = {"personal", "family", "shared"}
+
+
+class LinkSourceRequest(BaseModel):
+    path: str
+    scope: str = "personal"
+
+
+def _serialize_document(d: Document) -> Dict[str, Any]:
+    return {
+        "id": d.id,
+        "filename": d.original_filename or d.filename,
+        "scope": d.scope,
+        "created_at": d.created_at.isoformat() if d.created_at else "",
+        "processing_status": d.processing_status,
+        "content_type": d.content_type,
+        "chunk_count": d.chunk_count,
+        "summary": d.summary,
+        "ingest_job_status": d.ingest_job.status if d.ingest_job else None,
+        "ingest_attempt_count": d.ingest_job.attempt_count if d.ingest_job else 0,
+        "ingest_last_error": d.ingest_job.last_error if d.ingest_job else None,
+        "source_mode": d.source_mode,
+        "source_sync_status": d.source_sync_status,
+        "linked_source_id": d.linked_source_id,
+        "source_path": d.file_path,
+        "source_last_seen_at": d.source_last_seen_at.isoformat() if d.source_last_seen_at else None,
+        "source_modified_at": d.source_modified_at.isoformat() if d.source_modified_at else None,
+    }
+
+
+def _serialize_linked_source(source: LinkedSource) -> Dict[str, Any]:
+    docs = list(source.documents or [])
+    return {
+        "id": source.id,
+        "name": source.name,
+        "source_type": source.source_type,
+        "root_path": source.root_path,
+        "scope": source.scope,
+        "sync_status": source.sync_status,
+        "error_message": source.error_message,
+        "last_scanned_at": source.last_scanned_at.isoformat() if source.last_scanned_at else None,
+        "document_count": len(docs),
+        "ready_document_count": sum(1 for d in docs if d.processing_status == "ready"),
+        "missing_document_count": sum(1 for d in docs if d.source_sync_status == "missing"),
+        "created_at": source.created_at.isoformat() if source.created_at else "",
+    }
 
 # ── POST /library/ingest ──────────────────────────────────────────────────────
 
@@ -82,6 +129,90 @@ async def ingest_document(
     }
 
 
+@router.post("/link-file", status_code=status.HTTP_202_ACCEPTED)
+async def link_file_source(
+    body: LinkSourceRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    if body.scope not in _ALLOWED_SCOPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"scope must be one of: {', '.join(_ALLOWED_SCOPES)}",
+        )
+    try:
+        source, sync = await create_linked_source(
+            db,
+            user_id=current_user.id,
+            path=body.path,
+            source_type="file",
+            scope=body.scope,
+        )
+        source = await get_linked_source(db, source_id=source.id, user_id=current_user.id) or source
+        await db.commit()
+        return {
+            "source": _serialize_linked_source(source),
+            "sync": sync,
+        }
+    except (ValueError, ExtractionError) as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/link-folder", status_code=status.HTTP_202_ACCEPTED)
+async def link_folder_source(
+    body: LinkSourceRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    if body.scope not in _ALLOWED_SCOPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"scope must be one of: {', '.join(_ALLOWED_SCOPES)}",
+        )
+    try:
+        source, sync = await create_linked_source(
+            db,
+            user_id=current_user.id,
+            path=body.path,
+            source_type="folder",
+            scope=body.scope,
+        )
+        source = await get_linked_source(db, source_id=source.id, user_id=current_user.id) or source
+        await db.commit()
+        return {
+            "source": _serialize_linked_source(source),
+            "sync": sync,
+        }
+    except (ValueError, ExtractionError) as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/sources")
+async def list_sources(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    sources = await list_linked_sources(db, user_id=current_user.id)
+    return [_serialize_linked_source(source) for source in sources]
+
+
+@router.post("/sources/{source_id}/rescan", status_code=status.HTTP_202_ACCEPTED)
+async def rescan_source(
+    source_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    source = await get_linked_source(db, source_id=source_id, user_id=current_user.id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Linked source not found")
+    sync = await rescan_linked_source(db, source=source, user_id=current_user.id)
+    source = await get_linked_source(db, source_id=source_id, user_id=current_user.id) or source
+    await db.commit()
+    return {"source": _serialize_linked_source(source), "sync": sync}
+
+
 # ── GET /library/query ────────────────────────────────────────────────────────
 
 @router.get("/query")
@@ -134,22 +265,7 @@ async def list_documents(
     )
     docs = result.scalars().all()
 
-    return [
-        {
-            "id": d.id,
-            "filename": d.original_filename or d.filename,
-            "scope": d.scope,
-            "created_at": d.created_at.isoformat() if d.created_at else "",
-            "processing_status": d.processing_status,
-            "content_type": d.content_type,
-            "chunk_count": d.chunk_count,
-            "summary": d.summary,
-            "ingest_job_status": d.ingest_job.status if d.ingest_job else None,
-            "ingest_attempt_count": d.ingest_job.attempt_count if d.ingest_job else 0,
-            "ingest_last_error": d.ingest_job.last_error if d.ingest_job else None,
-        }
-        for d in docs
-    ]
+    return [_serialize_document(d) for d in docs]
 
 
 @router.get("/documents/{doc_id}")
@@ -190,6 +306,12 @@ async def get_document_details(
         "processing_completed_at": doc.processing_completed_at.isoformat() if doc.processing_completed_at else None,
         "created_at": doc.created_at.isoformat() if doc.created_at else "",
         "updated_at": doc.updated_at.isoformat() if doc.updated_at else "",
+        "source_mode": doc.source_mode,
+        "source_sync_status": doc.source_sync_status,
+        "linked_source_id": doc.linked_source_id,
+        "source_path": doc.file_path,
+        "source_last_seen_at": doc.source_last_seen_at.isoformat() if doc.source_last_seen_at else None,
+        "source_modified_at": doc.source_modified_at.isoformat() if doc.source_modified_at else None,
     }
 
 
@@ -273,11 +395,11 @@ async def delete_document(
     rag = get_rag_service()
     await rag.delete_document(doc_id)
 
-    # Remove file from disk (best-effort)
-    try:
-        Path(doc.file_path).unlink(missing_ok=True)
-    except Exception:
-        pass
+    if doc.source_mode != "linked":
+        try:
+            Path(doc.file_path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
     await db.delete(doc)
 
