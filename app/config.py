@@ -93,6 +93,7 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_dimension: int = 384
     embedding_batch_size: int = 32
+    embedding_cache_dir: str = "./storage/model_cache/huggingface"
 
     # ── Storage ───────────────────────────────────────────────────────────────
     storage_dir: str = "./storage"

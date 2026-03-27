@@ -18,18 +18,30 @@ _VALID_THRESHOLDS = {"low", "medium", "high"}
 _CONSEQUENTIAL_KEYWORDS = {
     "agreement",
     "attack",
+    "breach",
     "ceasefire",
+    "confidence",
     "conflict",
+    "cyber",
     "deal",
     "diplomatic",
     "diplomacy",
+    "economic",
     "enrichment",
+    "hack",
+    "hackers",
+    "hormuz",
+    "market",
+    "markets",
     "missile",
     "military",
     "minister",
     "negotiation",
     "negotiations",
     "nuclear",
+    "oil",
+    "pressure",
+    "propaganda",
     "president",
     "sanction",
     "sanctions",
@@ -42,10 +54,13 @@ _CONSEQUENTIAL_KEYWORDS = {
 }
 _THEME_KEYWORDS = {
     "diplomatic talks": {"agreement", "ceasefire", "deal", "diplomatic", "diplomacy", "negotiation", "negotiations", "summit", "talk", "talks"},
-    "military activity": {"attack", "conflict", "military", "missile", "strike", "warning"},
+    "military activity": {"attack", "bomb", "conflict", "military", "missile", "strike", "survivor", "survivors", "war", "warning"},
     "nuclear developments": {"enrichment", "nuclear", "uranium"},
-    "sanctions and economic pressure": {"sanction", "sanctions"},
-    "government and leadership changes": {"minister", "president"},
+    "sanctions and economic pressure": {"consumer confidence", "economic", "equity", "funds", "hormuz", "market", "markets", "oil", "sanction", "sanctions", "strait"},
+    "cyber and information operations": {"ai slop", "breach", "cyber", "disinformation", "hack", "hackers", "influence", "propaganda", "synthetic media"},
+    "domestic political backing": {"backing", "close ranks", "cpac", "republican", "republicans", "trump"},
+    "international coordination": {"g7", "garner support", "meets", "pressure", "rubio"},
+    "government and leadership changes": {"leadership", "minister", "president"},
 }
 _TOPIC_MEMORY_WINDOW_DAYS = 30
 _TOPIC_MEMORY_MAX_ITEMS = 8
@@ -652,22 +667,9 @@ def _build_memory_candidates(
     if not selected_items:
         return []
 
-    result_text_lower = (result_text or "").lower()
     clusters: dict[str, List[Dict[str, Any]]] = {}
     for item in selected_items:
-        item_text = " ".join(
-            [
-                result_text_lower,
-                str(item.get("title") or "").lower(),
-                str(item.get("summary") or "").lower(),
-            ]
-        )
-        matched_themes = [
-            theme
-            for theme, keywords in _THEME_KEYWORDS.items()
-            if any(keyword in item_text for keyword in keywords)
-        ]
-        cluster_key = matched_themes[0] if matched_themes else "notable developments"
+        cluster_key = _infer_item_theme(item)
         clusters.setdefault(cluster_key, []).append(item)
 
     ranked_clusters = sorted(
@@ -697,9 +699,27 @@ def _build_memory_candidates(
                 candidate["suppressed"] = True
                 candidate["suppressed_reason"] = duplicate_reason
             candidates.append(candidate)
-        if len(candidates) >= 3:
+        if len(candidates) >= 1:
             break
     return candidates
+
+
+def _infer_item_theme(item: Dict[str, Any]) -> str:
+    item_text = " ".join(
+        [
+            str(item.get("title") or "").lower(),
+            str(item.get("summary") or "").lower(),
+            str(item.get("source") or "").lower(),
+        ]
+    )
+    best_theme = "notable developments"
+    best_score = 0
+    for theme, keywords in _THEME_KEYWORDS.items():
+        score = sum(1 for keyword in keywords if keyword in item_text)
+        if score > best_score:
+            best_theme = theme
+            best_score = score
+    return best_theme
 
 
 def _build_cluster_memory_candidate(

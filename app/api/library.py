@@ -18,7 +18,14 @@ from app.auth.dependencies import get_current_user
 from app.config import settings
 from app.db.models import Document, LinkedSource, User
 from app.db.session import get_db
-from app.library_sources import create_linked_source, get_linked_source, list_linked_sources, rescan_linked_source
+from app.library_sources import (
+    build_linked_source_tree,
+    create_linked_source,
+    get_linked_source,
+    list_linked_sources,
+    rescan_linked_source,
+    update_linked_source_exclusions,
+)
 from app.rag.extractor import ExtractionError
 from app.rag.job_runner import enqueue_document_ingest
 from app.rag.service import get_rag_service
@@ -31,6 +38,11 @@ _ALLOWED_SCOPES = {"personal", "family", "shared"}
 class LinkSourceRequest(BaseModel):
     path: str
     scope: str = "personal"
+    excluded_paths: List[str] = []
+
+
+class UpdateLinkedSourceRequest(BaseModel):
+    excluded_paths: List[str]
 
 
 def _serialize_document(d: Document) -> Dict[str, Any]:
@@ -66,11 +78,23 @@ def _serialize_linked_source(source: LinkedSource) -> Dict[str, Any]:
         "sync_status": source.sync_status,
         "error_message": source.error_message,
         "last_scanned_at": source.last_scanned_at.isoformat() if source.last_scanned_at else None,
+        "excluded_paths": body_paths(source.excluded_paths),
+        "skipped_empty_count": int(source.skipped_empty_count or 0),
         "document_count": len(docs),
         "ready_document_count": sum(1 for d in docs if d.processing_status == "ready"),
         "missing_document_count": sum(1 for d in docs if d.source_sync_status == "missing"),
         "created_at": source.created_at.isoformat() if source.created_at else "",
     }
+
+
+def body_paths(raw: str | None) -> List[str]:
+    import json
+
+    try:
+        value = json.loads(raw or "[]")
+        return value if isinstance(value, list) else []
+    except Exception:
+        return []
 
 # ── POST /library/ingest ──────────────────────────────────────────────────────
 
@@ -147,6 +171,7 @@ async def link_file_source(
             path=body.path,
             source_type="file",
             scope=body.scope,
+            excluded_paths=[],
         )
         source = await get_linked_source(db, source_id=source.id, user_id=current_user.id) or source
         await db.commit()
@@ -177,6 +202,7 @@ async def link_folder_source(
             path=body.path,
             source_type="folder",
             scope=body.scope,
+            excluded_paths=body.excluded_paths,
         )
         source = await get_linked_source(db, source_id=source.id, user_id=current_user.id) or source
         await db.commit()
@@ -198,6 +224,50 @@ async def list_sources(
     return [_serialize_linked_source(source) for source in sources]
 
 
+@router.get("/sources/{source_id}")
+async def get_source_details(
+    source_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    source = await get_linked_source(db, source_id=source_id, user_id=current_user.id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Linked source not found")
+    return {
+        "source": _serialize_linked_source(source),
+        "tree": await build_linked_source_tree(source),
+    }
+
+
+@router.patch("/sources/{source_id}")
+async def update_source(
+    source_id: int,
+    body: UpdateLinkedSourceRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    source = await get_linked_source(db, source_id=source_id, user_id=current_user.id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Linked source not found")
+    try:
+        sync = await update_linked_source_exclusions(
+            db,
+            source=source,
+            user_id=current_user.id,
+            excluded_paths=body.excluded_paths,
+        )
+        source = await get_linked_source(db, source_id=source_id, user_id=current_user.id) or source
+        await db.commit()
+        return {
+            "source": _serialize_linked_source(source),
+            "sync": sync,
+            "tree": await build_linked_source_tree(source),
+        }
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/sources/{source_id}/rescan", status_code=status.HTTP_202_ACCEPTED)
 async def rescan_source(
     source_id: int,
@@ -210,7 +280,7 @@ async def rescan_source(
     sync = await rescan_linked_source(db, source=source, user_id=current_user.id)
     source = await get_linked_source(db, source_id=source_id, user_id=current_user.id) or source
     await db.commit()
-    return {"source": _serialize_linked_source(source), "sync": sync}
+    return {"source": _serialize_linked_source(source), "sync": sync, "tree": await build_linked_source_tree(source)}
 
 
 # ── GET /library/query ────────────────────────────────────────────────────────

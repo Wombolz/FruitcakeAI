@@ -190,6 +190,8 @@ class LinkedSource(Base):
     root_path = Column(Text, nullable=False)
     scope = Column(String(50), default="personal", nullable=False)
     sync_status = Column(String(30), default="pending", nullable=False)
+    excluded_paths = Column(Text, default="[]", nullable=False)
+    skipped_empty_count = Column(Integer, default=0, nullable=False)
     last_scanned_at = Column(DateTime(timezone=True), nullable=True)
     error_message = Column(Text, nullable=True)
 

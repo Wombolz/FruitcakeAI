@@ -72,6 +72,48 @@ def test_rag_health_ready():
     assert "fusion_runtime_disabled" in h
 
 
+def test_embedding_init_uses_local_files_only_when_model_is_cached(tmp_path):
+    svc = RAGService()
+    cache_dir = tmp_path / "hf-cache"
+    cache_dir.mkdir()
+
+    with patch.object(svc, "_huggingface_model_cached", return_value=True):
+        kwargs = svc._embedding_init_kwargs(
+            model_name="BAAI/bge-small-en-v1.5",
+            cache_folder=str(cache_dir),
+        )
+
+    assert kwargs["cache_folder"] == str(cache_dir)
+    assert kwargs["local_files_only"] is True
+
+
+def test_embedding_init_fails_fast_when_model_uncached_and_host_unreachable(tmp_path):
+    svc = RAGService()
+    cache_dir = tmp_path / "hf-cache"
+    cache_dir.mkdir()
+
+    with patch.object(svc, "_huggingface_model_cached", return_value=False):
+        with patch.object(svc, "_host_resolves", return_value=False):
+            with pytest.raises(RuntimeError, match="not cached locally"):
+                svc._embedding_init_kwargs(
+                    model_name="BAAI/bge-small-en-v1.5",
+                    cache_folder=str(cache_dir),
+                )
+
+
+def test_embedding_init_allows_local_path_without_network(tmp_path):
+    svc = RAGService()
+    model_dir = tmp_path / "local-model"
+    model_dir.mkdir()
+
+    kwargs = svc._embedding_init_kwargs(
+        model_name=str(model_dir),
+        cache_folder=str(tmp_path / "hf-cache"),
+    )
+
+    assert kwargs == {"cache_folder": str(tmp_path / "hf-cache")}
+
+
 def test_load_documents_extracts_text_from_pdf(tmp_path):
     from reportlab.pdfgen import canvas
 
@@ -258,6 +300,35 @@ async def test_rag_query_returns_formatted_results():
     assert results[0]["text"] == "chunk text here"
     assert results[0]["score"] == 0.85
     assert results[0]["metadata"]["filename"] == "test.pdf"
+
+
+@pytest.mark.asyncio
+async def test_rag_query_prefers_async_retriever_when_available():
+    svc = RAGService()
+    svc._loaded = True
+    svc._node_postprocessors = []
+
+    fake_node = MagicMock()
+    fake_node.get_content.return_value = "async grounded content"
+    fake_node.score = 0.77
+    fake_node.metadata = {"filename": "async.txt"}
+
+    async_retriever = MagicMock()
+    async_retriever.aretrieve = AsyncMock(return_value=[fake_node])
+    async_retriever.retrieve.side_effect = AssertionError("sync retrieve should not be used")
+    del async_retriever._retrievers
+    svc._retriever = async_retriever
+
+    results = await svc.query(
+        query_str="async query",
+        user_id=1,
+        accessible_scopes=["personal"],
+        top_k=10,
+    )
+
+    assert len(results) == 1
+    assert results[0]["text"] == "async grounded content"
+    async_retriever.aretrieve.assert_awaited_once_with("async query")
 
 
 @pytest.mark.asyncio

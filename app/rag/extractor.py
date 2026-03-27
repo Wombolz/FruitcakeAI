@@ -90,6 +90,13 @@ class DocumentExtractor:
         except ExtractionError:
             return False
 
+    def is_empty_textual_file(self, file_path: Path) -> bool:
+        content_type = self.content_type_from_extension(file_path)
+        if content_type in {"pdf", "docx"}:
+            return False
+        _, text = self.extract(file_path)
+        return not text.strip()
+
     def content_type_from_extension(self, file_path: Path) -> str:
         special = self._SPECIAL_TEXT_FILENAMES.get(file_path.name.lower())
         if special:
@@ -131,8 +138,6 @@ class DocumentExtractor:
 
     def _extract_plaintext(self, file_path: Path) -> tuple[str, str]:
         text = self._read_text(file_path)
-        if not text:
-            raise ExtractionError("No text extracted from plaintext file")
         return "plaintext", text
 
     def _extract_markdown(self, file_path: Path) -> tuple[str, str]:
@@ -144,8 +149,6 @@ class DocumentExtractor:
                     if lines[idx].strip() == "---":
                         text = "\n".join(lines[idx + 1 :]).strip()
                         break
-        if not text:
-            raise ExtractionError("No text extracted from markdown file")
         return "markdown", text
 
     def _extract_docx(self, file_path: Path) -> tuple[str, str]:

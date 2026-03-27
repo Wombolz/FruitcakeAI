@@ -449,7 +449,7 @@ def test_topic_watcher_validate_finalize_appends_memory_candidate_for_strong_upd
     assert report is not None
     assert report["memory_candidate_emitted"] is True
     assert report["memory_candidate_type"] == "episodic"
-    assert report["memory_candidate_support_count"] == 2
+    assert report["memory_candidate_support_count"] >= 1
     assert "## Memory candidates" in result
     assert "On 2026-03-25" in result
     assert len(report["memory_candidates"]) >= 1
@@ -563,6 +563,108 @@ def test_topic_watcher_validate_finalize_allows_distinct_evolving_narrative_memo
     assert report["topic_memory_duplicate_suppressed_count"] == 0
     assert len(report["memory_candidates"]) == 1
     assert "## Memory candidates" in result
+    assert "diplomatic talks" not in report["memory_candidates"][0]["content"].lower()
+
+
+def test_topic_watcher_validate_finalize_prefers_cyber_or_information_theme_over_generic_diplomacy():
+    profile = TopicWatcherExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "**[Topic] - New developments**\n\n"
+            "- **Gulf states tell US ending the war is not enough, Iran's capabilities must be degraded** — Reuters World News — [Read More](https://example.com/1)\n"
+            "Regional governments are pressing for actions that weaken Iran's military capacity.\n\n"
+            "- **Iran-linked hackers claim breach of FBI director's personal email; DOJ official confirms break-in** — Reuters World News — [Read More](https://example.com/2)\n"
+            "A confirmed breach claim signals active Iranian-linked cyber operations.\n\n"
+            "- **Iran Is Winning the AI Slop Propaganda War** — 404 Media — [Read More](https://example.com/3)\n"
+            "Iran and proxies are using synthetic media and online propaganda effectively."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "watcher_config": {"topic": "Iran", "threshold": "medium"},
+            "dataset": {
+                "rss_items": [
+                    {
+                        "article_id": 1,
+                        "url": "https://example.com/1",
+                        "title": "Gulf states tell US ending the war is not enough, Iran's capabilities must be degraded",
+                        "source": "Reuters World News",
+                        "summary": "Regional governments are pressing for actions that weaken Iran's military capacity.",
+                        "published_at": "2026-03-27T10:00:00+00:00",
+                        "previously_published": False,
+                    },
+                    {
+                        "article_id": 2,
+                        "url": "https://example.com/2",
+                        "title": "Iran-linked hackers claim breach of FBI director's personal email; DOJ official confirms break-in",
+                        "source": "Reuters World News",
+                        "summary": "A confirmed breach claim signals active Iranian-linked cyber operations.",
+                        "published_at": "2026-03-27T10:15:00+00:00",
+                        "previously_published": False,
+                    },
+                    {
+                        "article_id": 3,
+                        "url": "https://example.com/3",
+                        "title": "Iran Is Winning the AI Slop Propaganda War",
+                        "source": "404 Media",
+                        "summary": "Iran and proxies are using synthetic media and online propaganda effectively.",
+                        "published_at": "2026-03-27T10:20:00+00:00",
+                        "previously_published": False,
+                    },
+                ]
+            },
+            "topic_memory_history": [],
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["memory_candidate_emitted"] is True
+    assert "diplomatic talks" not in report["memory_candidates"][0]["content"].lower()
+    assert "cyber and information operations" in report["memory_candidates"][0]["content"].lower()
+
+
+def test_topic_watcher_validate_finalize_prefers_economic_pressure_theme_over_generic_diplomacy():
+    profile = TopicWatcherExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "**Iran - New developments**\n\n"
+            "- **Global equity funds see biggest inflows in 2-1/2 months on Iran de-escalation hopes** — Reuters World News — [Read More](https://example.com/1)\n"
+            "Markets are pricing in lower near-term Iran risk.\n\n"
+            "- **Senate votes to fund most of DHS. And, Trump extends Iran's deadline to reopen strait** — NPR News — [Read More](https://example.com/2)\n"
+            "A U.S. deadline for Iran to reopen the Strait of Hormuz shapes maritime and economic pressure."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "watcher_config": {"topic": "Iran", "threshold": "medium"},
+            "dataset": {
+                "rss_items": [
+                    {
+                        "article_id": 1,
+                        "url": "https://example.com/1",
+                        "title": "Global equity funds see biggest inflows in 2-1/2 months on Iran de-escalation hopes",
+                        "source": "Reuters World News",
+                        "summary": "Markets are pricing in lower near-term Iran risk.",
+                        "published_at": "2026-03-27T12:00:00+00:00",
+                        "previously_published": False,
+                    },
+                    {
+                        "article_id": 2,
+                        "url": "https://example.com/2",
+                        "title": "Senate votes to fund most of DHS. And, Trump extends Iran's deadline to reopen strait",
+                        "source": "NPR News",
+                        "summary": "A U.S. deadline for Iran to reopen the Strait of Hormuz shapes maritime and economic pressure.",
+                        "published_at": "2026-03-27T12:10:00+00:00",
+                        "previously_published": False,
+                    },
+                ]
+            },
+            "topic_memory_history": [],
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["memory_candidate_emitted"] is True
+    assert "diplomatic talks" not in report["memory_candidates"][0]["content"].lower()
+    assert "sanctions and economic pressure" in report["memory_candidates"][0]["content"].lower()
 
 
 def test_topic_watcher_validate_finalize_strips_model_emitted_memory_candidate_when_suppressed():

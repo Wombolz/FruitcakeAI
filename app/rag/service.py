@@ -7,8 +7,10 @@ Ported and cleaned up from v4 LlamaIndexService.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
+import socket
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -91,9 +93,19 @@ class RAGService:
             self._config.get("embedding", {}).get("model_name")
             or app_settings.embedding_model
         )
-        self._embed_model = HuggingFaceEmbedding(model_name=model_name)
+        cache_folder = self._embedding_cache_folder(app_settings)
+        embedding_kwargs = self._embedding_init_kwargs(
+            model_name=model_name,
+            cache_folder=cache_folder,
+        )
+        self._embed_model = HuggingFaceEmbedding(model_name=model_name, **embedding_kwargs)
         Settings.embed_model = self._embed_model
-        log.info("Embedding model loaded", model=model_name)
+        log.info(
+            "Embedding model loaded",
+            model=model_name,
+            cache_folder=cache_folder,
+            local_files_only=bool(embedding_kwargs.get("local_files_only")),
+        )
 
         # ── pgvector store ────────────────────────────────────────────────────
         # from_params() avoids the connection-string parsing bugs in v4
@@ -164,11 +176,8 @@ class RAGService:
                 )
                 self._apply_metadata_filters(meta_filters)
 
-            loop = asyncio.get_running_loop()
             try:
-                nodes = await loop.run_in_executor(
-                    None, lambda: self._retriever.retrieve(query_str)
-                )
+                nodes = await self._retrieve_nodes(query_str)
             except ValueError as e:
                 if "invalid fusion mode" not in str(e).lower():
                     raise
@@ -176,9 +185,7 @@ class RAGService:
                 self._swap_to_vector_only_retriever()
                 if meta_filters is not None:
                     self._apply_metadata_filters(meta_filters)
-                nodes = await loop.run_in_executor(
-                    None, lambda: self._retriever.retrieve(query_str)
-                )
+                nodes = await self._retrieve_nodes(query_str)
 
             for pp in self._node_postprocessors:
                 nodes = pp.postprocess_nodes(nodes, query_str=query_str)
@@ -195,6 +202,70 @@ class RAGService:
         except Exception as e:
             log.error("RAG query failed", query=query_str, error=str(e), exc_info=True)
             return []
+
+    async def _retrieve_nodes(self, query_str: str) -> List[Any]:
+        aretrieve = getattr(self._retriever, "aretrieve", None)
+        if callable(aretrieve):
+            maybe_result = aretrieve(query_str)
+            if inspect.isawaitable(maybe_result):
+                return await maybe_result
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self._retriever.retrieve(query_str)
+        )
+
+    def _embedding_cache_folder(self, app_settings: Any) -> str:
+        configured = (
+            self._config.get("embedding", {}).get("cache_folder")
+            or getattr(app_settings, "embedding_cache_dir", "")
+            or "./storage/model_cache/huggingface"
+        )
+        cache_folder = str(Path(configured).expanduser())
+        Path(cache_folder).mkdir(parents=True, exist_ok=True)
+        return cache_folder
+
+    def _embedding_init_kwargs(self, *, model_name: str, cache_folder: str) -> Dict[str, Any]:
+        if self._is_local_embedding_path(model_name):
+            return {"cache_folder": cache_folder}
+        if self._huggingface_model_cached(model_name, cache_folder=cache_folder):
+            return {"cache_folder": cache_folder, "local_files_only": True}
+        if not self._host_resolves("huggingface.co"):
+            raise RuntimeError(
+                "Embedding model is not cached locally and huggingface.co is unreachable. "
+                f"Set EMBEDDING_MODEL to a local path or pre-warm the cache at {cache_folder}."
+            )
+        return {"cache_folder": cache_folder}
+
+    def _is_local_embedding_path(self, model_name: str) -> bool:
+        if not model_name:
+            return False
+        if model_name.startswith((".", "/", "~")):
+            return True
+        return Path(model_name).expanduser().exists()
+
+    def _huggingface_model_cached(self, model_name: str, *, cache_folder: str) -> bool:
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            from huggingface_hub.file_download import _CACHED_NO_EXIST
+        except Exception:
+            return False
+        for filename in ("modules.json", "config.json", "sentence_bert_config.json"):
+            cached = try_to_load_from_cache(
+                repo_id=model_name,
+                filename=filename,
+                cache_dir=cache_folder,
+            )
+            if cached and cached is not _CACHED_NO_EXIST:
+                return True
+        return False
+
+    def _host_resolves(self, hostname: str) -> bool:
+        try:
+            socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
+            return True
+        except OSError:
+            return False
 
     def _apply_metadata_filters(self, meta_filters: Any) -> None:
         for r in [self._retriever] + list(getattr(self._retriever, "_retrievers", [])):
