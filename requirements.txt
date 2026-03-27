@@ -61,7 +61,7 @@ icalendar>=5.0.0
 pymupdf==1.25.1
 python-docx==1.1.2
 reportlab>=4.2,<5
-pypdf>=5,<6
+pypdf>=6,<7
 
 # ── Task scheduling (Phase 4) ─────────────────────────────────────────────────
 apscheduler>=3.10,<4
