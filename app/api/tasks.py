@@ -199,6 +199,7 @@ async def update_task(
         return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
 
     try:
+        fields_set = getattr(body, "model_fields_set", set())
         await update_task_record(
             db,
             task,
@@ -206,7 +207,7 @@ async def update_task(
             instruction=body.instruction if body.instruction is not None else UNSET,
             persona=body.persona if body.persona is not None else UNSET,
             profile=body.profile if body.profile is not None else UNSET,
-            llm_model_override=body.llm_model_override if body.llm_model_override is not None else UNSET,
+            llm_model_override=body.llm_model_override if "llm_model_override" in fields_set else UNSET,
             schedule=body.schedule if body.schedule is not None else UNSET,
             deliver=body.deliver if body.deliver is not None else UNSET,
             requires_approval=body.requires_approval if body.requires_approval is not None else UNSET,

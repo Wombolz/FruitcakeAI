@@ -109,6 +109,7 @@ async def list_personas() -> Dict[str, Any]:
     personas = _list()
     return {
         name: {
+            "display_name": cfg.get("display_name", ""),
             "description": cfg.get("description", ""),
             "tone": cfg.get("tone", ""),
             "blocked_tools": cfg.get("blocked_tools", []),

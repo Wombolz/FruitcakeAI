@@ -4,14 +4,16 @@
 
 personas:
   family_assistant:
+    display_name: Personal Assistant
     description: General family assistant with access to all shared resources
     tone: friendly and helpful
-    library_scopes: [family_docs, recipes, household]
+    library_scopes: [personal, family_docs, recipes, household, work_docs, projects, kids_books, homework]
     calendar_access: [family, personal]
     blocked_tools: []
     intent_keywords: [family, home, household, chores, groceries, recipe]
 
   restricted_assistant:
+    display_name: Restricted Assistant
     description: Restricted-access assistant with filtered content and limited tools
     tone: encouraging and simple
     library_scopes: [kids_books, homework]
@@ -22,6 +24,7 @@ personas:
     intent_keywords: [homework, school, spelling, reading, beginner, student]
 
   work_assistant:
+    display_name: Work Assistant
     description: Focused on professional tasks and productivity
     tone: professional and concise
     library_scopes: [work_docs, projects]
@@ -30,6 +33,7 @@ personas:
     intent_keywords: [project, work, meeting, report, client, proposal]
 
   news_researcher:
+    display_name: News Researcher
     description: Focused on gathering and summarizing current events with source grounding
     tone: concise and factual
     library_scopes: [work_docs, projects, household]

@@ -419,6 +419,7 @@ async def test_personas_endpoint_uses_restricted_naming(client):
     resp = await client.get("/chat/personas")
     assert resp.status_code == 200
     data = resp.json()
+    assert data["family_assistant"]["display_name"] == "Personal Assistant"
     assert "restricted_assistant" in data
     assert "kids_assistant" not in data
     assert data["restricted_assistant"]["content_filter"] == "strict"

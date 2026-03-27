@@ -99,6 +99,14 @@ async def test_task_create_and_patch_support_llm_model_override(client):
     assert updated.status_code == 200
     assert updated.json()["llm_model_override"] == "ollama_chat/qwen2.5:14b"
 
+    cleared = await client.patch(
+        f"/tasks/{created.json()['id']}",
+        json={"llm_model_override": None},
+        headers=headers,
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["llm_model_override"] is None
+
 
 @pytest.mark.asyncio
 async def test_magazine_plan_uses_deterministic_steps_without_approval(client):

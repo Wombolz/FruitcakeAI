@@ -1070,6 +1070,10 @@ Verification highlights:
 - Layered memory semantics expansion (deferred).
 - Event-driven heartbeat triggers (deferred).
 - Dream-cycle consolidation (deferred).
+- User-defined personas layered on top of stable built-in personas (deferred). Direction:
+  keep system persona keys stable, allow future user-created personas to inherit from a built-in base persona,
+  and support user-level overrides such as display name, tone, and selected tool restrictions without mutating
+  the built-in persona definitions directly.
 
 #### Reference Inputs
 - `Docs/phase_5_3_persona_routing_rollback_plan.md`
