@@ -1480,12 +1480,17 @@ Landed scope:
 - first proving implementations:
   - structured place lookup
   - authenticated ISS/N2YO watcher flow
+  - authenticated Alpha Vantage `global_quote` finance lookup
 
 Still out of scope for this sprint:
 
 - queued notifications / derived-event scheduling
 - generic model-visible arbitrary API calling
 - broad provider-specific integration abstractions beyond the first proving cases
+
+Follow-up cleanup:
+
+- refactor `api_service.py` from service-specific branching into a provider adapter registry before the approved service list grows much further
 
 ### Sprint 6.z — Linked Source Indexing And Codebase Awareness
 

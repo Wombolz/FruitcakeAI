@@ -119,17 +119,38 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "api_request",
+            "name": "get_daily_market_data",
             "description": (
-                "Call an approved backend-owned JSON API integration. "
-                "Use this for structured external API workflows instead of shell or web search. "
-                "Current supported service/endpoint combinations: n2yo + iss_visual_passes."
+                "Fetch normalized daily market data from an approved finance provider and optionally save it to the user's library. "
+                "Use this for daily OHLC and volume history datasets instead of manually chaining API calls and post-processing."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "service": {"type": "string", "description": "Approved service name, for example 'n2yo'."},
-                    "endpoint": {"type": "string", "description": "Approved endpoint name, for example 'iss_visual_passes'."},
+                    "symbol": {"type": "string", "description": "Ticker symbol, for example 'SPY' or 'KO'."},
+                    "days": {"type": "integer", "description": "Number of daily bars to return (1-100).", "default": 30},
+                    "provider": {"type": "string", "description": "Approved provider name. Currently only 'alphavantage' is supported.", "default": "alphavantage"},
+                    "save_to_library": {"type": "boolean", "description": "Whether to save the dataset as a library document.", "default": False},
+                    "output_format": {"type": "string", "description": "Output format for the dataset: csv, json, or table.", "default": "table"},
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "api_request",
+            "description": (
+                "Call an approved backend-owned JSON API integration. "
+                "Use this for structured external API workflows instead of shell or web search. "
+                "Current supported service/endpoint combinations: n2yo + iss_visual_passes; alphavantage + global_quote or time_series_daily."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {"type": "string", "description": "Approved service name, for example 'n2yo' or 'alphavantage'."},
+                    "endpoint": {"type": "string", "description": "Approved endpoint name, for example 'iss_visual_passes', 'global_quote', or 'time_series_daily'."},
                     "query_params": {
                         "type": "object",
                         "description": "Service-specific query parameters for the approved endpoint.",
@@ -710,6 +731,9 @@ async def _call_tool(
     if name == "api_request":
         return await _api_request(arguments, user_context)
 
+    if name == "get_daily_market_data":
+        return await _get_daily_market_data(arguments, user_context)
+
     if name == "search_places":
         return await _search_places(arguments, user_context)
 
@@ -881,6 +905,60 @@ async def _search_places(
             error=str(exc),
         )
         return str(exc)
+
+
+async def _get_daily_market_data(
+    arguments: Dict[str, Any], user_context: UserContext
+) -> str:
+    from app.api_service import APIRequestError
+    from app.db.session import AsyncSessionLocal
+    from app.market_data_service import get_daily_market_data
+
+    symbol = str(arguments.get("symbol", "") or "").strip()
+    provider = str(arguments.get("provider", "alphavantage") or "alphavantage").strip()
+    output_format = str(arguments.get("output_format", "table") or "table").strip()
+    save_to_library = bool(arguments.get("save_to_library", False))
+    try:
+        days = int(arguments.get("days", 30))
+    except Exception:
+        days = 30
+
+    if not symbol:
+        return "symbol is required."
+
+    async with AsyncSessionLocal() as db:
+        try:
+            payload = await get_daily_market_data(
+                db,
+                user_id=user_context.user_id,
+                symbol=symbol,
+                days=days,
+                provider=provider,
+                save_to_library=save_to_library,
+                output_format=output_format,
+            )
+            await db.commit()
+        except APIRequestError as exc:
+            await db.rollback()
+            return str(exc)
+        except Exception as exc:
+            await db.rollback()
+            log.warning(
+                "get_daily_market_data failed",
+                user_id=user_context.user_id,
+                symbol=symbol,
+                provider=provider,
+                error=str(exc),
+            )
+            return "Daily market data request failed."
+
+    rendered = str(payload.get("rendered") or "").strip()
+    if payload.get("saved_document_id"):
+        rendered = (
+            f"{rendered}\n\nSaved to library as {payload.get('saved_document_name')} "
+            f"(document_id={payload.get('saved_document_id')}, scope=personal)."
+        ).strip()
+    return rendered
 
 
 async def _list_library_documents(

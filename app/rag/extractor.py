@@ -56,6 +56,7 @@ class ExtractionError(Exception):
 class DocumentExtractor:
     _TEXT_EXTENSIONS = {
         ".txt": "txt",
+        ".csv": "txt",
         ".md": "md",
         ".py": "code",
         ".yaml": "config",

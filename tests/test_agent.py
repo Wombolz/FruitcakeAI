@@ -172,6 +172,18 @@ def test_api_request_schema_has_required_fields():
     assert required == ["service", "endpoint", "query_params"]
 
 
+def test_get_daily_market_data_schema_has_required_symbol():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "get_daily_market_data")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "symbol" in props
+    assert "days" in props
+    assert "provider" in props
+    assert "save_to_library" in props
+    assert "output_format" in props
+    assert required == ["symbol"]
+
+
 def test_update_task_schema_has_required_fields():
     schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "update_task")
     props = schema["function"]["parameters"]["properties"]
@@ -442,6 +454,36 @@ async def test_api_request_tool_uses_backend_api_service():
             )
 
     assert "ISS visible pass results" in result
+    mocked.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_daily_market_data_tool_uses_market_data_service():
+    import app.agent.tools as tools_module
+
+    ctx = _make_context()
+
+    fake_payload = {
+        "rendered": "Alpha Vantage daily market data for SPY:\n\n[1] date=2026-03-27 | open=552.10 | high=555.25 | low=549.80 | close=553.42 | volume=1000000",
+        "saved_document_id": 42,
+        "saved_document_name": "spy_alphavantage_daily_1.csv",
+    }
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        with patch("app.market_data_service.get_daily_market_data", new=AsyncMock(return_value=fake_payload)) as mocked:
+            result = await tools_module._get_daily_market_data(
+                {
+                    "symbol": "SPY",
+                    "days": 1,
+                    "provider": "alphavantage",
+                    "save_to_library": True,
+                    "output_format": "csv",
+                },
+                ctx,
+            )
+
+    assert "Alpha Vantage daily market data for SPY" in result
+    assert "Saved to library as spy_alphavantage_daily_1.csv" in result
     mocked.assert_awaited_once()
 
 

@@ -35,6 +35,12 @@ FAILED_SEARCH_PREFIXES = (
     "no results found for:",
     "tool web_search failed:",
 )
+UNSUPPORTED_ALPHA_VANTAGE_HINT = (
+    "I can use Alpha Vantage for quote lookup and daily history right now, but not intraday time-series history yet. "
+    "The current Alpha Vantage adapter supports `global_quote` and `time_series_daily`, so I can give you the latest quote "
+    "or recent daily bars for a symbol, but not intraday bars or derived intraday OHLC from time-series data yet. "
+    "If you want, I can either give you the latest quote, fetch recent daily bars, or help add the missing intraday endpoint support in Fruitcake."
+)
 
 
 def _build_messages(
@@ -144,6 +150,78 @@ def _max_turns_message(history: List[Dict[str, Any]]) -> str:
     return "I ran out of turns before I could finish that request cleanly. Try narrowing the request."
 
 
+def _latest_user_message_text(messages: List[Dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if str(message.get("role") or "") == "user":
+            return str(message.get("content") or "")
+    return ""
+
+
+def _recent_conversation_text(messages: List[Dict[str, Any]], *, limit: int = 6) -> str:
+    recent: list[str] = []
+    for message in reversed(messages):
+        role = str(message.get("role") or "")
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        recent.append(content)
+        if len(recent) >= limit:
+            break
+    return "\n".join(reversed(recent)).lower()
+
+
+def _unsupported_alphavantage_request_message(messages: List[Dict[str, Any]]) -> str | None:
+    text = _latest_user_message_text(messages).lower()
+    if not text:
+        return None
+    conversation_text = _recent_conversation_text(messages)
+    provider_in_context = (
+        "alpha vantage" in text
+        or "alphavantage" in text
+        or "alpha vantage" in conversation_text
+        or "alphavantage" in conversation_text
+    )
+    if not provider_in_context:
+        return None
+    explicit_daily_markers = (
+        "daily history",
+        "daily bars",
+        "daily ohlc",
+        "daily prices",
+        "time_series_daily",
+        "last 30 daily",
+        "last 5 daily",
+        "daily close",
+        "daily closes",
+    )
+    if any(marker in text for marker in explicit_daily_markers):
+        return None
+
+    intraday_markers = (
+        "intraday",
+        "time series",
+        "timeseries",
+        "last month",
+        "last 30 days",
+        "30 days",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m",
+        "intraday ohlc",
+        "intraday open high low close",
+        "intraday open, high, low, close",
+        "bar data",
+        "intraday bars",
+    )
+    if any(marker in text for marker in intraday_markers):
+        return UNSUPPORTED_ALPHA_VANTAGE_HINT
+    return None
+
+
 async def _stream_final_response(
     history: List[Dict[str, Any]],
     user_context: UserContext,
@@ -238,6 +316,10 @@ async def run_agent(
 
     Returns the assistant's final response as a plain string.
     """
+    unsupported_api_message = _unsupported_alphavantage_request_message(messages)
+    if unsupported_api_message:
+        return unsupported_api_message
+
     tools = get_tools_for_user(user_context)
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
@@ -314,6 +396,11 @@ async def stream_agent(
     Yields text tokens as they arrive from the LLM.
     Tool calls are resolved silently; the final response is streamed.
     """
+    unsupported_api_message = _unsupported_alphavantage_request_message(messages)
+    if unsupported_api_message:
+        yield unsupported_api_message
+        return
+
     tools = get_tools_for_user(user_context)
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
