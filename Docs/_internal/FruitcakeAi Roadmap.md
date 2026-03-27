@@ -1430,6 +1430,11 @@ Recent evidence:
 - Graceful failure behavior for research-heavy chat has also been tightened:
   - repeated failed search loops now return a bounded explanation with recent tool outcomes,
   - max-turn failures now return a tool-aware narrowing message instead of the generic fallback.
+- Alpha hardening now explicitly includes MCP/skills cleanup:
+  - ship with a conservative default MCP surface,
+  - keep only core first-party MCPs enabled by default,
+  - treat shell/browser automation as developer-only integrations,
+  - keep only reviewed shared skills in the alpha-default path.
 
 **Trigger**: A user requests it, or local judgment quality on heartbeats is demonstrably causing missed-important / false-alarm patterns in daily use.
 

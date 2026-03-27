@@ -288,6 +288,8 @@ class MCPRegistry:
                 "description": fn.get("description", ""),
                 "server": server_name,
                 "type": server_type,
+                "classification": self._server_configs.get(server_name, {}).get("classification", ""),
+                "shipping_default": bool(self._server_configs.get(server_name, {}).get("shipping_default", False)),
                 "available": True,
                 "connected": client.is_connected() if client else True,
             })
@@ -298,6 +300,8 @@ class MCPRegistry:
                 disabled.append({
                     "server": server_name,
                     "type": config.get("type", "unknown"),
+                    "classification": config.get("classification", ""),
+                    "shipping_default": bool(config.get("shipping_default", False)),
                     "available": False,
                     "reason": "disabled in mcp_config.yaml",
                 })
@@ -321,6 +325,9 @@ class MCPRegistry:
                 "server": server_name,
                 "type": server_type,
                 "enabled": enabled,
+                "classification": config.get("classification", ""),
+                "shipping_default": bool(config.get("shipping_default", False)),
+                "trust_boundary": config.get("trust_boundary", {}),
                 "declared_tools": config.get("tools", []),
             }
 

@@ -2,6 +2,11 @@
 
 New tools are added via `config/mcp_config.yaml` — no Python code changes required.
 
+Alpha shipping policy:
+- only clearly necessary first-party/internal MCPs ship enabled by default
+- Docker/third-party MCPs are optional and should be left disabled unless the operator explicitly needs them
+- developer-only integrations may remain documented, but they are not part of the default alpha distribution surface
+
 ---
 
 ## How the MCP registry works
@@ -15,12 +20,18 @@ each enabled server. Two transport types are supported:
 | `docker_stdio` | Subprocess via Docker | Isolates dependencies; for third-party MCP servers |
 
 All tools are registered in LiteLLM function-calling format and injected into
-the agent's tool schema. The LLM chooses which tool to call — you don't write
-routing logic.
+the agent's tool schema. The LLM chooses which tool to call.
+
+That does not mean every configured MCP is appropriate to ship enabled. Before enabling a server, classify it as:
+- `core` — first-party, required for the shipped product
+- `optional` — useful but not required
+- `developer-only` — local/admin tooling that should stay off in the default alpha config
 
 ---
 
 ## Adding a Docker stdio server
+
+Prefer this only for optional or developer-only integrations. Core alpha capability should favor first-party/internal MCPs or first-party backend-owned tools when possible.
 
 Docker MCP servers are the easiest way to add third-party tools.
 
@@ -142,3 +153,7 @@ Response includes:
 - `tools`: all enabled tools with server name and connection status
 - `disabled_servers`: servers present in config but `enabled: false`
 - `tool_count`: total tools visible to the agent (before persona filtering)
+
+For alpha operators:
+- if a deployment does not actively need an MCP, leave it disabled
+- prefer first-party core tools for task mutation, secrets, API-backed requests, and place lookup instead of adding overlapping MCPs

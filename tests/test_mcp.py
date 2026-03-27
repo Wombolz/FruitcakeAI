@@ -350,6 +350,42 @@ async def test_registry_get_diagnostics_includes_servers(fake_config: Path):
 
 
 @pytest.mark.asyncio
+async def test_registry_diagnostics_include_classification_metadata(tmp_path: Path):
+    fake_module = _make_fake_module(["diag_tool"])
+    config_file = tmp_path / "mcp_config.yaml"
+    config_file.write_text(
+        """
+mcp_servers:
+  test_server:
+    type: internal_python
+    module: fake.module
+    enabled: true
+    classification: core
+    shipping_default: true
+    trust_boundary:
+      first_party: true
+      uses_network: false
+      shell_execution: false
+      writes_disk: false
+"""
+    )
+    registry = MCPRegistry()
+    with patch("importlib.import_module", return_value=fake_module):
+        await registry.startup(config_path=config_file)
+
+    diagnostics = registry.get_diagnostics()
+    status = registry.get_status()
+    server = diagnostics["servers"][0]
+    tool = status["tools"][0]
+
+    assert server["classification"] == "core"
+    assert server["shipping_default"] is True
+    assert server["trust_boundary"]["first_party"] is True
+    assert tool["classification"] == "core"
+    assert tool["shipping_default"] is True
+
+
+@pytest.mark.asyncio
 async def test_registry_loads_filesystem_server_from_config(tmp_path: Path):
     cfg = {
         "mcp_servers": {

@@ -1,37 +1,77 @@
 # FruitcakeAI v5 — MCP Server Definitions
-# Add a new server here to make its tools available to the agent — no code changes needed.
+# Alpha shipping policy:
+# - internal first-party MCPs that are core to the product stay enabled
+# - third-party / Docker MCPs are disabled by default unless they are clearly required
+# - developer-only integrations may remain configured, but should not ship enabled by default
 
 mcp_servers:
   # ── Internal Python servers ──────────────────────────────────────────────────
+  # Alpha default: enabled core integrations
 
   calendar:
     type: internal_python
     module: app.mcp.servers.calendar
     enabled: true
+    classification: core
+    shipping_default: true
+    trust_boundary:
+      first_party: true
+      uses_network: false
+      shell_execution: false
+      writes_disk: false
 
   web_research:
     type: internal_python
     module: app.mcp.servers.web_research_v2
     enabled: true
+    classification: core
+    shipping_default: true
+    trust_boundary:
+      first_party: true
+      uses_network: true
+      shell_execution: false
+      writes_disk: false
 
   rss:
     type: internal_python
     module: app.mcp.servers.rss
     enabled: true
+    classification: core
+    shipping_default: true
+    trust_boundary:
+      first_party: true
+      uses_network: true
+      shell_execution: false
+      writes_disk: true
 
   filesystem:
     type: internal_python
     module: app.mcp.servers.filesystem
     enabled: true
+    classification: core
+    shipping_default: true
+    trust_boundary:
+      first_party: true
+      uses_network: false
+      shell_execution: false
+      writes_disk: true
 
   # ── Docker stdio servers ─────────────────────────────────────────────────────
   # These require Docker + the image to be available locally.
+  # Alpha default: disabled unless intentionally enabled by the operator.
 
   shell:
     type: docker_stdio
     image: fruitcake/mcp-shell
-    enabled: true
+    enabled: false
     timeout: 30
+    classification: developer_only
+    shipping_default: false
+    trust_boundary:
+      first_party: false
+      uses_network: false
+      shell_execution: true
+      writes_disk: true
     docker_run_args:
       - --network
       - none
@@ -45,30 +85,16 @@ mcp_servers:
     pass_user_context: true
     priority: 9
 
-  python_refactoring:
-    type: docker_stdio
-    image: mcp/mcp-python-refactoring
-    enabled: true
-    timeout: 60
-    priority: 10
-
-  duckduckgo:
-    type: docker_stdio
-    image: mcp/duckduckgo
-    enabled: false
-    timeout: 60
-    priority: 14
-
-  markitdown:
-    type: docker_stdio
-    image: mcp/markitdown
-    enabled: true
-    timeout: 60
-    priority: 13
-
   playwright:
     type: docker_stdio
     image: mcp/playwright
-    enabled: true
+    enabled: false
     timeout: 60
-    priority: 15    
+    classification: developer_only
+    shipping_default: false
+    trust_boundary:
+      first_party: false
+      uses_network: true
+      shell_execution: false
+      writes_disk: true
+    priority: 15

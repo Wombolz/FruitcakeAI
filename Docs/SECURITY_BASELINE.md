@@ -60,6 +60,10 @@ This baseline assumes a trusted local network or a deliberately hardened reverse
 - APNs uses token-based authentication with the Apple `.p8` key supplied by the operator.
 - Sensitive settings are expected via `.env` / environment variables, not hardcoded in the repo.
 - MCP integrations are explicitly configured; unused integrations are not automatically active.
+- Alpha default MCP policy is conservative:
+  - first-party internal MCPs may ship enabled when they are core product capability
+  - Docker/third-party MCPs should remain disabled unless the operator intentionally enables them
+- Skills remain admin-managed and additive only; only reviewed shared skills should be considered alpha-default.
 
 ### Persistence and auditability
 
@@ -87,6 +91,7 @@ These are mandatory for any deployment beyond personal local testing.
 3. Rotate any compromised JWT secret, APNs key, or cloud API key immediately.
 4. Review enabled MCP servers and remove any capability you are not actively using.
 5. Review admin accounts and keep the number of admin users minimal.
+6. Keep developer-only MCPs such as browser automation or shell execution disabled unless you are intentionally operating in a local/admin workflow.
 
 ## Public and Sensitive Endpoints
 
@@ -149,6 +154,7 @@ These are known constraints of the current security posture.
 5. MCP server trust is deployment-dependent; external MCP tools may expand the attack surface significantly.
 6. The repository is local-first and privacy-focused, but not yet documented as hardened for hostile multi-tenant hosting.
 7. Memory export/delete currently covers memory data only, not full account erasure across all data types.
+8. Skills are reviewed guidance, not sandbox boundaries; poor skill hygiene can still expand effective prompt/tool pressure even when persona caps remain in force.
 
 ## Security-Sensitive Defaults and Files
 
@@ -175,6 +181,7 @@ Recommended ongoing hygiene:
 2. Re-run `pip check` after dependency changes.
 3. Review MCP server updates before enabling new images or configs.
 4. Revisit this baseline whenever a new public integration surface is added.
+5. Keep the set of default shared skills small and reviewed; move experimental skills out of the alpha-default path.
 
 ## Minimum Deployment Checklist
 
@@ -184,6 +191,8 @@ Recommended ongoing hygiene:
 - [ ] database not exposed publicly
 - [ ] backend protected by trusted network or reverse proxy
 - [ ] only required MCP servers enabled
+- [ ] developer-only MCPs remain disabled in the default deployment
+- [ ] default shared skills reviewed and documented
 - [ ] APNs/calendar credentials stored outside the repo
 - [ ] admin accounts reviewed
 - [ ] backup/restore plan for PostgreSQL and uploaded files documented
