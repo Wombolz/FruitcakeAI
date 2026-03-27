@@ -512,6 +512,114 @@ def test_topic_watcher_validate_finalize_suppresses_duplicate_memory_candidate_f
     assert "## Memory candidates" not in result
 
 
+def test_topic_watcher_validate_finalize_allows_distinct_evolving_narrative_memory_candidate():
+    profile = TopicWatcherExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "**Iran - New developments**\n\n"
+            "- **At CPAC, Republicans close ranks behind Trump on Iran war** — Reuters — [Read More](https://example.com/1)\n"
+            "Republicans largely backed Trump's Iran stance at CPAC.\n\n"
+            "- **Three charts that are warning signs flashing for Trump on Iran war** — BBC — [Read More](https://example.com/2)\n"
+            "Political and economic indicators point to mounting risks around the Iran conflict."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "watcher_config": {"topic": "Iran", "threshold": "medium"},
+            "dataset": {
+                "rss_items": [
+                    {
+                        "article_id": 1,
+                        "url": "https://example.com/1",
+                        "title": "At CPAC, Republicans close ranks behind Trump on Iran war",
+                        "source": "Reuters",
+                        "summary": "Republicans largely backed Trump's Iran stance at CPAC.",
+                        "published_at": "2026-03-27T00:45:00+00:00",
+                        "previously_published": False,
+                    },
+                    {
+                        "article_id": 2,
+                        "url": "https://example.com/2",
+                        "title": "Three charts that are warning signs flashing for Trump on Iran war",
+                        "source": "BBC",
+                        "summary": "Political and economic indicators point to mounting risks around the Iran conflict.",
+                        "published_at": "2026-03-27T00:13:09+00:00",
+                        "previously_published": False,
+                    },
+                ]
+            },
+            "topic_memory_history": [
+                {
+                    "id": 19,
+                    "content": "On 2026-03-25, reports about Iran indicated diplomatic talks, based on coverage from Reuters, BBC.",
+                    "memory_type": "episodic",
+                    "created_at": "2026-03-25T13:15:16+00:00",
+                }
+            ],
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["memory_candidate_emitted"] is True
+    assert report["topic_memory_duplicate_suppressed_count"] == 0
+    assert len(report["memory_candidates"]) == 1
+    assert "## Memory candidates" in result
+
+
+def test_topic_watcher_validate_finalize_strips_model_emitted_memory_candidate_when_suppressed():
+    profile = TopicWatcherExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "**Iran - New developments**\n\n"
+            "- **US-Iran talks resume after sanctions warning** — Reuters — [Read More](https://example.com/1)\n"
+            "Renewed negotiations and sanctions pressure mark a notable diplomatic shift.\n\n"
+            "- **Regional officials warn of missile strike risk** — BBC — [Read More](https://example.com/2)\n"
+            "Military warnings suggest escalating regional pressure around Iran.\n\n"
+            "## Memory candidate\n"
+            "On 2026-03-25, reports about Iran indicated diplomatic talks and military pressure."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "watcher_config": {"topic": "Iran", "threshold": "medium"},
+            "dataset": {
+                "rss_items": [
+                    {
+                        "article_id": 1,
+                        "url": "https://example.com/1",
+                        "title": "US-Iran talks resume after sanctions warning",
+                        "source": "Reuters",
+                        "summary": "Renewed negotiations and sanctions pressure mark a notable diplomatic shift.",
+                        "published_at": "2026-03-25T01:00:00+00:00",
+                        "previously_published": False,
+                    },
+                    {
+                        "article_id": 2,
+                        "url": "https://example.com/2",
+                        "title": "Regional officials warn of missile strike risk",
+                        "source": "BBC",
+                        "summary": "Military warnings suggest escalating regional pressure around Iran.",
+                        "published_at": "2026-03-25T01:10:00+00:00",
+                        "previously_published": False,
+                    },
+                ]
+            },
+            "topic_memory_history": [
+                {
+                    "id": 44,
+                    "content": "On 2026-03-25, reports about Iran indicated diplomatic talks, based on coverage from Reuters, BBC.",
+                    "memory_type": "episodic",
+                    "created_at": "2026-03-25T02:00:00+00:00",
+                }
+            ],
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["memory_candidate_emitted"] is False
+    assert report["memory_candidates"] == []
+    assert "## Memory candidate" not in result
+    assert "## Memory candidates" not in result
+
+
 def test_topic_watcher_artifact_payloads_include_memory_candidates():
     profile = TopicWatcherExecutionProfile()
     artifacts = profile.artifact_payloads(

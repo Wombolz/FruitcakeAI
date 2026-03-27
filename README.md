@@ -30,6 +30,8 @@ Every subsystem is independently testable, swap-able, and extensible. If you wan
 
 **Zero ongoing API cost by default.** Ollama with a local model costs nothing to run. Cloud routing is opt-in and per-signal — you decide what, if anything, leaves the machine.
 
+**Explicit routing and trust boundaries.** `Automatic` chat uses the routing classifier and your reasoning preference. `Fast` forces the simpler chat path. `Deep` forces orchestrated chat. Tasks without an override use the existing `TASK_SMALL_MODEL` / `TASK_LARGE_MODEL` policy; tasks with an explicit model override use that model for all LLM stages.
+
 **Extensible via MCP — additive integrations.** New capabilities arrive as MCP servers in a config file. The agent discovers them at startup. Nothing in core depends on any optional provider. Everything added is additive; nothing is load-bearing.
 
 **Multi-user and safe by default.** Role-based personas with scoped tool access. Per-persona content filtering and blocked tool lists. Approval gates before irreversible actions. Active-hours windows that prevent the autonomous agent from running at 3am.
@@ -51,6 +53,14 @@ Before any shared-network or remote deployment:
 - treat webhook keys, APNs keys, and MCP credentials as secrets
 
 See [Security Baseline](Docs/SECURITY_BASELINE.md) for the full operator checklist, trust assumptions, and current limits.
+
+### LLM Routing Trust Boundary
+
+- Local models keep prompts, task context, and tool results on your hardware.
+- Choosing a cloud model, or routing a task/chat turn to a cloud model, sends the current turn context to that provider.
+- Stored secrets stay server-side. Fruitcake resolves them in backend-owned API adapters and does not place plaintext secret values into model prompts.
+- Structured external APIs are executed server-side through approved adapters; they are not run through shell improvisation.
+- When research-heavy chat cannot complete reliably, Fruitcake now fails with a bounded explanatory message instead of the generic fallback.
 
 ---
 

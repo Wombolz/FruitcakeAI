@@ -239,7 +239,33 @@ async def test_run_agent_stops_repeated_failed_search_loop_gracefully():
     ):
         result = await run_agent([{"role": "user", "content": "Find addresses in Statesboro, GA"}], user_context)
 
-    assert result == (
-        "I couldn't reliably find enough matching results for that lookup after several search attempts. "
-        "Try narrowing the request or giving me one restaurant at a time."
-    )
+    assert "I couldn't reliably finish that lookup after several search attempts." in result
+    assert "No results found for: Buffalo Wild Wings Statesboro GA" in result
+    assert "Try narrowing the request or giving me one item at a time." in result
+
+
+@pytest.mark.asyncio
+async def test_run_agent_returns_tool_aware_message_when_hitting_max_turns():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    failing = _fake_tool_response(tool_name="web_search")
+
+    async def _fake_dispatch(_tool_calls, _user_context):
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "Partial result: found Zaxby's Statesboro listing but no confirmed phone number.",
+            }
+        ]
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=[failing] * 4)),
+        patch("app.agent.core.dispatch_tool_calls", side_effect=_fake_dispatch),
+        patch.dict("app.agent.core.TURN_LIMITS", {"chat": 4}, clear=False),
+        patch("app.agent.core._is_failed_search_turn", return_value=False),
+    ):
+        result = await run_agent([{"role": "user", "content": "Find restaurant phone numbers in Statesboro, GA"}], user_context)
+
+    assert "I ran out of turns before I could finish that request cleanly." in result
+    assert "Partial result: found Zaxby's Statesboro listing but no confirmed phone number." in result

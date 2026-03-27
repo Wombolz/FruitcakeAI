@@ -246,7 +246,7 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
         threshold = str(config.get("threshold") or "medium")
         rss_items = list(dataset.get("rss_items") or [])
         allowed_urls = {str(item.get("url") or "").strip() for item in rss_items if item.get("url")}
-        text = (result or "").strip()
+        text = _strip_memory_candidate_section((result or "").strip())
         if not text:
             text = _NOTHING_NEW
         if text == _NOTHING_NEW:
@@ -633,6 +633,14 @@ def _append_memory_candidates(text: str, contents: List[str]) -> str:
     return f"{body}\n\n## Memory candidates\n" + "\n".join(lines)
 
 
+def _strip_memory_candidate_section(text: str) -> str:
+    body = (text or "").strip()
+    if not body:
+        return body
+    stripped = re.split(r"\n## Memory candidates?\n", body, maxsplit=1, flags=re.IGNORECASE)[0].rstrip()
+    return stripped or body
+
+
 def _build_memory_candidates(
     *,
     topic: str,
@@ -934,6 +942,19 @@ def _token_overlap_ratio(a: str, b: str) -> float:
     return len(a_tokens & b_tokens) / float(len(a_tokens | b_tokens))
 
 
+def _extract_memory_theme_clause(content: str) -> str:
+    text = re.sub(r"\s+", " ", str(content or "").strip())
+    if not text:
+        return ""
+    match = re.search(
+        r"\bindicated\s+(.*?)(?:,\s*based on coverage from\b|[.]?$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    clause = match.group(1).strip() if match else text
+    return _normalize_candidate_text(clause)
+
+
 def _topic_memory_duplicate_reason(
     *,
     candidate: Dict[str, Any],
@@ -942,14 +963,24 @@ def _topic_memory_duplicate_reason(
     candidate_content = str(candidate.get("content") or "").strip()
     if not candidate_content:
         return None
+    candidate_theme = _extract_memory_theme_clause(candidate_content)
     for memory in prior_topic_memories:
         prior_content = str(memory.get("content") or "").strip()
         if not prior_content:
             continue
+        prior_theme = _extract_memory_theme_clause(prior_content)
         overlap = _token_overlap_ratio(candidate_content, prior_content)
-        if overlap >= 0.7:
+        theme_overlap = _token_overlap_ratio(candidate_theme, prior_theme)
+        if candidate_theme and prior_theme and theme_overlap >= 0.85 and overlap >= 0.6:
             return f"Suppressed duplicate topic memory candidate due to high similarity with approved topic memory {memory.get('id')}."
         prior_date = str(memory.get("created_at") or "").split("T", 1)[0]
-        if prior_date and prior_date in candidate_content and overlap >= 0.55:
+        if (
+            prior_date
+            and prior_date in candidate_content
+            and candidate_theme
+            and prior_theme
+            and theme_overlap >= 0.75
+            and overlap >= 0.5
+        ):
             return f"Suppressed duplicate topic memory candidate due to repeated same-day development already captured in approved topic memory {memory.get('id')}."
     return None

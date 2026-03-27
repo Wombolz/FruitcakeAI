@@ -103,11 +103,45 @@ def _is_failed_search_turn(tool_calls: List[Any], tool_results: List[Dict[str, A
     return True
 
 
-def _repeated_failed_search_message() -> str:
+def _recent_tool_snippets(history: List[Dict[str, Any]], *, limit: int = 3) -> list[str]:
+    snippets: list[str] = []
+    for message in reversed(history):
+        if message.get("role") != "tool":
+            continue
+        content = " ".join(str(message.get("content", "")).split()).strip()
+        if not content:
+            continue
+        shortened = content[:140] + ("…" if len(content) > 140 else "")
+        if shortened not in snippets:
+            snippets.append(shortened)
+        if len(snippets) >= limit:
+            break
+    return snippets
+
+
+def _repeated_failed_search_message(history: List[Dict[str, Any]]) -> str:
+    snippets = _recent_tool_snippets(history)
+    if snippets:
+        return (
+            "I couldn't reliably finish that lookup after several search attempts. "
+            f"Recent results were: {' | '.join(snippets)}. "
+            "Try narrowing the request or giving me one item at a time."
+        )
     return (
         "I couldn't reliably find enough matching results for that lookup after several search attempts. "
-        "Try narrowing the request or giving me one restaurant at a time."
+        "Try narrowing the request or giving me one item at a time."
     )
+
+
+def _max_turns_message(history: List[Dict[str, Any]]) -> str:
+    snippets = _recent_tool_snippets(history)
+    if snippets:
+        return (
+            "I ran out of turns before I could finish that request cleanly. "
+            f"I got as far as: {' | '.join(snippets)}. "
+            "Try narrowing the request or splitting it into smaller parts."
+        )
+    return "I ran out of turns before I could finish that request cleanly. Try narrowing the request."
 
 
 async def _stream_final_response(
@@ -248,7 +282,7 @@ async def run_agent(
                         mode=mode,
                         stage=stage,
                     )
-                    return _repeated_failed_search_message()
+                    return _repeated_failed_search_message(history)
             else:
                 consecutive_failed_search_turns = 0
             log.info(
@@ -264,7 +298,7 @@ async def run_agent(
             return message.content or ""
 
     log.warning("Agent hit max turns without a final response", max_turns=max_turns)
-    return "I ran into an issue processing your request. Please try again."
+    return _max_turns_message(history)
 
 
 async def stream_agent(
@@ -323,7 +357,7 @@ async def stream_agent(
             if _is_failed_search_turn(message.tool_calls, tool_results):
                 consecutive_failed_search_turns += 1
                 if consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
-                    yield _repeated_failed_search_message()
+                    yield _repeated_failed_search_message(history)
                     return
             else:
                 consecutive_failed_search_turns = 0
@@ -345,4 +379,4 @@ async def stream_agent(
                 yield token
             return
 
-    yield "I ran into an issue processing your request. Please try again."
+    yield _max_turns_message(history)

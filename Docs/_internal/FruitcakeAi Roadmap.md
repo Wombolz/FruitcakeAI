@@ -1418,7 +1418,14 @@ Recent evidence:
 - User-visible hybrid controls have also landed:
   - chat sessions can select from configured models,
   - the client now exposes inline `Reasoning` controls for `Automatic`, `Fast`, and `Deep`,
-  - token usage inspection makes the selected model path auditable.
+  - token usage inspection makes the selected model path auditable,
+  - tasks can now opt into a per-task model override while `Automatic` preserves the existing small/large task routing defaults.
+- Routing/trust-boundary cleanup has also advanced:
+  - README now states the current chat/task routing policy explicitly,
+  - the trust boundary around cloud models, server-side secret resolution, and backend-owned API adapters is now documented in one place.
+- Graceful failure behavior for research-heavy chat has also been tightened:
+  - repeated failed search loops now return a bounded explanation with recent tool outcomes,
+  - max-turn failures now return a tool-aware narrowing message instead of the generic fallback.
 
 **Trigger**: A user requests it, or local judgment quality on heartbeats is demonstrably causing missed-important / false-alarm patterns in daily use.
 
