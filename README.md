@@ -219,6 +219,14 @@ Default users — **change these passwords before running on a shared network:**
 
 Upload a document via the Library tab, then ask about it.
 
+---
+
+## License
+
+FruitcakeAI is licensed under the GNU Affero General Public License v3.0.
+
+See [LICENSE](LICENSE) for the full text.
+
 If bootstrap or verification fails, see [Pre-Alpha Troubleshooting](Docs/PreAlpha_Troubleshooting.md).
 
 ---

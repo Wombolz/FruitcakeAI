@@ -1,6 +1,6 @@
 # Security Baseline
 
-This document describes the current security baseline for FruitcakeAI as of release `v0.6.8`.
+This document describes the current security baseline for FruitcakeAI as of release `v0.7.0`.
 
 It is not a formal security audit. It is the minimum operator and contributor reference for understanding:
 
