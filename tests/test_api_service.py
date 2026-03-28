@@ -69,7 +69,7 @@ async def test_execute_api_request_normalizes_n2yo_and_dedupes_for_task():
     }
 
     async with TestSessionLocal() as db:
-        with patch("app.api_service.fetch_json", new=AsyncMock(return_value=payload)):
+        with patch("app.api_adapters.n2yo.fetch_json", new=AsyncMock(return_value=payload)):
             first = await execute_api_request(
                 db,
                 user_id=user_id,
@@ -165,7 +165,7 @@ async def test_execute_api_request_normalizes_alphavantage_global_quote():
     }
 
     async with TestSessionLocal() as db:
-        with patch("app.api_service.fetch_json", new=AsyncMock(return_value=payload)):
+        with patch("app.api_adapters.alphavantage.fetch_json", new=AsyncMock(return_value=payload)):
             result = await execute_api_request(
                 db,
                 user_id=user_id,
@@ -200,8 +200,8 @@ async def test_execute_api_request_reports_alphavantage_rate_limit():
     }
 
     async with TestSessionLocal() as db:
-        with patch("app.api_service.fetch_json", new=AsyncMock(return_value=payload)):
-            with pytest.raises(APIRequestError, match="rate limit"):
+        with patch("app.api_adapters.alphavantage.fetch_json", new=AsyncMock(return_value=payload)):
+            with pytest.raises(APIRequestError, match="Thank you for using Alpha Vantage!"):
                 await execute_api_request(
                     db,
                     user_id=user_id,
@@ -210,6 +210,55 @@ async def test_execute_api_request_reports_alphavantage_rate_limit():
                     query_params={"symbol": "IBM"},
                     secret_name="alphavantage_api_key",
                 )
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_stores_raw_payload_for_task_state():
+    user_id, task_id = await _seed_user_task_and_secret()
+    async with TestSessionLocal() as db:
+        secret = Secret(
+            user_id=user_id,
+            name="alphavantage_api_key",
+            provider="alphavantage",
+            ciphertext=encrypt_secret_value("alpha-key"),
+            is_active=True,
+        )
+        db.add(secret)
+        await db.commit()
+
+    payload = {
+        "Global Quote": {
+            "01. symbol": "IBM",
+            "02. open": "254.7100",
+            "03. high": "255.4400",
+            "04. low": "253.7700",
+            "05. price": "255.1400",
+            "06. volume": "3475028",
+            "07. latest trading day": "2026-03-27",
+            "08. previous close": "253.5400",
+            "09. change": "1.6000",
+            "10. change percent": "0.6311%",
+        }
+    }
+
+    async with TestSessionLocal() as db:
+        with patch("app.api_adapters.alphavantage.fetch_json", new=AsyncMock(return_value=payload)):
+            await execute_api_request(
+                db,
+                user_id=user_id,
+                service="alphavantage",
+                endpoint="global_quote",
+                query_params={"symbol": "IBM"},
+                secret_name="alphavantage_api_key",
+                task_id=task_id,
+            )
+            await db.commit()
+
+        state = (
+            await db.execute(select(TaskAPIState).where(TaskAPIState.task_id == task_id))
+        ).scalar_one()
+        stored = json.loads(state.value_json)
+        assert stored["raw_payload"]["Global Quote"]["01. symbol"] == "IBM"
 
 
 @pytest.mark.asyncio
@@ -253,7 +302,7 @@ async def test_execute_api_request_normalizes_alphavantage_time_series_daily():
     }
 
     async with TestSessionLocal() as db:
-        with patch("app.api_service.fetch_json", new=AsyncMock(return_value=payload)):
+        with patch("app.api_adapters.alphavantage.fetch_json", new=AsyncMock(return_value=payload)):
             result = await execute_api_request(
                 db,
                 user_id=user_id,
@@ -290,5 +339,84 @@ async def test_execute_api_request_rejects_invalid_alphavantage_daily_outputsize
                 service="alphavantage",
                 endpoint="time_series_daily",
                 query_params={"symbol": "IBM", "outputsize": "bad"},
+                secret_name="alphavantage_api_key",
+            )
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_normalizes_alphavantage_time_series_intraday():
+    user_id, task_id = await _seed_user_task_and_secret()
+    async with TestSessionLocal() as db:
+        secret = Secret(
+            user_id=user_id,
+            name="alphavantage_api_key",
+            provider="alphavantage",
+            ciphertext=encrypt_secret_value("alpha-key"),
+            is_active=True,
+        )
+        db.add(secret)
+        await db.commit()
+
+    payload = {
+        "Meta Data": {
+            "1. Information": "Intraday (60min) open, high, low, close prices and volume",
+            "2. Symbol": "SPY",
+            "4. Interval": "60min",
+        },
+        "Time Series (60min)": {
+            "2026-03-27 16:00:00": {
+                "1. open": "552.10",
+                "2. high": "555.25",
+                "3. low": "549.80",
+                "4. close": "553.42",
+                "5. volume": "1000000",
+            },
+            "2026-03-27 15:00:00": {
+                "1. open": "548.00",
+                "2. high": "553.00",
+                "3. low": "547.50",
+                "4. close": "552.00",
+                "5. volume": "900000",
+            },
+        },
+    }
+
+    async with TestSessionLocal() as db:
+        with patch("app.api_adapters.alphavantage.fetch_json", new=AsyncMock(return_value=payload)):
+            result = await execute_api_request(
+                db,
+                user_id=user_id,
+                service="alphavantage",
+                endpoint="time_series_intraday",
+                query_params={"symbol": "SPY", "interval": "60min", "limit": 2},
+                secret_name="alphavantage_api_key",
+                task_id=task_id,
+            )
+
+    assert "Alpha Vantage intraday time series for SPY (60min)" in result
+    assert "[1] timestamp=2026-03-27 16:00:00 | open=552.10 | high=555.25 | low=549.80 | close=553.42" in result
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_rejects_invalid_alphavantage_intraday_interval():
+    user_id, _task_id = await _seed_user_task_and_secret()
+    async with TestSessionLocal() as db:
+        secret = Secret(
+            user_id=user_id,
+            name="alphavantage_api_key",
+            provider="alphavantage",
+            ciphertext=encrypt_secret_value("alpha-key"),
+            is_active=True,
+        )
+        db.add(secret)
+        await db.commit()
+
+        with pytest.raises(APIRequestError, match="intraday interval"):
+            await execute_api_request(
+                db,
+                user_id=user_id,
+                service="alphavantage",
+                endpoint="time_series_intraday",
+                query_params={"symbol": "SPY", "interval": "2min"},
                 secret_name="alphavantage_api_key",
             )

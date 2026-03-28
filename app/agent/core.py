@@ -36,10 +36,10 @@ FAILED_SEARCH_PREFIXES = (
     "tool web_search failed:",
 )
 UNSUPPORTED_ALPHA_VANTAGE_HINT = (
-    "I can use Alpha Vantage for quote lookup and daily history right now, but not intraday time-series history yet. "
-    "The current Alpha Vantage adapter supports `global_quote` and `time_series_daily`, so I can give you the latest quote "
-    "or recent daily bars for a symbol, but not intraday bars or derived intraday OHLC from time-series data yet. "
-    "If you want, I can either give you the latest quote, fetch recent daily bars, or help add the missing intraday endpoint support in Fruitcake."
+    "I can use Alpha Vantage for quote lookup, daily history, and bounded intraday history right now, "
+    "but not weekly, monthly, or technical-indicator endpoints yet. "
+    "The current Alpha Vantage adapter supports `global_quote`, `time_series_daily`, and `time_series_intraday`. "
+    "If you want, I can fetch a latest quote, recent daily bars, or bounded intraday bars for a symbol."
 )
 
 
@@ -185,7 +185,7 @@ def _unsupported_alphavantage_request_message(messages: List[Dict[str, Any]]) ->
     )
     if not provider_in_context:
         return None
-    explicit_daily_markers = (
+    supported_markers = (
         "daily history",
         "daily bars",
         "daily ohlc",
@@ -195,29 +195,32 @@ def _unsupported_alphavantage_request_message(messages: List[Dict[str, Any]]) ->
         "last 5 daily",
         "daily close",
         "daily closes",
-    )
-    if any(marker in text for marker in explicit_daily_markers):
-        return None
-
-    intraday_markers = (
         "intraday",
-        "time series",
-        "timeseries",
-        "last month",
-        "last 30 days",
-        "30 days",
+        "intraday bars",
+        "intraday ohlc",
+        "time_series_intraday",
         "1m",
         "5m",
         "15m",
         "30m",
         "60m",
-        "intraday ohlc",
-        "intraday open high low close",
-        "intraday open, high, low, close",
-        "bar data",
-        "intraday bars",
     )
-    if any(marker in text for marker in intraday_markers):
+    if any(marker in text for marker in supported_markers):
+        return None
+
+    unsupported_markers = (
+        "time_series_weekly",
+        "time_series_monthly",
+        "weekly",
+        "monthly",
+        "sma",
+        "ema",
+        "rsi",
+        "macd",
+        "bollinger",
+        "technical indicator",
+    )
+    if any(marker in text for marker in unsupported_markers):
         return UNSUPPORTED_ALPHA_VANTAGE_HINT
     return None
 

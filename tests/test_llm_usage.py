@@ -272,7 +272,7 @@ async def test_run_agent_returns_tool_aware_message_when_hitting_max_turns():
 
 
 @pytest.mark.asyncio
-async def test_run_agent_fails_fast_for_unsupported_alphavantage_time_series_request():
+async def test_run_agent_fails_fast_for_unsupported_alphavantage_weekly_request():
     user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
 
     with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=AssertionError("LLM should not be called"))):
@@ -280,14 +280,14 @@ async def test_run_agent_fails_fast_for_unsupported_alphavantage_time_series_req
             [
                 {
                     "role": "user",
-                    "content": "Use Alpha Vantage to give me the last month of intraday OHLC data for SPY.",
+                    "content": "Use Alpha Vantage to give me weekly bars for SPY.",
                 }
             ],
             user_context,
         )
 
-    assert "quote lookup and daily history right now" in result
-    assert "supports `global_quote` and `time_series_daily`" in result
+    assert "quote lookup, daily history, and bounded intraday history right now" in result
+    assert "supports `global_quote`, `time_series_daily`, and `time_series_intraday`" in result
 
 
 @pytest.mark.asyncio
@@ -309,7 +309,7 @@ async def test_run_agent_does_not_block_supported_alphavantage_daily_request():
 
 
 @pytest.mark.asyncio
-async def test_stream_agent_fails_fast_for_unsupported_alphavantage_time_series_request():
+async def test_stream_agent_fails_fast_for_unsupported_alphavantage_indicator_request():
     user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
 
     with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=AssertionError("LLM should not be called"))):
@@ -319,7 +319,7 @@ async def test_stream_agent_fails_fast_for_unsupported_alphavantage_time_series_
                 [
                     {
                         "role": "user",
-                        "content": "I have an Alpha Vantage key in secrets. Give me 5m intraday bars for SPY for the last month.",
+                        "content": "I have an Alpha Vantage key in secrets. Give me the RSI for SPY.",
                     }
                 ],
                 user_context,
@@ -328,14 +328,14 @@ async def test_stream_agent_fails_fast_for_unsupported_alphavantage_time_series_
         ]
 
     assert len(chunks) == 1
-    assert "quote lookup and daily history right now" in chunks[0]
+    assert "quote lookup, daily history, and bounded intraday history right now" in chunks[0]
 
 
 @pytest.mark.asyncio
-async def test_run_agent_fails_fast_for_shorthand_alphavantage_follow_up_request():
+async def test_run_agent_does_not_block_supported_intraday_follow_up_request():
     user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
 
-    with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=AssertionError("LLM should not be called"))):
+    with patch("app.agent.core.litellm.acompletion", new=AsyncMock(return_value=_fake_response(content="intraday bars here"))):
         result = await run_agent(
             [
                 {"role": "user", "content": "Use Alpha Vantage for intraday stock data."},
@@ -345,5 +345,4 @@ async def test_run_agent_fails_fast_for_shorthand_alphavantage_follow_up_request
             user_context,
         )
 
-    assert "quote lookup and daily history right now" in result
-    assert "latest quote, fetch recent daily bars" in result
+    assert result == "intraday bars here"
