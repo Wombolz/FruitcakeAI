@@ -346,3 +346,60 @@ async def test_run_agent_does_not_block_supported_intraday_follow_up_request():
         )
 
     assert result == "intraday bars here"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_stops_after_successful_recurring_task_create():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    tool_message = _fake_tool_response(tool_name="create_task")
+
+    async def _fake_dispatch(_tool_calls, _user_context):
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": '{"created": true, "task_id": 63, "title": "OpenClaw Watch", "task_type": "recurring", "schedule": "every:6h", "profile": "topic_watcher"}',
+            }
+        ]
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=[tool_message])),
+        patch("app.agent.core.dispatch_tool_calls", side_effect=_fake_dispatch),
+    ):
+        result = await run_agent(
+            [{"role": "user", "content": "Set up a recurring watcher for OpenClaw every 6 hours."}],
+            user_context,
+        )
+
+    assert result == "Created task 'OpenClaw Watch' (task_id=63) (schedule=every:6h, profile=topic_watcher)."
+
+
+@pytest.mark.asyncio
+async def test_run_agent_stops_after_successful_run_task_now():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    tool_message = _fake_tool_response(tool_name="run_task_now")
+
+    async def _fake_dispatch(_tool_calls, _user_context):
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": '{"queued": true, "task_id": 64, "title": "OpenClaw Watch"}',
+            }
+        ]
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=[tool_message])),
+        patch("app.agent.core.dispatch_tool_calls", side_effect=_fake_dispatch),
+    ):
+        result = await run_agent(
+            [
+                {"role": "assistant", "content": '{"created": true, "task_id": 64, "title": "OpenClaw Watch"}'},
+                {"role": "user", "content": "can you run the task now?"},
+            ],
+            user_context,
+        )
+
+    assert result == "Queued task 'OpenClaw Watch' (task_id=64) to run now."

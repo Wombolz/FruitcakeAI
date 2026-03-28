@@ -71,6 +71,31 @@ def resolve_task_profile(requested_profile: Optional[str]) -> Optional[str]:
         raise TaskValidationError(str(exc)) from exc
 
 
+def infer_task_profile(
+    *,
+    title: str,
+    instruction: str,
+    task_type: str,
+    requested_profile: Optional[str],
+) -> Optional[str]:
+    explicit = resolve_task_profile(requested_profile)
+    if explicit is not None:
+        return explicit
+    if task_type != "recurring":
+        return None
+
+    instruction_lower = instruction.lower()
+    haystack = f"{title} {instruction}".lower()
+    if "topic:" in instruction_lower:
+        return "topic_watcher"
+
+    watch_markers = ("watch", "watcher", "monitor", "track", "follow")
+    source_markers = ("news", "rss", "feed", "feeds", "headline", "headlines", "topic")
+    if any(marker in haystack for marker in watch_markers) and any(marker in haystack for marker in source_markers):
+        return "topic_watcher"
+    return None
+
+
 @dataclass(frozen=True)
 class TaskUpdateResult:
     title_changed: bool
@@ -107,7 +132,12 @@ async def create_task_record(
         title=title,
         instruction=instruction,
         persona=resolved_persona,
-        profile=resolve_task_profile(profile),
+        profile=infer_task_profile(
+            title=title,
+            instruction=instruction,
+            task_type=task_type,
+            requested_profile=profile,
+        ),
         llm_model_override=(str(llm_model_override).strip() or None) if llm_model_override is not None else None,
         task_type=task_type,
         status="pending",
@@ -162,7 +192,12 @@ async def update_task_record(
         )
         plan_inputs_changed = True
     if profile is not UNSET:
-        task.profile = resolve_task_profile(profile)
+        task.profile = infer_task_profile(
+            title=task.title,
+            instruction=task.instruction,
+            task_type=task.task_type,
+            requested_profile=profile,
+        )
         plan_inputs_changed = True
     if llm_model_override is not UNSET:
         task.llm_model_override = (str(llm_model_override).strip() or None) if llm_model_override is not None else None
