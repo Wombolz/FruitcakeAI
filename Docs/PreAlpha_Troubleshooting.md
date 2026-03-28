@@ -145,3 +145,39 @@ Start or restart the backend:
 ```
 
 If the process exits early, inspect the terminal output for the first failing dependency.
+
+---
+
+## HTTPS helper cannot start because `caddy` is missing
+
+**Symptom**
+- `./scripts/start_https.sh` says `caddy` is missing
+
+**Likely cause**
+- Caddy is not installed yet
+
+**Fix**
+```bash
+brew install caddy
+./scripts/start_https.sh
+```
+
+---
+
+## HTTPS URL loads with an untrusted certificate warning
+
+**Symptom**
+- browser or client warns that the Fruitcake certificate is not trusted
+- this usually happens on the default local/LAN path using `tls internal`
+
+**Likely cause**
+- Caddy's local certificate authority has not been trusted on that machine yet
+
+**Fix**
+```bash
+sudo caddy trust
+```
+
+Then retry the HTTPS URL.
+
+If you are using a public domain, make sure you removed `tls internal` from `Caddyfile` so Caddy can obtain a normal public certificate.

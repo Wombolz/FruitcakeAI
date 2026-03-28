@@ -86,7 +86,7 @@ These are mandatory for any deployment beyond personal local testing.
 
 ### Strongly recommended
 
-1. Run behind a reverse proxy that provides TLS, request size limits, and basic abuse controls.
+1. Run behind a reverse proxy that provides TLS, request size limits, and basic abuse controls. This repo ships a Caddy-based front door via `Caddyfile` and `./scripts/start_https.sh`.
 2. Limit inbound access to trusted devices or a VPN if remote access is needed.
 3. Rotate any compromised JWT secret, APNs key, or cloud API key immediately.
 4. Review enabled MCP servers and remove any capability you are not actively using.
