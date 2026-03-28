@@ -210,11 +210,36 @@ Default users — **change these passwords before running on a shared network:**
 | restricted | changeme123 | restricted |
 | guest | changeme123 | guest |
 
-### 4. Open the Swift app (optional)
+### 4. Put it behind HTTPS before other people log in
+
+For local development, `http://localhost:30417` is still fine.
+
+For any shared-network or tester-facing use, Fruitcake should sit behind HTTPS.
+This repo now ships a Caddy-based front door:
+
+```bash
+brew install caddy
+FRUITCAKE_SITE_ADDRESS=fruitcake.localhost ./scripts/start_https.sh
+```
+
+Then trust Caddy's local CA once on the machine running the client:
+
+```bash
+sudo caddy trust
+```
+
+Important:
+- the backend stays on `127.0.0.1:30417`
+- Caddy becomes the user-facing HTTPS entrypoint
+- for a public-domain rollout, edit `Caddyfile` and remove `tls internal` so Caddy can obtain a public certificate automatically
+
+### 5. Open the Swift app (optional)
 
 1. Open the `FruitcakeAI_Client` Swift project in Xcode
 2. Build and run (`⌘R`)
-3. Settings → Server URL → `http://localhost:30417`
+3. Settings → Server URL:
+   - local dev: `http://localhost:30417`
+   - shared-network/tester use: `https://<your-hostname>`
 4. Log in with any seed user
 
 Upload a document via the Library tab, then ask about it.
