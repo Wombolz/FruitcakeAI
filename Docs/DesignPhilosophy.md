@@ -89,7 +89,7 @@ The Model Context Protocol is the emerging standard for connecting AI agents to 
 
 An MCP server written for FruitcakeAI works with Cursor, Claude Desktop, and any other MCP-compatible host. An MCP server written for any of those works with FruitcakeAI. The ecosystem grows in all directions simultaneously.
 
-The practical architecture consequence: every capability in FruitcakeAI is either a built-in MCP server (`app/mcp/servers/`) or a Docker stdio MCP server registered in `config/mcp_config.yaml`. There is no tool registry that isn't MCP. This means the extension path is always the same regardless of what you're adding.
+The practical architecture consequence: FruitcakeAI favors a consistent MCP-based integration path for optional external capabilities. Built-in MCP servers and configured stdio MCP servers share the same operating model, which keeps integrations more portable and easier to reason about.
 
 **The boundary rule**: FruitcakeAI core must function fully without any optional MCP provider. Every integration is additive. Nothing external is load-bearing.
 
