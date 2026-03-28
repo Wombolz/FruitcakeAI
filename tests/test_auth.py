@@ -657,6 +657,7 @@ async def test_websocket_duplicate_prompt_is_rejected_before_execution(client):
                 current_user=user,
                 session=session,
                 user_message=prompt,
+                client_send_id="test-send-id",
                 allowed_tools=None,
                 blocked_tools=None,
             )

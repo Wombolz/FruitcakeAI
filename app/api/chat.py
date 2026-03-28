@@ -490,17 +490,17 @@ async def _run_websocket_message(
     current_user: User,
     session: ChatSession,
     user_message: str,
+    client_send_id: Optional[str],
     allowed_tools: Optional[List[str]],
     blocked_tools: Optional[List[str]],
 ) -> None:
     prompt_claimed = False
-    prompt_fingerprint = ""
     try:
         message_started = time.perf_counter()
         stage_timings_ms: Dict[str, float] = {}
-        chat_run_manager = get_chat_run_manager()
-
-        claimed, duplicate_active, prompt_fingerprint = await chat_run_manager.claim_prompt(
+        websocket_id = hex(id(websocket))
+        prompt_fingerprint = str(abs(hash(" ".join(str(user_message or "").split()))))[:12]
+        claimed, duplicate_active, claimed_fingerprint = await get_chat_run_manager().claim_prompt(
             session_id,
             user_message,
         )
@@ -509,7 +509,9 @@ async def _run_websocket_message(
                 "chat.duplicate_prompt_rejected",
                 session_id=session_id,
                 user_id=current_user.id,
-                prompt_fingerprint=prompt_fingerprint,
+                websocket_id=websocket_id,
+                client_send_id=client_send_id or "",
+                prompt_fingerprint=claimed_fingerprint,
                 active_run=duplicate_active,
             )
             await websocket.send_json(
@@ -524,10 +526,28 @@ async def _run_websocket_message(
             )
             return
         prompt_claimed = True
+        prompt_fingerprint = claimed_fingerprint or prompt_fingerprint
+        log.info(
+            "chat.websocket_message_received",
+            session_id=session_id,
+            user_id=current_user.id,
+            websocket_id=websocket_id,
+            client_send_id=client_send_id or "",
+            prompt_fingerprint=prompt_fingerprint,
+        )
 
         user_msg = ChatMessage(session_id=session_id, role="user", content=user_message)
         db.add(user_msg)
         await db.flush()
+        log.info(
+            "chat.websocket_message_persisted",
+            session_id=session_id,
+            user_id=current_user.id,
+            websocket_id=websocket_id,
+            client_send_id=client_send_id or "",
+            prompt_fingerprint=prompt_fingerprint,
+            chat_message_id=user_msg.id,
+        )
 
         stage_started = time.perf_counter()
         history = await _load_history(session_id, db)
@@ -615,7 +635,6 @@ async def _run_websocket_message(
                 model_override=session.llm_model,
                 stage="chat_complex",
                 enable_validation=effective_complex,
-                retry_max_attempts_override=settings.chat_websocket_validation_retry_max_attempts,
             )
             _record_chat_stage_timing(stage_timings_ms, "model_execution", stage_started)
             complete = _enforce_calendar_mutation_integrity(
@@ -671,11 +690,34 @@ async def _run_websocket_message(
                 },
             }
         )
+        log.info(
+            "chat.websocket_message_done",
+            session_id=session_id,
+            user_id=current_user.id,
+            websocket_id=websocket_id,
+            client_send_id=client_send_id or "",
+            prompt_fingerprint=prompt_fingerprint,
+            assistant_message_id=assistant_msg.id,
+        )
     except asyncio.CancelledError:
         await db.rollback()
+        log.info(
+            "chat.websocket_message_stopped",
+            session_id=session_id,
+            user_id=current_user.id,
+            websocket_id=hex(id(websocket)),
+            client_send_id=client_send_id or "",
+        )
         raise
     except Exception:
         await db.rollback()
+        log.exception(
+            "chat.websocket_message_error",
+            session_id=session_id,
+            user_id=current_user.id,
+            websocket_id=hex(id(websocket)),
+            client_send_id=client_send_id or "",
+        )
         raise
     finally:
         if prompt_claimed:
@@ -736,11 +778,24 @@ async def chat_websocket(
                 return
 
         # ── Read first message (content; token optional for legacy clients) ──
+        websocket_id = hex(id(websocket))
+
+        def _log_payload_received(payload: Dict[str, Any], send_id: Optional[str]) -> None:
+            log.info(
+                "chat.websocket_payload_received",
+                session_id=session_id,
+                websocket_id=websocket_id,
+                client_send_id=send_id or "",
+                message_type=str(payload.get("type", "")) if isinstance(payload, dict) else "",
+            )
+
         raw = await websocket.receive_text()
         data = json.loads(raw)
         user_message = data.get("content", "").strip()
+        client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
         allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
         blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
+        _log_payload_received(data, client_send_id)
 
         # ── Auth path 2: token in first message body (backward compat) ──
         if current_user is None:
@@ -775,6 +830,7 @@ async def chat_websocket(
         async def _start_message_run(
             *,
             content: str,
+            client_send_id_payload: Optional[str],
             allowed_tools_payload: Optional[List[str]],
             blocked_tools_payload: Optional[List[str]],
         ) -> None:
@@ -797,6 +853,7 @@ async def chat_websocket(
                     current_user=current_user,
                     session=session,
                     user_message=content,
+                    client_send_id=client_send_id_payload,
                     allowed_tools=allowed_tools_payload,
                     blocked_tools=blocked_tools_payload,
                 )
@@ -824,8 +881,10 @@ async def chat_websocket(
                     raw = await websocket.receive_text()
                     data = json.loads(raw)
                     user_message = data.get("content", "").strip()
+                    client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
                     allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
                     blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
+                    _log_payload_received(data, client_send_id)
                     continue
 
                 if not user_message:
@@ -833,8 +892,10 @@ async def chat_websocket(
                     raw = await websocket.receive_text()
                     data = json.loads(raw)
                     user_message = data.get("content", "").strip()
+                    client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
                     allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
                     blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
+                    _log_payload_received(data, client_send_id)
                     continue
                 else:
                     persona_name = _parse_persona_command(user_message)
@@ -851,12 +912,15 @@ async def chat_websocket(
                         raw = await websocket.receive_text()
                         data = json.loads(raw)
                         user_message = data.get("content", "").strip()
+                        client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
                         allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
                         blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
+                        _log_payload_received(data, client_send_id)
                         continue
                     else:
                         await _start_message_run(
                             content=user_message,
+                            client_send_id_payload=client_send_id,
                             allowed_tools_payload=allowed_tools,
                             blocked_tools_payload=blocked_tools,
                         )
@@ -882,8 +946,10 @@ async def chat_websocket(
                     raw = receive_task.result()
                     data = json.loads(raw)
                     user_message = data.get("content", "").strip()
+                    client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
                     allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
                     blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
+                    _log_payload_received(data, client_send_id)
                 else:
                     receive_task.cancel()
                     try:
@@ -895,8 +961,10 @@ async def chat_websocket(
             raw = receive_task.result()
             data = json.loads(raw)
             user_message = data.get("content", "").strip()
+            client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
             allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
             blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
+            _log_payload_received(data, client_send_id)
             if not await _handle_control_message(data):
                 await websocket.send_json(
                     {
@@ -1047,7 +1115,6 @@ async def _execute_chat_turn(
     model_override: str | None,
     stage: str,
     enable_validation: bool,
-    retry_max_attempts_override: int | None = None,
 ) -> str:
     started = time.perf_counter()
     reply = await run_agent(
@@ -1064,12 +1131,7 @@ async def _execute_chat_turn(
         )
         return reply
 
-    raw_max_attempts = (
-        settings.chat_validation_retry_max_attempts
-        if retry_max_attempts_override is None
-        else retry_max_attempts_override
-    )
-    max_attempts = max(0, int(raw_max_attempts))
+    max_attempts = max(0, int(settings.chat_validation_retry_max_attempts))
     attempts = 0
     current = reply
 

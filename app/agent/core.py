@@ -100,6 +100,118 @@ def _tool_call_name(call: Any) -> str:
     return str(getattr(getattr(call, "function", None), "name", "") or "").strip()
 
 
+def _content_fingerprint(value: str, *, length: int = 12) -> str:
+    normalized = " ".join(str(value or "").split())
+    return str(abs(hash(normalized)))[:length]
+
+
+def _turn_state_summary(history: List[Dict[str, Any]], *, limit: int = 6) -> Dict[str, Any]:
+    recent_roles = [str(item.get("role") or "") for item in history[-limit:]]
+    recent_tools = [
+        str(item.get("tool_call_id") or "")
+        for item in history[-limit:]
+        if str(item.get("role") or "") == "tool"
+    ]
+    last_user = _latest_user_message_text(history)
+    return {
+        "history_len": len(history),
+        "recent_roles": recent_roles,
+        "recent_tool_call_ids": recent_tools[-3:],
+        "last_user_fingerprint": _content_fingerprint(last_user),
+    }
+
+
+def _tool_result_fingerprints(tool_results: List[Dict[str, Any]]) -> List[str]:
+    return [
+        _content_fingerprint(str(result.get("content", "")))
+        for result in tool_results
+    ]
+
+
+def _tool_call_signature(tool_calls: List[Any], tool_results: List[Dict[str, Any]]) -> str:
+    names = [_tool_call_name(call) or "unknown" for call in tool_calls]
+    result_fingerprints = _tool_result_fingerprints(tool_results)
+    combined = "|".join(f"{name}:{fingerprint}" for name, fingerprint in zip(names, result_fingerprints))
+    return combined or "no_tool_signature"
+
+
+def _log_agent_turn_start(
+    *,
+    turn: int,
+    max_turns: int,
+    mode: str,
+    stage: str | None,
+    selected_model: str,
+    user_context: UserContext,
+    history: List[Dict[str, Any]],
+) -> None:
+    summary = _turn_state_summary(history)
+    log.info(
+        "agent.turn_start",
+        turn=turn,
+        max_turns=max_turns,
+        mode=mode,
+        stage=stage,
+        model=selected_model,
+        session_id=user_context.session_id,
+        task_id=user_context.task_id,
+        **summary,
+    )
+
+
+def _log_agent_tool_turn(
+    *,
+    turn: int,
+    mode: str,
+    stage: str | None,
+    selected_model: str,
+    user_context: UserContext,
+    tool_calls: List[Any],
+    tool_results: List[Dict[str, Any]],
+    repeated_signature_count: int,
+) -> None:
+    tool_names = [_tool_call_name(call) for call in tool_calls]
+    result_fingerprints = _tool_result_fingerprints(tool_results)
+    log_payload = {
+        "turn": turn,
+        "mode": mode,
+        "stage": stage,
+        "model": selected_model,
+        "session_id": user_context.session_id,
+        "task_id": user_context.task_id,
+        "tools": tool_names,
+        "result_fingerprints": result_fingerprints,
+        "tool_signature": _tool_call_signature(tool_calls, tool_results),
+        "repeated_signature_count": repeated_signature_count,
+    }
+    if repeated_signature_count >= 2:
+        log.warning("agent.tool_turn_repeated", **log_payload)
+    else:
+        log.info("agent.tool_turn", **log_payload)
+
+
+def _log_agent_final_turn(
+    *,
+    turn: int,
+    mode: str,
+    stage: str | None,
+    selected_model: str,
+    user_context: UserContext,
+    content: str,
+) -> None:
+    log.info(
+        "agent.final_turn",
+        turn=turn,
+        mode=mode,
+        stage=stage,
+        model=selected_model,
+        session_id=user_context.session_id,
+        task_id=user_context.task_id,
+        content_fingerprint=_content_fingerprint(content),
+        content_chars=len(str(content or "")),
+    )
+
+
 def _is_failed_search_turn(tool_calls: List[Any], tool_results: List[Dict[str, Any]]) -> bool:
     if not tool_calls or not tool_results or len(tool_calls) != len(tool_results):
         return False
@@ -445,8 +557,20 @@ async def run_agent(
     selected_model = model_override or settings.llm_model
     extra = _litellm_kwargs(selected_model)
     consecutive_failed_search_turns = 0
+    previous_tool_signature = ""
+    repeated_tool_signature_count = 0
 
     for turn in range(max_turns):
+        turn_number = turn + 1
+        _log_agent_turn_start(
+            turn=turn_number,
+            max_turns=max_turns,
+            mode=mode,
+            stage=stage,
+            selected_model=selected_model,
+            user_context=user_context,
+            history=history,
+        )
         try:
             response = await litellm.acompletion(
                 model=selected_model,
@@ -472,6 +596,22 @@ async def run_agent(
             # Execute all tool calls, append results, then loop
             tool_results = await dispatch_tool_calls(message.tool_calls, user_context)
             history.extend(tool_results)
+            current_tool_signature = _tool_call_signature(message.tool_calls, tool_results)
+            if current_tool_signature == previous_tool_signature:
+                repeated_tool_signature_count += 1
+            else:
+                repeated_tool_signature_count = 0
+                previous_tool_signature = current_tool_signature
+            _log_agent_tool_turn(
+                turn=turn_number,
+                mode=mode,
+                stage=stage,
+                selected_model=selected_model,
+                user_context=user_context,
+                tool_calls=message.tool_calls,
+                tool_results=tool_results,
+                repeated_signature_count=repeated_tool_signature_count,
+            )
             task_handoff = _task_handoff_message(messages, message.tool_calls, tool_results)
             if task_handoff:
                 return task_handoff
@@ -481,7 +621,7 @@ async def run_agent(
                 if consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
                     log.info(
                         "Stopping repeated failed search loop",
-                        turn=turn + 1,
+                        turn=turn_number,
                         model=selected_model,
                         mode=mode,
                         stage=stage,
@@ -499,6 +639,14 @@ async def run_agent(
             )
         else:
             # Final text response
+            _log_agent_final_turn(
+                turn=turn_number,
+                mode=mode,
+                stage=stage,
+                selected_model=selected_model,
+                user_context=user_context,
+                content=message.content or "",
+            )
             return message.content or ""
 
     log.warning("Agent hit max turns without a final response", max_turns=max_turns)
@@ -529,8 +677,20 @@ async def stream_agent(
     selected_model = model_override or settings.llm_model
     extra = _litellm_kwargs(selected_model)
     consecutive_failed_search_turns = 0
+    previous_tool_signature = ""
+    repeated_tool_signature_count = 0
 
     for turn in range(max_turns):
+        turn_number = turn + 1
+        _log_agent_turn_start(
+            turn=turn_number,
+            max_turns=max_turns,
+            mode=mode,
+            stage=stage,
+            selected_model=selected_model,
+            user_context=user_context,
+            history=history,
+        )
         # Probe turn non-streaming so intermediate tool turns stay internal.
         try:
             response = await litellm.acompletion(
@@ -562,6 +722,22 @@ async def stream_agent(
             history.append(_normalize_tool_calls(message.model_dump(exclude_none=True)))
             tool_results = await dispatch_tool_calls(message.tool_calls, user_context)
             history.extend(tool_results)
+            current_tool_signature = _tool_call_signature(message.tool_calls, tool_results)
+            if current_tool_signature == previous_tool_signature:
+                repeated_tool_signature_count += 1
+            else:
+                repeated_tool_signature_count = 0
+                previous_tool_signature = current_tool_signature
+            _log_agent_tool_turn(
+                turn=turn_number,
+                mode=mode,
+                stage=stage,
+                selected_model=selected_model,
+                user_context=user_context,
+                tool_calls=message.tool_calls,
+                tool_results=tool_results,
+                repeated_signature_count=repeated_tool_signature_count,
+            )
             task_handoff = _task_handoff_message(messages, message.tool_calls, tool_results)
             if task_handoff:
                 yield task_handoff
@@ -583,6 +759,14 @@ async def stream_agent(
                 stage=stage,
             )
         else:
+            _log_agent_final_turn(
+                turn=turn_number,
+                mode=mode,
+                stage=stage,
+                selected_model=selected_model,
+                user_context=user_context,
+                content=message.content or "",
+            )
             async for token in _stream_final_response(
                 history,
                 user_context,
