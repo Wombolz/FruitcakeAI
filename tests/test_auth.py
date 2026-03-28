@@ -3,6 +3,7 @@ Auth endpoint integration tests.
 Uses an in-memory SQLite database so no real postgres is needed.
 """
 
+import asyncio
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -551,3 +552,65 @@ async def test_get_session_history_includes_message_timestamps(client):
     messages = history.json()["messages"]
     assert len(messages) >= 2
     assert all("created_at" in msg for msg in messages)
+
+
+@pytest.mark.asyncio
+async def test_stop_chat_session_returns_false_when_idle(client):
+    await client.post("/auth/register", json={
+        "username": "chatstopidle",
+        "email": "chatstopidle@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatstopidle", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Stop Idle"}, headers=headers)
+    session_id = create.json()["id"]
+
+    stop = await client.post(f"/chat/sessions/{session_id}/stop", headers=headers)
+    assert stop.status_code == 200
+    assert stop.json() == {"stopped": False, "session_id": session_id}
+
+
+@pytest.mark.asyncio
+async def test_stop_chat_session_cancels_active_rest_run(client):
+    await client.post("/auth/register", json={
+        "username": "chatstoprun",
+        "email": "chatstoprun@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatstoprun", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Stop Active"}, headers=headers)
+    session_id = create.json()["id"]
+    started = asyncio.Event()
+
+    async def _slow_run_agent(*_args, **_kwargs):
+        started.set()
+        await asyncio.sleep(60)
+        return "done"
+
+    with patch("app.api.chat.run_agent", new=AsyncMock(side_effect=_slow_run_agent)):
+        send_task = asyncio.create_task(
+            client.post(
+                f"/chat/sessions/{session_id}/messages",
+                json={"content": "do something long"},
+                headers=headers,
+            )
+        )
+        await started.wait()
+        stop = await client.post(f"/chat/sessions/{session_id}/stop", headers=headers)
+        assert stop.status_code == 200
+        assert stop.json() == {"stopped": True, "session_id": session_id}
+
+        send = await send_task
+
+    assert send.status_code == 409
+    assert send.json()["detail"] == "Chat stopped by user"
+
+    stop_again = await client.post(f"/chat/sessions/{session_id}/stop", headers=headers)
+    assert stop_again.status_code == 200
+    assert stop_again.json() == {"stopped": False, "session_id": session_id}
