@@ -4,7 +4,7 @@
 **Status**: Phase 1 ✅ · Phase 2 ✅ · Phase 3 ✅ · Phase 4 ✅ · Phase 5.1 ✅ · Phase 5.2 ✅ · Phase 5.3 ✅ · Phase 5.4 ✅ · Phase 5.5 ✅ · Phase 5.6 ✅ · Phase 6 🚧  
 **Philosophy**: Trust · Privacy · Continuity. Local-first, cloud-optional, resilient by construction.  
 **Build Location**: `fruitcake_v5/`  
-**Last Updated**: March 26, 2026  
+**Last Updated**: March 28, 2026  
 **Checkpoint Note**: North Star direction remains the decision filter. Phase 6 is no longer purely deferred: targeted routing/accounting groundwork is now in `main`, while broader cloud judgment rollout and shared memory review remain gated behind measured need and product hardening.
 **Phase 6 Latest Additions**: first-class per-chat model selection and user-visible reasoning controls have landed, using a backend-configured selectable model registry, one credential per provider, and no changes to the underlying Ollama setup in v1.
 **Latest Capability Note**: normal chat can now create, inspect, and update persistent tasks through first-class task tools instead of only building one-shot plan scaffolds. Chat mutation validation now prevents it from claiming a task was created or updated unless the matching task tool explicitly confirmed success.
@@ -1540,6 +1540,68 @@ Reference:
 
 - `Docs/sprint_6_x_client_context_integration.md`
 
+### Phase 6 Follow-On — Platform Trust And Deployment
+
+These are the next platform-facing roadmap items worth carrying forward after the current chat/task stability pass. They matter directly to Fruitcake's positioning as a trusted local server for households and small teams, but they should stay tightly scoped.
+
+Near-term additions:
+
+- **Workspace scoping MVP**
+  - Goal: move from user-only ownership to first-class workspace ownership where it actually matters.
+  - MVP scope only:
+    - chat
+    - library
+    - tasks
+    - memories
+  - Required backend pieces:
+    - `workspaces`
+    - `workspace_memberships`
+    - workspace-scoped ownership / visibility rules
+    - invite + role-management APIs
+    - audit trail for membership and scope changes
+  - Explicitly deferred:
+    - workspace-scoped RSS/feed management
+    - skill sharing
+    - connector-specific workspace policy
+
+- **Encrypted backup/restore**
+  - Goal: make self-hosted trust real with a first-class recovery path.
+  - Planned scope:
+    - encrypted archive export of database + storage + essential config
+    - restore flow with integrity verification
+    - operator-friendly CLI / documented procedure
+    - scheduled backup support later if the base format proves stable
+  - Keep this operator-owned and explicit; do not hide restore semantics behind silent automation.
+
+- **Secrets management completion**
+  - Goal: finish the transition from `.env`-only configuration to a real app-owned secret contract.
+  - Planned scope:
+    - per-user and admin-managed secrets
+    - audited secret access
+    - encrypted import/export
+    - backend-owned secret resolution for approved adapters/tools/tasks
+  - This continues the secrets groundwork already landed in the API integration path, but tightens the product contract and operator surface.
+
+- **Hardware baseline docs**
+  - Goal: publish honest minimum/recommended hardware guidance instead of leaving users to infer it from scattered notes.
+  - Planned scope:
+    - minimum and recommended hardware tiers
+    - model guidance by machine class
+    - basic latency / throughput / memory notes
+    - deployment notes for common local-server targets
+  - This is docs/devrel work, but it is important enough to track alongside product roadmap items because it directly affects trust and install success.
+
+Internal future option:
+
+- **Browser events MVP**
+  - Keep this in the internal roadmap only for now.
+  - Goal when revisited:
+    - basic browser-event ingest endpoint
+    - stored browsing-context records
+    - conservative retrieval path for context, not broad browser automation
+  - Not currently active work.
+  - Keep references out of public-facing docs until the scope and trust model are clearer.
+
 ---
 
 ## Phase 7 — Trusted Local Capability Expansion (2 weeks)
@@ -1767,10 +1829,10 @@ These items are intentionally tracked outside the sprint list because they are r
 
 - **Application secrets management**
   - Why it matters: chat-created tasks and richer automations are starting to reference external APIs, and `.env` is the wrong abstraction for per-integration or task-usable secrets. Fruitcake needs a first-class way to store credentials safely and let approved task/tool paths use them without leaking values into prompts, logs, or files.
-  - Current status: no general secrets feature exists today. App configuration still relies on environment variables / `.env`, and task instructions that say "read secret X" are aspirational rather than executable.
-  - Decision needed later: whether to introduce a user/admin-managed secret store, how task/tool access should be scoped, and what audit/approval model should govern secret-backed actions.
-  - Planned sequence: land `Application secrets management` first, then a backend-owned `JSON/API integration path`, then a separate `Derived-event scheduling / queued notifications` capability.
-  - Earliest likely sprint: after the current memory/task-management hardening pass, once the tool and automation boundaries are stable enough to add a real secret-access contract.
+  - Current status: foundational API-integration work and encrypted-secret usage have landed in narrowed form, but the user/admin-facing secret-management contract is still incomplete.
+  - Decision needed later: how broad the first vault surface should be beyond the currently approved adapter/tool paths.
+  - Planned sequence: finish `Application secrets management`, keep `JSON/API integration path` bounded and backend-owned, then consider separate `Derived-event scheduling / queued notifications`.
+  - Earliest likely sprint: next platform trust/deployment pass.
 
 - **JSON/API integration path**
   - Why it matters: recurring tasks are starting to describe real external API workflows, and the current tool surface is weak for deterministic JSON fetch/parse/validate behavior.

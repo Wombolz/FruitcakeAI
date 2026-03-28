@@ -1,0 +1,29 @@
+# FruitcakeAI HTTPS front door
+#
+# Default alpha path:
+# - local/LAN/Tailscale hostname
+# - Caddy-managed internal CA via `tls internal`
+# - backend stays on loopback at 127.0.0.1:30417
+#
+# Public-domain path:
+# - set FRUITCAKE_SITE_ADDRESS to your real hostname
+# - remove the `tls internal` line below
+# - Caddy will obtain a public certificate automatically
+#
+# Examples:
+#   FRUITCAKE_SITE_ADDRESS=fruitcake.localhost ./scripts/start_https.sh
+#   FRUITCAKE_SITE_ADDRESS=fruitcake.example.com ./scripts/start_https.sh
+
+{
+    admin off
+}
+
+{$FRUITCAKE_SITE_ADDRESS:fruitcake.localhost} {
+    tls internal
+
+    reverse_proxy {$FRUITCAKE_UPSTREAM:127.0.0.1:30417} {
+        header_up Host {host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
