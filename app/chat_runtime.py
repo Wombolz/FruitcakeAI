@@ -1,13 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import time
+from dataclasses import dataclass
 from typing import Optional
 
 
+@dataclass
+class RecentPromptState:
+    normalized_prompt: str
+    fingerprint: str
+    timestamp_monotonic: float
+    active: bool
+
+
 class ChatRunManager:
-    def __init__(self) -> None:
+    def __init__(self, *, duplicate_window_seconds: float = 10.0) -> None:
         self._active_runs: dict[int, asyncio.Task] = {}
+        self._recent_prompts: dict[int, RecentPromptState] = {}
         self._lock = asyncio.Lock()
+        self._duplicate_window_seconds = duplicate_window_seconds
+
+    @staticmethod
+    def normalize_prompt(prompt: str) -> str:
+        return " ".join(str(prompt or "").split()).strip()
+
+    @staticmethod
+    def fingerprint_prompt(prompt: str) -> str:
+        normalized = ChatRunManager.normalize_prompt(prompt)
+        if not normalized:
+            return ""
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
 
     async def register(self, session_id: int, task: asyncio.Task) -> None:
         async with self._lock:
@@ -34,6 +58,43 @@ class ChatRunManager:
         async with self._lock:
             task = self._active_runs.get(session_id)
         return task is not None and not task.done()
+
+    async def claim_prompt(self, session_id: int, prompt: str) -> tuple[bool, bool, str]:
+        normalized = self.normalize_prompt(prompt)
+        fingerprint = self.fingerprint_prompt(prompt)
+        if not normalized:
+            return True, False, fingerprint
+
+        now = time.monotonic()
+        async with self._lock:
+            current = self._recent_prompts.get(session_id)
+            if (
+                current is not None
+                and current.normalized_prompt == normalized
+                and (now - current.timestamp_monotonic) <= self._duplicate_window_seconds
+            ):
+                return False, current.active, current.fingerprint
+
+            self._recent_prompts[session_id] = RecentPromptState(
+                normalized_prompt=normalized,
+                fingerprint=fingerprint,
+                timestamp_monotonic=now,
+                active=True,
+            )
+            return True, False, fingerprint
+
+    async def mark_prompt_finished(self, session_id: int, prompt: str) -> None:
+        normalized = self.normalize_prompt(prompt)
+        if not normalized:
+            return
+
+        now = time.monotonic()
+        async with self._lock:
+            current = self._recent_prompts.get(session_id)
+            if current is None or current.normalized_prompt != normalized:
+                return
+            current.active = False
+            current.timestamp_monotonic = now
 
 
 _chat_run_manager: ChatRunManager | None = None

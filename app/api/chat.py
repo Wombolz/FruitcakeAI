@@ -493,9 +493,37 @@ async def _run_websocket_message(
     allowed_tools: Optional[List[str]],
     blocked_tools: Optional[List[str]],
 ) -> None:
+    prompt_claimed = False
+    prompt_fingerprint = ""
     try:
         message_started = time.perf_counter()
         stage_timings_ms: Dict[str, float] = {}
+        chat_run_manager = get_chat_run_manager()
+
+        claimed, duplicate_active, prompt_fingerprint = await chat_run_manager.claim_prompt(
+            session_id,
+            user_message,
+        )
+        if not claimed:
+            log.info(
+                "chat.duplicate_prompt_rejected",
+                session_id=session_id,
+                user_id=current_user.id,
+                prompt_fingerprint=prompt_fingerprint,
+                active_run=duplicate_active,
+            )
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "content": (
+                        "A matching chat request is already running."
+                        if duplicate_active
+                        else "That message was already sent a moment ago."
+                    ),
+                }
+            )
+            return
+        prompt_claimed = True
 
         user_msg = ChatMessage(session_id=session_id, role="user", content=user_message)
         db.add(user_msg)
@@ -587,6 +615,7 @@ async def _run_websocket_message(
                 model_override=session.llm_model,
                 stage="chat_complex",
                 enable_validation=effective_complex,
+                retry_max_attempts_override=settings.chat_websocket_validation_retry_max_attempts,
             )
             _record_chat_stage_timing(stage_timings_ms, "model_execution", stage_started)
             complete = _enforce_calendar_mutation_integrity(
@@ -649,6 +678,8 @@ async def _run_websocket_message(
         await db.rollback()
         raise
     finally:
+        if prompt_claimed:
+            await get_chat_run_manager().mark_prompt_finished(session_id, user_message)
         if "record_token" in locals():
             restore_tool_execution_records(record_token)
         if "usage_token" in locals():
@@ -1016,6 +1047,7 @@ async def _execute_chat_turn(
     model_override: str | None,
     stage: str,
     enable_validation: bool,
+    retry_max_attempts_override: int | None = None,
 ) -> str:
     started = time.perf_counter()
     reply = await run_agent(
@@ -1032,7 +1064,12 @@ async def _execute_chat_turn(
         )
         return reply
 
-    max_attempts = max(0, int(settings.chat_validation_retry_max_attempts))
+    raw_max_attempts = (
+        settings.chat_validation_retry_max_attempts
+        if retry_max_attempts_override is None
+        else retry_max_attempts_override
+    )
+    max_attempts = max(0, int(raw_max_attempts))
     attempts = 0
     current = reply
 

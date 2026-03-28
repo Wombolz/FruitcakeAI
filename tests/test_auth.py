@@ -7,10 +7,14 @@ import asyncio
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import select, func
 from sqlalchemy.pool import StaticPool
 from unittest.mock import AsyncMock, patch
 
+from app.api.chat import _run_websocket_message
+from app.chat_runtime import get_chat_run_manager
 from app.db.session import Base, get_db
+from app.db.models import ChatMessage, ChatSession, User
 from app.main import app
 
 # ── In-memory SQLite engine for tests ─────────────────────────────────────────
@@ -614,3 +618,57 @@ async def test_stop_chat_session_cancels_active_rest_run(client):
     stop_again = await client.post(f"/chat/sessions/{session_id}/stop", headers=headers)
     assert stop_again.status_code == 200
     assert stop_again.json() == {"stopped": False, "session_id": session_id}
+
+
+@pytest.mark.asyncio
+async def test_websocket_duplicate_prompt_is_rejected_before_execution(client):
+    await client.post("/auth/register", json={
+        "username": "chatdupeuser",
+        "email": "chatdupe@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatdupeuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Dupe Guard"}, headers=headers)
+    session_id = create.json()["id"]
+    prompt = "run the search against my saved feeds and give me the results you find"
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "chatdupeuser"))
+        ).scalar_one()
+        session = (
+            await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        ).scalar_one()
+
+        manager = get_chat_run_manager()
+        await manager.clear(session_id)
+        manager._recent_prompts.pop(session_id, None)
+        await manager.claim_prompt(session_id, prompt)
+
+        websocket = AsyncMock()
+        with patch("app.api.chat._execute_chat_turn", new=AsyncMock(return_value="done")) as execute_mock:
+            await _run_websocket_message(
+                session_id=session_id,
+                websocket=websocket,
+                db=db,
+                current_user=user,
+                session=session,
+                user_message=prompt,
+                allowed_tools=None,
+                blocked_tools=None,
+            )
+
+        assert execute_mock.await_count == 0
+        websocket.send_json.assert_awaited_once()
+        payload = websocket.send_json.await_args.args[0]
+        assert payload["type"] == "error"
+        assert "matching chat request" in payload["content"].lower()
+
+        message_count = await db.scalar(
+            select(func.count()).select_from(ChatMessage).where(ChatMessage.session_id == session_id)
+        )
+        assert message_count == 0
+        manager._recent_prompts.pop(session_id, None)
