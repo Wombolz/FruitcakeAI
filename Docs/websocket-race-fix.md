@@ -126,7 +126,8 @@ Stale events from a raced old loop are discarded before they can be written to t
 - `recentSendBySession` fingerprint dedup — still in place as secondary net
 - `defer` block structure in `sendMessage` — unchanged except `activeSendTask = nil` added
 - `disconnect()` internals — unchanged
-- REST path, `APIClient`, backend — unchanged
+- REST path, `APIClient` — unchanged
+- backend stale-payload replay bug was fixed later in `app/api/chat.py`; this note only covers the Swift/WebSocketManager race fix
 
 ---
 

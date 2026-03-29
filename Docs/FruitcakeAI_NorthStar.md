@@ -105,6 +105,9 @@ This north star describes the full intended vision. Current development is gated
 - MCP execution profiles verified reliable under soak
 - Cloud routing implementation proven correct
 
+**Recent Phase 5.4 soak outcome:**
+- Chat websocket handling no longer replays stale completed message payloads after `.done`; payload processing is now bounded to freshly received frames.
+
 **Phase 6 scope additions enabled by this north star:**
 - Offline archive ingest pipeline (Kiwix integration)
 - Degradation tier runtime detection and tier-aware prompting

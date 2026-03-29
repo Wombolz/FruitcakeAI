@@ -1,5 +1,9 @@
 # WebSocket Duplicate Findings
 
+Status:
+- Resolved in `v0.7.1`
+- Backend websocket loop now scopes message state to each received payload and does not replay stale completed frames
+
 ## Confirmed Findings
 
 Date:
@@ -27,9 +31,9 @@ Scope:
 - same `client_send_id`
 - same `websocket_id`
 
-## Root Cause Hypothesis
+## Root Cause
 
-Most likely bug is stale websocket message state being reused in `app/api/chat.py` after a completed websocket turn.
+Stale websocket message state was being reused in `app/api/chat.py` after a completed websocket turn.
 
 Current websocket loop behavior:
 - first message is read into outer-scope variables:
@@ -44,7 +48,7 @@ Current websocket loop behavior:
 - on the next loop iteration, `active_message_task is None`, so the loop can reuse the stale first message
 - that second `_start_message_run(...)` then hits the duplicate `client_send_id` guard
 
-This hypothesis matches the observed pattern:
+This matched the observed pattern:
 - one real payload received
 - normal completion
 - duplicate guard fires afterward
@@ -64,17 +68,12 @@ The client-side work improved containment but did not identify the original dupl
   - websocket lifecycle
   - post-terminal frames
 
-## Next Fix
+## Applied Fix
 
-Backend websocket loop in `app/api/chat.py` should be refactored so a new run can only start from a freshly received payload, not from outer-scope message variables that can survive across loop iterations.
+Backend websocket loop in `app/api/chat.py` was refactored so a new run can only start from a freshly received payload, not from outer-scope message variables that can survive across loop iterations.
 
-Minimum safe fix:
-- after a completed turn with no `receive_task` payload, clear:
-  - `data`
-  - `user_message`
-  - `client_send_id`
-  - `allowed_tools`
-  - `blocked_tools`
-
-Better fix:
-- restructure the loop so message payload state is local to each received frame and cannot be replayed by control flow alone.
+The fix:
+- introduced a per-message websocket payload object
+- removed long-lived outer-scope message state from the chat loop
+- ensured completed turns with no new `receive_task` payload return to waiting for a fresh frame
+- preserved payload indexing logs so any future duplicate is attributable to a real later receive

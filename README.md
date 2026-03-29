@@ -81,6 +81,7 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - Multi-user JWT auth with role-based personas (`admin`, `parent`, `restricted`, `guest`)
 - Per-persona tool scoping, content filtering, and tone configuration
 - Streaming chat via WebSocket; REST fallback
+- WebSocket chat no longer replays stale completed sends from reused server-side message state
 
 **Memory**
 - Persistent per-user memory written by the agent via `create_memory` tool
