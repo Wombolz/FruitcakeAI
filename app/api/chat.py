@@ -14,6 +14,7 @@ import json
 import asyncio
 import contextlib
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -112,6 +113,15 @@ class SessionOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+@dataclass
+class ChatSocketPayload:
+    raw: Dict[str, Any]
+    content: str
+    client_send_id: Optional[str]
+    allowed_tools: Optional[List[str]]
+    blocked_tools: Optional[List[str]]
 
 
 # ── GET /chat/personas ────────────────────────────────────────────────────────
@@ -890,23 +900,47 @@ async def chat_websocket(
                 message_type=str(payload.get("type", "")) if isinstance(payload, dict) else "",
             )
 
-        raw = await websocket.receive_text()
-        data = json.loads(raw)
-        user_message = data.get("content", "").strip()
-        client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
-        allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
-        blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
-        _log_payload_received(data, client_send_id)
+        def _decode_payload(message_data: Dict[str, Any]) -> ChatSocketPayload:
+            content = message_data.get("content", "").strip() if isinstance(message_data, dict) else ""
+            client_send_id = message_data.get("client_send_id") if isinstance(message_data, dict) else None
+            allowed_tools = message_data.get("allowed_tools") if isinstance(message_data, dict) else None
+            blocked_tools = message_data.get("blocked_tools") if isinstance(message_data, dict) else None
+            return ChatSocketPayload(
+                raw=message_data,
+                content=content,
+                client_send_id=client_send_id,
+                allowed_tools=allowed_tools,
+                blocked_tools=blocked_tools,
+            )
+
+        async def _read_next_payload() -> Optional[ChatSocketPayload]:
+            while True:
+                try:
+                    raw_text = await websocket.receive_text()
+                except (WebSocketDisconnect, RuntimeError):
+                    return None
+                try:
+                    message_data = json.loads(raw_text)
+                except Exception:
+                    await websocket.send_json({"type": "error", "content": "invalid payload"})
+                    continue
+                message_payload = _decode_payload(message_data)
+                _log_payload_received(message_payload.raw, message_payload.client_send_id)
+                return message_payload
+
+        payload = await _read_next_payload()
+        if payload is None:
+            return
 
         # ── Auth path 2: token in first message body (backward compat) ──
         if current_user is None:
-            token = data.get("token", "").removeprefix("Bearer ").strip()
+            token = payload.raw.get("token", "").removeprefix("Bearer ").strip()
             if not token:
                 await websocket.send_json({"type": "error", "content": "token and content required"})
                 await websocket.close()
                 return
-            payload = decode_token(token)
-            user_id = int(payload["sub"])
+            token_payload = decode_token(token)
+            user_id = int(token_payload["sub"])
             result = await db.execute(select(UserModel).where(UserModel.id == user_id))
             current_user = result.scalar_one_or_none()
             if not current_user or not current_user.is_active:
@@ -928,23 +962,21 @@ async def chat_websocket(
 
         active_message_task: Optional[asyncio.Task] = None
 
-        def _extract_payload_from_receive_task(task: asyncio.Task) -> Optional[Dict[str, Any]]:
+        async def _extract_payload_from_receive_task(task: asyncio.Task) -> tuple[Optional[ChatSocketPayload], bool]:
             try:
                 raw_text = task.result()
             except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
-                return None
+                return None, True
             try:
-                return json.loads(raw_text)
+                message_data = json.loads(raw_text)
             except Exception:
-                return None
+                await websocket.send_json({"type": "error", "content": "invalid payload"})
+                return None, False
+            message_payload = _decode_payload(message_data)
+            _log_payload_received(message_payload.raw, message_payload.client_send_id)
+            return message_payload, False
 
-        async def _start_message_run(
-            *,
-            content: str,
-            client_send_id_payload: Optional[str],
-            allowed_tools_payload: Optional[List[str]],
-            blocked_tools_payload: Optional[List[str]],
-        ) -> None:
+        async def _start_message_run(message_payload: ChatSocketPayload) -> None:
             nonlocal active_message_task, session
             if active_message_task is not None and not active_message_task.done():
                 await websocket.send_json(
@@ -963,16 +995,16 @@ async def chat_websocket(
                     db=db,
                     current_user=current_user,
                     session=session,
-                    user_message=content,
-                    client_send_id=client_send_id_payload,
-                    allowed_tools=allowed_tools_payload,
-                    blocked_tools=blocked_tools_payload,
+                    user_message=message_payload.content,
+                    client_send_id=message_payload.client_send_id,
+                    allowed_tools=message_payload.allowed_tools,
+                    blocked_tools=message_payload.blocked_tools,
                 )
             )
             await chat_run_manager.register(session_id, active_message_task)
 
-        async def _handle_control_message(message_data: Dict[str, Any]) -> bool:
-            message_type = str(message_data.get("type", "")).strip().lower()
+        async def _handle_control_message(message_payload: ChatSocketPayload) -> bool:
+            message_type = str(message_payload.raw.get("type", "")).strip().lower()
             if message_type != "stop":
                 return False
             stopped = await chat_run_manager.request_stop(session_id)
@@ -988,53 +1020,36 @@ async def chat_websocket(
         # ── Message loop — keep connection alive for the session lifetime ────
         while True:
             if active_message_task is None:
-                if await _handle_control_message(data):
-                    raw = await websocket.receive_text()
-                    data = json.loads(raw)
-                    user_message = data.get("content", "").strip()
-                    client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
-                    allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
-                    blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
-                    _log_payload_received(data, client_send_id)
+                if payload is None:
+                    payload = await _read_next_payload()
+                    if payload is None:
+                        break
+
+                if await _handle_control_message(payload):
+                    payload = None
                     continue
 
-                if not user_message:
+                if not payload.content:
                     await websocket.send_json({"type": "error", "content": "content required"})
-                    raw = await websocket.receive_text()
-                    data = json.loads(raw)
-                    user_message = data.get("content", "").strip()
-                    client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
-                    allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
-                    blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
-                    _log_payload_received(data, client_send_id)
+                    payload = None
                     continue
-                else:
-                    persona_name = _parse_persona_command(user_message)
-                    if persona_name is not None:
-                        resp = await _switch_persona(session_id, persona_name, session, db)
-                        await websocket.send_json({
-                            "type": "persona",
-                            "content": resp["content"],
-                            "persona": resp.get("persona_switched", persona_name),
-                        })
-                        await websocket.send_json({"type": "done", "content": resp["content"]})
-                        sr = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
-                        session = sr.scalar_one_or_none() or session
-                        raw = await websocket.receive_text()
-                        data = json.loads(raw)
-                        user_message = data.get("content", "").strip()
-                        client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
-                        allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
-                        blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
-                        _log_payload_received(data, client_send_id)
-                        continue
-                    else:
-                        await _start_message_run(
-                            content=user_message,
-                            client_send_id_payload=client_send_id,
-                            allowed_tools_payload=allowed_tools,
-                            blocked_tools_payload=blocked_tools,
-                        )
+
+                persona_name = _parse_persona_command(payload.content)
+                if persona_name is not None:
+                    resp = await _switch_persona(session_id, persona_name, session, db)
+                    await websocket.send_json({
+                        "type": "persona",
+                        "content": resp["content"],
+                        "persona": resp.get("persona_switched", persona_name),
+                    })
+                    await websocket.send_json({"type": "done", "content": resp["content"]})
+                    sr = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+                    session = sr.scalar_one_or_none() or session
+                    payload = None
+                    continue
+
+                await _start_message_run(payload)
+                payload = None
                 continue
 
             receive_task = asyncio.create_task(websocket.receive_text())
@@ -1054,39 +1069,33 @@ async def chat_websocket(
                     await chat_run_manager.clear(session_id, active_message_task)
                     active_message_task = None
                 if receive_task in done:
-                    payload = _extract_payload_from_receive_task(receive_task)
+                    payload, disconnected = await _extract_payload_from_receive_task(receive_task)
                     if payload is None:
-                        break
-                    data = payload
-                    user_message = data.get("content", "").strip()
-                    client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
-                    allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
-                    blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
-                    _log_payload_received(data, client_send_id)
+                        if disconnected:
+                            break
+                        continue
                 else:
                     receive_task.cancel()
                     try:
                         await receive_task
                     except asyncio.CancelledError:
                         pass
+                    payload = None
                 continue
 
-            payload = _extract_payload_from_receive_task(receive_task)
+            payload, disconnected = await _extract_payload_from_receive_task(receive_task)
             if payload is None:
-                break
-            data = payload
-            user_message = data.get("content", "").strip()
-            client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
-            allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
-            blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
-            _log_payload_received(data, client_send_id)
-            if not await _handle_control_message(data):
+                if disconnected:
+                    break
+                continue
+            if not await _handle_control_message(payload):
                 await websocket.send_json(
                     {
                         "type": "error",
                         "content": "A chat response is already running. Stop it before sending another message.",
                     }
                 )
+            payload = None
 
     except WebSocketDisconnect:
         if 'active_message_task' in locals() and active_message_task is not None and not active_message_task.done():
