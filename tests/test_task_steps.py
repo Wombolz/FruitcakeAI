@@ -573,6 +573,25 @@ async def test_create_task_infers_persona_and_validates_explicit_persona(client)
 
 
 @pytest.mark.asyncio
+async def test_create_task_infers_topic_watcher_profile_for_clear_recurring_watch_request(client):
+    headers = await _headers(client, "watchprofileowner")
+
+    inferred = await client.post(
+        "/tasks",
+        json={
+            "title": "OpenClaw Watch",
+            "instruction": "Watch my RSS feeds for OpenClaw and summarize new headlines.",
+            "task_type": "recurring",
+            "schedule": "every:6h",
+            "deliver": True,
+        },
+        headers=headers,
+    )
+    assert inferred.status_code == 201
+    assert inferred.json()["profile"] == "topic_watcher"
+
+
+@pytest.mark.asyncio
 async def test_create_and_patch_task_profile_validation(client):
     headers = await _headers(client, "profileowner")
 

@@ -11,11 +11,14 @@ GET  /chat/personas               — list available personas
 from __future__ import annotations
 
 import json
+import asyncio
+import contextlib
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -39,6 +42,7 @@ from app.auth.dependencies import get_current_user
 from app.config import settings
 from app.db.models import ChatMessage, ChatSession, User
 from app.db.session import get_db
+from app.chat_runtime import get_chat_run_manager
 from app.llm_registry import available_llm_models, is_configured_model
 from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
@@ -65,8 +69,19 @@ class CreateSessionRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: str
+    client_send_id: Optional[str] = None
     allowed_tools: Optional[List[str]] = None
     blocked_tools: Optional[List[str]] = None
+
+
+class StopChatResponse(BaseModel):
+    stopped: bool
+    session_id: int
+
+
+class ChatSessionStatusResponse(BaseModel):
+    session_id: int
+    active: bool
 
 
 class RenameSessionRequest(BaseModel):
@@ -98,6 +113,15 @@ class SessionOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+@dataclass
+class ChatSocketPayload:
+    raw: Dict[str, Any]
+    content: str
+    client_send_id: Optional[str]
+    allowed_tools: Optional[List[str]]
+    blocked_tools: Optional[List[str]]
 
 
 # ── GET /chat/personas ────────────────────────────────────────────────────────
@@ -198,7 +222,7 @@ async def get_session(
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at)
+        .order_by(ChatMessage.created_at, ChatMessage.id)
     )
     messages = result.scalars().all()
 
@@ -311,11 +335,37 @@ async def send_message(
     request_started = time.perf_counter()
     stage_timings_ms: Dict[str, float] = {}
     session = await _get_session_or_404(session_id, current_user.id, db)
+    request_fingerprint = str(abs(hash(" ".join(str(body.content or "").split()))))[:12]
+    prompt_claimed = False
 
     # Handle /persona command before touching history or running the agent
     persona_name = _parse_persona_command(body.content)
     if persona_name is not None:
         return await _switch_persona(session_id, persona_name, session, db)
+
+    claimed, duplicate_active, claimed_fingerprint = await get_chat_run_manager().claim_prompt(
+        session_id,
+        body.content,
+    )
+    if not claimed:
+        log.info(
+            "chat.rest_duplicate_prompt_rejected",
+            session_id=session_id,
+            user_id=current_user.id,
+            client_send_id=body.client_send_id or "",
+            prompt_fingerprint=claimed_fingerprint or request_fingerprint,
+            active_run=duplicate_active,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A matching chat request is already running."
+                if duplicate_active
+                else "That message was already sent a moment ago."
+            ),
+        )
+    prompt_claimed = True
+    request_fingerprint = claimed_fingerprint or request_fingerprint
 
     # Load conversation history
     stage_started = time.perf_counter()
@@ -393,7 +443,12 @@ async def send_message(
         metrics.inc_chat_complexity_simple_count()
 
     usage_token = None
+    record_token = None
+    chat_run_manager = get_chat_run_manager()
+    current_task = asyncio.current_task()
     try:
+        if current_task is not None:
+            await chat_run_manager.register(session_id, current_task)
         record_token = reset_tool_execution_records()
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
@@ -416,12 +471,20 @@ async def send_message(
             reply,
             get_tool_execution_records(),
         )
+    except asyncio.CancelledError:
+        log.info("Chat REST run stopped", session_id=session_id, user_id=current_user.id)
+        return JSONResponse(status_code=409, content={"detail": "Chat stopped by user"})
     except Exception as e:
         log.exception("Agent error in REST handler", session_id=session_id)
         raise HTTPException(status_code=500, detail="Agent error — check server logs for details")
     finally:
+        if prompt_claimed:
+            await chat_run_manager.mark_prompt_finished(session_id, body.content)
+        if current_task is not None:
+            await chat_run_manager.clear(session_id, current_task)
         try:
-            restore_tool_execution_records(record_token)
+            if record_token is not None:
+                restore_tool_execution_records(record_token)
         except Exception:
             pass
         if usage_token is not None:
@@ -453,6 +516,325 @@ async def send_message(
     }
 
 
+@router.post("/sessions/{session_id}/stop", response_model=StopChatResponse)
+async def stop_chat_session(
+    session_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> StopChatResponse:
+    await _get_session_or_404(session_id, current_user.id, db)
+    stopped = await get_chat_run_manager().request_stop(session_id)
+    return StopChatResponse(stopped=stopped, session_id=session_id)
+
+
+@router.get("/sessions/{session_id}/status", response_model=ChatSessionStatusResponse)
+async def get_chat_session_status(
+    session_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChatSessionStatusResponse:
+    await _get_session_or_404(session_id, current_user.id, db)
+    active = await get_chat_run_manager().is_active(session_id)
+    return ChatSessionStatusResponse(session_id=session_id, active=active)
+
+
+async def _run_websocket_message(
+    *,
+    session_id: int,
+    websocket: WebSocket,
+    db: AsyncSession,
+    current_user: User,
+    session: ChatSession,
+    user_message: str,
+    client_send_id: Optional[str],
+    allowed_tools: Optional[List[str]],
+    blocked_tools: Optional[List[str]],
+) -> None:
+    prompt_claimed = False
+    send_id_claimed = False
+    websocket_closed = False
+
+    async def _send_json_if_open(payload: Dict[str, Any]) -> bool:
+        nonlocal websocket_closed
+        if websocket_closed:
+            return False
+        try:
+            await websocket.send_json(payload)
+            return True
+        except Exception:
+            websocket_closed = True
+            log.info(
+                "chat.websocket_send_skipped",
+                session_id=session_id,
+                user_id=current_user.id,
+                websocket_id=hex(id(websocket)),
+                client_send_id=client_send_id or "",
+                payload_type=str(payload.get("type", "")),
+            )
+            return False
+
+    try:
+        message_started = time.perf_counter()
+        stage_timings_ms: Dict[str, float] = {}
+        websocket_id = hex(id(websocket))
+        prompt_fingerprint = str(abs(hash(" ".join(str(user_message or "").split()))))[:12]
+        if client_send_id:
+            send_id_ok, send_id_active = await get_chat_run_manager().claim_client_send_id(
+                session_id,
+                client_send_id,
+            )
+            if not send_id_ok:
+                log.info(
+                    "chat.duplicate_client_send_id_rejected",
+                    session_id=session_id,
+                    user_id=current_user.id,
+                    websocket_id=websocket_id,
+                    client_send_id=client_send_id,
+                    prompt_fingerprint=prompt_fingerprint,
+                    active_run=send_id_active,
+                )
+                await _send_json_if_open(
+                    {
+                        "type": "error",
+                        "content": (
+                            "A matching chat request is already running."
+                            if send_id_active
+                            else "That message was already sent a moment ago."
+                        ),
+                    }
+                )
+                return
+            send_id_claimed = True
+        claimed, duplicate_active, claimed_fingerprint = await get_chat_run_manager().claim_prompt(
+            session_id,
+            user_message,
+        )
+        if not claimed:
+            log.info(
+                "chat.duplicate_prompt_rejected",
+                session_id=session_id,
+                user_id=current_user.id,
+                websocket_id=websocket_id,
+                client_send_id=client_send_id or "",
+                prompt_fingerprint=claimed_fingerprint,
+                active_run=duplicate_active,
+            )
+            await _send_json_if_open(
+                {
+                    "type": "error",
+                    "content": (
+                        "A matching chat request is already running."
+                        if duplicate_active
+                        else "That message was already sent a moment ago."
+                    ),
+                }
+            )
+            return
+        prompt_claimed = True
+        prompt_fingerprint = claimed_fingerprint or prompt_fingerprint
+        log.info(
+            "chat.websocket_message_received",
+            session_id=session_id,
+            user_id=current_user.id,
+            websocket_id=websocket_id,
+            client_send_id=client_send_id or "",
+            prompt_fingerprint=prompt_fingerprint,
+        )
+
+        user_msg = ChatMessage(session_id=session_id, role="user", content=user_message)
+        db.add(user_msg)
+        await db.flush()
+        log.info(
+            "chat.websocket_message_persisted",
+            session_id=session_id,
+            user_id=current_user.id,
+            websocket_id=websocket_id,
+            client_send_id=client_send_id or "",
+            prompt_fingerprint=prompt_fingerprint,
+            chat_message_id=user_msg.id,
+        )
+
+        stage_started = time.perf_counter()
+        history = await _load_history(session_id, db)
+        _record_chat_stage_timing(stage_timings_ms, "history_load", stage_started)
+
+        user_context = UserContext.from_user(current_user, persona_name=session.persona)
+        _apply_tool_overrides(
+            user_context,
+            allowed_tools=allowed_tools,
+            blocked_tools=blocked_tools,
+        )
+        stage_started = time.perf_counter()
+        user_context = await hydrate_user_context(db, user_context, query=user_message)
+        _record_chat_stage_timing(stage_timings_ms, "context_hydration", stage_started)
+        user_context.session_id = session_id
+        stage_started = time.perf_counter()
+        history, _memory_ids = await _apply_memory_context(
+            history,
+            db,
+            current_user.id,
+            user_message,
+        )
+        _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
+        library_list_intent = is_library_lookup_intent(user_message)
+        library_summary_intent = is_library_summary_intent(user_message)
+        library_detail_intent = is_library_detail_or_excerpt_intent(user_message)
+        library_intent = (
+            library_list_intent
+            or library_summary_intent
+            or library_detail_intent
+        )
+        stage_started = time.perf_counter()
+        history = await _apply_required_library_grounding(
+            history,
+            user_context,
+            user_prompt=user_message,
+            intent_type=(
+                "summary"
+                if library_summary_intent
+                else (
+                    "detail_or_excerpt"
+                    if library_detail_intent
+                    else ("list_documents" if library_list_intent else None)
+                )
+            ),
+        )
+        _record_chat_stage_timing(stage_timings_ms, "library_grounding", stage_started)
+        full_response: List[str] = []
+        decision = classify_chat_complexity(
+            user_message,
+            threshold=settings.chat_complexity_threshold,
+            routing_enabled=settings.chat_complexity_routing_enabled,
+        )
+        execution_mode, effective_complex = _resolve_chat_execution(
+            auto_complex=(decision.is_complex or library_intent),
+            preference=getattr(current_user, "chat_routing_preference", None),
+        )
+        stage_started = time.perf_counter()
+        execution_history = build_orchestrated_chat_history(
+            history,
+            enabled=(execution_mode == "chat_orchestrated" and settings.chat_orchestration_enabled),
+            max_steps=settings.chat_orchestration_max_steps,
+        )
+        _record_chat_stage_timing(stage_timings_ms, "orchestration_build", stage_started)
+        if decision.is_complex:
+            metrics.inc_chat_complexity_complex_count()
+            if effective_complex:
+                metrics.inc_chat_complexity_routed_complex_count()
+        else:
+            metrics.inc_chat_complexity_simple_count()
+
+        record_token = reset_tool_execution_records()
+        usage_token = bind_llm_usage_context(
+            user_id=current_user.id,
+            session_id=session_id,
+            source="chat_websocket",
+        )
+        if effective_complex:
+            stage_started = time.perf_counter()
+            complete = await _execute_chat_turn(
+                execution_history,
+                user_context,
+                user_prompt=user_message,
+                mode=execution_mode,
+                model_override=session.llm_model,
+                stage="chat_complex",
+                enable_validation=effective_complex,
+            )
+            _record_chat_stage_timing(stage_timings_ms, "model_execution", stage_started)
+            complete = _enforce_calendar_mutation_integrity(
+                user_message,
+                complete,
+                get_tool_execution_records(),
+            )
+            for token_chunk in _chunk_text(complete):
+                full_response.append(token_chunk)
+                await _send_json_if_open({"type": "token", "content": token_chunk})
+            complete = "".join(full_response)
+        else:
+            started = time.perf_counter()
+            async for token_chunk in stream_agent(
+                execution_history,
+                user_context,
+                mode=execution_mode,
+                model_override=session.llm_model,
+                stage="chat_simple",
+            ):
+                full_response.append(token_chunk)
+                await _send_json_if_open({"type": "token", "content": token_chunk})
+            metrics.record_chat_latency(
+                mode="chat",
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            _record_chat_stage_timing(stage_timings_ms, "model_execution", started)
+            complete = _enforce_calendar_mutation_integrity(
+                user_message,
+                "".join(full_response),
+                get_tool_execution_records(),
+            )
+        assistant_msg = ChatMessage(
+            session_id=session_id, role="assistant", content=complete
+        )
+        db.add(assistant_msg)
+        await db.commit()
+        _log_chat_latency_breakdown(
+            session_id=session_id,
+            mode=execution_mode,
+            total_started=message_started,
+            stage_timings_ms=stage_timings_ms,
+            transport="websocket",
+        )
+
+        await _send_json_if_open(
+            {
+                "type": "done",
+                "content": complete,
+                "metadata": {
+                    "active_skills": list(user_context.active_skill_slugs or []),
+                    "skill_selection_mode": user_context.skill_selection_mode or "",
+                },
+            }
+        )
+        log.info(
+            "chat.websocket_message_done",
+            session_id=session_id,
+            user_id=current_user.id,
+            websocket_id=websocket_id,
+            client_send_id=client_send_id or "",
+            prompt_fingerprint=prompt_fingerprint,
+            assistant_message_id=assistant_msg.id,
+        )
+    except asyncio.CancelledError:
+        await db.rollback()
+        log.info(
+            "chat.websocket_message_stopped",
+            session_id=session_id,
+            user_id=current_user.id,
+            websocket_id=hex(id(websocket)),
+            client_send_id=client_send_id or "",
+        )
+        raise
+    except Exception:
+        await db.rollback()
+        log.exception(
+            "chat.websocket_message_error",
+            session_id=session_id,
+            user_id=current_user.id,
+            websocket_id=hex(id(websocket)),
+            client_send_id=client_send_id or "",
+        )
+        raise
+    finally:
+        if prompt_claimed:
+            await get_chat_run_manager().mark_prompt_finished(session_id, user_message)
+        if send_id_claimed and client_send_id:
+            await get_chat_run_manager().mark_client_send_id_finished(session_id, client_send_id)
+        if "record_token" in locals():
+            restore_tool_execution_records(record_token)
+        if "usage_token" in locals():
+            reset_llm_usage_context(usage_token)
+
+
 # ── WebSocket /chat/sessions/{id}/ws (streaming) ─────────────────────────────
 
 @router.websocket("/sessions/{session_id}/ws")
@@ -478,6 +860,7 @@ async def chat_websocket(
     """
     await websocket.accept()
     metrics.ws_connect()
+    chat_run_manager = get_chat_run_manager()
 
     try:
         from app.auth.jwt import decode_token
@@ -502,21 +885,62 @@ async def chat_websocket(
                 return
 
         # ── Read first message (content; token optional for legacy clients) ──
-        raw = await websocket.receive_text()
-        data = json.loads(raw)
-        user_message = data.get("content", "").strip()
-        allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
-        blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
+        websocket_id = hex(id(websocket))
+        websocket_message_index = 0
+
+        def _log_payload_received(payload: Dict[str, Any], send_id: Optional[str]) -> None:
+            nonlocal websocket_message_index
+            websocket_message_index += 1
+            log.info(
+                "chat.websocket_payload_received",
+                session_id=session_id,
+                websocket_id=websocket_id,
+                websocket_message_index=websocket_message_index,
+                client_send_id=send_id or "",
+                message_type=str(payload.get("type", "")) if isinstance(payload, dict) else "",
+            )
+
+        def _decode_payload(message_data: Dict[str, Any]) -> ChatSocketPayload:
+            content = message_data.get("content", "").strip() if isinstance(message_data, dict) else ""
+            client_send_id = message_data.get("client_send_id") if isinstance(message_data, dict) else None
+            allowed_tools = message_data.get("allowed_tools") if isinstance(message_data, dict) else None
+            blocked_tools = message_data.get("blocked_tools") if isinstance(message_data, dict) else None
+            return ChatSocketPayload(
+                raw=message_data,
+                content=content,
+                client_send_id=client_send_id,
+                allowed_tools=allowed_tools,
+                blocked_tools=blocked_tools,
+            )
+
+        async def _read_next_payload() -> Optional[ChatSocketPayload]:
+            while True:
+                try:
+                    raw_text = await websocket.receive_text()
+                except (WebSocketDisconnect, RuntimeError):
+                    return None
+                try:
+                    message_data = json.loads(raw_text)
+                except Exception:
+                    await websocket.send_json({"type": "error", "content": "invalid payload"})
+                    continue
+                message_payload = _decode_payload(message_data)
+                _log_payload_received(message_payload.raw, message_payload.client_send_id)
+                return message_payload
+
+        payload = await _read_next_payload()
+        if payload is None:
+            return
 
         # ── Auth path 2: token in first message body (backward compat) ──
         if current_user is None:
-            token = data.get("token", "").removeprefix("Bearer ").strip()
+            token = payload.raw.get("token", "").removeprefix("Bearer ").strip()
             if not token:
                 await websocket.send_json({"type": "error", "content": "token and content required"})
                 await websocket.close()
                 return
-            payload = decode_token(token)
-            user_id = int(payload["sub"])
+            token_payload = decode_token(token)
+            user_id = int(token_payload["sub"])
             result = await db.execute(select(UserModel).where(UserModel.id == user_id))
             current_user = result.scalar_one_or_none()
             if not current_user or not current_user.is_active:
@@ -536,17 +960,81 @@ async def chat_websocket(
             await websocket.close()
             return
 
+        active_message_task: Optional[asyncio.Task] = None
+
+        async def _extract_payload_from_receive_task(task: asyncio.Task) -> tuple[Optional[ChatSocketPayload], bool]:
+            try:
+                raw_text = task.result()
+            except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
+                return None, True
+            try:
+                message_data = json.loads(raw_text)
+            except Exception:
+                await websocket.send_json({"type": "error", "content": "invalid payload"})
+                return None, False
+            message_payload = _decode_payload(message_data)
+            _log_payload_received(message_payload.raw, message_payload.client_send_id)
+            return message_payload, False
+
+        async def _start_message_run(message_payload: ChatSocketPayload) -> None:
+            nonlocal active_message_task, session
+            if active_message_task is not None and not active_message_task.done():
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "content": "A chat response is already running. Stop it before sending another message.",
+                    }
+                )
+                return
+            sr = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+            session = sr.scalar_one_or_none() or session
+            active_message_task = asyncio.create_task(
+                _run_websocket_message(
+                    session_id=session_id,
+                    websocket=websocket,
+                    db=db,
+                    current_user=current_user,
+                    session=session,
+                    user_message=message_payload.content,
+                    client_send_id=message_payload.client_send_id,
+                    allowed_tools=message_payload.allowed_tools,
+                    blocked_tools=message_payload.blocked_tools,
+                )
+            )
+            await chat_run_manager.register(session_id, active_message_task)
+
+        async def _handle_control_message(message_payload: ChatSocketPayload) -> bool:
+            message_type = str(message_payload.raw.get("type", "")).strip().lower()
+            if message_type != "stop":
+                return False
+            stopped = await chat_run_manager.request_stop(session_id)
+            await websocket.send_json(
+                {
+                    "type": "stop_requested" if stopped else "stopped",
+                    "content": "Stopping chat response" if stopped else "No active chat response to stop.",
+                    "stopped": stopped,
+                }
+            )
+            return True
+
         # ── Message loop — keep connection alive for the session lifetime ────
-        # user_message is already set from the first read above.
-        # WebSocketDisconnect raised by receive_text() exits the loop cleanly.
         while True:
-            if not user_message:
-                await websocket.send_json({"type": "error", "content": "content required"})
-            else:
-                message_started = time.perf_counter()
-                stage_timings_ms: Dict[str, float] = {}
-                # Handle /persona command
-                persona_name = _parse_persona_command(user_message)
+            if active_message_task is None:
+                if payload is None:
+                    payload = await _read_next_payload()
+                    if payload is None:
+                        break
+
+                if await _handle_control_message(payload):
+                    payload = None
+                    continue
+
+                if not payload.content:
+                    await websocket.send_json({"type": "error", "content": "content required"})
+                    payload = None
+                    continue
+
+                persona_name = _parse_persona_command(payload.content)
                 if persona_name is not None:
                     resp = await _switch_persona(session_id, persona_name, session, db)
                     await websocket.send_json({
@@ -555,177 +1043,64 @@ async def chat_websocket(
                         "persona": resp.get("persona_switched", persona_name),
                     })
                     await websocket.send_json({"type": "done", "content": resp["content"]})
-                    # Reload session so subsequent messages see the new persona
                     sr = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
                     session = sr.scalar_one_or_none() or session
-                else:
-                    # Store user message
-                    user_msg = ChatMessage(session_id=session_id, role="user", content=user_message)
-                    db.add(user_msg)
-                    await db.flush()
+                    payload = None
+                    continue
 
-                    # Load history and append new user message
-                    stage_started = time.perf_counter()
-                    history = await _load_history(session_id, db)
-                    _record_chat_stage_timing(stage_timings_ms, "history_load", stage_started)
+                await _start_message_run(payload)
+                payload = None
+                continue
 
-                    # Build context from session's current persona
-                    user_context = UserContext.from_user(current_user, persona_name=session.persona)
-                    _apply_tool_overrides(
-                        user_context,
-                        allowed_tools=allowed_tools,
-                        blocked_tools=blocked_tools,
-                    )
-                    stage_started = time.perf_counter()
-                    user_context = await hydrate_user_context(db, user_context, query=user_message)
-                    _record_chat_stage_timing(stage_timings_ms, "context_hydration", stage_started)
-                    user_context.session_id = session_id
-                    stage_started = time.perf_counter()
-                    history, _memory_ids = await _apply_memory_context(
-                        history,
-                        db,
-                        current_user.id,
-                        user_message,
-                    )
-                    _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
-                    library_list_intent = is_library_lookup_intent(user_message)
-                    library_summary_intent = is_library_summary_intent(user_message)
-                    library_detail_intent = is_library_detail_or_excerpt_intent(user_message)
-                    library_intent = (
-                        library_list_intent
-                        or library_summary_intent
-                        or library_detail_intent
-                    )
-                    stage_started = time.perf_counter()
-                    history = await _apply_required_library_grounding(
-                        history,
-                        user_context,
-                        user_prompt=user_message,
-                        intent_type=(
-                            "summary"
-                            if library_summary_intent
-                            else (
-                                "detail_or_excerpt"
-                                if library_detail_intent
-                                else ("list_documents" if library_list_intent else None)
-                            )
-                        ),
-                    )
-                    _record_chat_stage_timing(stage_timings_ms, "library_grounding", stage_started)
-                    full_response = []
-                    decision = classify_chat_complexity(
-                        user_message,
-                        threshold=settings.chat_complexity_threshold,
-                        routing_enabled=settings.chat_complexity_routing_enabled,
-                    )
-                    execution_mode, effective_complex = _resolve_chat_execution(
-                        auto_complex=(decision.is_complex or library_intent),
-                        preference=getattr(current_user, "chat_routing_preference", None),
-                    )
-                    stage_started = time.perf_counter()
-                    execution_history = build_orchestrated_chat_history(
-                        history,
-                        enabled=(execution_mode == "chat_orchestrated" and settings.chat_orchestration_enabled),
-                        max_steps=settings.chat_orchestration_max_steps,
-                    )
-                    _record_chat_stage_timing(stage_timings_ms, "orchestration_build", stage_started)
-                    if decision.is_complex:
-                        metrics.inc_chat_complexity_complex_count()
-                        if effective_complex:
-                            metrics.inc_chat_complexity_routed_complex_count()
-                    else:
-                        metrics.inc_chat_complexity_simple_count()
-                    if effective_complex:
-                        record_token = reset_tool_execution_records()
-                        usage_token = bind_llm_usage_context(
-                            user_id=current_user.id,
-                            session_id=session_id,
-                            source="chat_websocket",
-                        )
-                        stage_started = time.perf_counter()
-                        complete = await _execute_chat_turn(
-                            execution_history,
-                            user_context,
-                            user_prompt=user_message,
-                            mode=execution_mode,
-                            model_override=session.llm_model,
-                            stage="chat_complex",
-                            enable_validation=effective_complex,
-                        )
-                        _record_chat_stage_timing(stage_timings_ms, "model_execution", stage_started)
-                        complete = _enforce_calendar_mutation_integrity(
-                            user_message,
-                            complete,
-                            get_tool_execution_records(),
-                        )
-                        for token_chunk in _chunk_text(complete):
-                            full_response.append(token_chunk)
-                            await websocket.send_json({"type": "token", "content": token_chunk})
-                        complete = "".join(full_response)
-                    else:
-                        record_token = reset_tool_execution_records()
-                        usage_token = bind_llm_usage_context(
-                            user_id=current_user.id,
-                            session_id=session_id,
-                            source="chat_websocket",
-                        )
-                        started = time.perf_counter()
-                        async for token_chunk in stream_agent(
-                            execution_history,
-                            user_context,
-                            mode=execution_mode,
-                            model_override=session.llm_model,
-                            stage="chat_simple",
-                        ):
-                            full_response.append(token_chunk)
-                            await websocket.send_json({"type": "token", "content": token_chunk})
-                        metrics.record_chat_latency(
-                            mode="chat",
-                            elapsed_ms=(time.perf_counter() - started) * 1000.0,
-                        )
-                        _record_chat_stage_timing(stage_timings_ms, "model_execution", started)
-                        complete = _enforce_calendar_mutation_integrity(
-                            user_message,
-                            "".join(full_response),
-                            get_tool_execution_records(),
-                        )
-                    restore_tool_execution_records(record_token)
-                    reset_llm_usage_context(usage_token)
+            receive_task = asyncio.create_task(websocket.receive_text())
+            done, _pending = await asyncio.wait(
+                {active_message_task, receive_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-                    # Store assistant reply
-                    assistant_msg = ChatMessage(
-                        session_id=session_id, role="assistant", content=complete
-                    )
-                    db.add(assistant_msg)
-                    await db.commit()
-                    _log_chat_latency_breakdown(
-                        session_id=session_id,
-                        mode=execution_mode,
-                        total_started=message_started,
-                        stage_timings_ms=stage_timings_ms,
-                        transport="websocket",
-                    )
-
+            if active_message_task in done:
+                try:
+                    await active_message_task
+                except asyncio.CancelledError:
                     await websocket.send_json(
-                        {
-                            "type": "done",
-                            "content": complete,
-                            "metadata": {
-                                "active_skills": list(user_context.active_skill_slugs or []),
-                                "skill_selection_mode": user_context.skill_selection_mode or "",
-                            },
-                        }
+                        {"type": "stopped", "content": "Stopped by user", "stopped": True}
                     )
+                finally:
+                    await chat_run_manager.clear(session_id, active_message_task)
+                    active_message_task = None
+                if receive_task in done:
+                    payload, disconnected = await _extract_payload_from_receive_task(receive_task)
+                    if payload is None:
+                        if disconnected:
+                            break
+                        continue
+                else:
+                    receive_task.cancel()
+                    try:
+                        await receive_task
+                    except asyncio.CancelledError:
+                        pass
+                    payload = None
+                continue
 
-            # Wait for the next message from the client
-            raw = await websocket.receive_text()
-            data = json.loads(raw)
-            user_message = data.get("content", "").strip()
-            allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
-            blocked_tools = data.get("blocked_tools") if isinstance(data, dict) else None
+            payload, disconnected = await _extract_payload_from_receive_task(receive_task)
+            if payload is None:
+                if disconnected:
+                    break
+                continue
+            if not await _handle_control_message(payload):
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "content": "A chat response is already running. Stop it before sending another message.",
+                    }
+                )
+            payload = None
 
     except WebSocketDisconnect:
-        pass
+        if 'active_message_task' in locals() and active_message_task is not None and not active_message_task.done():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await active_message_task
     except Exception as e:
         log.exception("Unhandled error in WebSocket handler", session_id=session_id)
         try:
@@ -733,6 +1108,9 @@ async def chat_websocket(
         except Exception:
             pass
     finally:
+        if 'active_message_task' in locals() and active_message_task is not None:
+            if active_message_task.done():
+                await chat_run_manager.clear(session_id, active_message_task)
         metrics.ws_disconnect()
 
 
@@ -1079,7 +1457,7 @@ async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at)
+        .order_by(ChatMessage.created_at, ChatMessage.id)
     )
     messages = result.scalars().all()
     return [{"role": m.role, "content": m.content} for m in messages]

@@ -97,8 +97,22 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
         del goal, user_id, task_id, task_instruction, max_steps, notes, style, model_override, default_planner
         return [
             {
-                "title": "Evaluate Topic Watcher",
-                "instruction": "Review the prepared RSS dataset and either emit NOTHING_NEW or a watcher briefing.",
+                "title": "Shortlist Candidate Matches",
+                "instruction": (
+                    "Review the prepared RSS dataset and produce a compact shortlist of candidate items that are genuinely relevant "
+                    "to the requested topic, including fuzzy or indirect matches when they clearly satisfy the user's intent. "
+                    "Return ONLY exact titles, exact URLs, sources, and a brief reason each candidate appears relevant. "
+                    "If nothing qualifies, return NOTHING_NEW."
+                ),
+                "requires_approval": False,
+            },
+            {
+                "title": "Finalize Watcher Briefing",
+                "instruction": (
+                    "Use the prepared RSS dataset plus the candidate shortlist from the previous step to produce the final watcher "
+                    "briefing. Keep only items that truly satisfy the requested topic. Preserve exact URLs from the dataset or "
+                    "previous step. If the shortlist is NOTHING_NEW or no candidates hold up, return NOTHING_NEW."
+                ),
                 "requires_approval": False,
             }
         ]
@@ -222,11 +236,20 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
         run_context: Dict[str, Any],
         is_final_step: bool,
     ) -> None:
-        del is_final_step
         prompt_parts.append(load_profile_spec_text(self.name))
         prepared = (run_context.get("dataset_prompt") or "").strip()
         if prepared:
             prompt_parts.append(f"Prepared topic watcher dataset:\n{prepared[:18000]}")
+        if is_final_step:
+            prompt_parts.append(
+                "This is the final watcher-briefing step. Use the previous step's candidate shortlist as the primary relevance "
+                "signal, then verify against the prepared RSS dataset. Do not broaden beyond what the shortlist and dataset support."
+            )
+        else:
+            prompt_parts.append(
+                "This is the candidate-shortlist step. Favor semantic relevance over literal keyword rigidity when the user's "
+                "examples imply a broader topic. Include near matches only when the connection is concrete and defensible."
+            )
         topic_memory_timeline_summary = str(run_context.get("topic_memory_timeline_summary") or "").strip()
         if topic_memory_timeline_summary:
             prompt_parts.append(
@@ -546,9 +569,32 @@ def _parse_topic_watcher_instruction(instruction: str) -> Dict[str, Any]:
         config["sources"] = [part.strip().lower() for part in sources_raw.split(",") if part.strip()]
     else:
         config["sources"] = []
-    config["topic"] = str(config.get("topic") or "").strip()
+    topic = str(config.get("topic") or "").strip()
+    if not topic:
+        topic = _infer_legacy_topic_from_instruction(instruction)
+        if topic:
+            config["warnings"].append("Inferred topic from legacy watcher instruction.")
+    config["topic"] = topic
     config["notes"] = "\n".join(lines[body_start:]).strip()
     return config
+
+
+def _infer_legacy_topic_from_instruction(instruction: str) -> str:
+    text = re.sub(r"\s+", " ", str(instruction or "").strip())
+    if not text:
+        return ""
+    patterns = [
+        r"\bfor news about\s+(.+?)\s+using these\b",
+        r"\bwatch(?:ing)?\s+(?:my\s+curated\s+rss\s+feeds\s+)?for\s+(.+?)(?:[.;]|$)",
+        r"\bsearch(?: my)?\s+curated\s+rss\s+feeds\s+for\s+(.+?)(?:[.;]|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;\"'")
+            if candidate:
+                return candidate
+    return ""
 
 
 def _matches_source_filter(item: Dict[str, Any], source_filters: List[str]) -> bool:

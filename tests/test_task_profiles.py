@@ -32,6 +32,14 @@ def test_parse_topic_watcher_instruction_defaults_threshold_and_sources():
     assert "watch rate decisions too" in parsed["notes"]
 
 
+def test_parse_topic_watcher_instruction_infers_topic_from_legacy_watcher_prompt():
+    parsed = _parse_topic_watcher_instruction(
+        'Every run: 1) Search my curated RSS feeds for news about enterprise AI agent platforms similar to OpenClaw using these case-insensitive keywords and hashtags in titles/summaries/content: ["Alibaba AI agent platform","Qwen agent"]; 2) Dedupe items already logged in the last 30 days.'
+    )
+    assert parsed["topic"] == "enterprise AI agent platforms similar to OpenClaw"
+    assert "Inferred topic from legacy watcher instruction." in parsed["warnings"]
+
+
 def test_parse_maintenance_instruction_requires_tool_and_parses_args():
     parsed = _parse_maintenance_instruction(
         'tool: refresh_rss_cache\nargs: {"max_items_per_source": 20}\n\nrefresh cache'
@@ -143,6 +151,27 @@ async def test_maintenance_profile_plan_steps_are_deterministic():
             "requires_approval": False,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_topic_watcher_plan_steps_are_deterministic_and_two_stage():
+    profile = TopicWatcherExecutionProfile()
+    steps = await profile.plan_steps(
+        goal="Watch OpenClaw",
+        user_id=1,
+        task_id=47,
+        task_instruction="topic: OpenClaw",
+        max_steps=5,
+        notes="",
+        style="concise",
+        model_override=None,
+        default_planner=AsyncMock(),
+    )
+    assert [step["title"] for step in steps] == [
+        "Shortlist Candidate Matches",
+        "Finalize Watcher Briefing",
+    ]
+    assert all(step["requires_approval"] is False for step in steps)
 
 
 def test_maintenance_profile_blocks_memory_tools_and_caps_declared_tool():

@@ -88,7 +88,7 @@ mcp_servers:
   playwright:
     type: docker_stdio
     image: mcp/playwright
-    enabled: false
+    enabled: true
     timeout: 60
     classification: developer_only
     shipping_default: false

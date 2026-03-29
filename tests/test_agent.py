@@ -104,6 +104,14 @@ def test_system_prompt_includes_narrow_memory_capture_guidance():
     assert "do not create memories for trivial one-off chatter" in prompt
 
 
+def test_system_prompt_requires_confirmation_before_calendar_delete():
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    prompt = ctx.to_system_prompt().lower()
+    assert "never delete a calendar event unless the user explicitly confirms" in prompt
+    assert "identify the exact event id" in prompt
+    assert "delete_event" in prompt
+
+
 def test_parse_iso_datetime_accepts_z_suffix():
     dt = _parse_iso_datetime("2026-04-01T00:00:00Z")
     assert dt.isoformat() == "2026-04-01T00:00:00+00:00"
@@ -149,6 +157,14 @@ def test_create_task_schema_has_required_fields():
     assert "task_type" in props
     assert "deliver" in props
     assert set(["title", "instruction", "task_type", "deliver"]).issubset(set(required))
+
+
+def test_run_task_now_schema_has_required_task_id():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "run_task_now")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "task_id" in props
+    assert required == ["task_id"]
 
 
 def test_search_places_schema_has_required_query():
@@ -601,6 +617,39 @@ async def test_update_task_tool_updates_schedule_and_marks_plan_change():
         task = await db.get(Task, created["task_id"])
         assert task is not None
         assert task.schedule == "every:2h"
+
+
+@pytest.mark.asyncio
+async def test_run_task_now_tool_queues_existing_task():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        created = json.loads(
+            await tools_module._create_task(
+                {
+                    "title": "Run me",
+                    "instruction": "Do the task",
+                    "task_type": "one_shot",
+                    "deliver": True,
+                },
+                ctx,
+            )
+        )
+
+        with patch("app.autonomy.runner.get_task_runner") as mocked_runner:
+            mocked_runner.return_value.execute = AsyncMock()
+            result = json.loads(await tools_module._run_task_now({"task_id": created["task_id"]}, ctx))
+
+    assert result["queued"] is True
+    assert result["task_id"] == created["task_id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, created["task_id"])
+        assert task is not None
+        assert task.status == "pending"
 
 
 @pytest.mark.asyncio

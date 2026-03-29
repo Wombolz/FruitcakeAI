@@ -3,13 +3,20 @@ Auth endpoint integration tests.
 Uses an in-memory SQLite database so no real postgres is needed.
 """
 
+import asyncio
+import contextlib
+from types import SimpleNamespace
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import select, func
 from sqlalchemy.pool import StaticPool
 from unittest.mock import AsyncMock, patch
 
+from app.api.chat import _run_websocket_message, chat_websocket
+from app.chat_runtime import get_chat_run_manager
 from app.db.session import Base, get_db
+from app.db.models import ChatMessage, ChatSession, User
 from app.main import app
 
 # ── In-memory SQLite engine for tests ─────────────────────────────────────────
@@ -551,3 +558,354 @@ async def test_get_session_history_includes_message_timestamps(client):
     messages = history.json()["messages"]
     assert len(messages) >= 2
     assert all("created_at" in msg for msg in messages)
+
+
+@pytest.mark.asyncio
+async def test_stop_chat_session_returns_false_when_idle(client):
+    await client.post("/auth/register", json={
+        "username": "chatstopidle",
+        "email": "chatstopidle@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatstopidle", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Stop Idle"}, headers=headers)
+    session_id = create.json()["id"]
+
+    stop = await client.post(f"/chat/sessions/{session_id}/stop", headers=headers)
+    assert stop.status_code == 200
+    assert stop.json() == {"stopped": False, "session_id": session_id}
+
+
+@pytest.mark.asyncio
+async def test_stop_chat_session_cancels_active_rest_run(client):
+    await client.post("/auth/register", json={
+        "username": "chatstoprun",
+        "email": "chatstoprun@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatstoprun", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Stop Active"}, headers=headers)
+    session_id = create.json()["id"]
+    started = asyncio.Event()
+
+    async def _slow_run_agent(*_args, **_kwargs):
+        started.set()
+        await asyncio.sleep(60)
+        return "done"
+
+    with patch("app.api.chat.run_agent", new=AsyncMock(side_effect=_slow_run_agent)):
+        send_task = asyncio.create_task(
+            client.post(
+                f"/chat/sessions/{session_id}/messages",
+                json={"content": "do something long"},
+                headers=headers,
+            )
+        )
+        await started.wait()
+        stop = await client.post(f"/chat/sessions/{session_id}/stop", headers=headers)
+        assert stop.status_code == 200
+        assert stop.json() == {"stopped": True, "session_id": session_id}
+
+        send = await send_task
+
+    assert send.status_code == 409
+    assert send.json()["detail"] == "Chat stopped by user"
+
+    stop_again = await client.post(f"/chat/sessions/{session_id}/stop", headers=headers)
+    assert stop_again.status_code == 200
+    assert stop_again.json() == {"stopped": False, "session_id": session_id}
+
+
+@pytest.mark.asyncio
+async def test_rest_duplicate_prompt_is_rejected_before_execution(client):
+    await client.post("/auth/register", json={
+        "username": "chatrestdupe",
+        "email": "chatrestdupe@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatrestdupe", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "REST Dupe Guard"}, headers=headers)
+    session_id = create.json()["id"]
+    started = asyncio.Event()
+
+    async def _slow_execute(*_args, **_kwargs):
+        started.set()
+        await asyncio.sleep(60)
+        return "done"
+
+    with patch("app.api.chat._execute_chat_turn", new=AsyncMock(side_effect=_slow_execute)):
+        first_task = asyncio.create_task(
+            client.post(
+                f"/chat/sessions/{session_id}/messages",
+                json={"content": "tell me about Iran headlines", "client_send_id": "rest-dupe-1"},
+                headers=headers,
+            )
+        )
+        await started.wait()
+        second = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "tell me about Iran headlines", "client_send_id": "rest-dupe-1"},
+            headers=headers,
+        )
+        first_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first_task
+
+    assert second.status_code == 409
+    assert "A matching chat request is already running." in second.text
+
+
+@pytest.mark.asyncio
+async def test_websocket_duplicate_prompt_is_rejected_before_execution(client):
+    await client.post("/auth/register", json={
+        "username": "chatdupeuser",
+        "email": "chatdupe@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatdupeuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Dupe Guard"}, headers=headers)
+    session_id = create.json()["id"]
+    prompt = "run the search against my saved feeds and give me the results you find"
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "chatdupeuser"))
+        ).scalar_one()
+        session = (
+            await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        ).scalar_one()
+
+        manager = get_chat_run_manager()
+        await manager.clear(session_id)
+        manager._recent_prompts.pop(session_id, None)
+        await manager.claim_prompt(session_id, prompt)
+
+        websocket = AsyncMock()
+        with patch("app.api.chat._execute_chat_turn", new=AsyncMock(return_value="done")) as execute_mock:
+            await _run_websocket_message(
+                session_id=session_id,
+                websocket=websocket,
+                db=db,
+                current_user=user,
+                session=session,
+                user_message=prompt,
+                client_send_id="test-send-id",
+                allowed_tools=None,
+                blocked_tools=None,
+            )
+
+        assert execute_mock.await_count == 0
+        websocket.send_json.assert_awaited_once()
+        payload = websocket.send_json.await_args.args[0]
+        assert payload["type"] == "error"
+        assert "matching chat request" in payload["content"].lower()
+
+        message_count = await db.scalar(
+            select(func.count()).select_from(ChatMessage).where(ChatMessage.session_id == session_id)
+        )
+        assert message_count == 0
+        manager._recent_prompts.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_websocket_duplicate_client_send_id_is_rejected_before_execution(client):
+    await client.post("/auth/register", json={
+        "username": "chatdupesendid",
+        "email": "chatdupesendid@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatdupesendid", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Send ID Guard"}, headers=headers)
+    session_id = create.json()["id"]
+    prompt = "show me the latest iran headlines"
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "chatdupesendid"))
+        ).scalar_one()
+        session = (
+            await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        ).scalar_one()
+
+        manager = get_chat_run_manager()
+        await manager.clear(session_id)
+        manager._recent_prompts.pop(session_id, None)
+        manager._recent_send_ids.pop(session_id, None)
+        await manager.claim_client_send_id(session_id, "same-send-id")
+
+        websocket = AsyncMock()
+        with patch("app.api.chat._execute_chat_turn", new=AsyncMock(return_value="done")) as execute_mock:
+            await _run_websocket_message(
+                session_id=session_id,
+                websocket=websocket,
+                db=db,
+                current_user=user,
+                session=session,
+                user_message=prompt,
+                client_send_id="same-send-id",
+                allowed_tools=None,
+                blocked_tools=None,
+            )
+
+        assert execute_mock.await_count == 0
+        websocket.send_json.assert_awaited_once()
+        payload = websocket.send_json.await_args.args[0]
+        assert payload["type"] == "error"
+        assert "matching chat request" in payload["content"].lower()
+
+        message_count = await db.scalar(
+            select(func.count()).select_from(ChatMessage).where(ChatMessage.session_id == session_id)
+        )
+        assert message_count == 0
+        manager._recent_prompts.pop(session_id, None)
+        manager._recent_send_ids.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_websocket_disconnect_does_not_rollback_completed_response(client):
+    await client.post("/auth/register", json={
+        "username": "chatpersistuser",
+        "email": "chatpersist@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatpersistuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Persist On Disconnect"}, headers=headers)
+    session_id = create.json()["id"]
+
+    async def fake_stream_agent(*args, **kwargs):
+        yield "response survives disconnect"
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "chatpersistuser"))
+        ).scalar_one()
+        session = (
+            await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        ).scalar_one()
+
+        manager = get_chat_run_manager()
+        await manager.clear(session_id)
+        manager._recent_prompts.pop(session_id, None)
+        manager._recent_send_ids.pop(session_id, None)
+
+        websocket = AsyncMock()
+        websocket.send_json.side_effect = RuntimeError("socket already closed")
+
+        with (
+            patch("app.api.chat.stream_agent", new=fake_stream_agent),
+            patch("app.api.chat.classify_chat_complexity", return_value=SimpleNamespace(is_complex=False)),
+        ):
+            await _run_websocket_message(
+                session_id=session_id,
+                websocket=websocket,
+                db=db,
+                current_user=user,
+                session=session,
+                user_message="tell me something simple",
+                client_send_id="disconnect-persist-1",
+                allowed_tools=None,
+                blocked_tools=None,
+            )
+
+        rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == session_id)
+                .order_by(ChatMessage.id)
+            )
+        ).scalars().all()
+
+        assert [row.role for row in rows] == ["user", "assistant"]
+        assert rows[-1].content == "response survives disconnect"
+
+
+@pytest.mark.asyncio
+async def test_chat_session_status_reports_active_run(client):
+    await client.post("/auth/register", json={
+        "username": "chatstatususer",
+        "email": "chatstatus@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatstatususer", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Status"}, headers=headers)
+    session_id = create.json()["id"]
+
+    async with TestSessionLocal() as db:
+        manager = get_chat_run_manager()
+        task = asyncio.create_task(asyncio.sleep(5))
+        await manager.register(session_id, task)
+        try:
+            resp = await client.get(f"/chat/sessions/{session_id}/status", headers=headers)
+            assert resp.status_code == 200
+            assert resp.json() == {"session_id": session_id, "active": True}
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await manager.clear(session_id, task)
+
+
+@pytest.mark.asyncio
+async def test_websocket_handler_ignores_receive_task_disconnect_after_message_completion(client):
+    await client.post("/auth/register", json={
+        "username": "chatdisconnectuser",
+        "email": "chatdisconnect@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatdisconnectuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Disconnect Cleanup"}, headers=headers)
+    session_id = create.json()["id"]
+
+    async def fake_run_message(**kwargs):
+        return None
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.headers = {"authorization": f"Bearer {token}"}
+            self.sent = []
+            self._first = True
+
+        async def accept(self):
+            return None
+
+        async def receive_text(self):
+            if self._first:
+                self._first = False
+                return '{"content":"hello","client_send_id":"cleanup-1"}'
+            raise RuntimeError('WebSocket is not connected. Need to call "accept" first.')
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+        async def close(self):
+            return None
+
+    websocket = FakeWebSocket()
+
+    async with TestSessionLocal() as db:
+        with patch("app.api.chat._run_websocket_message", new=AsyncMock(side_effect=fake_run_message)):
+            await chat_websocket(session_id, websocket, db)

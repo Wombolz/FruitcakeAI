@@ -424,6 +424,23 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "run_task_now",
+            "description": (
+                "Queue an existing task owned by the current user for immediate execution. "
+                "Use this when the user asks to run an already-saved task now."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_task",
             "description": (
                 "Create a real persistent task for the current user. "
@@ -458,7 +475,8 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "description": (
                 "Update an existing task owned by the current user. "
                 "Use this after the user explicitly confirms a task change such as schedule, instruction, profile, or delivery settings. "
-                "If the updated fields materially change execution, regenerate the plan afterward with create_task_plan."
+                "If the updated fields materially change execution, regenerate the plan afterward with create_task_plan. "
+                "Use this instead of create_task when the user is modifying a task you just created."
             ),
             "parameters": {
                 "type": "object",
@@ -783,6 +801,9 @@ async def _call_tool(
 
     if name == "update_task":
         return await _update_task(arguments, user_context)
+
+    if name == "run_task_now":
+        return await _run_task_now(arguments, user_context)
 
     if name == "list_tasks":
         return await _list_tasks(arguments, user_context)
@@ -1567,6 +1588,41 @@ async def _update_task(arguments: Dict[str, Any], user_context: UserContext) -> 
             "plan_inputs_changed": update_result.plan_inputs_changed,
         }
     )
+
+
+async def _run_task_now(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from datetime import datetime, timezone
+
+    from app.autonomy.runner import get_task_runner
+    from app.db.models import Task
+    from app.db.session import AsyncSessionLocal
+
+    task_id_raw = arguments.get("task_id")
+    try:
+        task_id = int(task_id_raw)
+    except Exception:
+        return "Invalid task_id."
+
+    async with AsyncSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        if task is None or int(task.user_id) != int(user_context.user_id):
+            return "Task not found."
+        if task.status == "running":
+            return json.dumps({"queued": False, "task_id": task.id, "detail": "Task is already running"})
+
+        task.next_run_at = datetime.now(timezone.utc)
+        task.status = "pending"
+        await db.commit()
+        asyncio.create_task(get_task_runner().execute(task))
+
+        return json.dumps(
+            {
+                "queued": True,
+                "task_id": task.id,
+                "title": task.title,
+                "schedule": task.schedule,
+            }
+        )
 
 
 async def _list_tasks(arguments: Dict[str, Any], user_context: UserContext) -> str:

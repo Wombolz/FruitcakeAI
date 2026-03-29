@@ -6,6 +6,7 @@ from app.agent.chat_validation import (
     build_chat_retry_instruction,
     validate_chat_response,
 )
+from app.agent.context import UserContext
 from app.config import settings
 from app.metrics import metrics
 
@@ -57,6 +58,21 @@ def test_validate_chat_response_flags_unconfirmed_calendar_mutation_claim():
     assert out.mutation_unconfirmed is True
     assert out.should_retry is True
     assert out.retry_reason == "calendar_mutation_unconfirmed"
+
+
+def test_validate_chat_response_accepts_confirmed_calendar_delete_claim():
+    out = validate_chat_response(
+        "Delete the lunch with Rod event from my calendar",
+        "I've deleted the Lunch with Rod event from your calendar.",
+        executed_tools=[
+            {
+                "tool": "delete_event",
+                "result_summary": "Event deleted: 'Lunch with Rod' (evt_123)",
+            }
+        ],
+    )
+    assert out.mutation_unconfirmed is False
+    assert out.should_retry is False
 
 
 def test_validate_chat_response_flags_unconfirmed_task_mutation_claim():

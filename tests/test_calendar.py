@@ -9,9 +9,12 @@ from app.mcp.servers.calendar import (
     _calendar_matches,
     _collect_vevent_components,
     _create_event,
+    _delete_event,
     _dedupe_events,
     _format_event_timestamp,
+    _list_events,
     _parse_dt,
+    _search_events,
 )
 
 
@@ -85,6 +88,142 @@ async def test_create_event_returns_failure_when_provider_calendar_not_found():
         )
 
     assert out == "Failed to create event: calendar 'mcp' not found."
+
+
+@pytest.mark.asyncio
+async def test_delete_event_requires_explicit_confirmation():
+    out = await _delete_event({"event_id": "evt_123", "confirm": False}, user_context=None)
+    assert out == "Deletion requires explicit confirmation. Ask the user to confirm before deleting."
+
+
+@pytest.mark.asyncio
+async def test_delete_event_returns_failure_when_provider_event_not_found():
+    provider = AsyncMock()
+    provider.default_calendar_id.return_value = "home"
+    provider.delete_event.return_value = {"id": "evt_123", "status": "event_not_found"}
+
+    with patch("app.mcp.servers.calendar._get_provider", return_value=provider):
+        out = await _delete_event(
+            {
+                "event_id": "evt_123",
+                "confirm": True,
+                "calendar_id": "home",
+                "start": "2026-03-26T12:00:00+00:00",
+            },
+            user_context=None,
+        )
+
+    assert out == "Failed to delete event: event 'evt_123' not found."
+
+
+@pytest.mark.asyncio
+async def test_delete_event_returns_failure_when_provider_cannot_verify_deletion():
+    provider = AsyncMock()
+    provider.default_calendar_id.return_value = "home"
+    provider.delete_event.return_value = {"id": "evt_123", "status": "delete_unverified"}
+
+    with patch("app.mcp.servers.calendar._get_provider", return_value=provider):
+        out = await _delete_event(
+            {
+                "event_id": "evt_123",
+                "confirm": True,
+                "calendar_id": "home",
+                "start": "2026-03-26T12:00:00+00:00",
+            },
+            user_context=None,
+        )
+
+    assert out == (
+        "Failed to verify deletion for event 'evt_123'. "
+        "The calendar provider did not confirm that the event was removed."
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_event_returns_success_message():
+    provider = AsyncMock()
+    provider.default_calendar_id.return_value = "home"
+    provider.delete_event.return_value = {
+        "id": "evt_123",
+        "status": "deleted",
+        "summary": "Lunch with Rod",
+        "start": "2026-03-26T12:00:00+00:00",
+    }
+
+    with patch("app.mcp.servers.calendar._get_provider", return_value=provider):
+        out = await _delete_event(
+            {
+                "event_id": "evt_123",
+                "confirm": True,
+                "calendar_id": "home",
+                "start": "2026-03-26T12:00:00+00:00",
+            },
+            user_context=None,
+        )
+
+    assert out.startswith("Event deleted: 'Lunch with Rod' (evt_123)")
+
+
+@pytest.mark.asyncio
+async def test_delete_event_returns_failure_when_provider_requires_start_timestamp():
+    provider = AsyncMock()
+    provider.default_calendar_id.return_value = "home"
+    provider.delete_event.return_value = {"id": "evt_123", "status": "missing_start"}
+
+    with patch("app.mcp.servers.calendar._get_provider", return_value=provider):
+        out = await _delete_event(
+            {
+                "event_id": "evt_123",
+                "confirm": True,
+                "calendar_id": "home",
+            },
+            user_context=None,
+        )
+
+    assert out == (
+        "Failed to delete event: event 'evt_123' needs a start timestamp for bounded lookup. "
+        "List the event again and retry the delete with the exact event details."
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_events_includes_event_ids():
+    provider = AsyncMock()
+    provider.list_events.return_value = [
+        {
+            "id": "evt_123",
+            "summary": "Lunch with Rod",
+            "start": "2026-03-26T12:00:00+00:00",
+            "end": "2026-03-26T13:00:00+00:00",
+            "location": None,
+            "description": None,
+        }
+    ]
+
+    with patch("app.mcp.servers.calendar._get_provider", return_value=provider):
+        out = await _list_events({"start_date": "2026-03-26", "end_date": "2026-03-27"}, user_context=None)
+
+    assert "[evt_123]" in out
+
+
+@pytest.mark.asyncio
+async def test_search_events_includes_event_ids():
+    provider = AsyncMock()
+    provider.list_events.return_value = [
+        {
+            "id": "evt_123",
+            "summary": "Lunch with Rod",
+            "description": "",
+            "location": "",
+            "start": "2026-03-26T12:00:00+00:00",
+            "end": "2026-03-26T13:00:00+00:00",
+        }
+    ]
+
+    with patch("app.mcp.servers.calendar._get_provider", return_value=provider):
+        out = await _search_events({"query": "rod"}, user_context=None)
+
+    assert "[evt_123]" in out
 
 def test_format_event_timestamp_derives_correct_weekday_from_iso_date():
     assert _format_event_timestamp("2026-03-19T11:00:00+00:00") == "Thursday, 2026-03-19 11:00"
