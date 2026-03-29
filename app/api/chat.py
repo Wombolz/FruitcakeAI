@@ -876,12 +876,16 @@ async def chat_websocket(
 
         # ── Read first message (content; token optional for legacy clients) ──
         websocket_id = hex(id(websocket))
+        websocket_message_index = 0
 
         def _log_payload_received(payload: Dict[str, Any], send_id: Optional[str]) -> None:
+            nonlocal websocket_message_index
+            websocket_message_index += 1
             log.info(
                 "chat.websocket_payload_received",
                 session_id=session_id,
                 websocket_id=websocket_id,
+                websocket_message_index=websocket_message_index,
                 client_send_id=send_id or "",
                 message_type=str(payload.get("type", "")) if isinstance(payload, dict) else "",
             )
