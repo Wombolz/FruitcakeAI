@@ -403,3 +403,33 @@ async def test_run_agent_stops_after_successful_run_task_now():
         )
 
     assert result == "Queued task 'OpenClaw Watch' (task_id=64) to run now."
+
+
+@pytest.mark.asyncio
+async def test_run_agent_stops_after_failed_delete_event_tool_result():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    tool_message = _fake_tool_response(tool_name="delete_event")
+
+    async def _fake_dispatch(_tool_calls, _user_context):
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "Failed to verify deletion for event 'evt_123'. The calendar provider did not confirm that the event was removed.",
+            }
+        ]
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=[tool_message])),
+        patch("app.agent.core.dispatch_tool_calls", side_effect=_fake_dispatch),
+    ):
+        result = await run_agent(
+            [{"role": "user", "content": "Delete the lunch event"}],
+            user_context,
+        )
+
+    assert result == (
+        "Failed to verify deletion for event 'evt_123'. "
+        "The calendar provider did not confirm that the event was removed."
+    )

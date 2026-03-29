@@ -104,6 +104,14 @@ def test_system_prompt_includes_narrow_memory_capture_guidance():
     assert "do not create memories for trivial one-off chatter" in prompt
 
 
+def test_system_prompt_requires_confirmation_before_calendar_delete():
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    prompt = ctx.to_system_prompt().lower()
+    assert "never delete a calendar event unless the user explicitly confirms" in prompt
+    assert "identify the exact event id" in prompt
+    assert "delete_event" in prompt
+
+
 def test_parse_iso_datetime_accepts_z_suffix():
     dt = _parse_iso_datetime("2026-04-01T00:00:00Z")
     assert dt.isoformat() == "2026-04-01T00:00:00+00:00"

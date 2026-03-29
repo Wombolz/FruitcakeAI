@@ -36,6 +36,11 @@ FAILED_SEARCH_PREFIXES = (
     "no results found for:",
     "tool web_search failed:",
 )
+FAILED_DELETE_PREFIXES = (
+    "failed to delete event:",
+    "failed to verify deletion for event",
+    "deletion requires explicit confirmation.",
+)
 TASK_ID_RE = re.compile(r'"task_id"\s*:\s*(\d+)')
 UNSUPPORTED_ALPHA_VANTAGE_HINT = (
     "I can use Alpha Vantage for quote lookup, daily history, and bounded intraday history right now, "
@@ -225,6 +230,17 @@ def _is_failed_search_turn(tool_calls: List[Any], tool_results: List[Dict[str, A
             return False
 
     return True
+
+
+def _failed_delete_message(tool_calls: List[Any], tool_results: List[Dict[str, Any]]) -> str | None:
+    for call, result in zip(tool_calls, tool_results):
+        if _tool_call_name(call) != "delete_event":
+            continue
+        content = str(result.get("content", "")).strip()
+        lowered = content.lower()
+        if any(lowered.startswith(prefix) for prefix in FAILED_DELETE_PREFIXES):
+            return content
+    return None
 
 
 def _recent_tool_snippets(history: List[Dict[str, Any]], *, limit: int = 3) -> list[str]:
@@ -612,6 +628,9 @@ async def run_agent(
                 tool_results=tool_results,
                 repeated_signature_count=repeated_tool_signature_count,
             )
+            failed_delete = _failed_delete_message(message.tool_calls, tool_results)
+            if failed_delete:
+                return failed_delete
             task_handoff = _task_handoff_message(messages, message.tool_calls, tool_results)
             if task_handoff:
                 return task_handoff
@@ -738,6 +757,10 @@ async def stream_agent(
                 tool_results=tool_results,
                 repeated_signature_count=repeated_tool_signature_count,
             )
+            failed_delete = _failed_delete_message(message.tool_calls, tool_results)
+            if failed_delete:
+                yield failed_delete
+                return
             task_handoff = _task_handoff_message(messages, message.tool_calls, tool_results)
             if task_handoff:
                 yield task_handoff

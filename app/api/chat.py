@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import contextlib
 import time
 from typing import Any, Dict, List, Optional
 
@@ -67,6 +68,7 @@ class CreateSessionRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: str
+    client_send_id: Optional[str] = None
     allowed_tools: Optional[List[str]] = None
     blocked_tools: Optional[List[str]] = None
 
@@ -74,6 +76,11 @@ class SendMessageRequest(BaseModel):
 class StopChatResponse(BaseModel):
     stopped: bool
     session_id: int
+
+
+class ChatSessionStatusResponse(BaseModel):
+    session_id: int
+    active: bool
 
 
 class RenameSessionRequest(BaseModel):
@@ -205,7 +212,7 @@ async def get_session(
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at)
+        .order_by(ChatMessage.created_at, ChatMessage.id)
     )
     messages = result.scalars().all()
 
@@ -318,11 +325,37 @@ async def send_message(
     request_started = time.perf_counter()
     stage_timings_ms: Dict[str, float] = {}
     session = await _get_session_or_404(session_id, current_user.id, db)
+    request_fingerprint = str(abs(hash(" ".join(str(body.content or "").split()))))[:12]
+    prompt_claimed = False
 
     # Handle /persona command before touching history or running the agent
     persona_name = _parse_persona_command(body.content)
     if persona_name is not None:
         return await _switch_persona(session_id, persona_name, session, db)
+
+    claimed, duplicate_active, claimed_fingerprint = await get_chat_run_manager().claim_prompt(
+        session_id,
+        body.content,
+    )
+    if not claimed:
+        log.info(
+            "chat.rest_duplicate_prompt_rejected",
+            session_id=session_id,
+            user_id=current_user.id,
+            client_send_id=body.client_send_id or "",
+            prompt_fingerprint=claimed_fingerprint or request_fingerprint,
+            active_run=duplicate_active,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A matching chat request is already running."
+                if duplicate_active
+                else "That message was already sent a moment ago."
+            ),
+        )
+    prompt_claimed = True
+    request_fingerprint = claimed_fingerprint or request_fingerprint
 
     # Load conversation history
     stage_started = time.perf_counter()
@@ -435,6 +468,8 @@ async def send_message(
         log.exception("Agent error in REST handler", session_id=session_id)
         raise HTTPException(status_code=500, detail="Agent error — check server logs for details")
     finally:
+        if prompt_claimed:
+            await chat_run_manager.mark_prompt_finished(session_id, body.content)
         if current_task is not None:
             await chat_run_manager.clear(session_id, current_task)
         try:
@@ -482,6 +517,17 @@ async def stop_chat_session(
     return StopChatResponse(stopped=stopped, session_id=session_id)
 
 
+@router.get("/sessions/{session_id}/status", response_model=ChatSessionStatusResponse)
+async def get_chat_session_status(
+    session_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChatSessionStatusResponse:
+    await _get_session_or_404(session_id, current_user.id, db)
+    active = await get_chat_run_manager().is_active(session_id)
+    return ChatSessionStatusResponse(session_id=session_id, active=active)
+
+
 async def _run_websocket_message(
     *,
     session_id: int,
@@ -495,11 +541,60 @@ async def _run_websocket_message(
     blocked_tools: Optional[List[str]],
 ) -> None:
     prompt_claimed = False
+    send_id_claimed = False
+    websocket_closed = False
+
+    async def _send_json_if_open(payload: Dict[str, Any]) -> bool:
+        nonlocal websocket_closed
+        if websocket_closed:
+            return False
+        try:
+            await websocket.send_json(payload)
+            return True
+        except Exception:
+            websocket_closed = True
+            log.info(
+                "chat.websocket_send_skipped",
+                session_id=session_id,
+                user_id=current_user.id,
+                websocket_id=hex(id(websocket)),
+                client_send_id=client_send_id or "",
+                payload_type=str(payload.get("type", "")),
+            )
+            return False
+
     try:
         message_started = time.perf_counter()
         stage_timings_ms: Dict[str, float] = {}
         websocket_id = hex(id(websocket))
         prompt_fingerprint = str(abs(hash(" ".join(str(user_message or "").split()))))[:12]
+        if client_send_id:
+            send_id_ok, send_id_active = await get_chat_run_manager().claim_client_send_id(
+                session_id,
+                client_send_id,
+            )
+            if not send_id_ok:
+                log.info(
+                    "chat.duplicate_client_send_id_rejected",
+                    session_id=session_id,
+                    user_id=current_user.id,
+                    websocket_id=websocket_id,
+                    client_send_id=client_send_id,
+                    prompt_fingerprint=prompt_fingerprint,
+                    active_run=send_id_active,
+                )
+                await _send_json_if_open(
+                    {
+                        "type": "error",
+                        "content": (
+                            "A matching chat request is already running."
+                            if send_id_active
+                            else "That message was already sent a moment ago."
+                        ),
+                    }
+                )
+                return
+            send_id_claimed = True
         claimed, duplicate_active, claimed_fingerprint = await get_chat_run_manager().claim_prompt(
             session_id,
             user_message,
@@ -514,7 +609,7 @@ async def _run_websocket_message(
                 prompt_fingerprint=claimed_fingerprint,
                 active_run=duplicate_active,
             )
-            await websocket.send_json(
+            await _send_json_if_open(
                 {
                     "type": "error",
                     "content": (
@@ -644,7 +739,7 @@ async def _run_websocket_message(
             )
             for token_chunk in _chunk_text(complete):
                 full_response.append(token_chunk)
-                await websocket.send_json({"type": "token", "content": token_chunk})
+                await _send_json_if_open({"type": "token", "content": token_chunk})
             complete = "".join(full_response)
         else:
             started = time.perf_counter()
@@ -656,7 +751,7 @@ async def _run_websocket_message(
                 stage="chat_simple",
             ):
                 full_response.append(token_chunk)
-                await websocket.send_json({"type": "token", "content": token_chunk})
+                await _send_json_if_open({"type": "token", "content": token_chunk})
             metrics.record_chat_latency(
                 mode="chat",
                 elapsed_ms=(time.perf_counter() - started) * 1000.0,
@@ -680,7 +775,7 @@ async def _run_websocket_message(
             transport="websocket",
         )
 
-        await websocket.send_json(
+        await _send_json_if_open(
             {
                 "type": "done",
                 "content": complete,
@@ -722,6 +817,8 @@ async def _run_websocket_message(
     finally:
         if prompt_claimed:
             await get_chat_run_manager().mark_prompt_finished(session_id, user_message)
+        if send_id_claimed and client_send_id:
+            await get_chat_run_manager().mark_client_send_id_finished(session_id, client_send_id)
         if "record_token" in locals():
             restore_tool_execution_records(record_token)
         if "usage_token" in locals():
@@ -826,6 +923,16 @@ async def chat_websocket(
             return
 
         active_message_task: Optional[asyncio.Task] = None
+
+        def _extract_payload_from_receive_task(task: asyncio.Task) -> Optional[Dict[str, Any]]:
+            try:
+                raw_text = task.result()
+            except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
+                return None
+            try:
+                return json.loads(raw_text)
+            except Exception:
+                return None
 
         async def _start_message_run(
             *,
@@ -943,8 +1050,10 @@ async def chat_websocket(
                     await chat_run_manager.clear(session_id, active_message_task)
                     active_message_task = None
                 if receive_task in done:
-                    raw = receive_task.result()
-                    data = json.loads(raw)
+                    payload = _extract_payload_from_receive_task(receive_task)
+                    if payload is None:
+                        break
+                    data = payload
                     user_message = data.get("content", "").strip()
                     client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
                     allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
@@ -958,8 +1067,10 @@ async def chat_websocket(
                         pass
                 continue
 
-            raw = receive_task.result()
-            data = json.loads(raw)
+            payload = _extract_payload_from_receive_task(receive_task)
+            if payload is None:
+                break
+            data = payload
             user_message = data.get("content", "").strip()
             client_send_id = data.get("client_send_id") if isinstance(data, dict) else None
             allowed_tools = data.get("allowed_tools") if isinstance(data, dict) else None
@@ -974,7 +1085,9 @@ async def chat_websocket(
                 )
 
     except WebSocketDisconnect:
-        pass
+        if 'active_message_task' in locals() and active_message_task is not None and not active_message_task.done():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await active_message_task
     except Exception as e:
         log.exception("Unhandled error in WebSocket handler", session_id=session_id)
         try:
@@ -983,9 +1096,8 @@ async def chat_websocket(
             pass
     finally:
         if 'active_message_task' in locals() and active_message_task is not None:
-            if not active_message_task.done():
-                active_message_task.cancel()
-            await chat_run_manager.clear(session_id, active_message_task)
+            if active_message_task.done():
+                await chat_run_manager.clear(session_id, active_message_task)
         metrics.ws_disconnect()
 
 
@@ -1332,7 +1444,7 @@ async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at)
+        .order_by(ChatMessage.created_at, ChatMessage.id)
     )
     messages = result.scalars().all()
     return [{"role": m.role, "content": m.content} for m in messages]

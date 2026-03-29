@@ -34,6 +34,9 @@ CALENDAR_MUTATION_KEYWORDS = {
 CALENDAR_WRITE_ACTIONS = {
     "create",
     "add",
+    "delete",
+    "remove",
+    "cancel",
     "put",
     "schedule",
     "set up",
@@ -55,6 +58,12 @@ CALENDAR_SUCCESS_PATTERNS = (
     "i moved",
     "rescheduled",
     "updated your calendar",
+    "i've deleted",
+    "i deleted",
+    "successfully deleted",
+    "removed from your calendar",
+    "deleted from your calendar",
+    "cancelled on your calendar",
 )
 TASK_MUTATION_KEYWORDS = {
     "task",
@@ -209,7 +218,7 @@ def build_chat_retry_instruction(reason: str | None) -> str:
         )
     if reason == "calendar_mutation_unconfirmed":
         return (
-            "Do not claim that a calendar event was created, moved, or updated unless a calendar "
+            "Do not claim that a calendar event was created, deleted, moved, or updated unless a calendar "
             "tool explicitly confirmed success. If the mutation was not confirmed, say that clearly."
         )
     if reason == "task_mutation_unconfirmed":
@@ -277,6 +286,8 @@ def _calendar_mutation_confirmed(executed_tools: list[dict[str, Any]]) -> bool:
         tool = str(record.get("tool", "")).strip()
         summary = str(record.get("result_summary", "")).strip().lower()
         if tool == "create_event" and summary.startswith("event created:"):
+            return True
+        if tool == "delete_event" and summary.startswith("event deleted:"):
             return True
         if tool in {"update_event", "move_event"} and (
             summary.startswith("event updated:") or summary.startswith("event moved:")

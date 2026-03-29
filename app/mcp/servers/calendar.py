@@ -1,7 +1,7 @@
 """
 FruitcakeAI v5 — Calendar MCP server (internal_python)
 
-Tools: list_events, create_event, search_events
+Tools: list_events, create_event, delete_event, search_events
 Providers: Google Calendar, Apple CalDAV (graceful when not configured)
 
 To enable Google Calendar:
@@ -21,6 +21,7 @@ To enable Apple CalDAV:
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -102,6 +103,40 @@ def get_tools() -> List[Dict[str, Any]]:
             },
         },
         {
+            "name": "delete_event",
+            "description": (
+                "Delete an existing calendar event by id. "
+                "Use list_events or search_events first to identify the exact event id. "
+                "Only use this after the user explicitly confirms that the event should be deleted."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "event_id": {
+                        "type": "string",
+                        "description": "Exact event id returned by list_events or search_events.",
+                    },
+                    "calendar_id": {
+                        "type": "string",
+                        "description": "Optional calendar name. Defaults to the provider default calendar when omitted.",
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true after the user explicitly confirms the deletion.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional event title for the confirmation message.",
+                    },
+                    "start": {
+                        "type": "string",
+                        "description": "Optional event start timestamp for the confirmation message.",
+                    },
+                },
+                "required": ["event_id", "confirm"],
+            },
+        },
+        {
             "name": "search_events",
             "description": (
                 "Search calendar events by keyword across a date range. "
@@ -164,6 +199,8 @@ async def call_tool(tool_name: str, arguments: Dict[str, Any], user_context: Any
         return await _list_events(arguments, user_context)
     if tool_name == "create_event":
         return await _create_event(arguments, user_context)
+    if tool_name == "delete_event":
+        return await _delete_event(arguments, user_context)
     if tool_name == "search_events":
         return await _search_events(arguments, user_context)
     if tool_name == "compute_dates":
@@ -227,8 +264,9 @@ async def _list_events(args: Dict[str, Any], user_context: Any) -> str:
         start_label = _format_event_timestamp(ev.get("start") or "")
         end_label = _format_event_timestamp(ev.get("end") or "")
         summary = ev.get("summary") or "Untitled"
+        event_id = ev.get("id") or "unknown"
         loc = f" @ {ev['location']}" if ev.get("location") else ""
-        lines.append(f"• {start_label} – {end_label}: {summary}{loc}")
+        lines.append(f"• [{event_id}] {start_label} – {end_label}: {summary}{loc}")
         if ev.get("description"):
             lines.append(f"  {ev['description'][:100]}")
     return "\n".join(lines)
@@ -267,6 +305,55 @@ async def _create_event(args: Dict[str, Any], user_context: Any) -> str:
     except Exception as e:
         log.error("create_event failed", error=str(e))
         return f"Failed to create event: {e}"
+
+
+async def _delete_event(args: Dict[str, Any], user_context: Any) -> str:
+    event_id = str(args.get("event_id") or "").strip()
+    if not event_id:
+        return "Error: event_id is required."
+    if args.get("confirm") is not True:
+        return "Deletion requires explicit confirmation. Ask the user to confirm before deleting."
+
+    provider = _get_provider()
+    if provider is None:
+        return _not_configured()
+
+    calendar_id = args.get("calendar_id") or provider.default_calendar_id()
+    title = str(args.get("title") or "").strip()
+    start = str(args.get("start") or "").strip()
+
+    try:
+        result = await provider.delete_event(
+            calendar_id=calendar_id,
+            event_id=event_id,
+            start=start or None,
+        )
+        status = str(result.get("status") or "").strip().lower()
+        if status and status != "deleted":
+            if status == "calendar_not_found":
+                return f"Failed to delete event: calendar '{calendar_id}' not found."
+            if status == "event_not_found":
+                return f"Failed to delete event: event '{event_id}' not found."
+            if status == "missing_start":
+                return (
+                    f"Failed to delete event: event '{event_id}' needs a start timestamp for bounded lookup. "
+                    "List the event again and retry the delete with the exact event details."
+                )
+            if status == "delete_unverified":
+                return (
+                    f"Failed to verify deletion for event '{event_id}'. "
+                    "The calendar provider did not confirm that the event was removed."
+                )
+            return f"Failed to delete event: provider returned status '{status}'."
+
+        summary = title or str(result.get("summary") or "").strip() or event_id
+        when = start or str(result.get("start") or "").strip()
+        if when:
+            return f"Event deleted: '{summary}' ({event_id}) scheduled for {_format_event_timestamp(when)}"
+        return f"Event deleted: '{summary}' ({event_id})"
+    except Exception as e:
+        log.error("delete_event failed", error=str(e))
+        return f"Failed to delete event: {e}"
 
 
 async def _search_events(args: Dict[str, Any], user_context: Any) -> str:
@@ -308,7 +395,7 @@ async def _search_events(args: Dict[str, Any], user_context: Any) -> str:
     lines = [f"Events matching '{query}':\n"]
     for ev in matches:
         s = (ev.get("start") or "")[:16].replace("T", " ")
-        lines.append(f"• {s}: {ev.get('summary') or 'Untitled'}")
+        lines.append(f"• [{ev.get('id') or 'unknown'}] {s}: {ev.get('summary') or 'Untitled'}")
     return "\n".join(lines)
 
 
@@ -551,6 +638,29 @@ class _GoogleProvider:
         result = await loop.run_in_executor(None, _create)
         return {"id": result.get("id"), "status": result.get("status")}
 
+    async def delete_event(
+        self,
+        calendar_id: str,
+        event_id: str,
+        start: str | None = None,
+    ) -> Dict[str, Any]:
+        service = await self._get_service()
+        loop = asyncio.get_running_loop()
+
+        def _delete():
+            service.events().delete(
+                calendarId=calendar_id,
+                eventId=event_id,
+                sendUpdates="all",
+            ).execute()
+            try:
+                service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+                return {"id": event_id, "status": "delete_unverified"}
+            except Exception:
+                return {"id": event_id, "status": "deleted"}
+
+        return await loop.run_in_executor(None, _delete)
+
 
 # ── Apple CalDAV provider ─────────────────────────────────────────────────────
 
@@ -672,6 +782,76 @@ class _AppleProvider:
             return {"id": "", "status": "calendar_not_found"}
 
         return await loop.run_in_executor(None, _create)
+
+    async def delete_event(
+        self,
+        calendar_id: str,
+        event_id: str,
+        start: str | None = None,
+    ) -> Dict[str, Any]:
+        principal = await self._get_principal()
+        loop = asyncio.get_running_loop()
+
+        def _delete():
+            if not start:
+                return {"id": event_id, "status": "missing_start"}
+
+            try:
+                target_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            except Exception:
+                return {"id": event_id, "status": "missing_start"}
+
+            window_start = target_start - timedelta(days=1)
+            window_end = target_start + timedelta(days=2)
+
+            def _matching_events(cal_obj):
+                return cal_obj.date_search(window_start, window_end)
+
+            def _event_exists(cal_obj) -> bool:
+                for existing in _matching_events(cal_obj):
+                    comp = existing.icalendar_component
+                    for vevent in _collect_vevent_components(comp):
+                        uid = str(vevent.get("uid", "")).strip()
+                        if uid == event_id:
+                            return True
+                return False
+
+            calendars = list(principal.calendars())
+            selected = []
+            for cal in calendars:
+                name = getattr(cal, "name", None) or str(cal.url)
+                if _calendar_matches(calendar_id, name, str(cal.url)):
+                    selected.append(cal)
+            if not selected:
+                return {"id": event_id, "status": "calendar_not_found"}
+
+            for cal in selected:
+                for ev in _matching_events(cal):
+                    comp = ev.icalendar_component
+                    for vevent in _collect_vevent_components(comp):
+                        uid = str(vevent.get("uid", "")).strip()
+                        if uid == event_id:
+                            summary = str(vevent.get("summary", "") or "")
+                            event_start = vevent.decoded("dtstart").isoformat() if vevent.get("dtstart") else ""
+                            ev.delete()
+                            for _ in range(3):
+                                if not _event_exists(cal):
+                                    return {
+                                        "id": event_id,
+                                        "status": "deleted",
+                                        "summary": summary,
+                                        "start": event_start,
+                                    }
+                                time.sleep(0.2)
+                            return {
+                                "id": event_id,
+                                "status": "delete_unverified",
+                                "summary": summary,
+                                "start": event_start,
+                            }
+            return {"id": event_id, "status": "event_not_found"}
+
+        return await loop.run_in_executor(None, _delete)
 
 
 def _collect_vevent_components(component: Any) -> List[Any]:

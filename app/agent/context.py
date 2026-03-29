@@ -107,6 +107,7 @@ class UserContext:
             "- If a sandboxed tool is available for the requested action, use it and report the tool result rather than refusing from general model policy.",
             "- Do not claim a tool is unavailable when it is present in the current tool list.",
             "- If you just created a task in this conversation and the user asks to change it or run it, prefer updating or running that existing task instead of creating a second similar task.",
+            "- Never delete a calendar event unless the user explicitly confirms the deletion in the conversation first. List or search the event, identify the exact event id, ask for confirmation if it has not already been given, then use delete_event.",
             "- When you learn a stable user fact, durable preference, recurring household procedure, or meaningful near-term event that should persist beyond this turn, use create_memory once with a clear self-contained statement.",
             "- Do not create memories for trivial one-off chatter, temporary reasoning steps, or facts already captured in the visible memory context.",
             "- Always cite the source document name when using search_library results.",

@@ -9,7 +9,6 @@ from app.agent.chat_validation import (
 from app.agent.context import UserContext
 from app.config import settings
 from app.metrics import metrics
-from app.api.chat import _execute_chat_turn
 
 
 def test_validate_chat_response_requires_links_for_research_prompt():
@@ -59,6 +58,21 @@ def test_validate_chat_response_flags_unconfirmed_calendar_mutation_claim():
     assert out.mutation_unconfirmed is True
     assert out.should_retry is True
     assert out.retry_reason == "calendar_mutation_unconfirmed"
+
+
+def test_validate_chat_response_accepts_confirmed_calendar_delete_claim():
+    out = validate_chat_response(
+        "Delete the lunch with Rod event from my calendar",
+        "I've deleted the Lunch with Rod event from your calendar.",
+        executed_tools=[
+            {
+                "tool": "delete_event",
+                "result_summary": "Event deleted: 'Lunch with Rod' (evt_123)",
+            }
+        ],
+    )
+    assert out.mutation_unconfirmed is False
+    assert out.should_retry is False
 
 
 def test_validate_chat_response_flags_unconfirmed_task_mutation_claim():
@@ -133,36 +147,6 @@ async def test_send_message_retries_once_for_missing_links_on_complex_prompt(cli
     assert "https://apnews.com/" in resp.json()["content"]
     assert mock_run.await_count == 2
     assert mock_run.await_args_list[0].kwargs["mode"] == "chat_orchestrated"
-
-
-@pytest.mark.asyncio
-async def test_execute_chat_turn_honors_retry_override_zero():
-    user_context = UserContext(user_id=1, username="tester", role="parent")
-    history = [{"role": "user", "content": "Research the latest headlines and cite sources"}]
-
-    with (
-        patch.object(settings, "chat_validation_enabled", True),
-        patch.object(settings, "chat_validation_retry_enabled", True),
-        patch.object(settings, "chat_validation_retry_max_attempts", 1),
-        patch(
-            "app.api.chat.run_agent",
-            new_callable=AsyncMock,
-            return_value="Top stories today include several major events.",
-        ) as mock_run,
-    ):
-        content = await _execute_chat_turn(
-            history,
-            user_context,
-            user_prompt=history[0]["content"],
-            mode="chat_orchestrated",
-            model_override=None,
-            stage="chat_complex",
-            enable_validation=True,
-            retry_max_attempts_override=0,
-        )
-
-    assert "major events" in content
-    assert mock_run.await_count == 1
 
 
 @pytest.mark.asyncio

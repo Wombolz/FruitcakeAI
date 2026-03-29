@@ -15,10 +15,18 @@ class RecentPromptState:
     active: bool
 
 
+@dataclass
+class RecentSendIdState:
+    client_send_id: str
+    timestamp_monotonic: float
+    active: bool
+
+
 class ChatRunManager:
-    def __init__(self, *, duplicate_window_seconds: float = 10.0) -> None:
+    def __init__(self, *, duplicate_window_seconds: float = 300.0) -> None:
         self._active_runs: dict[int, asyncio.Task] = {}
         self._recent_prompts: dict[int, RecentPromptState] = {}
+        self._recent_send_ids: dict[int, RecentSendIdState] = {}
         self._lock = asyncio.Lock()
         self._duplicate_window_seconds = duplicate_window_seconds
 
@@ -83,6 +91,28 @@ class ChatRunManager:
             )
             return True, False, fingerprint
 
+    async def claim_client_send_id(self, session_id: int, client_send_id: str) -> tuple[bool, bool]:
+        normalized = str(client_send_id or "").strip()
+        if not normalized:
+            return True, False
+
+        now = time.monotonic()
+        async with self._lock:
+            current = self._recent_send_ids.get(session_id)
+            if (
+                current is not None
+                and current.client_send_id == normalized
+                and (now - current.timestamp_monotonic) <= self._duplicate_window_seconds
+            ):
+                return False, current.active
+
+            self._recent_send_ids[session_id] = RecentSendIdState(
+                client_send_id=normalized,
+                timestamp_monotonic=now,
+                active=True,
+            )
+            return True, False
+
     async def mark_prompt_finished(self, session_id: int, prompt: str) -> None:
         normalized = self.normalize_prompt(prompt)
         if not normalized:
@@ -92,6 +122,19 @@ class ChatRunManager:
         async with self._lock:
             current = self._recent_prompts.get(session_id)
             if current is None or current.normalized_prompt != normalized:
+                return
+            current.active = False
+            current.timestamp_monotonic = now
+
+    async def mark_client_send_id_finished(self, session_id: int, client_send_id: str) -> None:
+        normalized = str(client_send_id or "").strip()
+        if not normalized:
+            return
+
+        now = time.monotonic()
+        async with self._lock:
+            current = self._recent_send_ids.get(session_id)
+            if current is None or current.client_send_id != normalized:
                 return
             current.active = False
             current.timestamp_monotonic = now

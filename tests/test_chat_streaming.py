@@ -110,3 +110,38 @@ async def test_stream_agent_keeps_tool_turns_internal_before_streaming_final():
     assert mock_dispatch.await_count == 1
     assert mock_completion.await_count == 3
     assert mock_completion.await_args_list[-1].kwargs["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_stops_after_failed_delete_event_tool_result():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    tool_calls = [
+        SimpleNamespace(
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(name="delete_event", arguments='{"event_id":"evt_123","confirm":true}'),
+        )
+    ]
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[{"function": {"name": "delete_event"}}]),
+        patch(
+            "app.agent.core.dispatch_tool_calls",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "role": "tool",
+                        "content": "Failed to verify deletion for event 'evt_123'. The calendar provider did not confirm that the event was removed.",
+                    }
+                ]
+            ),
+        ) as mock_dispatch,
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(return_value=_fake_response(tool_calls=tool_calls))) as mock_completion,
+    ):
+        chunks = [chunk async for chunk in stream_agent([{"role": "user", "content": "delete it"}], user_context)]
+
+    assert chunks == [
+        "Failed to verify deletion for event 'evt_123'. The calendar provider did not confirm that the event was removed."
+    ]
+    assert mock_dispatch.await_count == 1
+    assert mock_completion.await_count == 1
