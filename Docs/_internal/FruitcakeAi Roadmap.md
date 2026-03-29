@@ -1563,6 +1563,29 @@ Near-term additions:
   - Explicitly deferred:
     - workspace-scoped RSS/feed management
     - skill sharing
+
+- **Per-user authenticated integrations Phase A**
+  - Goal: stop treating authenticated providers as deployment-wide credentials when the product is being used by multiple real users.
+  - First implementation only:
+    - Google Calendar per-user OAuth
+    - Apple CalDAV per-user credential onboarding
+    - connected-accounts UI in Settings
+    - per-user credential resolution in calendar execution paths
+  - Required backend pieces:
+    - `user_integrations` table with one active integration per user/provider/service
+    - secret references by durable ID, not name convention
+    - signed OAuth state validation
+    - concurrency-safe token refresh path
+  - Product policy decision required before build:
+    - whether users without a connected account get no personal provider access
+    - or fall back to an explicit shared household provider
+  - Explicitly deferred:
+    - Gmail
+    - Contacts
+    - merged/shared family calendar views
+    - admin “connect on behalf of user”
+  - Reference:
+    - `Docs/_internal/per_user_integrations_plan.md`
     - connector-specific workspace policy
 
 - **Encrypted backup/restore**
