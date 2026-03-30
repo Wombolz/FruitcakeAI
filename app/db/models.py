@@ -295,6 +295,7 @@ class ChatSession(Base):
 
     # Phase 4: task sessions are hidden from the chat UI session list
     is_task_session = Column(Boolean, default=False, nullable=False)
+    sort_order = Column(Integer, nullable=True, index=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

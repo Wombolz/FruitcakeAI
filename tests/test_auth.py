@@ -197,6 +197,112 @@ async def test_create_and_list_sessions(client):
     assert sessions.status_code == 200
     ids = [s["id"] for s in sessions.json()]
     assert session_id in ids
+    created_session = next(s for s in sessions.json() if s["id"] == session_id)
+    assert created_session["sort_order"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sessions_default_to_newest_first(client):
+    await client.post("/auth/register", json={
+        "username": "orderuser",
+        "email": "order@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "orderuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = await client.post("/chat/sessions", json={"title": "First"}, headers=headers)
+    second = await client.post("/chat/sessions", json={"title": "Second"}, headers=headers)
+    first_id = first.json()["id"]
+    second_id = second.json()["id"]
+
+    sessions = await client.get("/chat/sessions", headers=headers)
+    assert sessions.status_code == 200
+    data = sessions.json()
+    assert [row["id"] for row in data] == [second_id, first_id]
+    assert [row["sort_order"] for row in data] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_reorder_sessions_persists_order(client):
+    await client.post("/auth/register", json={
+        "username": "reorderuser",
+        "email": "reorder@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "reorderuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = await client.post("/chat/sessions", json={"title": "One"}, headers=headers)
+    second = await client.post("/chat/sessions", json={"title": "Two"}, headers=headers)
+    first_id = first.json()["id"]
+    second_id = second.json()["id"]
+
+    reorder = await client.patch(
+        "/chat/sessions/order",
+        json={"session_ids": [second_id, first_id]},
+        headers=headers,
+    )
+    assert reorder.status_code == 200
+    data = reorder.json()
+    assert [row["id"] for row in data[:2]] == [second_id, first_id]
+    assert [row["sort_order"] for row in data[:2]] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_reorder_sessions_rejects_missing_ids(client):
+    await client.post("/auth/register", json={
+        "username": "reorderreject",
+        "email": "reorderreject@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "reorderreject", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = await client.post("/chat/sessions", json={"title": "One"}, headers=headers)
+    second = await client.post("/chat/sessions", json={"title": "Two"}, headers=headers)
+    first_id = first.json()["id"]
+    _second_id = second.json()["id"]
+
+    reorder = await client.patch(
+        "/chat/sessions/order",
+        json={"session_ids": [first_id]},
+        headers=headers,
+    )
+    assert reorder.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_reordering_overrides_default_order(client):
+    await client.post("/auth/register", json={
+        "username": "manualorder",
+        "email": "manualorder@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "manualorder", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = await client.post("/chat/sessions", json={"title": "First"}, headers=headers)
+    second = await client.post("/chat/sessions", json={"title": "Second"}, headers=headers)
+    first_id = first.json()["id"]
+    second_id = second.json()["id"]
+
+    reorder = await client.patch(
+        "/chat/sessions/order",
+        json={"session_ids": [first_id, second_id]},
+        headers=headers,
+    )
+    assert reorder.status_code == 200
+
+    sessions = await client.get("/chat/sessions", headers=headers)
+    assert sessions.status_code == 200
+    data = sessions.json()
+    assert [row["id"] for row in data] == [first_id, second_id]
+    assert [row["sort_order"] for row in data] == [0, 1]
 
 
 @pytest.mark.asyncio
