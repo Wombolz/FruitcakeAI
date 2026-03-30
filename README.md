@@ -7,6 +7,14 @@ FruitcakeAI is a complete autonomous agent runtime — persistent memory, task s
 
 It's built for self-hosters, homelab tinkerers, developers, and small teams who want real autonomous AI capabilities without giving up ownership of their data or their stack. The foundation is fully working. What you build on top of it is up to you.
 
+<img width="1358" height="852" alt="Screenshot 2026-03-30 at 6 58 01 PM" src="https://github.com/user-attachments/assets/f1b5ddd8-00b7-4926-8083-2c33c43950b0" />
+
+<img width="1358" height="852" alt="Screenshot 2026-03-30 at 4 44 07 PM" src="https://github.com/user-attachments/assets/8043159e-575e-46cd-953a-d3d06d0b6f89" />
+
+<img width="1358" height="852" alt="Screenshot 2026-03-30 at 4 46 33 PM" src="https://github.com/user-attachments/assets/8f85eed4-7bc5-4a82-beae-460536f56e28" />
+
+
+
 ## Alpha Status
 
 FruitcakeAI is currently an alpha release.
