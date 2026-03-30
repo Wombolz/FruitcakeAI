@@ -1,6 +1,7 @@
 # FruitcakeAI
 
-**A self-hosted AI agent platform you run on your own hardware and extend however you want.**
+**A self-hosted AI agent platform for households and small teams.**
+**Local-first. Private by default.**
 
 FruitcakeAI is a complete autonomous agent runtime — persistent memory, task scheduling, multi-user access control, hybrid RAG document pipeline, MCP extensibility, and a native Swift client, all wired together and working. There's no SaaS dependency, no ongoing API cost, and no vendor lock-in. You bring your own models via Ollama, or swap in Claude or OpenAI with one environment variable.
 
