@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import asyncio
 import contextlib
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -1384,7 +1385,36 @@ def _enforce_calendar_mutation_integrity(
             "I couldn't confirm that the calendar change actually succeeded. "
             "Please check your calendar and try again."
         )
-    return response
+    return _strip_calendar_event_ids(response, executed_tools)
+
+
+def _strip_calendar_event_ids(
+    response: str,
+    executed_tools: list[dict[str, Any]],
+) -> str:
+    calendar_tools = {
+        "list_events",
+        "search_events",
+        "create_event",
+        "delete_event",
+        "update_event",
+        "move_event",
+    }
+    if not any((record or {}).get("tool") in calendar_tools for record in executed_tools):
+        return response
+
+    cleaned = response
+    cleaned = re.sub(
+        r"(^\s*[•*-]\s*)\[[^\]]+\]\s*",
+        r"\1",
+        cleaned,
+        flags=re.MULTILINE,
+    )
+    cleaned = re.sub(r"\s*\(id:\s*[^)]+\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(event id|id)\s*[:=]\s*[A-Za-z0-9_.:@-]+\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    return cleaned.strip()
 
 
 async def _apply_required_library_grounding(
