@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Support Guide
+    url: https://github.com/Wombolz/FruitcakeAI/blob/main/SUPPORT.md
+    about: Read where to file bugs, setup issues, and security concerns.
+  - name: Security Policy
+    url: https://github.com/Wombolz/FruitcakeAI/blob/main/SECURITY.md
+    about: Do not report security vulnerabilities in public issues.

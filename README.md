@@ -54,6 +54,15 @@ Before any shared-network or remote deployment:
 
 See [Security Baseline](Docs/SECURITY_BASELINE.md) for the full operator checklist, trust assumptions, and current limits.
 
+## Contributing
+
+Bug reports and reproducible issues are welcome.
+
+General outside code contributions are not broadly open yet while the project is still in an alpha-stage architecture churn phase.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the current contribution policy.
+See [SUPPORT.md](SUPPORT.md) for where to file bugs, setup issues, and security concerns.
+
 ### LLM Routing Trust Boundary
 
 - Local models keep prompts, task context, and tool results on your hardware.
