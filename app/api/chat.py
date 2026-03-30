@@ -17,11 +17,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 import structlog
 
@@ -96,6 +97,10 @@ class UpdateSessionModelRequest(BaseModel):
     llm_model: str = Field(min_length=1, max_length=200)
 
 
+class ReorderSessionsRequest(BaseModel):
+    session_ids: List[int]
+
+
 class MessageOut(BaseModel):
     id: int
     role: str
@@ -110,6 +115,7 @@ class SessionOut(BaseModel):
     title: Optional[str]
     persona: str
     llm_model: Optional[str]
+    sort_order: Optional[int]
 
     class Config:
         from_attributes = True
@@ -183,9 +189,20 @@ async def create_session(
         title=body.title or "New conversation",
         persona=current_user.persona or "family_assistant",
         llm_model=settings.llm_model,
+        sort_order=0,
     )
     db.add(session)
     await db.flush()
+    await db.execute(
+        sa.update(ChatSession)
+        .where(
+            ChatSession.user_id == current_user.id,
+            ChatSession.is_active == True,
+            ChatSession.is_task_session == False,
+            ChatSession.id != session.id,
+        )
+        .values(sort_order=func.coalesce(ChatSession.sort_order, 0) + 1)
+    )
     await db.refresh(session)
     return session
 
@@ -204,14 +221,17 @@ async def list_sessions(
             ChatSession.is_active == True,
             ChatSession.is_task_session == False,
         )
-        .order_by(ChatSession.updated_at.desc())
+        .order_by(
+            ChatSession.sort_order.asc().nullslast(),
+            ChatSession.id.desc(),
+        )
     )
     return result.scalars().all()
 
 
 # ── GET /chat/sessions/{id} ───────────────────────────────────────────────────
 
-@router.get("/sessions/{session_id}")
+@router.get("/sessions/{session_id:int}")
 async def get_session(
     session_id: int,
     db: AsyncSession = Depends(get_db),
@@ -245,7 +265,7 @@ async def get_session(
 
 # ── PATCH /chat/sessions/{id} ────────────────────────────────────────────────
 
-@router.patch("/sessions/{session_id}", response_model=SessionOut)
+@router.patch("/sessions/{session_id:int}", response_model=SessionOut)
 async def rename_session(
     session_id: int,
     body: RenameSessionRequest,
@@ -268,7 +288,7 @@ async def rename_session(
 
 # ── PATCH /chat/sessions/{id}/persona ────────────────────────────────────────
 
-@router.patch("/sessions/{session_id}/persona", response_model=SessionOut)
+@router.patch("/sessions/{session_id:int}/persona", response_model=SessionOut)
 async def update_session_persona(
     session_id: int,
     body: UpdateSessionPersonaRequest,
@@ -289,7 +309,7 @@ async def update_session_persona(
     return session
 
 
-@router.patch("/sessions/{session_id}/model", response_model=SessionOut)
+@router.patch("/sessions/{session_id:int}/model", response_model=SessionOut)
 async def update_session_model(
     session_id: int,
     body: UpdateSessionModelRequest,
@@ -307,9 +327,55 @@ async def update_session_model(
     return session
 
 
+@router.patch("/sessions/order", response_model=List[SessionOut])
+async def reorder_sessions(
+    body: ReorderSessionsRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> List[ChatSession]:
+    result = await db.execute(
+        select(ChatSession)
+        .where(
+            ChatSession.user_id == current_user.id,
+            ChatSession.is_active == True,
+            ChatSession.is_task_session == False,
+        )
+        .order_by(ChatSession.sort_order.asc().nullslast(), ChatSession.id.asc())
+    )
+    ordered_sessions = result.scalars().all()
+
+    current_ids = [session.id for session in ordered_sessions]
+    requested_ids = body.session_ids
+    if sorted(current_ids) != sorted(requested_ids):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Session IDs must match the current user's sessions exactly",
+        )
+
+    session_by_id = {session.id: session for session in ordered_sessions}
+    for idx, session_id in enumerate(requested_ids):
+        session_by_id[session_id].sort_order = idx
+
+    await db.flush()
+
+    refreshed = await db.execute(
+        select(ChatSession)
+        .where(
+            ChatSession.user_id == current_user.id,
+            ChatSession.is_active == True,
+            ChatSession.is_task_session == False,
+        )
+        .order_by(
+            ChatSession.sort_order.asc().nullslast(),
+            ChatSession.id.desc(),
+        )
+    )
+    return refreshed.scalars().all()
+
+
 # ── DELETE /chat/sessions/{id} ───────────────────────────────────────────────
 
-@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.delete("/sessions/{session_id:int}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 async def delete_session(
     session_id: int,
     db: AsyncSession = Depends(get_db),
