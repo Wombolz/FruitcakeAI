@@ -6,6 +6,20 @@ FruitcakeAI is a complete autonomous agent runtime — persistent memory, task s
 
 It's built for self-hosters, homelab tinkerers, developers, and small teams who want real autonomous AI capabilities without giving up ownership of their data or their stack. The foundation is fully working. What you build on top of it is up to you.
 
+## Alpha Status
+
+FruitcakeAI is currently an alpha release.
+
+That means:
+
+- behavior may still change between releases
+- setup is still opinionated and macOS-first
+- schema migrations are part of normal upgrade flow
+- some integrations are stable enough for testing, not guaranteed production-hard
+- public bug reports are welcome, but the project is not yet open to broad outside co-development
+
+If you are evaluating it publicly, treat it as a serious self-hosted alpha, not a polished production platform.
+
 ---
 
 ## What It Is
@@ -37,6 +51,17 @@ Every subsystem is independently testable, swap-able, and extensible. If you wan
 **Multi-user and safe by default.** Role-based personas with scoped tool access. Per-persona content filtering and blocked tool lists. Approval gates before irreversible actions. Active-hours windows that prevent the autonomous agent from running at 3am.
 
 **No speculative infrastructure.** The codebase contains only what the current use case requires. No Kubernetes, no distributed queues, no ELK stack. Complexity is added when real friction demands it, not in anticipation of scale that doesn't exist yet.
+
+## Known Limits
+
+- The primary operator path is still local/self-hosted on trusted hardware and trusted networks.
+- The backend is not positioned as internet-hardened by default.
+- The native client story is still split from the backend repository.
+- Setup and testing are currently macOS-first.
+- Apple ID / CalDAV and Google Calendar identity are currently shared application-wide rather than isolated per user.
+- Per-user access to those integrations is planned, but it is not the current development priority.
+- Some workflows are well-soaked for daily use; others are still alpha-grade and may shift quickly.
+- Internal planning and maintainer workflow are intentionally not the same thing as the public contribution surface.
 
 ---
 

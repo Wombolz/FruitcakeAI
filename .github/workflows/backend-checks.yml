@@ -1,0 +1,48 @@
+name: Backend Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-checks:
+    name: Python Compile + Smoke Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile Python sources
+        run: |
+          python - <<'PY'
+          import pathlib
+          import py_compile
+
+          roots = [pathlib.Path("app"), pathlib.Path("tests")]
+          for root in roots:
+              for path in root.rglob("*.py"):
+                  py_compile.compile(str(path), doraise=True)
+          print("Compiled app/ and tests/ successfully.")
+          PY
+
+      - name: Run focused smoke tests
+        run: |
+          pytest -q tests/test_auth.py -k "create_and_list_sessions or order"
