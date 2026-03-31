@@ -578,6 +578,35 @@ async def test_create_task_tool_persists_recurring_task():
         assert task is not None
         assert task.schedule == "every:2h"
         assert task.profile == "topic_watcher"
+        assert task.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_defaults_to_requires_approval_true():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Approval default",
+                "instruction": "Do a saved task safely",
+                "task_type": "one_shot",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["requires_approval"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.requires_approval is True
 
 
 @pytest.mark.asyncio

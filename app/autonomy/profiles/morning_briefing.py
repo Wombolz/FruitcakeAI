@@ -105,13 +105,33 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
     def effective_blocked_tools(self, *, run_context: Dict[str, Any]) -> set[str]:
         del run_context
         return {
+            # This profile should synthesize only from the prepared calendar and
+            # RSS datasets. Leaving unrelated task/memory/admin tools visible
+            # makes local models more brittle without improving the result.
+            "add_memory_observations",
+            "api_request",
+            "create_and_run_task_plan",
+            "create_memory",
+            "create_memory_entities",
+            "create_memory_relations",
+            "create_task",
+            "create_task_plan",
+            "get_daily_market_data",
             "get_feed_items",
+            "get_intraday_market_data",
+            "get_task",
+            "list_tasks",
             "search_feeds",
             "search_my_feeds",
             "list_recent_feed_items",
             "search_library",
+            "search_memory_graph",
+            "search_places",
             "summarize_document",
             "list_library_documents",
+            "open_memory_graph_nodes",
+            "run_task_now",
+            "update_task",
             "web_search",
             "fetch_page",
         }

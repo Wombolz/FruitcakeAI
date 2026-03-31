@@ -115,7 +115,7 @@ async def create_task_record(
     task_type: str = "one_shot",
     schedule: Optional[str] = None,
     deliver: bool = True,
-    requires_approval: bool = False,
+    requires_approval: bool = True,
     active_hours_start: Optional[str] = None,
     active_hours_end: Optional[str] = None,
     active_hours_tz: Optional[str] = None,

@@ -45,7 +45,7 @@ class TaskCreate(BaseModel):
     task_type: str = "one_shot"          # "one_shot" | "recurring"
     schedule: Optional[str] = None       # "every:30m" | cron | ISO timestamp
     deliver: bool = True
-    requires_approval: bool = False
+    requires_approval: bool = True
     active_hours_start: Optional[str] = None
     active_hours_end: Optional[str] = None
     active_hours_tz: Optional[str] = None
