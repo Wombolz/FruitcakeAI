@@ -570,8 +570,32 @@ def test_export_newspaper_edition_writes_pdf_markdown_and_manifest(tmp_path, mon
     assert manifest["task_id"] == 48
     assert manifest["task_run_id"] == 561
     assert manifest["publish_mode"] == "full"
-    assert manifest["display_timezone"]
+    assert manifest["display_timezone"] == "UTC"
+    assert manifest["display_published_at"].endswith("+00:00")
+
+
+def test_export_newspaper_edition_localizes_human_facing_manifest_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "storage_dir", str(tmp_path))
+    edition = export_newspaper_edition(
+        task_id=48,
+        task_run_id=562,
+        session_id=688,
+        profile="rss_newspaper",
+        final_markdown="# Fruitcake News\n",
+        started_at=datetime(2026, 3, 19, 15, 54, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 3, 19, 16, 0, 21, tzinfo=timezone.utc),
+        duration_seconds=381.0,
+        publish_mode="full",
+        dataset_stats={"selected_count": 100},
+        refresh_stats={"sources_refreshed": 137},
+        active_skills=["rss-grounded-briefing"],
+        timezone_name="America/New_York",
+    )
+
+    manifest = json.loads(Path(edition.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["display_timezone"] in {"EDT", "EST"}
     assert manifest["display_published_at"].endswith(("-04:00", "-05:00"))
+    assert "task-48/2026-03-19/" in edition.manifest["pdf_relative_path"]
 
 
 def test_news_magazine_validate_finalize_builds_dense_fruitcake_news_edition():

@@ -16,12 +16,13 @@ def test_filesystem_server_exposes_read_and_write_tools():
     assert "stat_file" in tool_names
     assert "read_file" in tool_names
     assert "write_file" in tool_names
+    assert "append_file" in tool_names
     assert "make_directory" in tool_names
 
 
 def test_filesystem_tool_descriptions_distinguish_workspace_from_library():
     tools = {tool["name"]: tool for tool in get_tools()}
-    for tool_name in ("list_directory", "find_files", "stat_file", "read_file", "write_file", "make_directory"):
+    for tool_name in ("list_directory", "find_files", "stat_file", "read_file", "write_file", "append_file", "make_directory"):
         description = tools[tool_name]["description"].lower()
         assert "workspace" in description
         assert "library" in description
@@ -61,6 +62,29 @@ async def test_write_and_read_file_inside_user_workspace(tmp_path, monkeypatch):
 
     read_result = await call_tool("read_file", {"path": "notes/today.md"}, user_context)
     assert read_result == "hello workspace"
+
+
+@pytest.mark.asyncio
+async def test_append_file_inside_user_workspace(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    user_context = UserContext(user_id=7, username="tester", role="parent")
+
+    first = await call_tool(
+        "append_file",
+        {"path": "reports/daily.md", "content": "line one\n"},
+        user_context,
+    )
+    second = await call_tool(
+        "append_file",
+        {"path": "reports/daily.md", "content": "line two\n"},
+        user_context,
+    )
+
+    expected_path = Path(tmp_path) / "7" / "reports" / "daily.md"
+    assert expected_path.exists()
+    assert expected_path.read_text() == "line one\nline two\n"
+    assert "Appended" in first
+    assert "Appended" in second
 
 
 @pytest.mark.asyncio
@@ -143,6 +167,21 @@ async def test_write_file_blocks_cross_user_absolute_path(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="within the user's workspace"):
         await call_tool(
             "write_file",
+            {"path": str(other_user_file), "content": "nope"},
+            user_context,
+        )
+
+
+@pytest.mark.asyncio
+async def test_append_file_blocks_cross_user_absolute_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    other_user_file = Path(tmp_path) / "9" / "private.txt"
+    other_user_file.parent.mkdir(parents=True, exist_ok=True)
+
+    user_context = UserContext(user_id=8, username="tester", role="parent")
+    with pytest.raises(ValueError, match="within the user's workspace"):
+        await call_tool(
+            "append_file",
             {"path": str(other_user_file), "content": "nope"},
             user_context,
         )

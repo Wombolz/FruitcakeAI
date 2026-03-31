@@ -142,6 +142,7 @@ async def create_task(
             active_hours_start=body.active_hours_start,
             active_hours_end=body.active_hours_end,
             active_hours_tz=body.active_hours_tz,
+            user_timezone=current_user.active_hours_tz,
         )
     except TaskValidationError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -214,6 +215,7 @@ async def update_task(
             active_hours_start=body.active_hours_start if body.active_hours_start is not None else UNSET,
             active_hours_end=body.active_hours_end if body.active_hours_end is not None else UNSET,
             active_hours_tz=body.active_hours_tz if body.active_hours_tz is not None else UNSET,
+            user_timezone=current_user.active_hours_tz,
         )
     except TaskValidationError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

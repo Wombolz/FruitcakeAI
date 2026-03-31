@@ -574,6 +574,7 @@ class Task(Base):
     persona = Column(String(100), nullable=True)
     # Optional task execution profile (default, rss_newspaper)
     profile = Column(String(50), nullable=True)
+    executor_config_json = Column(Text, default="{}", nullable=False)
     # Optional explicit model override for all LLM stages of this task.
     llm_model_override = Column(String(200), nullable=True)
 
@@ -643,6 +644,14 @@ class Task(Base):
         cascade="all, delete-orphan",
         order_by="TaskAPIState.updated_at.desc()",
     )
+
+    @property
+    def executor_config(self) -> dict:
+        return json.loads(self.executor_config_json or "{}")
+
+    @executor_config.setter
+    def executor_config(self, value: dict):
+        self.executor_config_json = json.dumps(value or {})
 
     def __repr__(self):
         return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"

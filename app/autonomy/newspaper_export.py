@@ -17,6 +17,7 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 from app.config import settings
+from app.time_utils import format_localized_datetime, localize_datetime, to_utc, utc_compact_timestamp, utc_day_folder
 
 
 @dataclass
@@ -90,12 +91,13 @@ def export_newspaper_edition(
     dataset_stats: Dict[str, Any],
     refresh_stats: Dict[str, Any],
     active_skills: List[str],
+    timezone_name: Optional[str] = None,
 ) -> NewspaperEditionExport:
-    finished_utc = _as_utc(finished_at) or datetime.now(timezone.utc)
-    finished_local = finished_utc.astimezone()
-    started_utc = _as_utc(started_at)
-    edition_stamp = finished_utc.strftime("%Y%m%dT%H%M%SZ")
-    day_folder = finished_utc.strftime("%Y-%m-%d")
+    finished_utc = to_utc(finished_at) or datetime.now(timezone.utc)
+    finished_local = localize_datetime(finished_utc, timezone_name)
+    started_utc = to_utc(started_at)
+    edition_stamp = utc_compact_timestamp(finished_utc)
+    day_folder = utc_day_folder(finished_utc)
 
     storage_root = Path(settings.storage_dir)
     edition_dir = (
@@ -117,7 +119,10 @@ def export_newspaper_edition(
     render_newspaper_pdf(
         pdf_path=pdf_path,
         markdown=normalized_markdown,
-        edition_label=finished_local.strftime("%B %d, %Y %I:%M %p %Z"),
+        edition_label=format_localized_datetime(
+            finished_utc,
+            timezone_name=timezone_name,
+        ),
         task_id=task_id,
         task_run_id=task_run_id,
     )
@@ -129,8 +134,8 @@ def export_newspaper_edition(
         "profile": profile,
         "started_at": started_utc.isoformat() if started_utc else None,
         "finished_at": finished_utc.isoformat(),
-        "display_timezone": finished_local.tzname(),
-        "display_published_at": finished_local.isoformat(),
+        "display_timezone": finished_local.tzname() if finished_local else "UTC",
+        "display_published_at": finished_local.isoformat() if finished_local else finished_utc.isoformat(),
         "duration_seconds": duration_seconds,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "publish_mode": publish_mode,
@@ -347,13 +352,6 @@ def _relative_to_storage(path: Path) -> str:
     storage_root = Path(settings.storage_dir).resolve()
     return str(path.resolve().relative_to(storage_root))
 
-
-def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
 
 
 def _is_masthead_line(line: str) -> bool:

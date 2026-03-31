@@ -1510,6 +1510,7 @@ async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> 
                 active_hours_start=arguments.get("active_hours_start"),
                 active_hours_end=arguments.get("active_hours_end"),
                 active_hours_tz=arguments.get("active_hours_tz"),
+                user_timezone=user_context.timezone,
             )
             await db.commit()
         except TaskValidationError as exc:
@@ -1565,6 +1566,7 @@ async def _update_task(arguments: Dict[str, Any], user_context: UserContext) -> 
                 active_hours_start=arguments["active_hours_start"] if "active_hours_start" in arguments else UNSET,
                 active_hours_end=arguments["active_hours_end"] if "active_hours_end" in arguments else UNSET,
                 active_hours_tz=arguments["active_hours_tz"] if "active_hours_tz" in arguments else UNSET,
+                user_timezone=user_context.timezone,
             )
             await db.commit()
         except TaskValidationError as exc:

@@ -305,6 +305,7 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
             dataset_stats=dict(run_debug.get("dataset_stats") or {}),
             refresh_stats=dict(run_debug.get("refresh_stats") or {}),
             active_skills=list(run_debug.get("active_skills") or []),
+            timezone_name=getattr(task, "active_hours_tz", None),
         )
         manifest = dict(edition.manifest)
         manifest["download_path"] = f"/admin/task-runs/{run.id}/edition.pdf"
