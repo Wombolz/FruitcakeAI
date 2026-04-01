@@ -684,6 +684,39 @@ async def test_run_task_now_tool_queues_existing_task():
 
 
 @pytest.mark.asyncio
+async def test_run_task_now_tool_rejects_when_active_run_exists():
+    import app.agent.tools as tools_module
+    from app.db.models import Task, TaskRun
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        created = json.loads(
+            await tools_module._create_task(
+                {
+                    "title": "Run me once",
+                    "instruction": "Do the task",
+                    "task_type": "one_shot",
+                    "deliver": True,
+                },
+                ctx,
+            )
+        )
+
+        async with TestSessionLocal() as db:
+            task = await db.get(Task, created["task_id"])
+            assert task is not None
+            task.status = "pending"
+            db.add(TaskRun(task_id=task.id, status="running"))
+            await db.commit()
+
+        result = json.loads(await tools_module._run_task_now({"task_id": created["task_id"]}, ctx))
+
+    assert result["queued"] is False
+    assert result["detail"] == "Task is already running"
+
+
+@pytest.mark.asyncio
 async def test_list_tasks_and_get_task_return_owned_task_state():
     import app.agent.tools as tools_module
 

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from sqlalchemy import select
 
-from app.db.models import User
+from app.db.models import Task, TaskRun, User
 from tests.conftest import TestSessionLocal
 
 
@@ -155,3 +155,43 @@ async def test_create_task_falls_back_to_utc_for_invalid_timezone(client):
     assert next_run.tzinfo == timezone.utc
     assert next_run.hour == 8
     assert next_run.minute == 0
+
+
+@pytest.mark.asyncio
+async def test_manual_run_rejects_when_task_has_active_run(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskrunconflictuser",
+            "email": "taskrunconflict@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskrunconflictuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Conflict task",
+            "instruction": "Do the thing.",
+            "task_type": "one_shot",
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.status = "pending"
+        db.add(TaskRun(task_id=task_id, status="running"))
+        await db.commit()
+
+    resp = await client.post(f"/tasks/{task_id}/run", headers=headers)
+    assert resp.status_code == 409
+    assert "Task is already running" in resp.text

@@ -98,3 +98,43 @@ Do not change:
 - The branch for this work is `codex/declarative-runtime`.
 - The first implementation pass is about runtime-state formalization, not emergency token reduction.
 - Within-step compaction remains a later decision after step-boundary preservation proves useful.
+
+## Follow-on Adjustment: Repetitive Reporting Dedup
+
+Live validation of task `69` showed that step reset and preserved runtime state were **not** the main source of repeated-looking report output.
+
+The real pressure point was **prepared dataset repeat density**:
+
+- exact recent-entry repeats could survive into the selected item set
+- rapid back-to-back runs could still feel duplicative even when the task steps were clean
+- persistence-level duplicate suppression alone was not enough
+
+Repeated reporting tasks therefore need two distinct protections:
+
+1. `duplicate_output_policy` at persistence time
+2. light recent-item pruning during dataset preparation
+
+These protections should be treated as runtime behavior, not profile-specific hacks.
+
+The current implementation is intentionally conservative:
+
+- compare only against the most recent appended entry
+- trim exact URL repeats only
+- only when the last entry is very recent
+- keep one overlapping item for continuity
+- keep all genuinely new items
+
+This adjustment should **not** be interpreted as justification for stronger blanket suppression yet.
+
+Still intentionally deferred:
+
+- broader story-cluster dedup
+- aggressive novelty scoring
+- multi-entry historical suppression windows
+- source-level weighting adjustments for Reuters/BBC repetition
+
+Current planning conclusion:
+
+- repeated-looking reporting output is not always a step/reset bug
+- repetitive reporting tasks need both post-draft duplicate suppression and pre-draft recent-item repeat trimming
+- the likely next quality step is light story-cluster diversity, not stronger blanket suppression
