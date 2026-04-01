@@ -12,6 +12,7 @@ from app.autonomy.profiles.maintenance import (
     _parse_maintenance_instruction,
 )
 from app.autonomy.profiles.morning_briefing import MorningBriefingExecutionProfile
+from app.autonomy.profiles.iss_pass_watcher import ISSPassWatcherExecutionProfile
 from app.autonomy.profiles.topic_watcher import (
     TopicWatcherExecutionProfile,
     _parse_topic_watcher_instruction,
@@ -183,6 +184,39 @@ def test_maintenance_profile_blocks_memory_tools_and_caps_declared_tool():
         run_context={"maintenance_config": {"tool": "refresh_rss_cache", "args": {}}}
     )
     assert allowed == {"refresh_rss_cache"}
+
+
+def test_iss_profile_disables_skill_injection_and_limits_tools():
+    profile = ISSPassWatcherExecutionProfile()
+    assert profile.allow_skill_injection(run_context={}) is False
+    assert profile.effective_allowed_tools(run_context={}) == {"api_request"}
+    blocked = profile.effective_blocked_tools(run_context={})
+    assert "web_search" in blocked
+    assert "create_memory" in blocked
+
+
+def test_iss_profile_validate_finalize_falls_back_to_exact_tool_result_for_chatty_failure():
+    profile = ISSPassWatcherExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "I tried to check ISS visual passes using the N2YO API, but the API request failed. "
+            "Would you like me to try again now?"
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "last_tool_records": [
+                {
+                    "tool": "api_request",
+                    "result_summary": "N2YO requests require a named secret.",
+                }
+            ]
+        },
+        is_final_step=True,
+    )
+    assert result == "N2YO requests require a named secret."
+    assert report is not None
+    assert report["fatal"] is False
+    assert report["used_tool_result_fallback"] is True
 
 
 def test_maintenance_validate_finalize_requires_exact_tool_output():

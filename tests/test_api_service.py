@@ -7,7 +7,8 @@ import pytest
 from sqlalchemy import select
 
 from app.api_service import APIRequestError, execute_api_request
-from app.db.models import Secret, Task, TaskAPIState, User
+from app.config import settings
+from app.db.models import Secret, SecretAccessEvent, Task, TaskAPIState, User
 from app.secrets_service import encrypt_secret_value
 from tests.conftest import TestSessionLocal
 
@@ -112,6 +113,11 @@ async def test_execute_api_request_normalizes_n2yo_and_dedupes_for_task():
         ).scalar_one()
         payload = json.loads(state.value_json)
         assert payload["normalized"]["passes"][0]["duration_seconds"] == 348
+        events = (
+            await db.execute(select(SecretAccessEvent).where(SecretAccessEvent.task_id == task_id))
+        ).scalars().all()
+        assert len(events) == 2
+        assert all(event.success is True for event in events)
 
 
 @pytest.mark.asyncio
@@ -133,6 +139,34 @@ async def test_execute_api_request_requires_secret_for_n2yo():
                     "min_visibility_seconds": 120,
                 },
             )
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_reports_secret_decryption_failure_helpfully():
+    user_id, task_id = await _seed_user_task_and_secret()
+    original = settings.secrets_master_key
+    try:
+        settings.secrets_master_key = "different-test-master-key"
+        async with TestSessionLocal() as db:
+            with pytest.raises(APIRequestError, match="Rotate this secret or verify SECRETS_MASTER_KEY"):
+                await execute_api_request(
+                    db,
+                    user_id=user_id,
+                    service="n2yo",
+                    endpoint="iss_visual_passes",
+                    query_params={
+                        "satellite_id": 25544,
+                        "lat": 32.4485,
+                        "lon": -81.7832,
+                        "alt_meters": 60,
+                        "days": 1,
+                        "min_visibility_seconds": 120,
+                    },
+                    secret_name="n2yo_api_key",
+                    task_id=task_id,
+                )
+    finally:
+        settings.secrets_master_key = original
 
 
 @pytest.mark.asyncio
@@ -210,6 +244,63 @@ async def test_execute_api_request_reports_alphavantage_rate_limit():
                     query_params={"symbol": "IBM"},
                     secret_name="alphavantage_api_key",
                 )
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_rejects_unapproved_secret_name_for_service():
+    user_id, _task_id = await _seed_user_task_and_secret()
+    async with TestSessionLocal() as db:
+        with pytest.raises(APIRequestError, match="not approved for service 'n2yo'"):
+            await execute_api_request(
+                db,
+                user_id=user_id,
+                service="n2yo",
+                endpoint="iss_visual_passes",
+                query_params={
+                    "satellite_id": 25544,
+                    "lat": 32.4485,
+                    "lon": -81.7832,
+                    "alt_meters": 60,
+                    "days": 1,
+                    "min_visibility_seconds": 120,
+                },
+                secret_name="some_other_secret",
+            )
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_rejects_provider_mismatch_secret():
+    user_id, _task_id = await _seed_user_task_and_secret()
+    async with TestSessionLocal() as db:
+        secret = (
+            await db.execute(
+                select(Secret).where(
+                    Secret.user_id == user_id,
+                    Secret.name == "n2yo_api_key",
+                )
+            )
+        ).scalar_one()
+        assert secret is not None
+        secret.provider = "weather"
+        await db.commit()
+
+    async with TestSessionLocal() as db:
+        with pytest.raises(APIRequestError, match="not a valid n2yo credential"):
+            await execute_api_request(
+                db,
+                user_id=user_id,
+                service="n2yo",
+                endpoint="iss_visual_passes",
+                query_params={
+                    "satellite_id": 25544,
+                    "lat": 32.4485,
+                    "lon": -81.7832,
+                    "alt_meters": 60,
+                    "days": 1,
+                    "min_visibility_seconds": 120,
+                },
+                secret_name="n2yo_api_key",
+            )
 
 
 @pytest.mark.asyncio

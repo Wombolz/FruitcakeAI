@@ -918,15 +918,18 @@ async def _api_request(
             return str(exc)
         except Exception as exc:
             await db.rollback()
+            error_type = exc.__class__.__name__
+            error_message = str(exc).strip() or error_type
             log.warning(
                 "api_request failed",
                 user_id=user_context.user_id,
                 task_id=getattr(user_context, "task_id", None),
                 service=service,
                 endpoint=endpoint,
-                error=str(exc),
+                error_type=error_type,
+                error=error_message,
             )
-            return "API request failed."
+            return f"API request failed: {error_type}"
 
 
 async def _search_places(

@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.7.5
+
+Release date:
+- 2026-04-01
+
+This release hardens Fruitcake's secrets layer, adds admin/operator visibility into secret access, and fixes the ISS watcher's secret-decryption and fallback handling.
+
+### Added
+
+- explicit `SECRETS_MASTER_KEY` enforcement for backend secret resolution
+- owner-facing secret access history
+- admin-facing secret access audit visibility
+- clearer failure reporting for secret decryption problems
+
+### Fixed
+
+- secret rotation now cleanly recovers previously encrypted credentials when the master key is stable
+- ISS watcher runs no longer hide secret decryption failures behind a generic `API request failed.` message
+- strict API-only task profiles now opt out of irrelevant skill injection
+
+### Operator Notes
+
+- if a secret was encrypted under a different master key, rotate or re-save it after updating `.env`
+- the broader JSON/API integration branch can now build on a real secret store instead of `.env`-only credentials
+
 ## v0.7.4
 
 Release date:

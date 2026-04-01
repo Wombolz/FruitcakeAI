@@ -82,6 +82,7 @@ class User(Base):
     memory_relations = relationship("MemoryRelation", back_populates="user", cascade="all, delete-orphan")
     memory_observations = relationship("MemoryObservation", back_populates="user", cascade="all, delete-orphan")
     secrets = relationship("Secret", back_populates="user", cascade="all, delete-orphan")
+    secret_access_events = relationship("SecretAccessEvent", back_populates="user", cascade="all, delete-orphan")
     webhook_configs = relationship("WebhookConfig", back_populates="user", cascade="all, delete-orphan")
     rss_sources = relationship("RSSSource", back_populates="user", cascade="all, delete-orphan")
     rss_user_state = relationship("RSSUserState", back_populates="user", uselist=False, cascade="all, delete-orphan")
@@ -225,6 +226,31 @@ class Secret(Base):
 
     def __repr__(self):
         return f"<Secret(user_id={self.user_id}, name='{self.name}', provider='{self.provider}')>"
+
+
+class SecretAccessEvent(Base):
+    __tablename__ = "secret_access_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    secret_id = Column(Integer, ForeignKey("secrets.id", ondelete="SET NULL"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    secret_name = Column(String(100), nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True)
+    tool_name = Column(String(100), nullable=False)
+    success = Column(Boolean, default=False, nullable=False)
+    error_class = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    secret = relationship("Secret")
+    user = relationship("User", back_populates="secret_access_events")
+    task = relationship("Task")
+
+    def __repr__(self):
+        return (
+            f"<SecretAccessEvent(user_id={self.user_id}, secret_name='{self.secret_name}', "
+            f"tool_name='{self.tool_name}', success={self.success})>"
+        )
+
 
 
 class DocumentIngestJob(Base):

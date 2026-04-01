@@ -13,6 +13,7 @@ from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from app.config import settings
 from app.db.session import Base, get_db
 from app.main import app
 
@@ -87,3 +88,13 @@ async def register_and_login(
 async def user_token(client: AsyncClient) -> str:
     """Access token for a regular (parent) user."""
     return await register_and_login(client, "testuser")
+
+
+@pytest.fixture(autouse=True)
+def secrets_master_key_for_tests():
+    original = settings.secrets_master_key
+    settings.secrets_master_key = "test-secrets-master-key"
+    try:
+        yield
+    finally:
+        settings.secrets_master_key = original

@@ -37,6 +37,7 @@ from app.db.models import (
     MemoryRelation,
     RSSSource,
     RSSSourceCandidate,
+    SecretAccessEvent,
     Skill,
     Task,
     TaskRun,
@@ -170,6 +171,19 @@ class SkillInjectionPreviewOut(BaseModel):
     active: bool
     scope: str
     selection_mode: str
+
+
+class SecretAccessEventAdminOut(BaseModel):
+    id: int
+    user_id: int
+    username: Optional[str]
+    secret_id: Optional[int]
+    secret_name: str
+    task_id: Optional[int]
+    tool_name: str
+    success: bool
+    error_class: Optional[str]
+    created_at: Optional[datetime]
 
 
 class MemoryGraphEntityAdminOut(BaseModel):
@@ -1104,6 +1118,54 @@ async def get_audit_log(
         for log_entry, username in rows
     ]
 
+    return {"count": len(entries), "entries": entries}
+
+
+@router.get("/secret-access-events", response_model=Dict[str, Any])
+async def get_secret_access_events_admin(
+    limit: int = Query(50, ge=1, le=500),
+    user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    secret_name: Optional[str] = Query(None, description="Filter by secret name"),
+    task_id: Optional[int] = Query(None, description="Filter by task ID"),
+    tool_name: Optional[str] = Query(None, description="Filter by tool name"),
+    success: Optional[bool] = Query(None, description="Filter by success/failure"),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Dict[str, Any]:
+    query = (
+        select(SecretAccessEvent, User.username)
+        .join(User, SecretAccessEvent.user_id == User.id, isouter=True)
+        .order_by(desc(SecretAccessEvent.created_at), desc(SecretAccessEvent.id))
+    )
+
+    if user_id is not None:
+        query = query.where(SecretAccessEvent.user_id == user_id)
+    if secret_name:
+        query = query.where(SecretAccessEvent.secret_name == secret_name.strip().lower())
+    if task_id is not None:
+        query = query.where(SecretAccessEvent.task_id == task_id)
+    if tool_name:
+        query = query.where(SecretAccessEvent.tool_name == tool_name.strip())
+    if success is not None:
+        query = query.where(SecretAccessEvent.success.is_(success))
+
+    result = await db.execute(query.limit(limit))
+    rows = result.all()
+    entries = [
+        SecretAccessEventAdminOut(
+            id=int(event.id),
+            user_id=int(event.user_id),
+            username=username,
+            secret_id=int(event.secret_id) if event.secret_id is not None else None,
+            secret_name=event.secret_name,
+            task_id=int(event.task_id) if event.task_id is not None else None,
+            tool_name=event.tool_name,
+            success=bool(event.success),
+            error_class=event.error_class,
+            created_at=event.created_at,
+        ).model_dump()
+        for event, username in rows
+    ]
     return {"count": len(entries), "entries": entries}
 
 

@@ -550,6 +550,16 @@ class TaskRunner:
                 blocked_tools=sorted(blocked),
                 allowed_tool_cap=allowed_cap,
             )
+        skills_enabled = not task_profile or task_profile.allow_skill_injection(run_context=run_context)
+        if not skills_enabled:
+            step_user_context = replace(
+                step_user_context,
+                active_skill_slugs=[],
+                skill_selection_mode="",
+                skill_injection_details=[],
+            )
+            run_debug["active_skills"] = []
+            run_debug["skill_selection_mode"] = ""
 
         async with AsyncSessionLocal() as db:
             task = await db.get(Task, task_id)
@@ -580,11 +590,12 @@ class TaskRunner:
                 memories = await svc.retrieve_for_context(db, user_id, query=step.instruction)
                 recalled_memory_ids.update(int(m.id) for m in memories)
                 step_context = replace(step_user_context)
-                step_context = await hydrate_user_context(
-                    db,
-                    step_context,
-                    query=step.instruction,
-                )
+                if skills_enabled:
+                    step_context = await hydrate_user_context(
+                        db,
+                        step_context,
+                        query=step.instruction,
+                    )
                 skill_events = run_debug.setdefault("skill_injection_events", [])
                 if isinstance(skill_events, list):
                     skill_events.append(
