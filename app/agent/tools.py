@@ -459,7 +459,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "profile": {"type": "string", "description": "Optional built-in task profile name."},
                     "llm_model_override": {"type": "string", "description": "Optional explicit model override for all LLM stages of this task."},
                     "persona": {"type": "string", "description": "Optional persona override."},
-                    "requires_approval": {"type": "boolean", "default": False},
+                    "requires_approval": {"type": "boolean", "default": True},
                     "active_hours_start": {"type": "string"},
                     "active_hours_end": {"type": "string"},
                     "active_hours_tz": {"type": "string"},
@@ -1506,10 +1506,11 @@ async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> 
                 task_type=task_type,
                 schedule=arguments.get("schedule"),
                 deliver=bool(arguments.get("deliver", True)),
-                requires_approval=bool(arguments.get("requires_approval", False)),
+                requires_approval=bool(arguments.get("requires_approval", True)),
                 active_hours_start=arguments.get("active_hours_start"),
                 active_hours_end=arguments.get("active_hours_end"),
                 active_hours_tz=arguments.get("active_hours_tz"),
+                user_timezone=user_context.timezone,
             )
             await db.commit()
         except TaskValidationError as exc:
@@ -1565,6 +1566,7 @@ async def _update_task(arguments: Dict[str, Any], user_context: UserContext) -> 
                 active_hours_start=arguments["active_hours_start"] if "active_hours_start" in arguments else UNSET,
                 active_hours_end=arguments["active_hours_end"] if "active_hours_end" in arguments else UNSET,
                 active_hours_tz=arguments["active_hours_tz"] if "active_hours_tz" in arguments else UNSET,
+                user_timezone=user_context.timezone,
             )
             await db.commit()
         except TaskValidationError as exc:

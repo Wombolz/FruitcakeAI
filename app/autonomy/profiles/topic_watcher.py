@@ -210,23 +210,38 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
     def effective_blocked_tools(self, *, run_context: Dict[str, Any]) -> set[str]:
         del run_context
         return {
+            # This profile is driven by a prepared RSS dataset plus approved
+            # topic-memory context. Extra task-management, memory-mutation, and
+            # unrelated utility tools add noise without helping the watcher
+            # produce a grounded shortlist/final briefing.
+            "add_memory_observations",
+            "api_request",
+            "create_and_run_task_plan",
+            "create_memory",
+            "create_memory_entities",
+            "create_memory_relations",
+            "create_task",
+            "create_task_plan",
+            "get_daily_market_data",
+            "get_intraday_market_data",
+            "get_task",
             "list_rss_sources",
+            "list_tasks",
             "add_rss_source",
             "get_feed_items",
+            "open_memory_graph_nodes",
             "search_feeds",
             "search_my_feeds",
             "list_recent_feed_items",
             "search_library",
+            "search_memory_graph",
+            "search_places",
             "summarize_document",
             "list_library_documents",
+            "run_task_now",
+            "update_task",
             "web_search",
             "fetch_page",
-            "create_memory",
-            "create_memory_entities",
-            "create_memory_relations",
-            "add_memory_observations",
-            "search_memory_graph",
-            "open_memory_graph_nodes",
         }
 
     def augment_prompt(

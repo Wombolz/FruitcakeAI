@@ -321,6 +321,7 @@ def test_family_assistant_sees_filesystem_mcp_tools_when_registry_ready():
         {"type": "function", "function": {"name": "stat_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "read_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "write_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "append_file", "description": "", "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "make_directory", "description": "", "parameters": {"type": "object", "properties": {}}}},
     ]
     mock_registry = MagicMock()
@@ -336,6 +337,7 @@ def test_family_assistant_sees_filesystem_mcp_tools_when_registry_ready():
     assert "stat_file" in names
     assert "read_file" in names
     assert "write_file" in names
+    assert "append_file" in names
     assert "make_directory" in names
 
 
@@ -578,6 +580,35 @@ async def test_create_task_tool_persists_recurring_task():
         assert task is not None
         assert task.schedule == "every:2h"
         assert task.profile == "topic_watcher"
+        assert task.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_defaults_to_requires_approval_true():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Approval default",
+                "instruction": "Do a saved task safely",
+                "task_type": "one_shot",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["requires_approval"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.requires_approval is True
 
 
 @pytest.mark.asyncio

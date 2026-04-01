@@ -27,6 +27,10 @@ class ApprovalRequired(Exception):
 APPROVAL_REQUIRED_TOOLS: frozenset[str] = frozenset({
     "create_event",
     "delete_event",
+    "create_task",
+    "update_task",
+    "create_and_run_task_plan",
+    "run_task_now",
 })
 
 # ContextVar: set to True by TaskRunner before calling run_agent() when

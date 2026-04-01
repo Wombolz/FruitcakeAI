@@ -7,6 +7,7 @@ Phase 7.1 starts with a narrow, user-scoped workspace contract:
 - stat_file
 - read_file
 - write_file
+- append_file
 - make_directory
 
 All file access is constrained to settings.workspace_dir / {user_id}.
@@ -141,6 +142,29 @@ def get_tools() -> List[Dict[str, Any]]:
             },
         },
         {
+            "name": "append_file",
+            "description": (
+                "Append text to a file in the current user's sandbox workspace. "
+                "Creates parent directories and the file when needed. Only paths "
+                "inside the user's sandboxed workspace are allowed. "
+                "This appends to workspace files, not uploaded library documents."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path inside the user's workspace.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Text content to append.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+        {
             "name": "make_directory",
             "description": (
                 "Create a directory in the current user's sandbox workspace. "
@@ -172,6 +196,8 @@ async def call_tool(tool_name: str, arguments: Dict[str, Any], user_context: Any
         return _read_file(arguments, user_context)
     if tool_name == "write_file":
         return _write_file(arguments, user_context)
+    if tool_name == "append_file":
+        return _append_file(arguments, user_context)
     if tool_name == "make_directory":
         return _make_directory(arguments, user_context)
     return f"Unknown filesystem tool: {tool_name}"
@@ -199,6 +225,12 @@ def _workspace_root(user_context: Any) -> Path:
     return root
 
 
+def workspace_root_for_user(user_id: int) -> Path:
+    root = (Path(settings.workspace_dir) / str(int(user_id))).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def _resolve_workspace_path(raw_path: str, user_context: Any) -> tuple[Path, Path]:
     workspace_root = _workspace_root(user_context)
     candidate_raw = (raw_path or "").strip()
@@ -217,6 +249,57 @@ def _resolve_workspace_path(raw_path: str, user_context: Any) -> tuple[Path, Pat
         raise ValueError("Path must stay within the user's workspace") from exc
 
     return workspace_root, candidate
+
+
+def resolve_workspace_path_for_user(user_id: int, raw_path: str) -> tuple[Path, Path]:
+    workspace_root = workspace_root_for_user(user_id)
+    candidate_raw = (raw_path or "").strip()
+    if not candidate_raw:
+        raise ValueError("Path is required")
+    raw = Path(candidate_raw)
+    candidate = raw.resolve(strict=False) if raw.is_absolute() else (workspace_root / raw).resolve(strict=False)
+    try:
+        candidate.relative_to(workspace_root)
+    except ValueError as exc:
+        raise ValueError("Path must stay within the user's workspace") from exc
+    return workspace_root, candidate
+
+
+def workspace_path_exists(user_id: int, raw_path: str) -> bool:
+    _, path = resolve_workspace_path_for_user(user_id, raw_path)
+    return path.exists()
+
+
+def read_workspace_text(user_id: int, raw_path: str) -> str:
+    _, path = resolve_workspace_path_for_user(user_id, raw_path)
+    if not path.exists() or not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def write_workspace_text(user_id: int, raw_path: str, content: str) -> str:
+    _, path = resolve_workspace_path_for_user(user_id, raw_path)
+    encoded = content.encode("utf-8")
+    if len(encoded) > settings.filesystem_mcp_max_write_bytes:
+        raise ValueError(
+            f"Content is too large to write safely. Limit is {settings.filesystem_mcp_max_write_bytes} bytes."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return f"Wrote {len(encoded)} bytes to {path.name}"
+
+
+def append_workspace_text(user_id: int, raw_path: str, content: str) -> str:
+    _, path = resolve_workspace_path_for_user(user_id, raw_path)
+    encoded = content.encode("utf-8")
+    if len(encoded) > settings.filesystem_mcp_max_write_bytes:
+        raise ValueError(
+            f"Content is too large to append safely. Limit is {settings.filesystem_mcp_max_write_bytes} bytes."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(content)
+    return f"Appended {len(encoded)} bytes to {path.name}"
 
 
 def _read_file(arguments: Dict[str, Any], user_context: Any) -> str:
@@ -327,6 +410,22 @@ def _write_file(arguments: Dict[str, Any], user_context: Any) -> str:
     path.write_text(content, encoding="utf-8")
     log.info("Workspace file written", user_id=_user_id_from_context(user_context), path=str(path))
     return f"Wrote {len(encoded)} bytes to {path.name}"
+
+
+def _append_file(arguments: Dict[str, Any], user_context: Any) -> str:
+    _, path = _resolve_workspace_path(arguments.get("path", ""), user_context)
+    content = str(arguments.get("content", ""))
+    encoded = content.encode("utf-8")
+    if len(encoded) > settings.filesystem_mcp_max_write_bytes:
+        return (
+            f"Content is too large to append safely. Limit is {settings.filesystem_mcp_max_write_bytes} bytes."
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(content)
+    log.info("Workspace file appended", user_id=_user_id_from_context(user_context), path=str(path))
+    return f"Appended {len(encoded)} bytes to {path.name}"
 
 
 def _make_directory(arguments: Dict[str, Any], user_context: Any) -> str:

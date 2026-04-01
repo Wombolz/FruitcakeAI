@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import settings
 from app.db.models import Document, LinkedSource
 from app.rag.document_processor import get_document_processor
 from app.rag.extractor import DocumentExtractor, ExtractionError
@@ -44,7 +45,44 @@ def _normalize_source_path(raw_path: str) -> Path:
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
         path = path.resolve()
-    return path
+    return path.resolve()
+
+
+def _allowed_linked_source_roots() -> list[Path]:
+    configured = str(settings.linked_source_allowed_roots or "").strip()
+    if not configured:
+        return []
+
+    roots: list[Path] = []
+    for raw in configured.split(","):
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+        root = Path(cleaned).expanduser().resolve()
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _ensure_path_within_allowed_roots(path: Path) -> None:
+    allowed_roots = _allowed_linked_source_roots()
+    if not allowed_roots:
+        raise ValueError(
+            "Linked folders are disabled until LINKED_SOURCE_ALLOWED_ROOTS is configured."
+        )
+
+    for root in allowed_roots:
+        try:
+            path.relative_to(root)
+            return
+        except ValueError:
+            continue
+
+    roots_text = ", ".join(str(root) for root in allowed_roots)
+    raise ValueError(
+        "Linked folders must be inside an allowed import root. "
+        f"Configured roots: {roots_text}"
+    )
 
 
 def _stat_mtime_to_utc(stat_result: Any) -> datetime:
@@ -169,6 +207,7 @@ async def create_linked_source(
     elif source_type == "folder":
         if not normalized.exists() or not normalized.is_dir():
             raise ValueError("Linked folder path does not exist or is not a directory.")
+        _ensure_path_within_allowed_roots(normalized)
         normalized_excluded_paths = _normalize_excluded_paths(normalized, excluded_paths)
     else:
         raise ValueError("source_type must be 'file' or 'folder'.")

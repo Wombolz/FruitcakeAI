@@ -27,13 +27,13 @@ import structlog
 from sqlalchemy import select, update
 
 from app.autonomy.approval import ApprovalRequired, _approval_armed
+from app.autonomy.configured_executor import resolve_task_execution_contract
 from app.autonomy.model_routing import TaskModelProfile, resolve_task_model_profile
-from app.autonomy.profiles import resolve_task_profile, resolve_task_profile_by_name
-from app.autonomy.scheduler import compute_next_run_at
 from app.config import settings
-from app.db.models import Task, TaskRun, TaskRunArtifact, TaskStep
+from app.db.models import Task, TaskRun, TaskRunArtifact, TaskStep, User
 from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
+from app.task_service import compute_next_run_at
 from app.agent.tools import (
     get_tool_execution_records,
     reset_tool_execution_records,
@@ -149,6 +149,7 @@ class TaskRunner:
             async with AsyncSessionLocal() as db:
                 from app.db.models import ChatMessage
                 task = await db.get(Task, task_id)
+                user = await db.get(User, task.user_id) if task is not None else None
                 task.status = "completed"
                 task.result = result
                 task.error = None
@@ -162,7 +163,11 @@ class TaskRunner:
                         task.id,
                         run_debug=run_debug,
                     )
-                    task.next_run_at = compute_next_run_at(task.schedule)
+                    task.next_run_at = compute_next_run_at(
+                        task.schedule,
+                        task_timezone=task.active_hours_tz,
+                        user_timezone=getattr(user, "active_hours_tz", None),
+                    )
                     task.status = "pending"   # re-queue for next run
 
                 if task_run_id:
@@ -293,7 +298,7 @@ class TaskRunner:
             from app.autonomy.execution_profile import resolve_execution_profile
             resolved = resolve_execution_profile(task, user)
             model_profile = resolve_task_model_profile(task, user)
-            task_profile = resolve_task_profile(task, user)
+            task_profile = resolve_task_execution_contract(task, user)
             persona_name = resolved.persona
             task_user_id = task.user_id
             task_instruction = task.instruction
@@ -492,7 +497,7 @@ class TaskRunner:
                 )
                 await db.commit()
             if isinstance(run_context, dict):
-                for key in ("dataset", "dataset_stats", "refresh_stats", "watcher_config", "config_warnings"):
+                for key in ("dataset", "dataset_stats", "refresh_stats", "watcher_config", "config_warnings", "executor_config"):
                     if key in run_context:
                         run_debug[key] = run_context[key]
             blocked = set(step_user_context.blocked_tools or [])
@@ -1127,27 +1132,28 @@ async def _persist_run_artifacts(
     final_markdown: str,
     run_debug: dict[str, object],
 ) -> None:
-    profile = resolve_task_profile_by_name(str(run_debug.get("profile") or "default"))
     run = await db.get(TaskRun, task_run_id)
     task = await db.get(Task, run.task_id) if run is not None else None
-    if run is not None and task is not None:
-        await profile.persist_run_records(
-            db=db,
+    if run is None or task is None:
+        return
+
+    profile = resolve_task_execution_contract(task)
+    await profile.persist_run_records(
+        db=db,
+        task=task,
+        run=run,
+        final_markdown=final_markdown,
+        run_debug=run_debug,
+    )
+    payloads = profile.artifact_payloads(final_markdown=final_markdown, run_debug=run_debug)
+    payloads.extend(
+        await profile.export_artifact_payloads(
             task=task,
             run=run,
             final_markdown=final_markdown,
             run_debug=run_debug,
         )
-    payloads = profile.artifact_payloads(final_markdown=final_markdown, run_debug=run_debug)
-    if run is not None and task is not None:
-        payloads.extend(
-            await profile.export_artifact_payloads(
-                task=task,
-                run=run,
-                final_markdown=final_markdown,
-                run_debug=run_debug,
-            )
-        )
+    )
 
     # Replace previous artifacts for this run/type to keep data deterministic.
     existing_rows = (

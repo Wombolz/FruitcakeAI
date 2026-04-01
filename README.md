@@ -139,6 +139,7 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 
 **Document library**
 - Upload and ingest PDFs and documents into a personal or shared library
+- Linked-folder ingestion is restricted to operator-approved roots via `LINKED_SOURCE_ALLOWED_ROOTS`
 - Hybrid BM25 + vector + RRF retrieval with source citations
 - Per-user library scoping — personal, shared, team
 
@@ -257,6 +258,16 @@ Default users — **change these passwords before running on a shared network:**
 ### 4. Put it behind HTTPS before other people log in
 
 For local development, `http://localhost:30417` is still fine.
+
+### 3.5 Optional: enable reviewed linked-folder roots
+
+Folder linking is disabled by default unless you explicitly allow roots in `.env`:
+
+```env
+LINKED_SOURCE_ALLOWED_ROOTS=/Users/you/Documents/FruitcakeLibrary,/Users/you/Shared/FruitcakeImports
+```
+
+Only folders inside those roots may be linked through `/library/link-folder`. Regular file upload is unaffected.
 
 For any shared-network or tester-facing use, Fruitcake should sit behind HTTPS.
 This repo now ships a Caddy-based front door:

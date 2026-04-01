@@ -8,8 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.persona_loader import list_personas, persona_exists
 from app.agent.persona_router import infer_persona_for_task
+from app.autonomy.configured_executor import infer_configured_executor
 from app.autonomy.profiles import normalize_task_profile
 from app.db.models import Task
+from app.time_utils import resolve_effective_timezone
 
 
 class TaskValidationError(ValueError):
@@ -19,19 +21,29 @@ class TaskValidationError(ValueError):
 UNSET = object()
 
 
-def compute_next_run_at(schedule: str | None) -> datetime | None:
+def compute_next_run_at(
+    schedule: str | None,
+    *,
+    task_timezone: Optional[str] = None,
+    user_timezone: Optional[str] = None,
+    after: datetime | None = None,
+) -> datetime | None:
     if not schedule:
         return None
     try:
         from app.autonomy.scheduler import compute_next_run_at as _compute
 
-        return _compute(schedule)
+        return _compute(
+            schedule,
+            after=after,
+            timezone_name=resolve_effective_timezone(task_timezone, user_timezone),
+        )
     except ImportError:
-        return _simple_next_run(schedule)
+        return _simple_next_run(schedule, after=after)
 
 
-def _simple_next_run(schedule: str) -> datetime | None:
-    now = datetime.now(timezone.utc)
+def _simple_next_run(schedule: str, *, after: datetime | None = None) -> datetime | None:
+    now = after or datetime.now(timezone.utc)
     if schedule.startswith("every:"):
         expr = schedule[6:].strip()
         multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -115,10 +127,11 @@ async def create_task_record(
     task_type: str = "one_shot",
     schedule: Optional[str] = None,
     deliver: bool = True,
-    requires_approval: bool = False,
+    requires_approval: bool = True,
     active_hours_start: Optional[str] = None,
     active_hours_end: Optional[str] = None,
     active_hours_tz: Optional[str] = None,
+    user_timezone: Optional[str] = None,
 ) -> Task:
     if task_type not in {"one_shot", "recurring"}:
         raise TaskValidationError("task_type must be one_shot or recurring.")
@@ -127,17 +140,24 @@ async def create_task_record(
         instruction=instruction,
         requested_persona=persona,
     )
+    inferred = infer_configured_executor(
+        title=title,
+        instruction=instruction,
+        task_type=task_type,
+        requested_profile=profile,
+    )
     task = Task(
         user_id=user_id,
         title=title,
         instruction=instruction,
         persona=resolved_persona,
-        profile=infer_task_profile(
+        profile=inferred.profile if inferred.executor_config else infer_task_profile(
             title=title,
             instruction=instruction,
             task_type=task_type,
             requested_profile=profile,
         ),
+        executor_config=inferred.executor_config,
         llm_model_override=(str(llm_model_override).strip() or None) if llm_model_override is not None else None,
         task_type=task_type,
         status="pending",
@@ -147,7 +167,11 @@ async def create_task_record(
         active_hours_start=active_hours_start,
         active_hours_end=active_hours_end,
         active_hours_tz=active_hours_tz,
-        next_run_at=compute_next_run_at(schedule),
+        next_run_at=compute_next_run_at(
+            schedule,
+            task_timezone=active_hours_tz,
+            user_timezone=user_timezone,
+        ),
     )
     db.add(task)
     await db.flush()
@@ -169,6 +193,7 @@ async def update_task_record(
     active_hours_start=UNSET,
     active_hours_end=UNSET,
     active_hours_tz=UNSET,
+    user_timezone: Optional[str] = None,
 ) -> TaskUpdateResult:
     del db  # reserved for future validation that may require queries
 
@@ -192,13 +217,40 @@ async def update_task_record(
         )
         plan_inputs_changed = True
     if profile is not UNSET:
-        task.profile = infer_task_profile(
+        inferred = infer_configured_executor(
             title=task.title,
             instruction=task.instruction,
             task_type=task.task_type,
             requested_profile=profile,
         )
+        task.profile = inferred.profile if inferred.executor_config else infer_task_profile(
+            title=task.title,
+            instruction=task.instruction,
+            task_type=task.task_type,
+            requested_profile=profile,
+        )
+        task.executor_config = inferred.executor_config
         plan_inputs_changed = True
+    elif title_changed or instruction_changed:
+        inferred = infer_configured_executor(
+            title=task.title,
+            instruction=task.instruction,
+            task_type=task.task_type,
+            requested_profile=None,
+        )
+        if inferred.executor_config:
+            task.profile = inferred.profile
+            task.executor_config = inferred.executor_config
+            plan_inputs_changed = True
+        elif task.executor_config:
+            task.executor_config = {}
+            task.profile = infer_task_profile(
+                title=task.title,
+                instruction=task.instruction,
+                task_type=task.task_type,
+                requested_profile=task.profile,
+            )
+            plan_inputs_changed = True
     if llm_model_override is not UNSET:
         task.llm_model_override = (str(llm_model_override).strip() or None) if llm_model_override is not None else None
         plan_inputs_changed = True
@@ -214,8 +266,13 @@ async def update_task_record(
         task.active_hours_tz = active_hours_tz
     if schedule is not UNSET:
         task.schedule = schedule
-        task.next_run_at = compute_next_run_at(schedule)
         plan_inputs_changed = True
+    if schedule is not UNSET or active_hours_tz is not UNSET:
+        task.next_run_at = compute_next_run_at(
+            task.schedule,
+            task_timezone=task.active_hours_tz,
+            user_timezone=user_timezone,
+        )
 
     if persona is UNSET and (title_changed or instruction_changed) and not task.persona:
         inferred, _, _ = infer_persona_for_task(task.title, task.instruction)

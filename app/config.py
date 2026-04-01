@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     # ── Storage ───────────────────────────────────────────────────────────────
     storage_dir: str = "./storage"
     workspace_dir: str = "./workspace"
+    linked_source_allowed_roots: str = ""
     upload_max_size_mb: int = 50
     filesystem_mcp_max_read_bytes: int = 100_000
     filesystem_mcp_max_write_bytes: int = 100_000

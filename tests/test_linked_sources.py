@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
+from app.config import settings
 from app.db.models import Document, LinkedSource
 from app.rag.extractor import DocumentExtractor
 from tests.conftest import TestSessionLocal
@@ -76,9 +77,10 @@ async def test_link_file_creates_linked_source_and_document(client, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_link_folder_respects_excluded_paths_and_reports_tree(client, tmp_path):
+async def test_link_folder_respects_excluded_paths_and_reports_tree(client, tmp_path, monkeypatch):
     token = await _token(client, "linkedfolderuser")
     headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(tmp_path))
 
     repo = tmp_path / "repo"
     storage = repo / "storage"
@@ -116,9 +118,10 @@ async def test_link_folder_respects_excluded_paths_and_reports_tree(client, tmp_
 
 
 @pytest.mark.asyncio
-async def test_link_folder_skips_env_files_by_default(client, tmp_path):
+async def test_link_folder_skips_env_files_by_default(client, tmp_path, monkeypatch):
     token = await _token(client, "linkedsensitiveuser")
     headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(tmp_path))
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -142,9 +145,10 @@ async def test_link_folder_skips_env_files_by_default(client, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_update_source_exclusions_removes_existing_subfolder_docs(client, tmp_path):
+async def test_update_source_exclusions_removes_existing_subfolder_docs(client, tmp_path, monkeypatch):
     token = await _token(client, "linkedremoveuser")
     headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(tmp_path))
 
     repo = tmp_path / "repo"
     (repo / "storage").mkdir(parents=True)
@@ -183,9 +187,10 @@ async def test_update_source_exclusions_removes_existing_subfolder_docs(client, 
 
 
 @pytest.mark.asyncio
-async def test_empty_python_files_are_skipped_not_failed(client, tmp_path):
+async def test_empty_python_files_are_skipped_not_failed(client, tmp_path, monkeypatch):
     token = await _token(client, "linkedemptyuser")
     headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(tmp_path))
 
     repo = tmp_path / "repo"
     pkg = repo / "package"
@@ -211,9 +216,10 @@ async def test_empty_python_files_are_skipped_not_failed(client, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_rescan_marks_missing_linked_documents(client, tmp_path):
+async def test_rescan_marks_missing_linked_documents(client, tmp_path, monkeypatch):
     token = await _token(client, "linkedrescanuser")
     headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(tmp_path))
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -240,3 +246,88 @@ async def test_rescan_marks_missing_linked_documents(client, tmp_path):
 
     assert source.sync_status == "ready"
     assert doc.source_sync_status == "missing"
+
+
+@pytest.mark.asyncio
+async def test_link_folder_requires_allowed_roots_configuration(client, tmp_path, monkeypatch):
+    token = await _token(client, "linkedrootsrequired")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", "")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("print('hi')\n")
+
+    resp = await client.post(
+        "/library/link-folder",
+        headers=headers,
+        json={"path": str(repo), "scope": "personal"},
+    )
+
+    assert resp.status_code == 400
+    assert "LINKED_SOURCE_ALLOWED_ROOTS" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_link_folder_rejects_path_outside_allowed_roots(client, tmp_path, monkeypatch):
+    token = await _token(client, "linkedrootsoutside")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir()
+    (outside_root / "app.py").write_text("print('hi')\n")
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(allowed_root))
+
+    resp = await client.post(
+        "/library/link-folder",
+        headers=headers,
+        json={"path": str(outside_root), "scope": "personal"},
+    )
+
+    assert resp.status_code == 400
+    assert "allowed import root" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_link_folder_allows_multiple_configured_roots(client, tmp_path, monkeypatch):
+    token = await _token(client, "linkedrootsmulti")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    repo = second_root / "repo"
+    repo.mkdir()
+    (repo / "notes.py").write_text("print('hello')\n")
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", f"{first_root}, {second_root}")
+
+    resp = await client.post(
+        "/library/link-folder",
+        headers=headers,
+        json={"path": str(repo), "scope": "personal"},
+    )
+
+    assert resp.status_code == 202
+    assert resp.json()["source"]["document_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_link_file_remains_allowed_without_folder_roots(client, tmp_path, monkeypatch):
+    token = await _token(client, "linkedfileroots")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", "")
+
+    code_file = tmp_path / "notes.py"
+    code_file.write_text("print('hello')\n")
+
+    resp = await client.post(
+        "/library/link-file",
+        headers=headers,
+        json={"path": str(code_file), "scope": "personal"},
+    )
+
+    assert resp.status_code == 202
+    assert resp.json()["source"]["source_type"] == "file"

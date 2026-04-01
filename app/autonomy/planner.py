@@ -18,7 +18,7 @@ from app.config import settings
 from app.db.models import Task, TaskStep
 from app.llm_usage import record_llm_usage_event
 from app.metrics import metrics
-from app.autonomy.profiles import resolve_task_profile
+from app.autonomy.configured_executor import resolve_task_execution_contract
 
 
 async def create_task_plan_for_user(
@@ -40,7 +40,7 @@ async def create_task_plan_for_user(
 
     bounded_steps = min(max(max_steps, 1), max(1, int(settings.task_plan_max_steps)))
     resolved_goal = goal.strip() or task.title
-    profile = resolve_task_profile(task)
+    profile = resolve_task_execution_contract(task)
     steps = await profile.plan_steps(
         goal=resolved_goal,
         user_id=user_id,

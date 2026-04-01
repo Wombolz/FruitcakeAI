@@ -117,13 +117,32 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
 
     def effective_blocked_tools(self, *, run_context: Dict[str, Any]) -> set[str]:
         return {
+            # This profile is intentionally dataset-driven. Giving local models the
+            # broader task-management / memory tool surface has proven brittle and
+            # can derail the drafting step into empty non-content turns.
+            "add_memory_observations",
+            "api_request",
+            "create_and_run_task_plan",
+            "create_memory",
+            "create_memory_entities",
+            "create_memory_relations",
+            "create_task",
+            "create_task_plan",
+            "get_daily_market_data",
+            "get_intraday_market_data",
+            "get_task",
             "get_feed_items",
+            "list_tasks",
             "search_feeds",
             "search_my_feeds",
             "list_recent_feed_items",
             "search_library",
+            "search_memory_graph",
+            "search_places",
             "summarize_document",
-            "create_memory",
+            "open_memory_graph_nodes",
+            "run_task_now",
+            "update_task",
             "web_search",
             "fetch_page",
         }
@@ -286,6 +305,7 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
             dataset_stats=dict(run_debug.get("dataset_stats") or {}),
             refresh_stats=dict(run_debug.get("refresh_stats") or {}),
             active_skills=list(run_debug.get("active_skills") or []),
+            timezone_name=getattr(task, "active_hours_tz", None),
         )
         manifest = dict(edition.manifest)
         manifest["download_path"] = f"/admin/task-runs/{run.id}/edition.pdf"

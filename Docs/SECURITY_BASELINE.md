@@ -48,6 +48,7 @@ This baseline assumes a trusted local network or a deliberately hardened reverse
 - Persona-scoped blocked tools and content restrictions are applied in agent context.
 - Skills are additive only and cannot bypass persona-blocked tools or task execution-profile caps.
 - Memory retrieval is per-user and deliberate recall/material-use is tracked separately from passive retrieval.
+- Linked-folder ingestion is disabled unless the operator configures explicit allowed roots via `LINKED_SOURCE_ALLOWED_ROOTS`.
 
 ### Task and tool safety
 
@@ -83,6 +84,7 @@ These are mandatory for any deployment beyond personal local testing.
 3. Keep PostgreSQL bound to trusted interfaces only, or place it behind host-level firewall rules.
 4. Do not expose the API directly to the public internet without TLS and an authenticated reverse proxy.
 5. Restrict filesystem access to `.env`, APNs keys, and any calendar credentials.
+6. If linked-folder ingestion is needed, configure `LINKED_SOURCE_ALLOWED_ROOTS` narrowly and only for directories intended for Fruitcake document import.
 
 ### Strongly recommended
 
@@ -155,12 +157,14 @@ These are known constraints of the current security posture.
 6. The repository is local-first and privacy-focused, but not yet documented as hardened for hostile multi-tenant hosting.
 7. Memory export/delete currently covers memory data only, not full account erasure across all data types.
 8. Skills are reviewed guidance, not sandbox boundaries; poor skill hygiene can still expand effective prompt/tool pressure even when persona caps remain in force.
+9. Linked-folder ingestion is intentionally narrowed to operator-approved roots; broad arbitrary host-folder ingestion is not part of the alpha trust model.
 
 ## Security-Sensitive Defaults and Files
 
 - `.env`
 - `config/users.yaml`
 - `config/mcp_config.yaml`
+- any directories listed in `LINKED_SOURCE_ALLOWED_ROOTS`
 - APNs `.p8` auth key referenced by `APNS_AUTH_KEY_PATH`
 - any Google Calendar service account credentials
 - any Apple CalDAV app password

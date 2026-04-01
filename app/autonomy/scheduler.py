@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
+from app.time_utils import get_timezone, to_utc
 
 # Interval unit → seconds multiplier
 _UNIT_SECONDS: dict[str, int] = {
@@ -34,6 +35,7 @@ _CRON_RE = re.compile(r"^[\d*,\-/]+(?: [\d*,\-/]+){4,5}$")
 def compute_next_run_at(
     schedule: str,
     after: Optional[datetime] = None,
+    timezone_name: Optional[str] = None,
 ) -> Optional[datetime]:
     """
     Parse a schedule expression and return the next run datetime (UTC).
@@ -48,7 +50,7 @@ def compute_next_run_at(
     if not schedule:
         return None
 
-    now = after or datetime.now(timezone.utc)
+    now = to_utc(after) or datetime.now(timezone.utc)
     schedule = schedule.strip()
 
     # ── Interval: "every:30m", "every:1h", "every:2d", "every:90s" ──────────
@@ -61,14 +63,14 @@ def compute_next_run_at(
         try:
             dt = datetime.fromisoformat(schedule)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
+                dt = dt.replace(tzinfo=get_timezone(timezone_name))
+            return dt.astimezone(timezone.utc)
         except ValueError:
             pass
 
     # ── Cron expression ───────────────────────────────────────────────────────
     if _CRON_RE.match(schedule):
-        return _parse_cron(schedule, now)
+        return _parse_cron(schedule, now, timezone_name=timezone_name)
 
     return None
 
@@ -90,7 +92,7 @@ def _parse_interval(expr: str, after: datetime) -> Optional[datetime]:
     return after + timedelta(seconds=n * _UNIT_SECONDS[unit])
 
 
-def _parse_cron(expr: str, after: datetime) -> Optional[datetime]:
+def _parse_cron(expr: str, after: datetime, *, timezone_name: Optional[str]) -> Optional[datetime]:
     """
     Compute the next datetime after `after` that satisfies the cron expression.
 
@@ -110,9 +112,11 @@ def _parse_cron(expr: str, after: datetime) -> Optional[datetime]:
 
     minute_f, hour_f, dom_f, month_f, dow_f = fields
 
-    # Advance at least one minute past `after`
-    candidate = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    limit = after + timedelta(days=366)
+    local_tz = get_timezone(timezone_name)
+    local_after = after.astimezone(local_tz)
+    # Advance at least one minute past `after` in the intended local timezone.
+    candidate = local_after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    limit = local_after + timedelta(days=366)
 
     while candidate <= limit:
         # Python weekday(): Mon=0 … Sun=6 → cron dow: Sun=0, Mon=1 … Sat=6
@@ -124,7 +128,7 @@ def _parse_cron(expr: str, after: datetime) -> Optional[datetime]:
             and _cron_match(candidate.month, month_f, 1, 12)
             and _cron_match(cron_dow, dow_f, 0, 7, sunday7=True)
         ):
-            return candidate
+            return candidate.astimezone(timezone.utc)
         # When minute/hour already matched, skip ahead to avoid minute-by-minute crawl
         if _cron_match(candidate.hour, hour_f, 0, 23) and not _cron_match(candidate.minute, minute_f, 0, 59):
             # Jump to next matching minute in this hour, or next hour
@@ -266,7 +270,7 @@ async def tick() -> None:
     from datetime import datetime, timezone
     from sqlalchemy import select, and_
     from app.db.session import AsyncSessionLocal
-    from app.db.models import Task
+    from app.db.models import Task, User
     from app.autonomy.runner import get_task_runner
 
     now = datetime.now(timezone.utc)
@@ -412,7 +416,19 @@ async def _skip_recurring_backlog(due: list, now: datetime) -> int:
     async with AsyncSessionLocal() as db:
         rows = await db.execute(select(Task).where(Task.id.in_(recurring_ids)))
         for task in rows.scalars().all():
-            nxt = compute_next_run_at(task.schedule, after=now) if task.schedule else None
+            user_tz = None
+            if getattr(task, "user_id", None) is not None:
+                user = await db.get(User, task.user_id)
+                user_tz = getattr(user, "active_hours_tz", None) if user is not None else None
+            nxt = (
+                compute_next_run_at(
+                    task.schedule,
+                    after=now,
+                    timezone_name=getattr(task, "active_hours_tz", None) or user_tz,
+                )
+                if task.schedule
+                else None
+            )
             task.next_run_at = nxt or (now + timedelta(minutes=1))
             skipped += 1
         await db.commit()
