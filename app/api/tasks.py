@@ -303,7 +303,15 @@ async def manual_run(
 ):
     """Enqueue the task for immediate execution (dev/testing)."""
     task = await _get_owned_task(task_id, current_user.id, db)
-    if task.status == "running":
+    run_rows = await db.execute(
+        select(TaskRun)
+        .where(
+            TaskRun.task_id == task.id,
+            TaskRun.status.in_(["running", "waiting_approval"]),
+        )
+        .order_by(desc(TaskRun.started_at))
+    )
+    if task.status == "running" or run_rows.scalars().first() is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Task is already running",

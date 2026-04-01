@@ -1595,8 +1595,10 @@ async def _update_task(arguments: Dict[str, Any], user_context: UserContext) -> 
 async def _run_task_now(arguments: Dict[str, Any], user_context: UserContext) -> str:
     from datetime import datetime, timezone
 
+    from sqlalchemy import select
+
     from app.autonomy.runner import get_task_runner
-    from app.db.models import Task
+    from app.db.models import Task, TaskRun
     from app.db.session import AsyncSessionLocal
 
     task_id_raw = arguments.get("task_id")
@@ -1609,7 +1611,15 @@ async def _run_task_now(arguments: Dict[str, Any], user_context: UserContext) ->
         task = await db.get(Task, task_id)
         if task is None or int(task.user_id) != int(user_context.user_id):
             return "Task not found."
-        if task.status == "running":
+        run_rows = await db.execute(
+            select(TaskRun)
+            .where(
+                TaskRun.task_id == task.id,
+                TaskRun.status.in_(["running", "waiting_approval"]),
+            )
+            .order_by(TaskRun.id.desc())
+        )
+        if task.status == "running" or run_rows.scalars().first() is not None:
             return json.dumps({"queued": False, "task_id": task.id, "detail": "Task is already running"})
 
         task.next_run_at = datetime.now(timezone.utc)

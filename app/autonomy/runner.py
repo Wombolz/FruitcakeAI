@@ -27,7 +27,7 @@ import structlog
 from sqlalchemy import select, update
 
 from app.autonomy.approval import ApprovalRequired, _approval_armed
-from app.autonomy.configured_executor import resolve_task_execution_contract
+from app.autonomy.configured_executor import build_preserved_runtime_state, resolve_task_execution_contract
 from app.autonomy.model_routing import TaskModelProfile, resolve_task_model_profile
 from app.config import settings
 from app.db.models import Task, TaskRun, TaskRunArtifact, TaskStep, User
@@ -96,6 +96,10 @@ class TaskRunner:
 
         current = asyncio.current_task()
         async with self._active_lock:
+            existing = self._active_runs.get(task_id)
+            if existing is not None and not existing.done():
+                log.info("task.skip_duplicate_active_coroutine", task_id=task_id)
+                return
             if current is not None:
                 self._active_runs[task_id] = current
 
@@ -131,6 +135,25 @@ class TaskRunner:
                 if task is None:
                     log.warning("task.not_found", task_id=task_id)
                     await db.rollback()
+                    return
+                active_run_rows = await db.execute(
+                    select(TaskRun)
+                    .where(
+                        TaskRun.task_id == task.id,
+                        TaskRun.status.in_(["running", "waiting_approval"]),
+                    )
+                    .order_by(TaskRun.id.desc())
+                )
+                active_run = active_run_rows.scalars().first()
+                if active_run is not None:
+                    task.status = "running"
+                    await db.commit()
+                    log.info(
+                        "task.skip_duplicate_active_run",
+                        task_id=task_id,
+                        active_run_id=active_run.id,
+                        active_status=active_run.status,
+                    )
                     return
                 task_title = task.title
                 task_deliver = task.deliver
@@ -500,6 +523,19 @@ class TaskRunner:
                 for key in ("dataset", "dataset_stats", "refresh_stats", "watcher_config", "config_warnings", "executor_config"):
                     if key in run_context:
                         run_debug[key] = run_context[key]
+                if "executor_config" in run_context:
+                    executor_config = run_context.get("executor_config") or {}
+                    if isinstance(executor_config, dict):
+                        run_debug["runtime_contract"] = {
+                            "kind": executor_config.get("kind"),
+                            "input_mode": executor_config.get("input_mode"),
+                            "tool_policy": executor_config.get("tool_policy"),
+                            "output_mode": executor_config.get("output_mode"),
+                            "persistence_mode": executor_config.get("persistence_mode"),
+                            "validation_mode": executor_config.get("validation_mode"),
+                            "notify_mode": executor_config.get("notify_mode"),
+                            "no_update_policy": executor_config.get("no_update_policy"),
+                        }
             blocked = set(step_user_context.blocked_tools or [])
             blocked.update(task_profile.effective_blocked_tools(run_context=run_context))
             allowed_cap = list(step_user_context.allowed_tool_cap or [])
@@ -587,6 +623,26 @@ class TaskRunner:
 
             is_final_step = self._is_final_synthesis_step(step, steps)
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if isinstance(run_context, dict) and isinstance(run_context.get("executor_config"), dict):
+                latest_skill_event = {}
+                skill_events = run_debug.get("skill_injection_events") or []
+                if isinstance(skill_events, list) and skill_events:
+                    latest = skill_events[-1]
+                    if isinstance(latest, dict):
+                        latest_skill_event = latest
+                preserved_runtime_state = build_preserved_runtime_state(
+                    executor_config=run_context.get("executor_config") or {},
+                    step_index=step.step_index,
+                    step_title=step.title,
+                    step_instruction=step.instruction,
+                    is_final_step=is_final_step,
+                    dataset=run_context.get("dataset") if isinstance(run_context.get("dataset"), dict) else {},
+                    prior_step_summaries=prior_summaries,
+                    active_skill_slugs=list(latest_skill_event.get("active_skills") or run_debug.get("active_skills") or []),
+                    skill_injection_details=list(latest_skill_event.get("details") or []),
+                )
+                run_context["preserved_runtime_state"] = preserved_runtime_state
+                run_debug["preserved_runtime_state"] = preserved_runtime_state
             prompt_parts: list[str] = [f"[Task: {task_title}]", task_instruction]
             prompt_parts.append(f"Current Step ({step.step_index}): {step.title}")
             prompt_parts.append(step.instruction)
@@ -598,7 +654,10 @@ class TaskRunner:
                 )
             if prior_summaries:
                 prompt_parts.append("Previous step summaries:\n" + "\n".join(prior_summaries))
-            if is_final_step and prior_full_outputs:
+            include_prior_full_outputs = not (
+                isinstance(run_context, dict) and isinstance(run_context.get("executor_config"), dict)
+            )
+            if is_final_step and include_prior_full_outputs and prior_full_outputs:
                 prompt_parts.append(
                     "Previous step outputs (use exact details for final synthesis):\n"
                     + "\n\n".join(prior_full_outputs)
