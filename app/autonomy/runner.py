@@ -500,6 +500,19 @@ class TaskRunner:
                 for key in ("dataset", "dataset_stats", "refresh_stats", "watcher_config", "config_warnings", "executor_config"):
                     if key in run_context:
                         run_debug[key] = run_context[key]
+                if "executor_config" in run_context:
+                    executor_config = run_context.get("executor_config") or {}
+                    if isinstance(executor_config, dict):
+                        run_debug["runtime_contract"] = {
+                            "kind": executor_config.get("kind"),
+                            "input_mode": executor_config.get("input_mode"),
+                            "tool_policy": executor_config.get("tool_policy"),
+                            "output_mode": executor_config.get("output_mode"),
+                            "persistence_mode": executor_config.get("persistence_mode"),
+                            "validation_mode": executor_config.get("validation_mode"),
+                            "notify_mode": executor_config.get("notify_mode"),
+                            "no_update_policy": executor_config.get("no_update_policy"),
+                        }
             blocked = set(step_user_context.blocked_tools or [])
             blocked.update(task_profile.effective_blocked_tools(run_context=run_context))
             allowed_cap = list(step_user_context.allowed_tool_cap or [])

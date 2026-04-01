@@ -16,6 +16,7 @@ from app.time_utils import utc_compact_timestamp
 
 _SUPPORTED_KIND = "configured_executor"
 _SUPPORTED_INPUT_MODE = "prepared_rss_topic_dataset"
+_SUPPORTED_TOOL_POLICY = "dataset_plus_workspace_append"
 _SUPPORTED_OUTPUT_MODE = "daily_research_briefing"
 _SUPPORTED_PERSISTENCE_MODE = "append_workspace_file"
 _SUPPORTED_VALIDATION_MODE = "grounded_briefing"
@@ -36,6 +37,74 @@ Daily research briefing contract:
 - Preserve exact URLs from the dataset. Do not invent, rewrite, or shorten URLs.
 - If there are no meaningful developments, return ONLY NO_SIGNIFICANT_UPDATES.
 """
+
+_TOOL_POLICY_BLOCKED_TOOLS: dict[str, set[str]] = {
+    "dataset_plus_workspace_append": {
+        "add_memory_observations",
+        "api_request",
+        "append_file",
+        "create_and_run_task_plan",
+        "create_event",
+        "create_memory",
+        "create_memory_entities",
+        "create_memory_relations",
+        "create_task",
+        "create_task_plan",
+        "delete_event",
+        "fetch_page",
+        "find_files",
+        "get_daily_market_data",
+        "get_intraday_market_data",
+        "get_task",
+        "list_directory",
+        "list_library_documents",
+        "list_recent_feed_items",
+        "list_rss_sources",
+        "list_tasks",
+        "make_directory",
+        "open_memory_graph_nodes",
+        "read_file",
+        "run_task_now",
+        "search_feeds",
+        "search_library",
+        "search_memory_graph",
+        "search_my_feeds",
+        "search_places",
+        "stat_file",
+        "summarize_document",
+        "update_task",
+        "web_search",
+        "write_file",
+    }
+}
+
+
+@dataclass(frozen=True)
+class NormalizedConfiguredExecutor:
+    kind: str
+    input_mode: str
+    tool_policy: str
+    output_mode: str
+    persistence_mode: str
+    validation_mode: str
+    notify_mode: str
+    no_update_policy: str
+    input: dict[str, Any]
+    persistence: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "input_mode": self.input_mode,
+            "tool_policy": self.tool_policy,
+            "output_mode": self.output_mode,
+            "persistence_mode": self.persistence_mode,
+            "validation_mode": self.validation_mode,
+            "notify_mode": self.notify_mode,
+            "no_update_policy": self.no_update_policy,
+            "input": dict(self.input),
+            "persistence": dict(self.persistence),
+        }
 
 
 @dataclass(frozen=True)
@@ -140,44 +209,10 @@ class ConfiguredDailyResearchBriefingExecution(TaskExecutionProfile):
         }
 
     def effective_blocked_tools(self, *, run_context: Dict[str, Any]) -> set[str]:
-        del run_context
-        return {
-            "add_memory_observations",
-            "api_request",
-            "create_and_run_task_plan",
-            "create_event",
-            "create_memory",
-            "create_memory_entities",
-            "create_memory_relations",
-            "create_task",
-            "create_task_plan",
-            "delete_event",
-            "fetch_page",
-            "get_daily_market_data",
-            "get_intraday_market_data",
-            "get_task",
-            "list_library_documents",
-            "list_recent_feed_items",
-            "list_rss_sources",
-            "list_tasks",
-            "list_directory",
-            "find_files",
-            "stat_file",
-            "read_file",
-            "write_file",
-            "append_file",
-            "make_directory",
-            "open_memory_graph_nodes",
-            "run_task_now",
-            "search_feeds",
-            "search_library",
-            "search_memory_graph",
-            "search_my_feeds",
-            "search_places",
-            "summarize_document",
-            "update_task",
-            "web_search",
-        }
+        config = normalize_executor_config(run_context.get("executor_config") or self.config)
+        if config is None:
+            return set()
+        return set(_TOOL_POLICY_BLOCKED_TOOLS.get(config["tool_policy"], set()))
 
     def augment_prompt(
         self,
@@ -288,12 +323,15 @@ class ConfiguredDailyResearchBriefingExecution(TaskExecutionProfile):
         grounding = run_debug.get("grounding_report")
         diagnostics = {
             "executor_config": run_debug.get("executor_config", {}),
+            "runtime_contract": run_debug.get("runtime_contract", {}),
             "dataset_stats": run_debug.get("dataset_stats", {}),
             "refresh_stats": run_debug.get("refresh_stats", {}),
             "append_result": run_debug.get("append_result", {}),
         }
         if isinstance(dataset, dict):
             out.append({"artifact_type": "prepared_dataset", "content_json": dataset})
+        if isinstance(run_debug.get("runtime_contract"), dict):
+            out.append({"artifact_type": "runtime_contract", "content_json": run_debug.get("runtime_contract")})
         if final_markdown:
             out.append({"artifact_type": "final_output", "content_text": final_markdown})
         if isinstance(grounding, dict):
@@ -349,6 +387,9 @@ def normalize_executor_config(value: Any) -> dict[str, Any] | None:
         return None
     if str(value.get("input_mode") or "").strip().lower() != _SUPPORTED_INPUT_MODE:
         return None
+    tool_policy = _normalize_tool_policy(value.get("tool_policy"))
+    if tool_policy != _SUPPORTED_TOOL_POLICY:
+        return None
     if str(value.get("output_mode") or "").strip().lower() != _SUPPORTED_OUTPUT_MODE:
         return None
     if str(value.get("persistence_mode") or "").strip().lower() != _SUPPORTED_PERSISTENCE_MODE:
@@ -357,28 +398,29 @@ def normalize_executor_config(value: Any) -> dict[str, Any] | None:
         return None
     if str(value.get("notify_mode") or "").strip().lower() != _SUPPORTED_NOTIFY_MODE:
         return None
-    normalized = {
-        "kind": _SUPPORTED_KIND,
-        "input_mode": _SUPPORTED_INPUT_MODE,
-        "output_mode": _SUPPORTED_OUTPUT_MODE,
-        "persistence_mode": _SUPPORTED_PERSISTENCE_MODE,
-        "validation_mode": _SUPPORTED_VALIDATION_MODE,
-        "notify_mode": _SUPPORTED_NOTIFY_MODE,
-        "no_update_policy": _SUPPORTED_NO_UPDATE_POLICY,
-        "input": {
+    normalized = NormalizedConfiguredExecutor(
+        kind=_SUPPORTED_KIND,
+        input_mode=_SUPPORTED_INPUT_MODE,
+        tool_policy=tool_policy,
+        output_mode=_SUPPORTED_OUTPUT_MODE,
+        persistence_mode=_SUPPORTED_PERSISTENCE_MODE,
+        validation_mode=_SUPPORTED_VALIDATION_MODE,
+        notify_mode=_SUPPORTED_NOTIFY_MODE,
+        no_update_policy=_SUPPORTED_NO_UPDATE_POLICY,
+        input={
             "topic": str(((value.get("input") or {}).get("topic") or "")).strip(),
             "window_hours": max(1, min(int(((value.get("input") or {}).get("window_hours") or 24)), 168)),
             "threshold": _normalize_threshold((value.get("input") or {}).get("threshold")),
             "sources": [str(item).strip() for item in ((value.get("input") or {}).get("sources") or []) if str(item).strip()],
         },
-        "persistence": {
+        persistence={
             "path": _normalize_workspace_path((value.get("persistence") or {}).get("path")),
             "write_preamble_if_missing": bool((value.get("persistence") or {}).get("write_preamble_if_missing", True)),
         },
-    }
-    if not normalized["input"]["topic"] or not normalized["persistence"]["path"]:
+    )
+    if not normalized.input["topic"] or not normalized.persistence["path"]:
         return None
-    return normalized
+    return normalized.to_dict()
 
 
 def infer_configured_executor(
@@ -408,6 +450,7 @@ def infer_configured_executor(
     config = {
         "kind": _SUPPORTED_KIND,
         "input_mode": _SUPPORTED_INPUT_MODE,
+        "tool_policy": _SUPPORTED_TOOL_POLICY,
         "output_mode": _SUPPORTED_OUTPUT_MODE,
         "persistence_mode": _SUPPORTED_PERSISTENCE_MODE,
         "validation_mode": _SUPPORTED_VALIDATION_MODE,
@@ -483,6 +526,13 @@ def _normalize_threshold(value: Any) -> str:
     if threshold not in {"low", "medium", "high"}:
         return "medium"
     return threshold
+
+
+def _normalize_tool_policy(value: Any) -> str:
+    policy = str(value or _SUPPORTED_TOOL_POLICY).strip().lower()
+    if policy not in _TOOL_POLICY_BLOCKED_TOOLS:
+        return ""
+    return policy
 
 
 def _normalize_workspace_path(value: Any) -> str:

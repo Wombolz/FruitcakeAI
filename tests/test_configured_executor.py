@@ -52,6 +52,7 @@ def test_infer_configured_executor_for_daily_research_briefing():
     )
 
     assert inferred.profile is None
+    assert inferred.executor_config["tool_policy"] == "dataset_plus_workspace_append"
     assert inferred.executor_config["input"]["topic"] == "Iran and the Middle East"
     assert inferred.executor_config["input"]["window_hours"] == 24
     assert inferred.executor_config["persistence"]["path"] == "reports/iran_middle_east_developments.md"
@@ -82,7 +83,19 @@ async def test_create_task_auto_selects_configured_executor(client):
         task = rows.scalar_one()
         assert task.profile is None
         assert task.executor_config["kind"] == "configured_executor"
+        assert task.executor_config["tool_policy"] == "dataset_plus_workspace_append"
         assert task.executor_config["output_mode"] == "daily_research_briefing"
+
+
+def test_legacy_executor_config_without_tool_policy_still_normalizes():
+    config = _sample_executor_config()
+    config.pop("tool_policy", None)
+    profile = ConfiguredDailyResearchBriefingExecution(config)
+
+    blocked = profile.effective_blocked_tools(run_context={"executor_config": config})
+
+    assert "append_file" in blocked
+    assert "web_search" in blocked
 
 
 @pytest.mark.asyncio
