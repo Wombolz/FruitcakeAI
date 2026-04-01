@@ -116,6 +116,16 @@ Repeated reporting tasks therefore need two distinct protections:
 
 These protections should be treated as runtime behavior, not profile-specific hacks.
 
+Live follow-through also showed a third conservative quality layer was useful:
+
+3. light title-cluster diversity during dataset preparation
+
+This is now implemented narrowly for repetitive reporting tasks:
+
+- only near-identical titles are clustered
+- the strongest/first item is kept
+- broader same-event coverage with meaningfully different framing is still allowed
+
 The current implementation is intentionally conservative:
 
 - compare only against the most recent appended entry
@@ -128,7 +138,7 @@ This adjustment should **not** be interpreted as justification for stronger blan
 
 Still intentionally deferred:
 
-- broader story-cluster dedup
+- broader story-cluster dedup beyond near-identical title variants
 - aggressive novelty scoring
 - multi-entry historical suppression windows
 - source-level weighting adjustments for Reuters/BBC repetition
@@ -136,5 +146,6 @@ Still intentionally deferred:
 Current planning conclusion:
 
 - repeated-looking reporting output is not always a step/reset bug
-- repetitive reporting tasks need both post-draft duplicate suppression and pre-draft recent-item repeat trimming
-- the likely next quality step is light story-cluster diversity, not stronger blanket suppression
+- repetitive reporting tasks need post-draft duplicate suppression plus conservative pre-draft dataset shaping
+- current dataset shaping now includes recent-item repeat trimming and light title-cluster diversity
+- the next likely quality step is broader story-cluster diversity, not stronger blanket suppression

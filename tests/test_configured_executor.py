@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
@@ -341,6 +342,95 @@ def test_apply_light_title_cluster_diversity_prunes_near_identical_titles():
     ]
     assert stats["title_cluster_count"] == 1
     assert stats["title_cluster_pruned_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_run_context_applies_recent_repeat_pruning_and_light_title_diversity(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    config = _sample_executor_config()
+    profile = ConfiguredDailyResearchBriefingExecution(config)
+
+    report_path = tmp_path / "1" / "reports"
+    report_path.mkdir(parents=True, exist_ok=True)
+    (report_path / "iran_middle_east_developments.md").write_text(
+        "20260401T030729Z\n"
+        "**[Iran & Middle East] - New developments**\n\n"
+        "Links (from cached feeds):\n"
+        "- https://example.com/repeat-a\n"
+        "- https://example.com/repeat-b\n",
+        encoding="utf-8",
+    )
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Daily Iran & Middle East Developments Briefing",
+            instruction=(
+                "Analyze the news about Iran and the Middle East from the past 24 hours and append the results "
+                "to reports/iran_middle_east_developments.md in the workspace file."
+            ),
+            status="pending",
+        )
+        task.executor_config = config
+        db.add(task)
+        await db.flush()
+
+        dataset_items = [
+            {
+                "title": "Trump says the US could end the Iran war in two to three weeks",
+                "source": "Reuters",
+                "source_category": "news",
+                "url": "https://example.com/repeat-a",
+                "summary": "A repeated line from the most recent entry.",
+                "score": 1.5,
+            },
+            {
+                "title": "Trump says U.S. could end war in Iran in two to three weeks",
+                "source": "Reuters",
+                "source_category": "news",
+                "url": "https://example.com/repeat-b",
+                "summary": "A near-identical desk variant.",
+                "score": 1.49,
+            },
+            {
+                "title": "Asia's factory activity slows on cost pressure from Iran war",
+                "source": "Reuters",
+                "source_category": "news",
+                "url": "https://example.com/new-c",
+                "summary": "New economic spillover reporting.",
+                "score": 1.48,
+            },
+            {
+                "title": "Oil nears highest price since start of Iran war",
+                "source": "BBC",
+                "source_category": "news",
+                "url": "https://example.com/new-d",
+                "summary": "Energy markets remain under pressure.",
+                "score": 1.47,
+            },
+        ]
+
+        async def fake_build_magazine_dataset(*args, **kwargs):
+            return {"items": dataset_items, "refresh": {"enabled": True}}
+
+        with patch("app.autonomy.configured_executor.build_magazine_dataset", new=fake_build_magazine_dataset):
+            out = await profile.prepare_run_context(
+                db=db,
+                user_id=1,
+                task_id=task.id,
+                task_run_id=None,
+            )
+
+    urls = [item["url"] for item in out["dataset"]["rss_items"]]
+    assert urls == [
+        "https://example.com/repeat-a",
+        "https://example.com/new-c",
+        "https://example.com/new-d",
+    ]
+    assert out["dataset_stats"]["recent_entry_considered"] is True
+    assert out["dataset_stats"]["recent_overlap_count"] == 2
+    assert out["dataset_stats"]["recent_repeat_pruned_count"] == 1
+    assert out["dataset_stats"]["title_cluster_pruned_count"] == 0
 
 
 @pytest.mark.asyncio
