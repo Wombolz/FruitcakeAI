@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.7.4
+
+Release date:
+- 2026-03-31
+
+This release lands the first declarative-runtime preservation and repetitive-reporting hardening pass for configured research briefing tasks.
+
+### Added
+
+- step-boundary `preserved_runtime_state` artifacts for configured executors
+- compact runtime-contract reinjection for later configured-executor steps
+- conservative repetitive-reporting dataset shaping:
+  - recent-entry exact-repeat trimming
+  - light title-cluster diversity
+- integration coverage for configured-executor dataset preparation behavior
+
+### Fixed
+
+- configured-executor runs now reject overlapping active task runs more consistently
+- manual task runs and `run_task_now` now honor active `TaskRun` records instead of relying only on task status
+- prior-step carry-forward is more compact and less noisy
+- non-final configured-executor steps no longer use the full final-briefing contract
+- final configured-executor steps no longer ingest prior full step outputs in a way that can corrupt validation
+- repetitive reporting output now suppresses near-identical consecutive file appends while preserving a successful run outcome
+
+### Operator Notes
+
+- repetitive reporting tasks now use a conservative two-layer dedup approach:
+  - persistence-time duplicate suppression
+  - pre-draft dataset shaping for very recent repeats
+- broader story-cluster diversity and stronger novelty scoring remain future quality work, not part of this release
+
 ## v0.7.3
 
 Release date:
