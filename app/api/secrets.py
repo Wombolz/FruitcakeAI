@@ -12,7 +12,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import get_current_user
 from app.db.models import Secret, User
 from app.db.session import get_db
-from app.secrets_service import encrypt_secret_value, mask_secret_value, normalize_secret_name
+from app.db.models import SecretAccessEvent
+from app.secrets_service import (
+    SecretConfigurationError,
+    encrypt_secret_value,
+    list_secret_access_events,
+    mask_secret_value,
+    normalize_secret_name,
+)
 
 router = APIRouter()
 
@@ -33,6 +40,11 @@ class SecretRotate(BaseModel):
     value: str
 
 
+class SecretDisableOut(BaseModel):
+    id: int
+    is_active: bool
+
+
 class SecretOut(BaseModel):
     id: int
     name: str
@@ -47,12 +59,28 @@ class SecretOut(BaseModel):
         from_attributes = True
 
 
+class SecretAccessEventOut(BaseModel):
+    id: int
+    secret_id: Optional[int]
+    secret_name: str
+    task_id: Optional[int]
+    tool_name: str
+    success: bool
+    error_class: Optional[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 def _serialize_secret(secret: Secret) -> SecretOut:
     masked_preview = "****"
     try:
         from app.secrets_service import decrypt_secret_value
 
         masked_preview = mask_secret_value(decrypt_secret_value(secret.ciphertext))
+    except SecretConfigurationError:
+        masked_preview = "****"
     except Exception:
         pass
     return SecretOut(
@@ -73,6 +101,19 @@ async def _get_owned_secret(db: AsyncSession, *, user_id: int, secret_id: int) -
     if secret is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Secret not found")
     return secret
+
+
+def _serialize_secret_access_event(event: SecretAccessEvent) -> SecretAccessEventOut:
+    return SecretAccessEventOut(
+        id=int(event.id),
+        secret_id=int(event.secret_id) if event.secret_id is not None else None,
+        secret_name=event.secret_name,
+        task_id=int(event.task_id) if event.task_id is not None else None,
+        tool_name=event.tool_name,
+        success=bool(event.success),
+        error_class=event.error_class,
+        created_at=event.created_at,
+    )
 
 
 @router.get("/secrets", response_model=list[SecretOut])
@@ -116,6 +157,18 @@ async def create_secret(
     return _serialize_secret(secret)
 
 
+@router.post("/secrets/{secret_id}/disable", response_model=SecretDisableOut)
+async def disable_secret(
+    secret_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    secret = await _get_owned_secret(db, user_id=current_user.id, secret_id=secret_id)
+    secret.is_active = False
+    await db.flush()
+    return SecretDisableOut(id=int(secret.id), is_active=bool(secret.is_active))
+
+
 @router.get("/secrets/{secret_id}", response_model=SecretOut)
 async def get_secret(
     secret_id: int,
@@ -124,6 +177,23 @@ async def get_secret(
 ):
     secret = await _get_owned_secret(db, user_id=current_user.id, secret_id=secret_id)
     return _serialize_secret(secret)
+
+
+@router.get("/secrets/{secret_id}/access-events", response_model=list[SecretAccessEventOut])
+async def get_secret_access_events(
+    secret_id: int,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    secret = await _get_owned_secret(db, user_id=current_user.id, secret_id=secret_id)
+    events = await list_secret_access_events(
+        db,
+        user_id=current_user.id,
+        secret_id=int(secret.id),
+        limit=limit,
+    )
+    return [_serialize_secret_access_event(event) for event in events]
 
 
 @router.patch("/secrets/{secret_id}", response_model=SecretOut)

@@ -76,6 +76,10 @@ class ISSPassWatcherExecutionProfile(TaskExecutionProfile):
         del run_context
         return {"api_request"}
 
+    def allow_skill_injection(self, *, run_context: Dict[str, Any]) -> bool:
+        del run_context
+        return False
+
     def augment_prompt(
         self,
         *,
@@ -95,6 +99,61 @@ class ISSPassWatcherExecutionProfile(TaskExecutionProfile):
                 f"- query_params: {contract.get('query_params')}\n"
             )
 
+    def validate_finalize(
+        self,
+        *,
+        result: str,
+        prior_full_outputs: List[str],
+        run_context: Dict[str, Any],
+        is_final_step: bool,
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        del prior_full_outputs, is_final_step
+        tool_records = list(run_context.get("last_tool_records") or [])
+        api_result = ""
+        for record in tool_records:
+            if str(record.get("tool") or "") == "api_request":
+                api_result = str(record.get("result_summary") or "").strip()
+        cleaned = str(result or "").strip()
+        normalized = cleaned.lower()
+
+        fallback_markers = (
+            "api request failed",
+            "i tried to check",
+            "would you like me to",
+            "tell me which option",
+            "it seems there was an issue",
+            "let's try again",
+            "or would you prefer i stop",
+        )
+        no_data_markers = (
+            "no visible iss passes found",
+            "no new iss pass changes",
+            "no visible passes found",
+        )
+        api_failed = bool(api_result) and (
+            api_result == "API request failed."
+            or api_result.startswith("Tool api_request failed:")
+            or "failed" in api_result.lower()
+            or "require a named secret" in api_result.lower()
+        )
+
+        if api_result and (not cleaned or any(marker in normalized for marker in fallback_markers)):
+            cleaned = api_result
+        elif api_result and api_failed:
+            cleaned = api_result
+        elif api_result and any(marker in api_result.lower() for marker in no_data_markers):
+            cleaned = api_result
+
+        if cleaned.lower() == "api request failed." and api_result:
+            cleaned = api_result
+
+        report = {
+            "fatal": False,
+            "api_request_called": bool(api_result),
+            "used_tool_result_fallback": cleaned == api_result and bool(api_result),
+        }
+        return cleaned, report
+
 
 def _extract_number(pattern: str, text: str, *, cast=float, default: Any = None) -> Any:
     match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -110,7 +169,10 @@ def _extract_secret_name(text: str) -> str:
     match = re.search(r"secret\s+([A-Za-z0-9_]+)", text, flags=re.IGNORECASE)
     if not match:
         return "n2yo_api_key"
-    return str(match.group(1)).strip().lower()
+    candidate = str(match.group(1)).strip().lower()
+    if candidate != "n2yo_api_key":
+        return "n2yo_api_key"
+    return candidate
 
 
 def _build_contract(instruction: str) -> Dict[str, Any]:

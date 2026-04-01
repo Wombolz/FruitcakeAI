@@ -50,6 +50,9 @@ class TaskExecutionProfile(ABC):
     def effective_allowed_tools(self, *, run_context: Dict[str, Any]) -> Optional[Set[str]]:
         return None
 
+    def allow_skill_injection(self, *, run_context: Dict[str, Any]) -> bool:
+        return True
+
     def augment_prompt(
         self,
         *,
