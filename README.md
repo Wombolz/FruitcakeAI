@@ -15,9 +15,9 @@ It's built for self-hosters, homelab tinkerers, developers, and small teams who 
 
 
 
-## Alpha Status
+## Project Status
 
-FruitcakeAI is currently an alpha release.
+FruitcakeAI is currently a quiet open alpha.
 
 That means:
 
@@ -27,7 +27,7 @@ That means:
 - some integrations are stable enough for testing, not guaranteed production-hard
 - public bug reports are welcome, but the project is not yet open to broad outside co-development
 
-If you are evaluating it publicly, treat it as a serious self-hosted alpha, not a polished production platform.
+The repository is available publicly, but it is not being actively pushed as a broad launch. Treat it as a serious self-hosted alpha under active development, not a polished production platform.
 
 ---
 
