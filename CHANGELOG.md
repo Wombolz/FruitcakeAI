@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.7.3
+
+Release date:
+- 2026-03-31
+
+This release lands the first configured research-briefing executor path and the supporting task/runtime fixes around it.
+
+### Added
+
+- configured executor v1 for daily research briefings
+- deterministic configured-executor planning for task-69-style recurring research tasks
+- workspace append persistence path for recurring briefing output
+
+### Fixed
+
+- task scheduling now respects task/user timezone intent when computing future runs
+- recurring run rescheduling uses the same timezone-aware task scheduling path
+- configured-briefing validation now tolerates a heading before the bullet block
+- configured-briefing output strips watcher-style memory-candidate sections before persisting to workspace files
+- runner regressions around user loading, artifact persistence ordering, and recurring reschedule helper usage
+
+### Operator Notes
+
+- existing tasks keep their stored `next_run_at` until recomputed or updated once under the new time-semantics rules
+- task `69` was migrated onto the configured executor path and validated against its report-file output
+
 ## v0.7.2
 
 Release date:
