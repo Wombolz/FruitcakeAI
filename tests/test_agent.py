@@ -112,6 +112,15 @@ def test_system_prompt_requires_confirmation_before_calendar_delete():
     assert "delete_event" in prompt
 
 
+def test_system_prompt_requires_task_draft_before_create_or_update():
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    prompt = ctx.to_system_prompt().lower()
+    assert "before using create_task or update_task" in prompt
+    assert "short normalized task draft" in prompt
+    assert "what it will do, when it will run" in prompt
+    assert "high-confidence task recipe" in prompt
+
+
 def test_parse_iso_datetime_accepts_z_suffix():
     dt = _parse_iso_datetime("2026-04-01T00:00:00Z")
     assert dt.isoformat() == "2026-04-01T00:00:00+00:00"
@@ -225,6 +234,20 @@ def test_update_task_schema_has_required_fields():
     assert "recipe_family" in props
     assert "recipe_params" in props
     assert required == ["task_id"]
+
+
+def test_create_task_schema_description_mentions_normalized_draft():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_task")
+    description = schema["function"]["description"].lower()
+    assert "normalized draft" in description
+    assert "recipe_family" in description
+
+
+def test_update_task_schema_description_mentions_restate_before_save():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "update_task")
+    description = schema["function"]["description"].lower()
+    assert "restate the normalized change" in description
+    assert "explicitly confirms" in description
 
 
 def test_list_tasks_schema_fields():

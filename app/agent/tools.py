@@ -448,8 +448,10 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "name": "create_task",
             "description": (
                 "Create a real persistent task for the current user. "
-                "Use this only after the user has explicitly confirmed the task details. "
+                "Before calling it, present a short normalized draft with what the task will do, when it will run, and any key assumptions. "
+                "Use this only after the user has explicitly confirmed those details. "
                 "Use it for recurring watchers, briefings, maintenance tasks, or one-shot tasks the user wants saved. "
+                "When a high-confidence recipe fits, include recipe_family and recipe_params instead of relying on loose prose alone. "
                 "This creates the task row only; plan it afterward with create_task_plan unless the task is already deterministic."
             ),
             "parameters": {
@@ -494,7 +496,8 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "name": "update_task",
             "description": (
                 "Update an existing task owned by the current user. "
-                "Use this after the user explicitly confirms a task change such as schedule, instruction, profile, or delivery settings. "
+                "Before calling it, restate the normalized change you are about to save, including any schedule or behavior change. "
+                "Use this after the user explicitly confirms that update. "
                 "If the updated fields materially change execution, regenerate the plan afterward with create_task_plan. "
                 "Use this instead of create_task when the user is modifying a task you just created."
             ),
