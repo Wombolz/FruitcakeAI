@@ -707,6 +707,196 @@ async def test_create_task_tool_normalizes_plain_english_watcher_recipe():
 
 
 @pytest.mark.asyncio
+async def test_create_task_tool_trims_watcher_draft_topic_and_sources():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    draft_instruction = (
+        "Watch NASA and Artemis news for major updates.\n"
+        "Sources (proposed): NASA Press Releases, NASA Media Advisories, NASA Artemis Blog, SpaceNews (Artemis tag). "
+        "Major update criteria: official NASA posts or corroborated major program changes. "
+        "Behavior: check every 2 hours and deduplicate.\n"
+    )
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "NASA + Artemis Major Updates Watch",
+                "instruction": draft_instruction,
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.title == "NASA + Artemis Watcher"
+        assert task.task_recipe["params"]["topic"] == "NASA + Artemis"
+        assert task.task_recipe["params"]["sources"] == [
+            "nasa press releases",
+            "nasa media advisories",
+            "nasa artemis blog",
+            "spacenews (artemis tag)",
+        ]
+        assert "major update criteria" not in task.instruction.lower()
+        assert "behavior:" not in task.instruction.lower()
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_parses_bulleted_watcher_sources_and_drops_major_update_suffix():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    draft_instruction = (
+        "What it will do:\n"
+        "- Check official NASA and high-signal space news RSS feeds every 2 hours.\n"
+        "Sources (RSS):\n"
+        "- NASA Artemis Blog: https://blogs.nasa.gov/artemis/feed/\n"
+        "- NASA Press Releases: https://www.nasa.gov/rss/dyn/breaking_news.rss\n"
+        "- NASA Media Advisories: https://www.nasa.gov/rss/dyn/lg_image_of_the_day.rss\n"
+        "- SpaceNews (Artemis tag): https://spacenews.com/tag/artemis/feed/\n"
+        "Behavior:\n"
+        "- Notify on major updates only.\n"
+    )
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "NASA/Artemis II Major Update Monitor",
+                "instruction": draft_instruction,
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.title == "NASA/Artemis II Watcher"
+        assert task.task_recipe["params"]["topic"] == "NASA/Artemis II"
+        assert task.task_recipe["params"]["sources"] == [
+            "nasa artemis blog",
+            "nasa press releases",
+            "nasa media advisories",
+            "spacenews (artemis tag)",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_parses_suggested_sources_heading_without_colon():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    draft_instruction = (
+        "Draft task\n"
+        "Sources (suggested)\n"
+        "- NASA official feeds / press releases\n"
+        "- NASA Artemis Blog\n"
+        "- SpaceNews Artemis coverage\n"
+        "When it will run\n"
+        "- Every 2 hours during wake hours.\n"
+    )
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "NASA & Artemis II Watcher",
+                "instruction": draft_instruction,
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.task_recipe["params"]["sources"] == [
+            "nasa official feeds / press releases",
+            "nasa artemis blog",
+            "spacenews artemis coverage",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_keeps_only_watcher_sources_that_match_active_feeds():
+    import app.agent.tools as tools_module
+    from app.db.models import RSSSource, Task
+
+    ctx = _make_context()
+
+    async with TestSessionLocal() as db:
+        db.add_all(
+            [
+                RSSSource(
+                    user_id=1,
+                    name="Ars Technica",
+                    url="https://feeds.arstechnica.com/arstechnica/index",
+                    url_canonical="https://feeds.arstechnica.com/arstechnica/index",
+                    category="tech",
+                    active=True,
+                ),
+                RSSSource(
+                    user_id=1,
+                    name="Reuters World News",
+                    url="https://feeds.reuters.com/Reuters/worldNews",
+                    url_canonical="https://feeds.reuters.com/reuters/worldnews",
+                    category="news",
+                    active=True,
+                ),
+            ]
+        )
+        await db.commit()
+
+    draft_instruction = (
+        "Watch NASA and Artemis II news for major updates.\n"
+        "Sources: Reuters - Science, Ars Technica - Science, NASA Press Releases\n"
+    )
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "NASA + Artemis II Update Monitor",
+                "instruction": draft_instruction,
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.task_recipe["params"]["sources"] == []
+        assert "sources:" not in task.instruction
+
+
+@pytest.mark.asyncio
 async def test_create_task_tool_normalizes_recurring_briefing_recipe_into_configured_executor():
     import app.agent.tools as tools_module
     from app.db.models import Task

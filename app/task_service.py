@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import re
 from typing import Optional
 
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.persona_loader import list_personas, persona_exists
 from app.agent.persona_router import infer_persona_for_task
 from app.autonomy.configured_executor import infer_configured_executor
 from app.autonomy.profiles import normalize_task_profile
-from app.db.models import Task
+from app.db.models import RSSSource, Task
 from app.task_recipes import build_task_recipe_metadata, normalize_task_recipe
 from app.time_utils import resolve_effective_timezone
 
@@ -120,6 +122,96 @@ class TaskUpdateResult:
     plan_inputs_changed: bool
 
 
+async def _align_topic_watcher_sources(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    recipe,
+):
+    if recipe is None or recipe.family != "topic_watcher":
+        return recipe
+    requested_sources = list(recipe.params.get("sources") or [])
+    if not requested_sources:
+        return recipe
+
+    rows = (
+        await db.execute(
+            select(RSSSource)
+            .where(
+                RSSSource.active == True,
+                or_(RSSSource.user_id == user_id, RSSSource.user_id.is_(None)),
+            )
+            .order_by(RSSSource.user_id.is_(None), RSSSource.name.asc())
+        )
+    ).scalars().all()
+    if not rows:
+        return recipe
+
+    active_names = [str(row.name or "").strip() for row in rows if str(row.name or "").strip()]
+    matched_names: list[str] = []
+    for source in requested_sources:
+        match = _match_active_source_name(str(source), active_names)
+        if match and match not in matched_names:
+            matched_names.append(match)
+
+    assumptions = list(recipe.assumptions)
+    if requested_sources and not matched_names:
+        assumptions.append("dropped watcher source filters because they did not match active RSS sources")
+    elif len(matched_names) < len(requested_sources):
+        assumptions.append("dropped watcher source filters because only some suggested sources matched active RSS sources")
+        matched_names = []
+
+    lines = [f"topic: {recipe.params.get('topic')}", f"threshold: {recipe.params.get('threshold') or 'medium'}"]
+    if matched_names:
+        lines.append(f"sources: {', '.join(matched_names)}")
+    lines.extend(
+        [
+            "",
+            f"Watch my curated RSS feeds for significant updates about {recipe.params.get('topic')}.",
+            "Return NOTHING_NEW when there is no meaningful change.",
+        ]
+    )
+    return replace(
+        recipe,
+        instruction="\n".join(lines).strip(),
+        params={**recipe.params, "sources": matched_names},
+        assumptions=assumptions,
+    )
+
+
+def _match_active_source_name(requested: str, active_names: list[str]) -> str | None:
+    normalized_requested = _normalize_source_name(requested)
+    if not normalized_requested:
+        return None
+    for candidate in active_names:
+        normalized_candidate = _normalize_source_name(candidate)
+        if normalized_candidate == normalized_requested:
+            return candidate
+    requested_tokens = set(normalized_requested.split())
+    for candidate in active_names:
+        normalized_candidate = _normalize_source_name(candidate)
+        candidate_tokens = set(normalized_candidate.split())
+        if requested_tokens and requested_tokens.issubset(candidate_tokens):
+            return candidate
+        if candidate_tokens and candidate_tokens.issubset(requested_tokens):
+            return candidate
+    return None
+
+
+def _normalize_source_name(value: str) -> str:
+    candidate = str(value or "").lower().strip()
+    candidate = re.sub(r"[–—:/()]+", " ", candidate)
+    candidate = re.sub(r"\brss\b", " ", candidate)
+    candidate = re.sub(r"\bofficial\b", " ", candidate)
+    candidate = re.sub(r"\bfeeds?\b", " ", candidate)
+    candidate = re.sub(r"\bblogs?\b", "blog", candidate)
+    candidate = re.sub(r"\bscience\b", " ", candidate)
+    candidate = re.sub(r"\bworld news\b", "world", candidate)
+    candidate = re.sub(r"[^a-z0-9+& ]+", " ", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    return candidate
+
+
 async def create_task_record(
     db: AsyncSession,
     *,
@@ -149,6 +241,11 @@ async def create_task_record(
         requested_profile=profile,
         recipe_family=recipe_family,
         recipe_params=recipe_params,
+    )
+    normalized_recipe = await _align_topic_watcher_sources(
+        db,
+        user_id=user_id,
+        recipe=normalized_recipe,
     )
     normalized_title = normalized_recipe.title if normalized_recipe is not None else title
     normalized_instruction = normalized_recipe.instruction if normalized_recipe is not None else instruction
@@ -222,8 +319,6 @@ async def update_task_record(
     recipe_family=UNSET,
     recipe_params=UNSET,
 ) -> TaskUpdateResult:
-    del db  # reserved for future validation that may require queries
-
     title_changed = False
     instruction_changed = False
     plan_inputs_changed = False
@@ -291,6 +386,11 @@ async def update_task_record(
             recipe_family=requested_recipe_family,
             recipe_params=requested_recipe_params if isinstance(requested_recipe_params, dict) else None,
             preferred_family=preferred_family,
+        )
+        normalized_recipe = await _align_topic_watcher_sources(
+            db,
+            user_id=int(task.user_id),
+            recipe=normalized_recipe,
         )
         if normalized_recipe is not None:
             if not title_changed:

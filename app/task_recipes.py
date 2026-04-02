@@ -274,7 +274,7 @@ def _build_topic_watcher_recipe(
     return NormalizedTaskRecipe(
         family="topic_watcher",
         confidence="high",
-        title=_string_param(params, "title") or f"{topic} Watcher",
+        title=_string_param(params, "title") or _build_topic_watcher_title(topic),
         instruction="\n".join(lines).strip(),
         task_type=task_type,
         profile="topic_watcher",
@@ -449,10 +449,40 @@ def _extract_threshold(instruction: str) -> str | None:
 
 
 def _extract_sources(instruction: str) -> list[str]:
-    match = re.search(r"sources\s*:\s*(.+?)(?:\n|$)", instruction, flags=re.IGNORECASE)
-    if not match:
-        return []
-    return [item.strip().lower() for item in str(match.group(1)).split(",") if item.strip()]
+    block_match = re.search(
+        r"sources(?:\s*\([^)]+\))?(?:\s*:)?\s*(.*?)(?:\n\s*\n|\n[A-Z][A-Za-z /()]+(?:\s*:)?\s*|$)",
+        instruction,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if block_match:
+        raw = str(block_match.group(1)).strip()
+    else:
+        match = re.search(r"sources(?:\s*\([^)]+\))?\s*:\s*(.+?)(?:\n|$)", instruction, flags=re.IGNORECASE)
+        if not match:
+            return []
+        raw = str(match.group(1)).strip()
+    raw = re.split(r"\b(optional add-ons|major update criteria|behavior)\s*:", raw, flags=re.IGNORECASE)[0].strip()
+    values: list[str] = []
+    bullet_lines = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            bullet_lines.append(stripped[2:].strip())
+    items = bullet_lines if bullet_lines else raw.split(",")
+    for item in items:
+        candidate = re.sub(r"\s+", " ", item).strip(" .,:;\"'`").lower()
+        candidate = re.sub(r":\s*https?://\S+$", "", candidate)
+        if not candidate:
+            continue
+        if len(candidate.split()) > 8:
+            continue
+        if candidate not in values:
+            values.append(candidate)
+    return values
+
+
+def _build_topic_watcher_title(topic: str) -> str:
+    return f"{topic} Watcher"
 
 
 def _extract_timezone(instruction: str) -> str | None:
@@ -520,8 +550,14 @@ def _timezone_param(params: dict[str, Any], key: str) -> str | None:
 
 def _clean_topic(value: str) -> str:
     candidate = re.sub(r"\s+", " ", str(value or "").strip(" .,:;\"'`"))
+    candidate = re.sub(r"\bmajor updates?\b", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\bsignificant updates?\b", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\bimportant updates?\b", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\bmeaningful changes?\b", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\bupdates?\b", "", candidate, flags=re.IGNORECASE)
     candidate = re.sub(r"\b(my|the|current|latest)\b", "", candidate, flags=re.IGNORECASE)
     candidate = re.sub(r"\b(news|updates|headlines|developments)\b", "", candidate, flags=re.IGNORECASE)
     candidate = re.sub(r"\b(for|with)\s+major\s*$", "", candidate, flags=re.IGNORECASE)
     candidate = re.sub(r"\b(for|with)\s+(meaningful|important|significant)\s*$", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\b(major|significant|important|meaningful)\s*$", "", candidate, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", candidate).strip(" .,:;\"'`")
