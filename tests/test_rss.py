@@ -17,6 +17,7 @@ from app.mcp.services.rss_sources import (
     list_recent_items,
     search_cached_items,
     set_recent_list_cursor,
+    upsert_feed_entries,
 )
 from tests.conftest import TestSessionLocal
 
@@ -202,6 +203,51 @@ async def test_search_cached_items_temporal_query_returns_latest_items():
 
     assert len(rows) >= 1
     assert rows[0]["title"] == "Breaking market move"
+
+
+@pytest.mark.asyncio
+async def test_upsert_feed_entries_dedupes_duplicate_items_within_same_batch():
+    async with TestSessionLocal() as db:
+        source = RSSSource(
+            user_id=1,
+            name="Duplicate Batch Feed",
+            url="https://duplicates.example/feed.xml",
+            url_canonical="https://duplicates.example/feed.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(source)
+        await db.flush()
+
+        entries = [
+            {
+                "id": "same-item",
+                "title": "Same Story",
+                "link": "https://duplicates.example/story",
+                "summary": "Original summary",
+                "published": "2026-04-01T18:00:25Z",
+            },
+            {
+                "id": "same-item",
+                "title": "Same Story",
+                "link": "https://duplicates.example/story",
+                "summary": "Updated summary",
+                "published": "2026-04-01T18:00:25Z",
+            },
+        ]
+
+        upserted = await upsert_feed_entries(db, source=source, entries=entries)
+        await db.flush()
+
+        rows = (
+            await db.execute(select(RSSItem).where(RSSItem.source_id == source.id))
+        ).scalars().all()
+
+    assert upserted == 2
+    assert len(rows) == 1
+    assert rows[0].summary == "Updated summary"
 
 
 @pytest.mark.asyncio

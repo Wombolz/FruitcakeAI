@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api_adapters import get_api_adapter
 from app.api_adapters.alphavantage import fetch_daily_payload, fetch_intraday_payload
 from app.api_errors import APIRequestError
+from app.json_api import JsonApiError, extract_json_fields
 from app.db.models import TaskAPIState
 from app.secrets_service import SecretDecryptionError, audit_secret_access, resolve_secret
 
@@ -23,6 +24,12 @@ _SERVICE_PROVIDER_ALLOWLIST: dict[str, dict[str, Any]] = {
     "alphavantage": {
         "provider": "alphavantage",
         "allowed_secret_names": {"alphavantage_api_key"},
+    },
+    "weather": {
+        "provider": "weather",
+        "allowed_providers": {"weather", "openweathermap", "openweather"},
+        "allowed_secret_names": {"openweathermap_api_key", "weather_api_key"},
+        "provider_optional_for_allowed_names": True,
     },
 }
 
@@ -97,7 +104,13 @@ async def _resolve_service_secret(
 
     provider = str(getattr(resolved.secret, "provider", "") or "").strip().lower()
     expected_provider = str(policy.get("provider") or "").strip().lower()
-    if provider != expected_provider:
+    allowed_providers = {
+        str(item or "").strip().lower()
+        for item in (policy.get("allowed_providers") or {expected_provider})
+        if str(item or "").strip()
+    }
+    provider_optional = bool(policy.get("provider_optional_for_allowed_names"))
+    if not provider_optional and provider not in allowed_providers:
         await audit_secret_access(
             db,
             user_id=user_id,
@@ -193,6 +206,7 @@ async def execute_api_request(
     query_params: Dict[str, Any] | None = None,
     secret_name: str | None = None,
     response_mode: str | None = None,
+    response_fields: Dict[str, str] | None = None,
     task_id: int | None = None,
 ) -> str:
     service_name = str(service or "").strip().lower()
@@ -242,6 +256,17 @@ async def execute_api_request(
                 task_id=task_id,
                 state_key=state_key,
                 payload={"fingerprint": fp, "normalized": normalized, "raw_payload": raw_payload},
+            )
+
+        if response_fields:
+            try:
+                extracted = extract_json_fields(normalized, response_fields)
+            except JsonApiError as exc:
+                raise APIRequestError(str(exc)) from exc
+            return json.dumps(
+                {"deduped": deduped, "fields": extracted},
+                ensure_ascii=True,
+                sort_keys=True,
             )
 
         return formatter(normalized, deduped=deduped)

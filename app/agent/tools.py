@@ -167,11 +167,11 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "api_request",
-            "description": (
-                "Call an approved backend-owned JSON API integration. "
-                "Use this for structured external API workflows instead of shell or web search. "
-                "Current supported service/endpoint combinations: n2yo + iss_visual_passes; alphavantage + global_quote, time_series_daily, or time_series_intraday."
-            ),
+                "description": (
+                    "Call an approved backend-owned JSON API integration. "
+                    "Use this for structured external API workflows instead of shell or web search. "
+                    "Current supported service/endpoint combinations: n2yo + iss_visual_passes; alphavantage + global_quote, time_series_daily, or time_series_intraday; weather + current_conditions."
+                ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -192,6 +192,10 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "response_mode": {
                         "type": "string",
                         "description": "Optional response hint. Current adapters return normalized text output.",
+                    },
+                    "response_fields": {
+                        "type": "object",
+                        "description": "Optional named JSON field selectors for deterministic backend extraction.",
                     },
                 },
                 "required": ["service", "endpoint", "query_params"],
@@ -891,6 +895,7 @@ async def _api_request(
     query_params = arguments.get("query_params") or {}
     secret_name = str(arguments.get("secret_name", "") or "").strip()
     response_mode = str(arguments.get("response_mode", "") or "").strip()
+    response_fields = arguments.get("response_fields")
 
     if not service:
         return "service is required."
@@ -898,6 +903,26 @@ async def _api_request(
         return "endpoint is required."
     if not isinstance(query_params, dict):
         return "query_params must be an object."
+    if response_fields is not None and not isinstance(response_fields, dict):
+        return "response_fields must be an object."
+
+    if not query_params:
+        reserved = {
+            "service",
+            "endpoint",
+            "query_params",
+            "secret_name",
+            "auth_mode",
+            "response_mode",
+            "response_fields",
+        }
+        lifted = {
+            key: value
+            for key, value in arguments.items()
+            if key not in reserved
+        }
+        if lifted:
+            query_params = lifted
 
     async with AsyncSessionLocal() as db:
         try:
@@ -909,6 +934,7 @@ async def _api_request(
                 query_params=query_params,
                 secret_name=secret_name or None,
                 response_mode=response_mode or None,
+                response_fields=response_fields or None,
                 task_id=getattr(user_context, "task_id", None),
             )
             await db.commit()

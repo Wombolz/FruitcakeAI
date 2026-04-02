@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.7.6
+
+Release date:
+- 2026-04-01
+
+This release lands the first bounded JSON/API integration slice, proves it on ISS and weather, and hardens the chat/runtime path around live integration failures.
+
+### Added
+
+- deterministic `response_fields` extraction for backend-owned JSON/API calls
+- OpenWeather-backed `weather + current_conditions` integration and `weather_conditions` task profile
+- structured ISS and weather profile contracts on top of the JSON/API substrate
+
+### Fixed
+
+- weather secret handling now tolerates provider-label drift while still enforcing approved secret names
+- chat `api_request` calls now lift top-level tool-call fields into `query_params` when the model omits the nested object
+- weather requests now accept both `latitude`/`longitude` and `lat`/`lon`, and honor requested `units`
+- RSS refresh no longer fails on duplicate items within the same fetched feed batch
+
+### Operator Notes
+
+- the live weather rollout confirmed that tool-argument normalization is part of the runtime contract surface, not just adapter logic
+- future backend-owned integrations should assume chat may emit a flatter tool-call shape and rely on the normalization layer before backend validation
+
 ## v0.7.5
 
 Release date:

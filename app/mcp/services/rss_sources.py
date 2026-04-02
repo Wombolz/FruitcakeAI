@@ -759,6 +759,8 @@ async def upsert_feed_entries(
 ) -> int:
     now = datetime.now(timezone.utc)
     upserted = 0
+    normalized_entries: list[dict[str, Any]] = []
+    uids: list[str] = []
     for entry in entries:
         title = (entry.get("title") or "").strip()
         if not title:
@@ -773,28 +775,52 @@ async def upsert_feed_entries(
             or entry.get("pubDate")
         )
         uid = _entry_uid(entry, fallback_link=link or "", fallback_title=title)
-        existing = await db.execute(
-            select(RSSItem).where(RSSItem.source_id == source.id, RSSItem.item_uid == uid)
+        normalized_entries.append(
+            {
+                "uid": uid,
+                "title": title[:1000],
+                "link": link,
+                "summary": summary,
+                "published": published,
+            }
         )
-        row = existing.scalar_one_or_none()
+        uids.append(uid)
+
+    if not normalized_entries:
+        return 0
+
+    existing_rows = (
+        await db.execute(
+            select(RSSItem).where(
+                RSSItem.source_id == source.id,
+                RSSItem.item_uid.in_(sorted(set(uids))),
+            )
+        )
+    ).scalars().all()
+    rows_by_uid: dict[str, RSSItem] = {row.item_uid: row for row in existing_rows}
+
+    for entry in normalized_entries:
+        uid = entry["uid"]
+        row = rows_by_uid.get(uid)
         if row is None:
             row = RSSItem(
                 source_id=source.id,
                 item_uid=uid,
-                title=title[:1000],
-                link=link,
-                summary=summary,
-                published_at=published,
+                title=entry["title"],
+                link=entry["link"],
+                summary=entry["summary"],
+                published_at=entry["published"],
                 fetched_at=now,
                 first_seen_at=now,
                 last_seen_at=now,
             )
             db.add(row)
+            rows_by_uid[uid] = row
         else:
-            row.title = title[:1000]
-            row.link = link
-            row.summary = summary
-            row.published_at = published or row.published_at
+            row.title = entry["title"]
+            row.link = entry["link"]
+            row.summary = entry["summary"]
+            row.published_at = entry["published"] or row.published_at
             row.fetched_at = now
             row.last_seen_at = now
         upserted += 1
