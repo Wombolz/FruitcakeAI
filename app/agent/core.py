@@ -436,6 +436,9 @@ def _task_handoff_message(
         if tool_name == "update_task" and payload and payload.get("updated") is True:
             if "run now" in latest_user:
                 continue
+            confirmation = str(payload.get("task_confirmation") or "").strip()
+            if confirmation:
+                return confirmation
             title = str(payload.get("title") or "").strip()
             task_id = payload.get("task_id")
             schedule = str(payload.get("schedule") or "").strip()
@@ -453,6 +456,9 @@ def _task_handoff_message(
     )
     for tool_name, payload in paired:
         if tool_name == "create_task" and payload and payload.get("created") is True:
+            confirmation = str(payload.get("task_confirmation") or "").strip()
+            if confirmation:
+                return confirmation
             task_type = str(payload.get("task_type") or "").strip().lower()
             title = str(payload.get("title") or "").strip()
             task_id = payload.get("task_id")

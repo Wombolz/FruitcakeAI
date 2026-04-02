@@ -1537,7 +1537,7 @@ async def _create_and_run_task_plan(
 
 async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> str:
     from app.db.session import AsyncSessionLocal
-    from app.task_recipes import build_task_recipe_summary
+    from app.task_recipes import build_task_confirmation_text, build_task_recipe_summary
     from app.task_service import TaskValidationError, create_task_record
 
     title = str(arguments.get("title", "") or "").strip()
@@ -1593,6 +1593,13 @@ async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> 
                 task_recipe=task.task_recipe,
                 profile=task.profile,
             ),
+            "task_confirmation": build_task_confirmation_text(
+                title=task.title,
+                task_type=task.task_type,
+                schedule=task.schedule,
+                task_recipe=task.task_recipe,
+                profile=task.profile,
+            ),
             "llm_model_override": task.llm_model_override,
             "task_type": task.task_type,
             "schedule": task.schedule,
@@ -1606,7 +1613,7 @@ async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> 
 async def _update_task(arguments: Dict[str, Any], user_context: UserContext) -> str:
     from app.db.models import Task
     from app.db.session import AsyncSessionLocal
-    from app.task_recipes import build_task_recipe_summary
+    from app.task_recipes import build_task_confirmation_text, build_task_recipe_summary
     from app.task_service import TaskValidationError, UNSET, update_task_record
 
     task_id_raw = arguments.get("task_id")
@@ -1654,6 +1661,13 @@ async def _update_task(arguments: Dict[str, Any], user_context: UserContext) -> 
             "profile": task.profile,
             "task_recipe": task.task_recipe or None,
             "task_summary": build_task_recipe_summary(
+                title=task.title,
+                task_type=task.task_type,
+                schedule=task.schedule,
+                task_recipe=task.task_recipe,
+                profile=task.profile,
+            ),
+            "task_confirmation": build_task_confirmation_text(
                 title=task.title,
                 task_type=task.task_type,
                 schedule=task.schedule,

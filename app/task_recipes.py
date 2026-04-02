@@ -112,6 +112,91 @@ def build_task_recipe_summary(
     return " | ".join(parts)
 
 
+def build_task_confirmation_text(
+    *,
+    title: str,
+    task_type: str,
+    schedule: str | None,
+    task_recipe: dict[str, Any] | None,
+    profile: str | None,
+) -> str:
+    recipe = task_recipe or {}
+    family = str(recipe.get("family") or "").strip().lower()
+    params = recipe.get("params") if isinstance(recipe.get("params"), dict) else {}
+    cadence = "recurring" if task_type == "recurring" else "saved"
+
+    if family == "topic_watcher":
+        topic = str(params.get("topic") or title).strip()
+        threshold = str(params.get("threshold") or "medium").strip()
+        summary = f"Created a {cadence} topic watcher, '{title}', for {topic}."
+        detail = f" It will watch your feeds for meaningful changes at {threshold} sensitivity."
+        return summary + detail + _schedule_suffix(schedule)
+
+    if family == "daily_research_briefing":
+        topic = str(params.get("topic") or title).strip()
+        path = str(params.get("path") or "").strip()
+        window_hours = params.get("window_hours")
+        summary = f"Created a {cadence} research briefing task, '{title}', for {topic}."
+        parts = []
+        if window_hours:
+            parts.append(f"it will analyze the past {window_hours} hours")
+        else:
+            parts.append("it will analyze recent coverage")
+        if path:
+            parts.append(f"append the briefing to {path}")
+        detail = " It will " + " and ".join(parts) + "."
+        return summary + detail + _schedule_suffix(schedule)
+
+    if family == "morning_briefing":
+        return (
+            f"Created a {cadence} morning briefing task, '{title}'."
+            " It will prepare a daily agenda and headline summary."
+            + _schedule_suffix(schedule)
+        )
+
+    if family == "iss_pass_watcher":
+        lat = params.get("lat")
+        lon = params.get("lon")
+        timezone_name = str(params.get("timezone") or "UTC").strip()
+        location = f"lat={lat}, lon={lon}" if lat is not None and lon is not None else "the configured location"
+        return (
+            f"Created a {cadence} ISS pass watcher, '{title}', for {location}."
+            f" It will report results in {timezone_name} time."
+            + _schedule_suffix(schedule)
+        )
+
+    if family == "weather_conditions":
+        lat = params.get("lat")
+        lon = params.get("lon")
+        timezone_name = str(params.get("timezone") or "UTC").strip()
+        location = f"lat={lat}, lon={lon}" if lat is not None and lon is not None else "the configured location"
+        return (
+            f"Created a {cadence} weather task, '{title}', for {location}."
+            f" It will report current conditions in {timezone_name} time."
+            + _schedule_suffix(schedule)
+        )
+
+    if family == "maintenance":
+        return (
+            f"Created a {cadence} maintenance task, '{title}'."
+            " It will run the configured upkeep action."
+            + _schedule_suffix(schedule)
+        )
+
+    summary = build_task_recipe_summary(
+        title=title,
+        task_type=task_type,
+        schedule=schedule,
+        task_recipe=task_recipe,
+        profile=profile,
+    )
+    return f"Created task summary: {summary}."
+
+
+def _schedule_suffix(schedule: str | None) -> str:
+    return f" Schedule: {schedule}." if schedule else ""
+
+
 def _resolve_recipe_family(
     *,
     title: str,

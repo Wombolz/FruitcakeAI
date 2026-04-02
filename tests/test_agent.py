@@ -671,6 +671,8 @@ async def test_create_task_tool_normalizes_plain_english_watcher_recipe():
     assert payload["profile"] == "topic_watcher"
     assert payload["task_recipe"]["family"] == "topic_watcher"
     assert "family=topic_watcher" in payload["task_summary"]
+    assert "topic watcher" in payload["task_confirmation"].lower()
+    assert "iran" in payload["task_confirmation"].lower()
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, payload["task_id"])
@@ -706,6 +708,8 @@ async def test_create_task_tool_normalizes_recurring_briefing_recipe_into_config
     payload = json.loads(result)
     assert payload["created"] is True
     assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert "research briefing task" in payload["task_confirmation"].lower()
+    assert "append the briefing to reports/iran_middle_east_developments.md" in payload["task_confirmation"].lower()
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, payload["task_id"])
@@ -739,6 +743,7 @@ async def test_create_task_tool_normalizes_maintenance_recipe():
     assert payload["created"] is True
     assert payload["profile"] == "maintenance"
     assert payload["task_recipe"]["family"] == "maintenance"
+    assert "maintenance task" in payload["task_confirmation"].lower()
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, payload["task_id"])
@@ -780,6 +785,7 @@ async def test_update_task_tool_updates_schedule_and_marks_plan_change():
     assert updated["updated"] is True
     assert updated["schedule"] == "every:2h"
     assert updated["plan_inputs_changed"] is True
+    assert "schedule: every:2h" in updated["task_confirmation"].lower()
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, created["task_id"])
@@ -817,6 +823,7 @@ async def test_update_task_tool_preserves_recipe_identity_when_only_schedule_cha
 
     assert updated["updated"] is True
     assert updated["task_recipe"]["family"] == "topic_watcher"
+    assert "topic watcher" in updated["task_confirmation"].lower()
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, created["task_id"])
