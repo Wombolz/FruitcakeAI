@@ -401,7 +401,7 @@ async def _skip_recurring_backlog(due: list, now: datetime) -> int:
     """
     from sqlalchemy import select
     from app.db.session import AsyncSessionLocal
-    from app.db.models import Task
+    from app.db.models import Task, User
     from app.metrics import metrics
 
     recurring_ids = [
@@ -420,15 +420,16 @@ async def _skip_recurring_backlog(due: list, now: datetime) -> int:
             if getattr(task, "user_id", None) is not None:
                 user = await db.get(User, task.user_id)
                 user_tz = getattr(user, "active_hours_tz", None) if user is not None else None
-            nxt = (
-                compute_next_run_at(
+            nxt = None
+            if task.schedule:
+                from app.task_service import compute_next_run_at as task_compute_next_run_at
+
+                nxt = task_compute_next_run_at(
                     task.schedule,
                     after=now,
-                    timezone_name=getattr(task, "active_hours_tz", None) or user_tz,
+                    task_timezone=getattr(task, "active_hours_tz", None),
+                    user_timezone=user_tz,
                 )
-                if task.schedule
-                else None
-            )
             task.next_run_at = nxt or (now + timedelta(minutes=1))
             skipped += 1
         await db.commit()

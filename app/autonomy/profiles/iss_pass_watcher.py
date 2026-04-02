@@ -5,10 +5,9 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from zoneinfo import ZoneInfo
-
 from app.autonomy.profiles.base import TaskExecutionProfile
 from app.autonomy.profiles.spec_loader import load_profile_spec_text
+from app.time_utils import format_local_and_utc_pair, is_valid_timezone_name
 
 
 class ISSPassWatcherExecutionProfile(TaskExecutionProfile):
@@ -52,7 +51,7 @@ class ISSPassWatcherExecutionProfile(TaskExecutionProfile):
 
         task = await db.get(Task, task_id)
         instruction = str(getattr(task, "instruction", "") or "")
-        contract = _build_contract(instruction)
+        contract = _build_contract(instruction, task_timezone=getattr(task, "active_hours_tz", None))
         return {
             "api_contract": contract,
             "dataset_stats": {
@@ -151,7 +150,10 @@ class ISSPassWatcherExecutionProfile(TaskExecutionProfile):
                 if not passes:
                     structured_override = "No visible ISS passes found in the requested window."
                 elif not cleaned or any(marker in normalized for marker in fallback_markers):
-                    structured_override = _format_structured_passes(passes)
+                    structured_override = _format_structured_passes(
+                        passes,
+                        timezone_name=(run_context.get("api_contract") or {}).get("display_timezone"),
+                    )
 
         if structured_override is not None:
             cleaned = structured_override
@@ -194,7 +196,18 @@ def _extract_secret_name(text: str) -> str:
     return candidate
 
 
-def _build_contract(instruction: str) -> Dict[str, Any]:
+def _extract_timezone_name(text: str, *, default: Optional[str] = None) -> str:
+    match = re.search(r"timezone\s*=\s*([A-Za-z_/\-]+)", text, flags=re.IGNORECASE)
+    if match:
+        candidate = str(match.group(1)).strip()
+        if is_valid_timezone_name(candidate):
+            return candidate
+    if is_valid_timezone_name(default):
+        return str(default).strip()
+    return "UTC"
+
+
+def _build_contract(instruction: str, *, task_timezone: Optional[str]) -> Dict[str, Any]:
     satellite_id = _extract_number(r"(?:NORAD|satellite)[^0-9]*(\d+)", instruction, cast=int, default=25544)
     lat = _extract_number(r"lat\s*=\s*(-?\d+(?:\.\d+)?)", instruction, cast=float, default=32.4485)
     lon = _extract_number(r"lon\s*=\s*(-?\d+(?:\.\d+)?)", instruction, cast=float, default=-81.7832)
@@ -206,10 +219,12 @@ def _build_contract(instruction: str) -> Dict[str, Any]:
     min_max_elevation = _extract_number(
         r"max elevation\s*>=\s*(\d+)", instruction, cast=int, default=30
     )
+    display_timezone = _extract_timezone_name(instruction, default=task_timezone)
     return {
         "service": "n2yo",
         "endpoint": "iss_visual_passes",
         "secret_name": _extract_secret_name(instruction),
+        "display_timezone": display_timezone,
         "response_fields": {
             "passes": "passes",
         },
@@ -241,8 +256,7 @@ def _parse_structured_api_result(text: str) -> Dict[str, Any] | None:
     return parsed
 
 
-def _format_structured_passes(passes: List[Dict[str, Any]]) -> str:
-    local_tz = ZoneInfo("America/New_York")
+def _format_structured_passes(passes: List[Dict[str, Any]], *, timezone_name: Optional[str]) -> str:
     lines = ["ISS visible pass results:", ""]
     for idx, item in enumerate(passes, start=1):
         start_utc = str(item.get("start_utc") or "").strip() or "unknown"
@@ -250,7 +264,7 @@ def _format_structured_passes(passes: List[Dict[str, Any]]) -> str:
         try:
             if start_utc != "unknown":
                 utc_dt = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
-                start_local = utc_dt.astimezone(local_tz).isoformat()
+                start_local, start_utc = format_local_and_utc_pair(utc_dt, timezone_name=timezone_name)
         except Exception:
             start_local = "unknown"
         duration = item.get("duration_seconds")

@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from app.db.models import Task, TaskRun, User
+from app.task_service import compute_next_run_at
 from tests.conftest import TestSessionLocal
 
 
@@ -77,6 +78,9 @@ async def test_create_task_computes_next_run_at_from_task_timezone(client):
     assert next_run_local.hour == 8
     assert next_run_local.minute == 0
     assert next_run.tzinfo == timezone.utc
+    assert created.json()["effective_timezone"] == "America/New_York"
+    assert created.json()["next_run_at_localized"].endswith(("EDT", "EST"))
+    assert created.json()["created_at_localized"].endswith(("EDT", "EST"))
 
 
 @pytest.mark.asyncio
@@ -119,6 +123,8 @@ async def test_create_task_uses_user_timezone_when_task_timezone_missing(client)
     next_run_local = next_run.astimezone(ZoneInfo("America/New_York"))
     assert next_run_local.hour == 8
     assert next_run_local.minute == 0
+    assert created.json()["effective_timezone"] == "America/New_York"
+    assert created.json()["next_run_at_localized"].endswith(("EDT", "EST"))
 
 
 @pytest.mark.asyncio
@@ -155,6 +161,25 @@ async def test_create_task_falls_back_to_utc_for_invalid_timezone(client):
     assert next_run.tzinfo == timezone.utc
     assert next_run.hour == 8
     assert next_run.minute == 0
+    assert created.json()["effective_timezone"] == "UTC"
+    assert created.json()["next_run_at_localized"].endswith("UTC")
+
+
+def test_compute_next_run_at_preserves_local_hour_across_dst_boundary():
+    after = datetime(2026, 3, 8, 11, 30, tzinfo=timezone.utc)
+
+    next_run = compute_next_run_at(
+        "0 08 * * *",
+        after=after,
+        task_timezone="America/New_York",
+        user_timezone=None,
+    )
+
+    assert next_run is not None
+    next_run_local = next_run.astimezone(ZoneInfo("America/New_York"))
+    assert next_run_local.hour == 8
+    assert next_run_local.minute == 0
+    assert next_run_local.tzname() == "EDT"
 
 
 @pytest.mark.asyncio

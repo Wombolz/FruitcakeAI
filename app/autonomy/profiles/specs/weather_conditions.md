@@ -21,7 +21,7 @@ When calling the tool:
 Output:
 - Provide a short markdown list with current conditions.
 - Include:
-  - local time in America/New_York
+  - local time in the prepared display timezone
   - UTC time in parentheses
   - temperature
   - wind speed

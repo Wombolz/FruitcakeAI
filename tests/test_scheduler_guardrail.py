@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import select
@@ -189,6 +191,47 @@ async def test_recover_stale_running_tasks_requeues_and_closes_run(monkeypatch):
         assert row.next_run_at is not None
         assert run_row.status == "failed"
         assert run_row.error == "recovered_after_restart_or_sleep"
+
+
+@pytest.mark.asyncio
+async def test_skip_recurring_backlog_uses_user_timezone_fallback(monkeypatch):
+    now = datetime(2026, 3, 8, 11, 30, tzinfo=timezone.utc)
+
+    async with TestSessionLocal() as db:
+        user = _make_user()
+        user.username = "sched_user4"
+        user.email = "sched_user4@test.local"
+        user.active_hours_tz = "America/New_York"
+        db.add(user)
+        await db.flush()
+
+        recurring = Task(
+            user_id=user.id,
+            title="Recurring fallback tz",
+            instruction="refresh",
+            task_type="recurring",
+            status="pending",
+            schedule="0 08 * * *",
+            next_run_at=now - timedelta(minutes=2),
+            active_hours_tz=None,
+        )
+        db.add(recurring)
+        await db.commit()
+
+    monkeypatch.setattr("app.db.session.AsyncSessionLocal", TestSessionLocal)
+
+    due = [SimpleNamespace(id=recurring.id, task_type="recurring", schedule="0 08 * * *")]
+    skipped = await sched._skip_recurring_backlog(due, now)
+
+    assert skipped == 1
+
+    async with TestSessionLocal() as db:
+        row = await db.get(Task, recurring.id)
+        assert row is not None
+        assert row.next_run_at is not None
+        next_run_local = _as_aware(row.next_run_at).astimezone(ZoneInfo("America/New_York"))
+        assert next_run_local.hour == 8
+        assert next_run_local.minute == 0
 
 
 async def asyncio_sleep() -> None:

@@ -220,7 +220,34 @@ async def test_iss_profile_prepare_run_context_includes_response_fields():
 
     contract = context["api_contract"]
     assert contract["response_fields"] == {"passes": "passes"}
+    assert contract["display_timezone"] == "UTC"
     assert context["dataset_stats"]["response_fields_present"] == ["passes"]
+
+
+@pytest.mark.asyncio
+async def test_iss_profile_prepare_run_context_uses_task_timezone_when_instruction_omits_one():
+    profile = ISSPassWatcherExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="ISS",
+            instruction="Check ISS passes",
+            profile="iss_pass_watcher",
+            active_hours_tz="America/Chicago",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        context = await profile.prepare_run_context(
+            db=db,
+            user_id=1,
+            task_id=task.id,
+            task_run_id=101,
+        )
+
+    assert context["api_contract"]["display_timezone"] == "America/Chicago"
 
 
 def test_iss_profile_validate_finalize_falls_back_to_exact_tool_result_for_chatty_failure():
@@ -302,6 +329,7 @@ def test_weather_profile_validate_finalize_formats_structured_current_conditions
         result="API request failed.",
         prior_full_outputs=[],
         run_context={
+            "api_contract": {"display_timezone": "America/New_York"},
             "last_tool_records": [
                 {
                     "tool": "api_request",
@@ -321,8 +349,36 @@ def test_weather_profile_validate_finalize_formats_structured_current_conditions
     assert "Weather briefing" in result
     assert "temperature_c=22.3" in result
     assert "weather_main=Clouds" in result
+    assert "time_local=2026-04-01 10:00 AM EDT" in result
+    assert "time_utc=2026-04-01T14:00:00+00:00" in result
     assert report is not None
     assert report["structured_api_result"] is True
+
+
+@pytest.mark.asyncio
+async def test_weather_profile_prepare_run_context_uses_task_timezone_when_instruction_omits_one():
+    profile = WeatherConditionsExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Weather",
+            instruction="Check current conditions at lat=32.4485 lon=-81.7832",
+            profile="weather_conditions",
+            active_hours_tz="America/Los_Angeles",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        context = await profile.prepare_run_context(
+            db=db,
+            user_id=1,
+            task_id=task.id,
+            task_run_id=101,
+        )
+
+    assert context["api_contract"]["display_timezone"] == "America/Los_Angeles"
 
 
 def test_maintenance_validate_finalize_requires_exact_tool_output():

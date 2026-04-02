@@ -30,6 +30,7 @@ from app.db.models import AuditLog, Task, TaskRun, TaskRunArtifact, TaskStep, Us
 from app.db.session import get_db
 from app.memory.service import get_memory_service
 from app.task_service import TaskValidationError, UNSET, create_task_record, update_task_record
+from app.time_utils import format_localized_datetime, resolve_effective_timezone
 
 router = APIRouter()
 
@@ -93,6 +94,10 @@ class TaskOut(BaseModel):
     created_at: Optional[datetime]
     last_run_at: Optional[datetime]
     next_run_at: Optional[datetime]
+    effective_timezone: str
+    created_at_localized: Optional[str]
+    last_run_at_localized: Optional[str]
+    next_run_at_localized: Optional[str]
 
     class Config:
         from_attributes = True
@@ -146,7 +151,7 @@ async def create_task(
         )
     except TaskValidationError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return _to_task_out(task, None)
+    return _to_task_out(task, None, user_timezone=current_user.active_hours_tz)
 
 
 @router.get("/tasks", response_model=List[TaskOut])
@@ -161,7 +166,10 @@ async def list_tasks(
     )
     tasks = result.scalars().all()
     step_lookup = await _load_current_steps(db, tasks)
-    return [_to_task_out(task, step_lookup.get((task.id, task.current_step_index))) for task in tasks]
+    return [
+        _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
+        for task in tasks
+    ]
 
 
 @router.get("/tasks/{task_id}", response_model=TaskOut)
@@ -172,7 +180,7 @@ async def get_task(
 ):
     task = await _get_owned_task(task_id, current_user.id, db)
     step_lookup = await _load_current_steps(db, [task])
-    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
 
 
 @router.patch("/tasks/{task_id}", response_model=TaskOut)
@@ -197,7 +205,7 @@ async def update_task(
         else:
             task.status = "cancelled"
         step_lookup = await _load_current_steps(db, [task])
-        return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
+        return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
 
     try:
         fields_set = getattr(body, "model_fields_set", set())
@@ -221,7 +229,7 @@ async def update_task(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     step_lookup = await _load_current_steps(db, [task])
-    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
 
 
 @router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -249,7 +257,7 @@ async def stop_task(
 
     if task.status in {"completed", "failed", "cancelled"}:
         step_lookup = await _load_current_steps(db, [task])
-        return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
+        return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
 
     from app.autonomy.runner import get_task_runner
 
@@ -291,7 +299,7 @@ async def stop_task(
         run.error = "Stopped by user"
 
     step_lookup = await _load_current_steps(db, [task])
-    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
 
 
 @router.post("/tasks/{task_id}/run", response_model=Dict[str, Any])
@@ -364,7 +372,7 @@ async def reset_task(
     else:
         task.status = "cancelled"
     step_lookup = await _load_current_steps(db, [task])
-    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)))
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
 
 
 # ── GET /tasks/{id}/audit ─────────────────────────────────────────────────────
@@ -667,10 +675,11 @@ def _parse_optional_iso_datetime(raw: str | None) -> Optional[datetime]:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def _to_task_out(task: Task, current_step: Optional[TaskStep]) -> TaskOut:
+def _to_task_out(task: Task, current_step: Optional[TaskStep], *, user_timezone: Optional[str]) -> TaskOut:
     waiting_tool: Optional[str] = None
     if task.status == "waiting_approval" and current_step is not None:
         waiting_tool = current_step.waiting_approval_tool
+    effective_timezone = resolve_effective_timezone(task.active_hours_tz, user_timezone)
 
     return TaskOut(
         id=task.id,
@@ -698,6 +707,10 @@ def _to_task_out(task: Task, current_step: Optional[TaskStep]) -> TaskOut:
         created_at=task.created_at,
         last_run_at=task.last_run_at,
         next_run_at=task.next_run_at,
+        effective_timezone=effective_timezone,
+        created_at_localized=format_localized_datetime(task.created_at, timezone_name=effective_timezone) or None,
+        last_run_at_localized=format_localized_datetime(task.last_run_at, timezone_name=effective_timezone) or None,
+        next_run_at_localized=format_localized_datetime(task.next_run_at, timezone_name=effective_timezone) or None,
     )
 
 
