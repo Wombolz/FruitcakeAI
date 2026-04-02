@@ -21,7 +21,7 @@ When calling the tool:
 Output:
 - If qualifying passes exist, provide a short markdown list.
 - For each pass include:
-  - local time in America/New_York
+  - local time in the prepared display timezone
   - UTC time in parentheses
   - duration
   - max elevation

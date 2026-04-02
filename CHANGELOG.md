@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.7.7
+
+Release date:
+- 2026-04-02
+
+This release closes the long-running time semantics thread by standardizing timezone precedence, keeping UTC as the storage truth, and normalizing the highest-value human-facing schedule and profile outputs.
+
+### Added
+
+- shared timezone helper coverage for effective timezone resolution, localized display formatting, and paired local/UTC rendering
+- additive task API fields for localized schedule metadata:
+  - `effective_timezone`
+  - `created_at_localized`
+  - `last_run_at_localized`
+  - `next_run_at_localized`
+- focused regression coverage for:
+  - timezone precedence
+  - DST-safe recurring scheduling
+  - scheduler user-timezone fallback
+  - ISS/weather display-time formatting
+
+### Fixed
+
+- recurring backlog skipping now uses the canonical task scheduling path instead of bypassing task/user timezone resolution
+- ISS and weather profiles no longer hardcode `America/New_York` in user-facing output when a task-specific timezone is available
+- task API schedule surfaces now present localized companion timestamps without changing stored UTC values
+- invalid timezone names now fall back cleanly to UTC through the shared helper path
+
+### Operator Notes
+
+- UTC remains the storage and scheduler execution truth
+- task `active_hours_tz` overrides user timezone, user timezone overrides UTC fallback
+- durable IDs, filenames, and low-level metadata remain UTC-safe even when display timestamps are localized
+
 ## v0.7.6
 
 Release date:

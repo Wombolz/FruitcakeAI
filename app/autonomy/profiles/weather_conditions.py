@@ -4,10 +4,9 @@ import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
-
 from app.autonomy.profiles.base import TaskExecutionProfile
 from app.autonomy.profiles.spec_loader import load_profile_spec_text
+from app.time_utils import format_local_and_utc_pair, is_valid_timezone_name
 
 
 class WeatherConditionsExecutionProfile(TaskExecutionProfile):
@@ -48,7 +47,7 @@ class WeatherConditionsExecutionProfile(TaskExecutionProfile):
 
         task = await db.get(Task, task_id)
         instruction = str(getattr(task, "instruction", "") or "")
-        contract = _build_contract(instruction)
+        contract = _build_contract(instruction, task_timezone=getattr(task, "active_hours_tz", None))
         return {
             "api_contract": contract,
             "dataset_stats": {
@@ -136,7 +135,11 @@ class WeatherConditionsExecutionProfile(TaskExecutionProfile):
                 if not current_weather:
                     structured_override = "No current weather conditions found for the requested location."
                 elif not cleaned or any(marker in normalized for marker in fallback_markers):
-                    structured_override = _format_current_weather(current_weather, fields.get("location"))
+                    structured_override = _format_current_weather(
+                        current_weather,
+                        fields.get("location"),
+                        timezone_name=(run_context.get("api_contract") or {}).get("display_timezone"),
+                    )
 
         if structured_override is not None:
             cleaned = structured_override
@@ -172,13 +175,28 @@ def _extract_secret_name(text: str) -> str:
     if candidate not in {"openweathermap_api_key", "weather_api_key"}:
         return "openweathermap_api_key"
     return candidate
-def _build_contract(instruction: str) -> Dict[str, Any]:
+
+
+def _extract_timezone_name(text: str, *, default: Optional[str] = None) -> str:
+    match = re.search(r"timezone\s*=\s*([A-Za-z_/\-]+)", text, flags=re.IGNORECASE)
+    if match:
+        candidate = str(match.group(1)).strip()
+        if is_valid_timezone_name(candidate):
+            return candidate
+    if is_valid_timezone_name(default):
+        return str(default).strip()
+    return "UTC"
+
+
+def _build_contract(instruction: str, *, task_timezone: Optional[str]) -> Dict[str, Any]:
     latitude = _extract_number(r"lat(?:itude)?\s*=\s*(-?\d+(?:\.\d+)?)", instruction, cast=float, default=32.4485)
     longitude = _extract_number(r"lon(?:gitude)?\s*=\s*(-?\d+(?:\.\d+)?)", instruction, cast=float, default=-81.7832)
+    display_timezone = _extract_timezone_name(instruction, default=task_timezone)
     return {
         "service": "weather",
         "endpoint": "current_conditions",
         "secret_name": _extract_secret_name(instruction),
+        "display_timezone": display_timezone,
         "response_fields": {
             "location": "location",
             "current_weather": "current_weather",
@@ -206,7 +224,12 @@ def _parse_structured_api_result(text: str) -> Dict[str, Any] | None:
     return parsed
 
 
-def _format_current_weather(current_weather: Dict[str, Any], location: Dict[str, Any] | None) -> str:
+def _format_current_weather(
+    current_weather: Dict[str, Any],
+    location: Dict[str, Any] | None,
+    *,
+    timezone_name: Optional[str],
+) -> str:
     lines = ["Weather briefing:", ""]
     if isinstance(location, dict):
         city_name = str(location.get("city_name") or "").strip()
@@ -222,9 +245,9 @@ def _format_current_weather(current_weather: Dict[str, Any], location: Dict[str,
     if time_value:
         try:
             utc_dt = datetime.fromisoformat(time_value.replace("Z", "+00:00"))
-            local_dt = utc_dt.astimezone(ZoneInfo("America/New_York"))
-            lines.append(f"time_local={local_dt.isoformat()}")
-            lines.append(f"time_utc={utc_dt.astimezone(timezone.utc).isoformat()}")
+            local_text, utc_text = format_local_and_utc_pair(utc_dt, timezone_name=timezone_name)
+            lines.append(f"time_local={local_text}")
+            lines.append(f"time_utc={utc_text}")
         except Exception:
             lines.append(f"time={time_value}")
     if current_weather.get("temperature_c") is not None:
