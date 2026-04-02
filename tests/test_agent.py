@@ -156,6 +156,8 @@ def test_create_task_schema_has_required_fields():
     assert "instruction" in props
     assert "task_type" in props
     assert "deliver" in props
+    assert "recipe_family" in props
+    assert "recipe_params" in props
     assert set(["title", "instruction", "task_type", "deliver"]).issubset(set(required))
 
 
@@ -220,6 +222,8 @@ def test_update_task_schema_has_required_fields():
     props = schema["function"]["parameters"]["properties"]
     required = schema["function"]["parameters"].get("required", [])
     assert "task_id" in props
+    assert "recipe_family" in props
+    assert "recipe_params" in props
     assert required == ["task_id"]
 
 
@@ -644,6 +648,107 @@ async def test_create_task_tool_defaults_to_requires_approval_true():
 
 
 @pytest.mark.asyncio
+async def test_create_task_tool_normalizes_plain_english_watcher_recipe():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Iran Watch",
+                "instruction": "Watch Iran and Middle East news for major updates.",
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["profile"] == "topic_watcher"
+    assert payload["task_recipe"]["family"] == "topic_watcher"
+    assert "family=topic_watcher" in payload["task_summary"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.profile == "topic_watcher"
+        assert "topic:" in task.instruction
+        assert "NOTHING_NEW" in task.instruction
+        assert task.task_recipe["family"] == "topic_watcher"
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_normalizes_recurring_briefing_recipe_into_configured_executor():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Iran briefing",
+                "instruction": (
+                    "Append a daily research briefing about Iran and the Middle East from the past 24 hours "
+                    "to reports/iran_middle_east_developments.md."
+                ),
+                "task_type": "recurring",
+                "schedule": "0 8 * * *",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.profile is None
+        assert task.executor_config["kind"] == "configured_executor"
+        assert task.task_recipe["family"] == "daily_research_briefing"
+        assert "cached RSS feeds" in task.instruction
+        assert "append a daily research briefing" in task.instruction
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_normalizes_maintenance_recipe():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Refresh feeds",
+                "instruction": "Refresh the RSS cache.",
+                "task_type": "one_shot",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["profile"] == "maintenance"
+    assert payload["task_recipe"]["family"] == "maintenance"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.profile == "maintenance"
+        assert task.instruction.startswith("tool: refresh_rss_cache")
+        assert task.task_recipe["family"] == "maintenance"
+
+
+@pytest.mark.asyncio
 async def test_update_task_tool_updates_schedule_and_marks_plan_change():
     import app.agent.tools as tools_module
     from app.db.models import Task
@@ -680,6 +785,44 @@ async def test_update_task_tool_updates_schedule_and_marks_plan_change():
         task = await db.get(Task, created["task_id"])
         assert task is not None
         assert task.schedule == "every:2h"
+
+
+@pytest.mark.asyncio
+async def test_update_task_tool_preserves_recipe_identity_when_only_schedule_changes():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        created = json.loads(
+            await tools_module._create_task(
+                {
+                    "title": "Iran Watch",
+                    "instruction": "Watch Iran and Middle East news for major updates.",
+                    "task_type": "recurring",
+                    "schedule": "every:4h",
+                    "deliver": True,
+                },
+                ctx,
+            )
+        )
+
+        updated = json.loads(
+            await tools_module._update_task(
+                {"task_id": created["task_id"], "schedule": "every:2h"},
+                ctx,
+            )
+        )
+
+    assert updated["updated"] is True
+    assert updated["task_recipe"]["family"] == "topic_watcher"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, created["task_id"])
+        assert task is not None
+        assert task.schedule == "every:2h"
+        assert task.task_recipe["family"] == "topic_watcher"
 
 
 @pytest.mark.asyncio

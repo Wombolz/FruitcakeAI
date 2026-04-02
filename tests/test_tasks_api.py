@@ -84,6 +84,42 @@ async def test_create_task_computes_next_run_at_from_task_timezone(client):
 
 
 @pytest.mark.asyncio
+async def test_create_task_returns_recipe_metadata_for_normalized_watcher(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskrecipeuser",
+            "email": "taskrecipe@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskrecipeuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Iran Watch",
+            "instruction": "Watch Iran and Middle East news for major updates.",
+            "task_type": "recurring",
+            "schedule": "every:2h",
+            "deliver": True,
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["profile"] == "topic_watcher"
+    assert payload["task_recipe"]["family"] == "topic_watcher"
+    assert payload["task_recipe"]["instruction_style"] == "recipe_v1"
+
+
+@pytest.mark.asyncio
 async def test_create_task_uses_user_timezone_when_task_timezone_missing(client):
     await client.post(
         "/auth/register",

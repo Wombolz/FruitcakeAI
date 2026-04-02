@@ -98,6 +98,7 @@ class TaskOut(BaseModel):
     created_at_localized: Optional[str]
     last_run_at_localized: Optional[str]
     next_run_at_localized: Optional[str]
+    task_recipe: Optional[Dict[str, Any]]
 
     class Config:
         from_attributes = True
@@ -711,6 +712,7 @@ def _to_task_out(task: Task, current_step: Optional[TaskStep], *, user_timezone:
         created_at_localized=format_localized_datetime(task.created_at, timezone_name=effective_timezone) or None,
         last_run_at_localized=format_localized_datetime(task.last_run_at, timezone_name=effective_timezone) or None,
         next_run_at_localized=format_localized_datetime(task.next_run_at, timezone_name=effective_timezone) or None,
+        task_recipe=(task.task_recipe or None) if hasattr(task, "task_recipe") else None,
     )
 
 

@@ -461,6 +461,22 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "schedule": {"type": "string", "description": "Optional schedule like every:2h, cron, or ISO timestamp."},
                     "deliver": {"type": "boolean", "default": True},
                     "profile": {"type": "string", "description": "Optional built-in task profile name."},
+                    "recipe_family": {
+                        "type": "string",
+                        "enum": [
+                            "topic_watcher",
+                            "daily_research_briefing",
+                            "morning_briefing",
+                            "iss_pass_watcher",
+                            "weather_conditions",
+                            "maintenance",
+                        ],
+                        "description": "Optional high-confidence internal recipe family for stronger task normalization.",
+                    },
+                    "recipe_params": {
+                        "type": "object",
+                        "description": "Optional structured task recipe params such as topic, path, location, or timezone.",
+                    },
                     "llm_model_override": {"type": "string", "description": "Optional explicit model override for all LLM stages of this task."},
                     "persona": {"type": "string", "description": "Optional persona override."},
                     "requires_approval": {"type": "boolean", "default": True},
@@ -491,6 +507,18 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "schedule": {"type": "string"},
                     "deliver": {"type": "boolean"},
                     "profile": {"type": "string"},
+                    "recipe_family": {
+                        "type": "string",
+                        "enum": [
+                            "topic_watcher",
+                            "daily_research_briefing",
+                            "morning_briefing",
+                            "iss_pass_watcher",
+                            "weather_conditions",
+                            "maintenance",
+                        ],
+                    },
+                    "recipe_params": {"type": "object"},
                     "llm_model_override": {"type": "string"},
                     "persona": {"type": "string"},
                     "requires_approval": {"type": "boolean"},
@@ -1509,6 +1537,7 @@ async def _create_and_run_task_plan(
 
 async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> str:
     from app.db.session import AsyncSessionLocal
+    from app.task_recipes import build_task_recipe_summary
     from app.task_service import TaskValidationError, create_task_record
 
     title = str(arguments.get("title", "") or "").strip()
@@ -1531,6 +1560,8 @@ async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> 
                 instruction=instruction,
                 persona=arguments.get("persona"),
                 profile=arguments.get("profile"),
+                recipe_family=arguments.get("recipe_family"),
+                recipe_params=arguments.get("recipe_params"),
                 llm_model_override=arguments.get("llm_model_override"),
                 task_type=task_type,
                 schedule=arguments.get("schedule"),
@@ -1554,6 +1585,14 @@ async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> 
             "instruction": task.instruction,
             "persona": task.persona,
             "profile": task.profile,
+            "task_recipe": task.task_recipe or None,
+            "task_summary": build_task_recipe_summary(
+                title=task.title,
+                task_type=task.task_type,
+                schedule=task.schedule,
+                task_recipe=task.task_recipe,
+                profile=task.profile,
+            ),
             "llm_model_override": task.llm_model_override,
             "task_type": task.task_type,
             "schedule": task.schedule,
@@ -1567,6 +1606,7 @@ async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> 
 async def _update_task(arguments: Dict[str, Any], user_context: UserContext) -> str:
     from app.db.models import Task
     from app.db.session import AsyncSessionLocal
+    from app.task_recipes import build_task_recipe_summary
     from app.task_service import TaskValidationError, UNSET, update_task_record
 
     task_id_raw = arguments.get("task_id")
@@ -1588,6 +1628,8 @@ async def _update_task(arguments: Dict[str, Any], user_context: UserContext) -> 
                 instruction=arguments["instruction"] if "instruction" in arguments else UNSET,
                 persona=arguments["persona"] if "persona" in arguments else UNSET,
                 profile=arguments["profile"] if "profile" in arguments else UNSET,
+                recipe_family=arguments["recipe_family"] if "recipe_family" in arguments else UNSET,
+                recipe_params=arguments["recipe_params"] if "recipe_params" in arguments else UNSET,
                 llm_model_override=arguments["llm_model_override"] if "llm_model_override" in arguments else UNSET,
                 schedule=arguments["schedule"] if "schedule" in arguments else UNSET,
                 deliver=arguments["deliver"] if "deliver" in arguments else UNSET,
@@ -1610,6 +1652,14 @@ async def _update_task(arguments: Dict[str, Any], user_context: UserContext) -> 
             "instruction": task.instruction,
             "persona": task.persona,
             "profile": task.profile,
+            "task_recipe": task.task_recipe or None,
+            "task_summary": build_task_recipe_summary(
+                title=task.title,
+                task_type=task.task_type,
+                schedule=task.schedule,
+                task_recipe=task.task_recipe,
+                profile=task.profile,
+            ),
             "llm_model_override": task.llm_model_override,
             "task_type": task.task_type,
             "schedule": task.schedule,

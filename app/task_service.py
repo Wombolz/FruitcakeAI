@@ -11,6 +11,7 @@ from app.agent.persona_router import infer_persona_for_task
 from app.autonomy.configured_executor import infer_configured_executor
 from app.autonomy.profiles import normalize_task_profile
 from app.db.models import Task
+from app.task_recipes import build_task_recipe_metadata, normalize_task_recipe
 from app.time_utils import resolve_effective_timezone
 
 
@@ -136,34 +137,54 @@ async def create_task_record(
     active_hours_end: Optional[str] = None,
     active_hours_tz: Optional[str] = None,
     user_timezone: Optional[str] = None,
+    recipe_family: Optional[str] = None,
+    recipe_params: Optional[dict] = None,
 ) -> Task:
     if task_type not in {"one_shot", "recurring"}:
         raise TaskValidationError("task_type must be one_shot or recurring.")
-    resolved_persona = resolve_task_persona(
-        title=title,
-        instruction=instruction,
-        requested_persona=persona,
-    )
-    inferred = infer_configured_executor(
+    normalized_recipe = normalize_task_recipe(
         title=title,
         instruction=instruction,
         task_type=task_type,
         requested_profile=profile,
+        recipe_family=recipe_family,
+        recipe_params=recipe_params,
+    )
+    normalized_title = normalized_recipe.title if normalized_recipe is not None else title
+    normalized_instruction = normalized_recipe.instruction if normalized_recipe is not None else instruction
+    normalized_task_type = normalized_recipe.task_type if normalized_recipe is not None else task_type
+    normalized_profile = normalized_recipe.profile if normalized_recipe is not None and normalized_recipe.profile else profile
+    resolved_persona = resolve_task_persona(
+        title=normalized_title,
+        instruction=normalized_instruction,
+        requested_persona=persona,
+    )
+    inferred = infer_configured_executor(
+        title=normalized_title,
+        instruction=normalized_instruction,
+        task_type=normalized_task_type,
+        requested_profile=normalized_profile,
+    )
+    resolved_profile = inferred.profile if inferred.executor_config else infer_task_profile(
+        title=normalized_title,
+        instruction=normalized_instruction,
+        task_type=normalized_task_type,
+        requested_profile=normalized_profile,
     )
     task = Task(
         user_id=user_id,
-        title=title,
-        instruction=instruction,
+        title=normalized_title,
+        instruction=normalized_instruction,
         persona=resolved_persona,
-        profile=inferred.profile if inferred.executor_config else infer_task_profile(
-            title=title,
-            instruction=instruction,
-            task_type=task_type,
-            requested_profile=profile,
-        ),
+        profile=resolved_profile,
         executor_config=inferred.executor_config,
+        task_recipe=build_task_recipe_metadata(
+            normalized_recipe,
+            selected_profile=resolved_profile,
+            executor_config=inferred.executor_config,
+        ),
         llm_model_override=(str(llm_model_override).strip() or None) if llm_model_override is not None else None,
-        task_type=task_type,
+        task_type=normalized_task_type,
         status="pending",
         schedule=schedule,
         deliver=deliver,
@@ -198,12 +219,15 @@ async def update_task_record(
     active_hours_end=UNSET,
     active_hours_tz=UNSET,
     user_timezone: Optional[str] = None,
+    recipe_family=UNSET,
+    recipe_params=UNSET,
 ) -> TaskUpdateResult:
     del db  # reserved for future validation that may require queries
 
     title_changed = False
     instruction_changed = False
     plan_inputs_changed = False
+    recipe_inputs_changed = False
 
     if title is not UNSET:
         task.title = str(title)
@@ -221,40 +245,10 @@ async def update_task_record(
         )
         plan_inputs_changed = True
     if profile is not UNSET:
-        inferred = infer_configured_executor(
-            title=task.title,
-            instruction=task.instruction,
-            task_type=task.task_type,
-            requested_profile=profile,
-        )
-        task.profile = inferred.profile if inferred.executor_config else infer_task_profile(
-            title=task.title,
-            instruction=task.instruction,
-            task_type=task.task_type,
-            requested_profile=profile,
-        )
-        task.executor_config = inferred.executor_config
         plan_inputs_changed = True
-    elif title_changed or instruction_changed:
-        inferred = infer_configured_executor(
-            title=task.title,
-            instruction=task.instruction,
-            task_type=task.task_type,
-            requested_profile=None,
-        )
-        if inferred.executor_config:
-            task.profile = inferred.profile
-            task.executor_config = inferred.executor_config
-            plan_inputs_changed = True
-        elif task.executor_config:
-            task.executor_config = {}
-            task.profile = infer_task_profile(
-                title=task.title,
-                instruction=task.instruction,
-                task_type=task.task_type,
-                requested_profile=task.profile,
-            )
-            plan_inputs_changed = True
+    if recipe_family is not UNSET or recipe_params is not UNSET:
+        recipe_inputs_changed = True
+        plan_inputs_changed = True
     if llm_model_override is not UNSET:
         task.llm_model_override = (str(llm_model_override).strip() or None) if llm_model_override is not None else None
         plan_inputs_changed = True
@@ -282,6 +276,45 @@ async def update_task_record(
         inferred, _, _ = infer_persona_for_task(task.title, task.instruction)
         task.persona = inferred
         plan_inputs_changed = True
+
+    if title_changed or instruction_changed or profile is not UNSET or recipe_inputs_changed:
+        existing_recipe = task.task_recipe if isinstance(task.task_recipe, dict) else {}
+        preferred_family = str(existing_recipe.get("family") or "").strip().lower() or None
+        requested_recipe_family = recipe_family if recipe_family is not UNSET else preferred_family
+        requested_recipe_params = recipe_params if recipe_params is not UNSET else existing_recipe.get("params")
+        requested_profile_value = task.profile if profile is UNSET else profile
+        normalized_recipe = normalize_task_recipe(
+            title=task.title,
+            instruction=task.instruction,
+            task_type=task.task_type,
+            requested_profile=requested_profile_value,
+            recipe_family=requested_recipe_family,
+            recipe_params=requested_recipe_params if isinstance(requested_recipe_params, dict) else None,
+            preferred_family=preferred_family,
+        )
+        if normalized_recipe is not None:
+            if not title_changed:
+                task.title = normalized_recipe.title
+            task.instruction = normalized_recipe.instruction
+            requested_profile_value = normalized_recipe.profile if normalized_recipe.profile else requested_profile_value
+        inferred = infer_configured_executor(
+            title=task.title,
+            instruction=task.instruction,
+            task_type=task.task_type,
+            requested_profile=requested_profile_value,
+        )
+        task.profile = inferred.profile if inferred.executor_config else infer_task_profile(
+            title=task.title,
+            instruction=task.instruction,
+            task_type=task.task_type,
+            requested_profile=requested_profile_value,
+        )
+        task.executor_config = inferred.executor_config
+        task.task_recipe = build_task_recipe_metadata(
+            normalized_recipe,
+            selected_profile=task.profile,
+            executor_config=inferred.executor_config,
+        )
 
     return TaskUpdateResult(
         title_changed=title_changed,
