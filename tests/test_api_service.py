@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import select
 
+from app.api_adapters.base import AdapterExecutionResult
 from app.api_service import APIRequestError, execute_api_request
 from app.config import settings
 from app.db.models import Secret, SecretAccessEvent, Task, TaskAPIState, User
@@ -43,6 +44,14 @@ async def _seed_user_task_and_secret() -> tuple[int, int]:
             is_active=True,
         )
         db.add(secret)
+        weather_secret = Secret(
+            user_id=user.id,
+            name="openweathermap_api_key",
+            provider="weather",
+            ciphertext=encrypt_secret_value("weather-api-key"),
+            is_active=True,
+        )
+        db.add(weather_secret)
         await db.commit()
         return int(user.id), int(task.id)
 
@@ -58,6 +67,312 @@ async def test_execute_api_request_rejects_unknown_service():
                 endpoint="anything",
                 query_params={},
             )
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_normalizes_weather_current_conditions_and_dedupes_for_task():
+    user_id, task_id = await _seed_user_task_and_secret()
+    payload = {
+        "coord": {"lat": 32.4485, "lon": -81.7832},
+        "weather": [
+            {
+                "id": 802,
+                "main": "Clouds",
+                "description": "scattered clouds",
+                "icon": "03d",
+            }
+        ],
+        "main": {
+            "temp": 22.3,
+            "feels_like": 23.1,
+            "pressure": 1014,
+            "humidity": 64,
+        },
+        "wind": {"speed": 11.4, "deg": 270},
+        "dt": 1775037600,
+        "sys": {"country": "US", "sunrise": 1775006400, "sunset": 1775052000},
+        "timezone": -14400,
+        "id": 4591484,
+        "name": "Statesboro",
+    }
+
+    async with TestSessionLocal() as db:
+        with patch("app.api_adapters.weather.fetch_json", new=AsyncMock(return_value=payload)):
+            first = await execute_api_request(
+                db,
+                user_id=user_id,
+                service="weather",
+                endpoint="current_conditions",
+                query_params={
+                    "latitude": 32.4485,
+                    "longitude": -81.7832,
+                },
+                task_id=task_id,
+                secret_name="openweathermap_api_key",
+                response_fields={
+                    "location": "location",
+                    "current_weather": "current_weather",
+                },
+            )
+            second = await execute_api_request(
+                db,
+                user_id=user_id,
+                service="weather",
+                endpoint="current_conditions",
+                query_params={
+                    "latitude": 32.4485,
+                    "longitude": -81.7832,
+                },
+                task_id=task_id,
+                secret_name="openweathermap_api_key",
+                response_fields={
+                    "location": "location",
+                    "current_weather": "current_weather",
+                },
+            )
+
+    assert '"city_name": "Statesboro"' in first
+    assert '"deduped": false' in first
+    assert '"deduped": true' in second
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_accepts_lat_lon_aliases_for_weather():
+    user_id, task_id = await _seed_user_task_and_secret()
+    payload = {
+        "coord": {"lat": 32.4485, "lon": -81.7832},
+        "weather": [
+            {
+                "id": 802,
+                "main": "Clouds",
+                "description": "scattered clouds",
+                "icon": "03d",
+            }
+        ],
+        "main": {
+            "temp": 22.3,
+            "feels_like": 23.1,
+            "pressure": 1014,
+            "humidity": 64,
+        },
+        "wind": {"speed": 11.4, "deg": 270},
+        "dt": 1775037600,
+        "sys": {"country": "US", "sunrise": 1775006400, "sunset": 1775052000},
+        "timezone": -14400,
+        "id": 4591484,
+        "name": "Statesboro",
+    }
+
+    async with TestSessionLocal() as db:
+        with patch("app.api_adapters.weather.fetch_json", new=AsyncMock(return_value=payload)):
+            result = await execute_api_request(
+                db,
+                user_id=user_id,
+                service="weather",
+                endpoint="current_conditions",
+                query_params={
+                    "lat": 32.4485,
+                    "lon": -81.7832,
+                },
+                task_id=task_id,
+                secret_name="openweathermap_api_key",
+                response_fields={
+                    "location": "location",
+                    "current_weather": "current_weather",
+                },
+            )
+
+    assert '"city_name": "Statesboro"' in result
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_honors_weather_units_argument():
+    user_id, task_id = await _seed_user_task_and_secret()
+    payload = {
+        "coord": {"lat": 32.4485, "lon": -81.7832},
+        "weather": [{"id": 800, "main": "Clear", "description": "clear sky", "icon": "01d"}],
+        "main": {"temp": 72.0, "feels_like": 73.0, "pressure": 1013, "humidity": 55},
+        "wind": {"speed": 8.0, "deg": 180},
+        "dt": 1775037600,
+        "sys": {"country": "US", "sunrise": 1775006400, "sunset": 1775052000},
+        "timezone": -14400,
+        "name": "Statesboro",
+    }
+
+    async with TestSessionLocal() as db:
+        with patch("app.api_adapters.weather.fetch_json", new=AsyncMock(return_value=payload)) as mocked:
+            result = await execute_api_request(
+                db,
+                user_id=user_id,
+                service="weather",
+                endpoint="current_conditions",
+                query_params={
+                    "latitude": 32.4485,
+                    "longitude": -81.7832,
+                    "units": "imperial",
+                },
+                task_id=task_id,
+                secret_name="openweathermap_api_key",
+                response_fields={
+                    "location": "location",
+                    "current_weather": "current_weather",
+                },
+            )
+
+    assert '"city_name": "Statesboro"' in result
+    assert mocked.await_args.kwargs["params"]["units"] == "imperial"
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_accepts_openweathermap_provider_alias_for_weather():
+    user_id, task_id = await _seed_user_task_and_secret()
+    payload = {
+        "coord": {"lat": 32.4485, "lon": -81.7832},
+        "weather": [{"id": 800, "main": "Clear", "description": "clear sky", "icon": "01d"}],
+        "main": {"temp": 20.0, "feels_like": 20.0, "pressure": 1013, "humidity": 55},
+        "wind": {"speed": 2.0, "deg": 180},
+        "dt": 1775037600,
+        "sys": {"country": "US", "sunrise": 1775006400, "sunset": 1775052000},
+        "timezone": -14400,
+        "name": "Statesboro",
+    }
+
+    async with TestSessionLocal() as db:
+        secret = (
+            await db.execute(select(Secret).where(Secret.user_id == user_id, Secret.name == "openweathermap_api_key"))
+        ).scalar_one()
+        secret.provider = "openweathermap"
+        await db.flush()
+
+        with patch("app.api_adapters.weather.fetch_json", new=AsyncMock(return_value=payload)):
+            result = await execute_api_request(
+                db,
+                user_id=user_id,
+                service="weather",
+                endpoint="current_conditions",
+                query_params={
+                    "latitude": 32.4485,
+                    "longitude": -81.7832,
+                },
+                task_id=task_id,
+                secret_name="openweathermap_api_key",
+                response_fields={
+                    "location": "location",
+                    "current_weather": "current_weather",
+                },
+            )
+
+    assert '"city_name": "Statesboro"' in result
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_accepts_weather_secret_when_provider_label_drifts():
+    user_id, task_id = await _seed_user_task_and_secret()
+    payload = {
+        "coord": {"lat": 32.4485, "lon": -81.7832},
+        "weather": [{"id": 800, "main": "Clear", "description": "clear sky", "icon": "01d"}],
+        "main": {"temp": 20.0, "feels_like": 20.0, "pressure": 1013, "humidity": 55},
+        "wind": {"speed": 2.0, "deg": 180},
+        "dt": 1775037600,
+        "sys": {"country": "US", "sunrise": 1775006400, "sunset": 1775052000},
+        "timezone": -14400,
+        "name": "Statesboro",
+    }
+
+    async with TestSessionLocal() as db:
+        secret = (
+            await db.execute(select(Secret).where(Secret.user_id == user_id, Secret.name == "openweathermap_api_key"))
+        ).scalar_one()
+        secret.provider = "OpenWeatherMap API"
+        await db.flush()
+
+        with patch("app.api_adapters.weather.fetch_json", new=AsyncMock(return_value=payload)):
+            result = await execute_api_request(
+                db,
+                user_id=user_id,
+                service="weather",
+                endpoint="current_conditions",
+                query_params={
+                    "latitude": 32.4485,
+                    "longitude": -81.7832,
+                },
+                task_id=task_id,
+                secret_name="openweathermap_api_key",
+                response_fields={
+                    "location": "location",
+                    "current_weather": "current_weather",
+                },
+            )
+
+    assert '"city_name": "Statesboro"' in result
+
+
+@pytest.mark.asyncio
+async def test_execute_api_request_supports_response_field_extraction():
+    user_id, task_id = await _seed_user_task_and_secret()
+
+    class _Adapter:
+        service_name = "n2yo"
+
+        async def execute(self, *, endpoint, query_params, api_key):
+            return AdapterExecutionResult(
+                normalized={
+                    "passes": [
+                        {
+                            "start_utc": "2026-04-01T09:30:00+00:00",
+                            "max_elevation_deg": 67.0,
+                        }
+                    ]
+                },
+                formatter=lambda normalized, deduped: "should not be used",
+                raw_payload={"passes": [{"startUTC": 1775035800, "maxEl": 67}]},
+            )
+
+    async with TestSessionLocal() as db:
+        with patch("app.api_service.get_api_adapter", return_value=_Adapter()):
+            result = await execute_api_request(
+                db,
+                user_id=user_id,
+                service="n2yo",
+                endpoint="iss_visual_passes",
+                query_params={
+                    "satellite_id": 25544,
+                    "lat": 32.4485,
+                    "lon": -81.7832,
+                    "alt_meters": 60,
+                    "days": 1,
+                    "min_visibility_seconds": 120,
+                },
+                secret_name="n2yo_api_key",
+                task_id=task_id,
+                response_fields={
+                    "start_utc": "passes[0].start_utc",
+                    "max_elevation_deg": "passes[0].max_elevation_deg",
+                },
+            )
+            repeat = await execute_api_request(
+                db,
+                user_id=user_id,
+                service="n2yo",
+                endpoint="iss_visual_passes",
+                query_params={
+                    "satellite_id": 25544,
+                    "lat": 32.4485,
+                    "lon": -81.7832,
+                    "alt_meters": 60,
+                    "days": 1,
+                    "min_visibility_seconds": 120,
+                },
+                secret_name="n2yo_api_key",
+                task_id=task_id,
+                response_fields={
+                    "start_utc": "passes[0].start_utc",
+                    "max_elevation_deg": "passes[0].max_elevation_deg",
+                },
+            )
+
+    assert result == '{"deduped": false, "fields": {"max_elevation_deg": 67.0, "start_utc": "2026-04-01T09:30:00+00:00"}}'
+    assert repeat == '{"deduped": true, "fields": {"max_elevation_deg": 67.0, "start_utc": "2026-04-01T09:30:00+00:00"}}'
 
 
 @pytest.mark.asyncio

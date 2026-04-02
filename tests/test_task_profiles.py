@@ -13,6 +13,7 @@ from app.autonomy.profiles.maintenance import (
 )
 from app.autonomy.profiles.morning_briefing import MorningBriefingExecutionProfile
 from app.autonomy.profiles.iss_pass_watcher import ISSPassWatcherExecutionProfile
+from app.autonomy.profiles.weather_conditions import WeatherConditionsExecutionProfile
 from app.autonomy.profiles.topic_watcher import (
     TopicWatcherExecutionProfile,
     _parse_topic_watcher_instruction,
@@ -195,6 +196,33 @@ def test_iss_profile_disables_skill_injection_and_limits_tools():
     assert "create_memory" in blocked
 
 
+@pytest.mark.asyncio
+async def test_iss_profile_prepare_run_context_includes_response_fields():
+    profile = ISSPassWatcherExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="ISS",
+            instruction="Check ISS passes",
+            profile="iss_pass_watcher",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        context = await profile.prepare_run_context(
+            db=db,
+            user_id=1,
+            task_id=task.id,
+            task_run_id=101,
+        )
+
+    contract = context["api_contract"]
+    assert contract["response_fields"] == {"passes": "passes"}
+    assert context["dataset_stats"]["response_fields_present"] == ["passes"]
+
+
 def test_iss_profile_validate_finalize_falls_back_to_exact_tool_result_for_chatty_failure():
     profile = ISSPassWatcherExecutionProfile()
     result, report = profile.validate_finalize(
@@ -217,6 +245,84 @@ def test_iss_profile_validate_finalize_falls_back_to_exact_tool_result_for_chatt
     assert report is not None
     assert report["fatal"] is False
     assert report["used_tool_result_fallback"] is True
+
+
+def test_iss_profile_validate_finalize_formats_empty_structured_result_as_no_passes():
+    profile = ISSPassWatcherExecutionProfile()
+    result, report = profile.validate_finalize(
+        result="API request failed.",
+        prior_full_outputs=[],
+        run_context={
+            "last_tool_records": [
+                {
+                    "tool": "api_request",
+                    "result_summary": '{"deduped": false, "fields": {"passes": []}}',
+                }
+            ]
+        },
+        is_final_step=True,
+    )
+    assert result == "No visible ISS passes found in the requested window."
+    assert report is not None
+    assert report["structured_api_result"] is True
+
+
+@pytest.mark.asyncio
+async def test_weather_profile_prepare_run_context_includes_response_fields():
+    profile = WeatherConditionsExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Weather",
+            instruction="Check current conditions at lat=32.4485 lon=-81.7832 timezone=America/New_York",
+            profile="weather_conditions",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        context = await profile.prepare_run_context(
+            db=db,
+            user_id=1,
+            task_id=task.id,
+            task_run_id=101,
+        )
+
+    contract = context["api_contract"]
+    assert contract["service"] == "weather"
+    assert contract["endpoint"] == "current_conditions"
+    assert contract["response_fields"] == {"location": "location", "current_weather": "current_weather"}
+    assert context["dataset_stats"]["response_fields_present"] == ["current_weather", "location"]
+
+
+def test_weather_profile_validate_finalize_formats_structured_current_conditions():
+    profile = WeatherConditionsExecutionProfile()
+    result, report = profile.validate_finalize(
+        result="API request failed.",
+        prior_full_outputs=[],
+        run_context={
+            "last_tool_records": [
+                {
+                    "tool": "api_request",
+                    "result_summary": (
+                        '{"deduped": false, "fields": {"location": {"latitude": 32.4485, "longitude": -81.7832, '
+                        '"city_name": "Statesboro", "country": "US"}, "current_weather": {"observed_at_utc": '
+                        '"2026-04-01T14:00:00+00:00", "temperature_c": 22.3, "feels_like_c": 23.1, '
+                        '"humidity_percent": 64, "pressure_hpa": 1014, "wind_speed_mps": 11.4, '
+                        '"wind_direction_deg": 270, "weather_code": 802, "weather_main": "Clouds", '
+                        '"description": "scattered clouds", "is_day": true}}}'
+                    ),
+                }
+            ]
+        },
+        is_final_step=True,
+    )
+    assert "Weather briefing" in result
+    assert "temperature_c=22.3" in result
+    assert "weather_main=Clouds" in result
+    assert report is not None
+    assert report["structured_api_result"] is True
 
 
 def test_maintenance_validate_finalize_requires_exact_tool_output():

@@ -2,7 +2,7 @@
 FruitcakeAI v5 — Backend-owned JSON/API helpers.
 
 This is the first JSON/API sprint substrate: a narrow, reusable HTTP JSON
-fetch helper plus a structured place lookup built on OpenStreetMap Nominatim.
+fetch helper plus deterministic field extraction for backend-owned contracts.
 """
 
 from __future__ import annotations
@@ -54,6 +54,86 @@ async def fetch_json(
         return response.json()
     except ValueError as exc:
         raise JsonApiError("JSON API response was not valid JSON.") from exc
+
+
+def _split_json_path(path: str) -> List[str]:
+    cleaned = str(path or "").strip()
+    if not cleaned:
+        raise JsonApiError("JSON field path is required.")
+
+    tokens: List[str] = []
+    current = []
+    index = 0
+    while index < len(cleaned):
+        char = cleaned[index]
+        if char == ".":
+            if current:
+                tokens.append("".join(current))
+                current = []
+            index += 1
+            continue
+        if char == "[":
+            if current:
+                tokens.append("".join(current))
+                current = []
+            close = cleaned.find("]", index)
+            if close == -1:
+                raise JsonApiError(f"Invalid JSON field path '{path}'.")
+            inner = cleaned[index + 1 : close].strip()
+            if not inner:
+                raise JsonApiError(f"Invalid JSON field path '{path}'.")
+            if not inner.isdigit():
+                raise JsonApiError(f"JSON field path '{path}' must use numeric list indexes inside brackets.")
+            tokens.append(inner)
+            index = close + 1
+            continue
+        current.append(char)
+        index += 1
+
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def extract_json_path(payload: Any, path: str) -> Any:
+    """Extract a deterministic value from a JSON-compatible payload."""
+
+    current = payload
+    for token in _split_json_path(path):
+        if isinstance(current, dict):
+            if token not in current:
+                raise JsonApiError(f"JSON field '{path}' was missing.")
+            current = current[token]
+            continue
+        if isinstance(current, list):
+            if not token.isdigit():
+                raise JsonApiError(f"JSON field '{path}' expected a list index but found '{token}'.")
+            index = int(token)
+            if index < 0 or index >= len(current):
+                raise JsonApiError(f"JSON field '{path}' was missing.")
+            current = current[index]
+            continue
+        raise JsonApiError(f"JSON field '{path}' was missing.")
+
+    if current is None:
+        raise JsonApiError(f"JSON field '{path}' was missing.")
+    return current
+
+
+def extract_json_fields(payload: Any, fields: Dict[str, str]) -> Dict[str, Any]:
+    """Extract a normalized mapping of named JSON fields from a payload."""
+
+    if not isinstance(fields, dict) or not fields:
+        raise JsonApiError("JSON field selectors must be a non-empty object.")
+
+    extracted: Dict[str, Any] = {}
+    for field_name, path in fields.items():
+        name = str(field_name or "").strip()
+        selector = str(path or "").strip()
+        if not name:
+            raise JsonApiError("JSON field selectors must use non-empty names.")
+        extracted[name] = extract_json_path(payload, selector)
+    return extracted
 
 
 def _format_place_result(item: Dict[str, Any], index: int) -> str:

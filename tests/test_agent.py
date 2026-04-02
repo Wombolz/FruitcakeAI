@@ -185,6 +185,7 @@ def test_api_request_schema_has_required_fields():
     assert "endpoint" in props
     assert "query_params" in props
     assert "secret_name" in props
+    assert "response_fields" in props
     assert required == ["service", "endpoint", "query_params"]
 
 
@@ -481,12 +482,43 @@ async def test_api_request_tool_uses_backend_api_service():
                         "min_visibility_seconds": 120,
                     },
                     "secret_name": "n2yo_api_key",
+                    "response_fields": {
+                        "start_utc": "passes[0].start_utc",
+                    },
                 },
                 ctx,
             )
 
     assert "ISS visible pass results" in result
     mocked.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_api_request_tool_lifts_top_level_fields_into_query_params():
+    import app.agent.tools as tools_module
+
+    with patch("app.api_service.execute_api_request", new=AsyncMock(return_value="ok")) as mocked:
+        result = await tools_module._api_request(
+            {
+                "service": "weather",
+                "endpoint": "current_conditions",
+                "secret_name": "openweathermap_api_key",
+                "latitude": 32.4488,
+                "longitude": -81.7832,
+                "units": "imperial",
+            },
+            _make_context(),
+        )
+
+    assert result == "ok"
+    mocked.assert_awaited_once()
+    kwargs = mocked.await_args.kwargs
+    assert kwargs["query_params"] == {
+        "latitude": 32.4488,
+        "longitude": -81.7832,
+        "units": "imperial",
+    }
+    assert kwargs["response_fields"] is None
 
 
 @pytest.mark.asyncio

@@ -60,14 +60,14 @@ async def test_secret_name_is_unique_per_user(client):
 
     first = await client.post(
         "/secrets",
-        json={"name": "weather_api_key", "provider": "weather", "value": "one"},
+        json={"name": "openweathermap_api_key", "provider": "weather", "value": "one"},
         headers=headers,
     )
     assert first.status_code == 201
 
     second = await client.post(
         "/secrets",
-        json={"name": "weather_api_key", "provider": "weather", "value": "two"},
+        json={"name": "openweathermap_api_key", "provider": "weather", "value": "two"},
         headers=headers,
     )
     assert second.status_code == 409
@@ -102,7 +102,7 @@ async def test_disable_secret_prevents_resolution(client):
     headers = {"Authorization": f"Bearer {token}"}
     created = await client.post(
         "/secrets",
-        json={"name": "weather_api_key", "provider": "weather", "value": "wx-secret"},
+        json={"name": "openweathermap_api_key", "provider": "weather", "value": "wx-secret"},
         headers=headers,
     )
     secret_id = created.json()["id"]
@@ -115,7 +115,7 @@ async def test_disable_secret_prevents_resolution(client):
         secret = await db.get(Secret, secret_id)
         assert secret is not None
         assert secret.is_active is False
-        resolved = await resolve_secret_value(db, user_id=secret.user_id, name="weather_api_key", mark_used=True)
+        resolved = await resolve_secret_value(db, user_id=secret.user_id, name="openweathermap_api_key", mark_used=True)
         assert resolved is None
 
 

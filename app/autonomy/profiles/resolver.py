@@ -5,6 +5,7 @@ from app.autonomy.profiles.iss_pass_watcher import ISSPassWatcherExecutionProfil
 from app.autonomy.profiles.maintenance import MaintenanceExecutionProfile
 from app.autonomy.profiles.morning_briefing import MorningBriefingExecutionProfile
 from app.autonomy.profiles.news_magazine import NewsMagazineExecutionProfile
+from app.autonomy.profiles.weather_conditions import WeatherConditionsExecutionProfile
 from app.autonomy.profiles.topic_watcher import TopicWatcherExecutionProfile
 
 _RSS_NEWSPAPER_ALIASES = {"rss_newspaper", "news_magazine"}
@@ -14,6 +15,7 @@ ALLOWED_TASK_PROFILES = {
     "news_magazine",
     "maintenance",
     "morning_briefing",
+    "weather_conditions",
     "topic_watcher",
     "iss_pass_watcher",
 }
@@ -30,6 +32,8 @@ def resolve_task_profile_by_name(value: str | None):
         return NewsMagazineExecutionProfile()
     if value == "morning_briefing":
         return MorningBriefingExecutionProfile()
+    if value == "weather_conditions":
+        return WeatherConditionsExecutionProfile()
     if value == "topic_watcher":
         return TopicWatcherExecutionProfile()
     if value == "iss_pass_watcher":
@@ -49,7 +53,7 @@ def normalize_task_profile(value: str | None) -> str | None:
         raise ValueError(
             "Unknown profile "
             f"'{value}'. Allowed: default, rss_newspaper, news_magazine, maintenance, "
-            "morning_briefing, topic_watcher, iss_pass_watcher"
+            "morning_briefing, weather_conditions, topic_watcher, iss_pass_watcher"
         )
     if v in _RSS_NEWSPAPER_ALIASES:
         return "rss_newspaper"
