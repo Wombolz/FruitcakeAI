@@ -386,6 +386,66 @@ async def test_delete_task_removes_row(client):
 
 
 @pytest.mark.asyncio
+async def test_recurring_task_skips_stale_queued_dispatch_after_reschedule(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "stalequeuedowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Recurring digest",
+            "instruction": "Compile recurring updates",
+            "task_type": "recurring",
+            "schedule": "every:30m",
+            "deliver": False,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        queued_run_at = task.next_run_at
+
+    assert queued_run_at is not None
+
+    runner = TaskRunner()
+    with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+        with patch("app.autonomy.runner._preflight_llm_dispatch", new=AsyncMock(return_value=None)):
+                with patch("app.agent.core.run_agent", new=AsyncMock(return_value="FINAL RECURRING OUTPUT")) as run_agent_mock:
+                    with patch.object(runner, "_push", new=AsyncMock()):
+                        await runner._run(
+                            task_id,
+                            expected_next_run_at=queued_run_at,
+                            trigger_source="test",
+                        )
+                        await_count_after_first = run_agent_mock.await_count
+                        await runner._run(
+                            task_id,
+                            expected_next_run_at=queued_run_at,
+                            trigger_source="test",
+                        )
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "pending"
+        assert task.next_run_at is not None
+        assert task.next_run_at > queued_run_at
+
+        runs = await db.execute(
+            select(TaskRun).where(TaskRun.task_id == task_id).order_by(TaskRun.started_at.desc())
+        )
+        run_rows = runs.scalars().all()
+        assert len(run_rows) == 1
+        assert run_rows[0].status == "completed"
+
+    assert await_count_after_first > 0
+    assert run_agent_mock.await_count == await_count_after_first
+
+
+@pytest.mark.asyncio
 async def test_stop_task_marks_task_and_run_cancelled(client):
     headers = await _headers(client, "stopowner")
     task = await client.post(

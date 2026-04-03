@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.7.9
+
+Release date:
+- 2026-04-03
+
+This release fixes the recurring task claim race that could cause a task to complete and then start again immediately from a stale queued dispatch.
+
+### Fixed
+
+- recurring task claims now handshake against the queued `next_run_at` value instead of only `status = pending`
+- stale queued dispatches are skipped cleanly after a successful recurring run reschedules the task into the future
+- manual-run and scheduler-adjacent runner paths retain compatibility while using the stronger claim semantics
+- focused regression coverage now protects the stale queued-dispatch case directly
+
+### Operator Notes
+
+- this is a backend execution fix; restart the server after deploy so the updated runner claim logic is active
+
 ## v0.7.8
 
 Release date:
