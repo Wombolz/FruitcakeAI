@@ -62,6 +62,59 @@ def test_infer_configured_executor_for_daily_research_briefing():
     assert inferred.executor_config["persistence"]["path"] == "reports/iran_middle_east_developments.md"
 
 
+def test_infer_configured_executor_for_daily_research_briefing_with_spaced_path_and_previous_window():
+    inferred = infer_configured_executor(
+        title="Daily NASA & Artemis II 24-Hour Summary",
+        instruction=(
+            "Each day at 08:00 America/New_York, gather all cached/news items from the user's curated RSS/cache "
+            "for the previous 24 hours that match NASA and Artemis II. "
+            "Produce the daily summary in markdown format to /workspace/NASA Artemis Mission/daily-summary-YYYY-MM-DD.md."
+        ),
+        task_type="recurring",
+        requested_profile=None,
+    )
+
+    assert inferred.profile is None
+    assert inferred.executor_config["kind"] == "configured_executor"
+    assert inferred.executor_config["input"]["topic"] == "NASA & Artemis II"
+    assert inferred.executor_config["input"]["window_hours"] == 24
+    assert inferred.executor_config["persistence"]["path"] == "workspace/NASA Artemis Mission/daily-summary-YYYY-MM-DD.md"
+
+
+def test_infer_configured_executor_for_daily_analysis_with_mention_language():
+    inferred = infer_configured_executor(
+        title="Daily Trump 24-Hour Analysis",
+        instruction=(
+            "Each day at 08:00 America/New_York, gather all cached/news items from the user's curated RSS feeds "
+            "covering the previous 24 hours that mention \"Trump\" or directly relate to Donald Trump. "
+            "Append the analysis to workspace/Politics/Trump/Trump_summary.md."
+        ),
+        task_type="recurring",
+        requested_profile=None,
+    )
+
+    assert inferred.profile is None
+    assert inferred.executor_config["kind"] == "configured_executor"
+    assert inferred.executor_config["input"]["topic"] == "Trump"
+    assert inferred.executor_config["persistence"]["path"] == "workspace/Politics/Trump/Trump_summary.md"
+
+
+def test_infer_configured_executor_for_briefing_title_with_daily_suffix():
+    inferred = infer_configured_executor(
+        title="US Politics Daily Briefing (cached RSS, last 24h)",
+        instruction=(
+            "Generate a brief, source-grounded US politics roundup using ONLY cached items from my curated RSS catalog. "
+            "Append the result to the workspace file at workspace/politics/US Politics.md."
+        ),
+        task_type="recurring",
+        requested_profile=None,
+    )
+
+    assert inferred.executor_config["kind"] == "configured_executor"
+    assert inferred.executor_config["input"]["topic"] == "US Politics"
+    assert inferred.executor_config["persistence"]["path"] == "workspace/politics/US Politics.md"
+
+
 @pytest.mark.asyncio
 async def test_create_task_auto_selects_configured_executor(client):
     headers = await _headers(client, "configuredexecuser")

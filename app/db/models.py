@@ -601,6 +601,7 @@ class Task(Base):
     # Optional task execution profile (default, rss_newspaper)
     profile = Column(String(50), nullable=True)
     executor_config_json = Column(Text, default="{}", nullable=False)
+    task_recipe_json = Column(Text, default="{}", nullable=False)
     # Optional explicit model override for all LLM stages of this task.
     llm_model_override = Column(String(200), nullable=True)
 
@@ -678,6 +679,14 @@ class Task(Base):
     @executor_config.setter
     def executor_config(self, value: dict):
         self.executor_config_json = json.dumps(value or {})
+
+    @property
+    def task_recipe(self) -> dict:
+        return json.loads(self.task_recipe_json or "{}")
+
+    @task_recipe.setter
+    def task_recipe(self, value: dict):
+        self.task_recipe_json = json.dumps(value or {})
 
     def __repr__(self):
         return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"

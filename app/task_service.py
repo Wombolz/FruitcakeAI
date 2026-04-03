@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import re
 from typing import Optional
 
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.persona_loader import list_personas, persona_exists
 from app.agent.persona_router import infer_persona_for_task
 from app.autonomy.configured_executor import infer_configured_executor
 from app.autonomy.profiles import normalize_task_profile
-from app.db.models import Task
+from app.db.models import RSSSource, Task
+from app.task_recipes import build_task_recipe_metadata, normalize_task_recipe
 from app.time_utils import resolve_effective_timezone
 
 
@@ -119,6 +122,96 @@ class TaskUpdateResult:
     plan_inputs_changed: bool
 
 
+async def _align_topic_watcher_sources(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    recipe,
+):
+    if recipe is None or recipe.family != "topic_watcher":
+        return recipe
+    requested_sources = list(recipe.params.get("sources") or [])
+    if not requested_sources:
+        return recipe
+
+    rows = (
+        await db.execute(
+            select(RSSSource)
+            .where(
+                RSSSource.active == True,
+                or_(RSSSource.user_id == user_id, RSSSource.user_id.is_(None)),
+            )
+            .order_by(RSSSource.user_id.is_(None), RSSSource.name.asc())
+        )
+    ).scalars().all()
+    if not rows:
+        return recipe
+
+    active_names = [str(row.name or "").strip() for row in rows if str(row.name or "").strip()]
+    matched_names: list[str] = []
+    for source in requested_sources:
+        match = _match_active_source_name(str(source), active_names)
+        if match and match not in matched_names:
+            matched_names.append(match)
+
+    assumptions = list(recipe.assumptions)
+    if requested_sources and not matched_names:
+        assumptions.append("dropped watcher source filters because they did not match active RSS sources")
+    elif len(matched_names) < len(requested_sources):
+        assumptions.append("dropped watcher source filters because only some suggested sources matched active RSS sources")
+        matched_names = []
+
+    lines = [f"topic: {recipe.params.get('topic')}", f"threshold: {recipe.params.get('threshold') or 'medium'}"]
+    if matched_names:
+        lines.append(f"sources: {', '.join(matched_names)}")
+    lines.extend(
+        [
+            "",
+            f"Watch my curated RSS feeds for significant updates about {recipe.params.get('topic')}.",
+            "Return NOTHING_NEW when there is no meaningful change.",
+        ]
+    )
+    return replace(
+        recipe,
+        instruction="\n".join(lines).strip(),
+        params={**recipe.params, "sources": matched_names},
+        assumptions=assumptions,
+    )
+
+
+def _match_active_source_name(requested: str, active_names: list[str]) -> str | None:
+    normalized_requested = _normalize_source_name(requested)
+    if not normalized_requested:
+        return None
+    for candidate in active_names:
+        normalized_candidate = _normalize_source_name(candidate)
+        if normalized_candidate == normalized_requested:
+            return candidate
+    requested_tokens = set(normalized_requested.split())
+    for candidate in active_names:
+        normalized_candidate = _normalize_source_name(candidate)
+        candidate_tokens = set(normalized_candidate.split())
+        if requested_tokens and requested_tokens.issubset(candidate_tokens):
+            return candidate
+        if candidate_tokens and candidate_tokens.issubset(requested_tokens):
+            return candidate
+    return None
+
+
+def _normalize_source_name(value: str) -> str:
+    candidate = str(value or "").lower().strip()
+    candidate = re.sub(r"[–—:/()]+", " ", candidate)
+    candidate = re.sub(r"\brss\b", " ", candidate)
+    candidate = re.sub(r"\bofficial\b", " ", candidate)
+    candidate = re.sub(r"\bfeeds?\b", " ", candidate)
+    candidate = re.sub(r"\bblogs?\b", "blog", candidate)
+    candidate = re.sub(r"\bscience\b", " ", candidate)
+    candidate = re.sub(r"\bworld news\b", "world", candidate)
+    candidate = re.sub(r"[^a-z0-9+& ]+", " ", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    return candidate
+
+
 async def create_task_record(
     db: AsyncSession,
     *,
@@ -136,34 +229,59 @@ async def create_task_record(
     active_hours_end: Optional[str] = None,
     active_hours_tz: Optional[str] = None,
     user_timezone: Optional[str] = None,
+    recipe_family: Optional[str] = None,
+    recipe_params: Optional[dict] = None,
 ) -> Task:
     if task_type not in {"one_shot", "recurring"}:
         raise TaskValidationError("task_type must be one_shot or recurring.")
-    resolved_persona = resolve_task_persona(
-        title=title,
-        instruction=instruction,
-        requested_persona=persona,
-    )
-    inferred = infer_configured_executor(
+    normalized_recipe = normalize_task_recipe(
         title=title,
         instruction=instruction,
         task_type=task_type,
         requested_profile=profile,
+        recipe_family=recipe_family,
+        recipe_params=recipe_params,
+    )
+    normalized_recipe = await _align_topic_watcher_sources(
+        db,
+        user_id=user_id,
+        recipe=normalized_recipe,
+    )
+    normalized_title = normalized_recipe.title if normalized_recipe is not None else title
+    normalized_instruction = normalized_recipe.instruction if normalized_recipe is not None else instruction
+    normalized_task_type = normalized_recipe.task_type if normalized_recipe is not None else task_type
+    normalized_profile = normalized_recipe.profile if normalized_recipe is not None and normalized_recipe.profile else profile
+    resolved_persona = resolve_task_persona(
+        title=normalized_title,
+        instruction=normalized_instruction,
+        requested_persona=persona,
+    )
+    inferred = infer_configured_executor(
+        title=normalized_title,
+        instruction=normalized_instruction,
+        task_type=normalized_task_type,
+        requested_profile=normalized_profile,
+    )
+    resolved_profile = inferred.profile if inferred.executor_config else infer_task_profile(
+        title=normalized_title,
+        instruction=normalized_instruction,
+        task_type=normalized_task_type,
+        requested_profile=normalized_profile,
     )
     task = Task(
         user_id=user_id,
-        title=title,
-        instruction=instruction,
+        title=normalized_title,
+        instruction=normalized_instruction,
         persona=resolved_persona,
-        profile=inferred.profile if inferred.executor_config else infer_task_profile(
-            title=title,
-            instruction=instruction,
-            task_type=task_type,
-            requested_profile=profile,
-        ),
+        profile=resolved_profile,
         executor_config=inferred.executor_config,
+        task_recipe=build_task_recipe_metadata(
+            normalized_recipe,
+            selected_profile=resolved_profile,
+            executor_config=inferred.executor_config,
+        ),
         llm_model_override=(str(llm_model_override).strip() or None) if llm_model_override is not None else None,
-        task_type=task_type,
+        task_type=normalized_task_type,
         status="pending",
         schedule=schedule,
         deliver=deliver,
@@ -198,12 +316,13 @@ async def update_task_record(
     active_hours_end=UNSET,
     active_hours_tz=UNSET,
     user_timezone: Optional[str] = None,
+    recipe_family=UNSET,
+    recipe_params=UNSET,
 ) -> TaskUpdateResult:
-    del db  # reserved for future validation that may require queries
-
     title_changed = False
     instruction_changed = False
     plan_inputs_changed = False
+    recipe_inputs_changed = False
 
     if title is not UNSET:
         task.title = str(title)
@@ -221,40 +340,10 @@ async def update_task_record(
         )
         plan_inputs_changed = True
     if profile is not UNSET:
-        inferred = infer_configured_executor(
-            title=task.title,
-            instruction=task.instruction,
-            task_type=task.task_type,
-            requested_profile=profile,
-        )
-        task.profile = inferred.profile if inferred.executor_config else infer_task_profile(
-            title=task.title,
-            instruction=task.instruction,
-            task_type=task.task_type,
-            requested_profile=profile,
-        )
-        task.executor_config = inferred.executor_config
         plan_inputs_changed = True
-    elif title_changed or instruction_changed:
-        inferred = infer_configured_executor(
-            title=task.title,
-            instruction=task.instruction,
-            task_type=task.task_type,
-            requested_profile=None,
-        )
-        if inferred.executor_config:
-            task.profile = inferred.profile
-            task.executor_config = inferred.executor_config
-            plan_inputs_changed = True
-        elif task.executor_config:
-            task.executor_config = {}
-            task.profile = infer_task_profile(
-                title=task.title,
-                instruction=task.instruction,
-                task_type=task.task_type,
-                requested_profile=task.profile,
-            )
-            plan_inputs_changed = True
+    if recipe_family is not UNSET or recipe_params is not UNSET:
+        recipe_inputs_changed = True
+        plan_inputs_changed = True
     if llm_model_override is not UNSET:
         task.llm_model_override = (str(llm_model_override).strip() or None) if llm_model_override is not None else None
         plan_inputs_changed = True
@@ -282,6 +371,61 @@ async def update_task_record(
         inferred, _, _ = infer_persona_for_task(task.title, task.instruction)
         task.persona = inferred
         plan_inputs_changed = True
+
+    if title_changed or instruction_changed or profile is not UNSET or recipe_inputs_changed:
+        existing_recipe = task.task_recipe if isinstance(task.task_recipe, dict) else {}
+        preferred_family = str(existing_recipe.get("family") or "").strip().lower() or None
+        requested_recipe_family = recipe_family if recipe_family is not UNSET else preferred_family
+        requested_recipe_params = recipe_params if recipe_params is not UNSET else existing_recipe.get("params")
+        requested_profile_value = task.profile if profile is UNSET else profile
+        explicit_recipe_family = (
+            str(recipe_family).strip().lower()
+            if recipe_family is not UNSET and recipe_family is not None
+            else ""
+        )
+        if (
+            profile is UNSET
+            and explicit_recipe_family
+            and explicit_recipe_family != preferred_family
+        ):
+            requested_profile_value = None
+        normalized_recipe = normalize_task_recipe(
+            title=task.title,
+            instruction=task.instruction,
+            task_type=task.task_type,
+            requested_profile=requested_profile_value,
+            recipe_family=requested_recipe_family,
+            recipe_params=requested_recipe_params if isinstance(requested_recipe_params, dict) else None,
+            preferred_family=preferred_family,
+        )
+        normalized_recipe = await _align_topic_watcher_sources(
+            db,
+            user_id=int(task.user_id),
+            recipe=normalized_recipe,
+        )
+        if normalized_recipe is not None:
+            if not title_changed:
+                task.title = normalized_recipe.title
+            task.instruction = normalized_recipe.instruction
+            requested_profile_value = normalized_recipe.profile if normalized_recipe.profile else requested_profile_value
+        inferred = infer_configured_executor(
+            title=task.title,
+            instruction=task.instruction,
+            task_type=task.task_type,
+            requested_profile=requested_profile_value,
+        )
+        task.profile = inferred.profile if inferred.executor_config else infer_task_profile(
+            title=task.title,
+            instruction=task.instruction,
+            task_type=task.task_type,
+            requested_profile=requested_profile_value,
+        )
+        task.executor_config = inferred.executor_config
+        task.task_recipe = build_task_recipe_metadata(
+            normalized_recipe,
+            selected_profile=task.profile,
+            executor_config=inferred.executor_config,
+        )
 
     return TaskUpdateResult(
         title_changed=title_changed,

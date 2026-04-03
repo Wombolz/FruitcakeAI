@@ -436,10 +436,16 @@ def _task_handoff_message(
         if tool_name == "update_task" and payload and payload.get("updated") is True:
             if "run now" in latest_user:
                 continue
+            confirmation = str(payload.get("task_confirmation") or "").strip()
+            if confirmation:
+                return confirmation
             title = str(payload.get("title") or "").strip()
             task_id = payload.get("task_id")
             schedule = str(payload.get("schedule") or "").strip()
+            recipe_family = str(((payload.get("task_recipe") or {}).get("family") or "")).strip()
             suffix = f" Schedule: {schedule}." if schedule else ""
+            if recipe_family:
+                suffix = f" Recipe: {recipe_family}.{suffix}"
             if title:
                 return f"Updated task '{title}' (task_id={task_id}).{suffix}"
             return f"Updated task {task_id}.{suffix}"
@@ -450,17 +456,23 @@ def _task_handoff_message(
     )
     for tool_name, payload in paired:
         if tool_name == "create_task" and payload and payload.get("created") is True:
+            confirmation = str(payload.get("task_confirmation") or "").strip()
+            if confirmation:
+                return confirmation
             task_type = str(payload.get("task_type") or "").strip().lower()
             title = str(payload.get("title") or "").strip()
             task_id = payload.get("task_id")
             schedule = str(payload.get("schedule") or "").strip()
             profile = str(payload.get("profile") or "").strip()
+            recipe_family = str(((payload.get("task_recipe") or {}).get("family") or "")).strip()
             if saw_plan or task_type == "recurring" or profile in {"topic_watcher", "iss_pass_watcher", "rss_newspaper", "maintenance", "morning_briefing"}:
                 details = []
                 if schedule:
                     details.append(f"schedule={schedule}")
                 if profile:
                     details.append(f"profile={profile}")
+                if recipe_family and recipe_family != profile:
+                    details.append(f"recipe={recipe_family}")
                 suffix = f" ({', '.join(details)})" if details else ""
                 if title:
                     return f"Created task '{title}' (task_id={task_id}){suffix}."

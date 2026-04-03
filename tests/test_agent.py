@@ -112,6 +112,15 @@ def test_system_prompt_requires_confirmation_before_calendar_delete():
     assert "delete_event" in prompt
 
 
+def test_system_prompt_requires_task_draft_before_create_or_update():
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    prompt = ctx.to_system_prompt().lower()
+    assert "before using create_task or update_task" in prompt
+    assert "short normalized task draft" in prompt
+    assert "what it will do, when it will run" in prompt
+    assert "high-confidence task recipe" in prompt
+
+
 def test_parse_iso_datetime_accepts_z_suffix():
     dt = _parse_iso_datetime("2026-04-01T00:00:00Z")
     assert dt.isoformat() == "2026-04-01T00:00:00+00:00"
@@ -156,6 +165,8 @@ def test_create_task_schema_has_required_fields():
     assert "instruction" in props
     assert "task_type" in props
     assert "deliver" in props
+    assert "recipe_family" in props
+    assert "recipe_params" in props
     assert set(["title", "instruction", "task_type", "deliver"]).issubset(set(required))
 
 
@@ -220,7 +231,23 @@ def test_update_task_schema_has_required_fields():
     props = schema["function"]["parameters"]["properties"]
     required = schema["function"]["parameters"].get("required", [])
     assert "task_id" in props
+    assert "recipe_family" in props
+    assert "recipe_params" in props
     assert required == ["task_id"]
+
+
+def test_create_task_schema_description_mentions_normalized_draft():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_task")
+    description = schema["function"]["description"].lower()
+    assert "normalized draft" in description
+    assert "recipe_family" in description
+
+
+def test_update_task_schema_description_mentions_restate_before_save():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "update_task")
+    description = schema["function"]["description"].lower()
+    assert "restate the normalized change" in description
+    assert "explicitly confirms" in description
 
 
 def test_list_tasks_schema_fields():
@@ -644,6 +671,454 @@ async def test_create_task_tool_defaults_to_requires_approval_true():
 
 
 @pytest.mark.asyncio
+async def test_create_task_tool_normalizes_plain_english_watcher_recipe():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Iran Watch",
+                "instruction": "Watch Iran and Middle East news for major updates.",
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["profile"] == "topic_watcher"
+    assert payload["task_recipe"]["family"] == "topic_watcher"
+    assert "family=topic_watcher" in payload["task_summary"]
+    assert "topic watcher" in payload["task_confirmation"].lower()
+    assert "iran" in payload["task_confirmation"].lower()
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.profile == "topic_watcher"
+        assert "topic:" in task.instruction
+        assert "NOTHING_NEW" in task.instruction
+        assert task.task_recipe["family"] == "topic_watcher"
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_trims_watcher_draft_topic_and_sources():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    draft_instruction = (
+        "Watch NASA and Artemis news for major updates.\n"
+        "Sources (proposed): NASA Press Releases, NASA Media Advisories, NASA Artemis Blog, SpaceNews (Artemis tag). "
+        "Major update criteria: official NASA posts or corroborated major program changes. "
+        "Behavior: check every 2 hours and deduplicate.\n"
+    )
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "NASA + Artemis Major Updates Watch",
+                "instruction": draft_instruction,
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.title == "NASA + Artemis Watcher"
+        assert task.task_recipe["params"]["topic"] == "NASA + Artemis"
+        assert task.task_recipe["params"]["sources"] == [
+            "nasa press releases",
+            "nasa media advisories",
+            "nasa artemis blog",
+            "spacenews (artemis tag)",
+        ]
+        assert "major update criteria" not in task.instruction.lower()
+        assert "behavior:" not in task.instruction.lower()
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_parses_bulleted_watcher_sources_and_drops_major_update_suffix():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    draft_instruction = (
+        "What it will do:\n"
+        "- Check official NASA and high-signal space news RSS feeds every 2 hours.\n"
+        "Sources (RSS):\n"
+        "- NASA Artemis Blog: https://blogs.nasa.gov/artemis/feed/\n"
+        "- NASA Press Releases: https://www.nasa.gov/rss/dyn/breaking_news.rss\n"
+        "- NASA Media Advisories: https://www.nasa.gov/rss/dyn/lg_image_of_the_day.rss\n"
+        "- SpaceNews (Artemis tag): https://spacenews.com/tag/artemis/feed/\n"
+        "Behavior:\n"
+        "- Notify on major updates only.\n"
+    )
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "NASA/Artemis II Major Update Monitor",
+                "instruction": draft_instruction,
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.title == "NASA/Artemis II Watcher"
+        assert task.task_recipe["params"]["topic"] == "NASA/Artemis II"
+        assert task.task_recipe["params"]["sources"] == [
+            "nasa artemis blog",
+            "nasa press releases",
+            "nasa media advisories",
+            "spacenews (artemis tag)",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_parses_suggested_sources_heading_without_colon():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    draft_instruction = (
+        "Draft task\n"
+        "Sources (suggested)\n"
+        "- NASA official feeds / press releases\n"
+        "- NASA Artemis Blog\n"
+        "- SpaceNews Artemis coverage\n"
+        "When it will run\n"
+        "- Every 2 hours during wake hours.\n"
+    )
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "NASA & Artemis II Watcher",
+                "instruction": draft_instruction,
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.task_recipe["params"]["sources"] == [
+            "nasa official feeds / press releases",
+            "nasa artemis blog",
+            "spacenews artemis coverage",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_keeps_only_watcher_sources_that_match_active_feeds():
+    import app.agent.tools as tools_module
+    from app.db.models import RSSSource, Task
+
+    ctx = _make_context()
+
+    async with TestSessionLocal() as db:
+        db.add_all(
+            [
+                RSSSource(
+                    user_id=1,
+                    name="Ars Technica",
+                    url="https://feeds.arstechnica.com/arstechnica/index",
+                    url_canonical="https://feeds.arstechnica.com/arstechnica/index",
+                    category="tech",
+                    active=True,
+                ),
+                RSSSource(
+                    user_id=1,
+                    name="Reuters World News",
+                    url="https://feeds.reuters.com/Reuters/worldNews",
+                    url_canonical="https://feeds.reuters.com/reuters/worldnews",
+                    category="news",
+                    active=True,
+                ),
+            ]
+        )
+        await db.commit()
+
+    draft_instruction = (
+        "Watch NASA and Artemis II news for major updates.\n"
+        "Sources: Reuters - Science, Ars Technica - Science, NASA Press Releases\n"
+    )
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "NASA + Artemis II Update Monitor",
+                "instruction": draft_instruction,
+                "task_type": "recurring",
+                "schedule": "every:2h",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.task_recipe["params"]["sources"] == []
+        assert "sources:" not in task.instruction
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_normalizes_recurring_briefing_recipe_into_configured_executor():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Iran briefing",
+                "instruction": (
+                    "Append a daily research briefing about Iran and the Middle East from the past 24 hours "
+                    "to reports/iran_middle_east_developments.md."
+                ),
+                "task_type": "recurring",
+                "schedule": "0 8 * * *",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert "research briefing task" in payload["task_confirmation"].lower()
+    assert "append the briefing to reports/iran_middle_east_developments.md" in payload["task_confirmation"].lower()
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.profile is None
+        assert task.executor_config["kind"] == "configured_executor"
+        assert task.task_recipe["family"] == "daily_research_briefing"
+        assert "cached RSS feeds" in task.instruction
+        assert "append a daily research briefing" in task.instruction
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_normalizes_recurring_briefing_recipe_with_spaced_workspace_path():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Daily NASA & Artemis II 24-Hour Summary",
+                "instruction": (
+                    "Each day at 08:00 America/New_York, gather all cached/news items from the user's curated RSS/cache "
+                    "for the previous 24 hours that match NASA and Artemis II. "
+                    "Produce the daily summary in markdown format to /workspace/NASA Artemis Mission/daily-summary-YYYY-MM-DD.md."
+                ),
+                "task_type": "recurring",
+                "schedule": "daily at 08:00 America/New_York",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert "research briefing task" in payload["task_confirmation"].lower()
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.executor_config["kind"] == "configured_executor"
+        assert task.task_recipe["family"] == "daily_research_briefing"
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_normalizes_daily_analysis_request_into_configured_executor():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Daily Trump 24-Hour Analysis",
+                "instruction": (
+                    "Each day at 08:00 America/New_York, gather all cached/news items from the user's curated RSS feeds "
+                    "covering the previous 24 hours that mention \"Trump\" or directly relate to Donald Trump. "
+                    "Append the analysis to workspace/Politics/Trump/Trump_summary.md."
+                ),
+                "task_type": "recurring",
+                "schedule": "daily at 08:00 America/New_York",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.executor_config["kind"] == "configured_executor"
+        assert task.task_recipe["family"] == "daily_research_briefing"
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_prefers_daily_briefing_recipe_over_topic_watcher_for_cached_rss_briefing():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "US Politics Daily Briefing (cached RSS, last 24h)",
+                "instruction": (
+                    "Generate a brief, source-grounded US politics roundup using ONLY cached items from my curated RSS catalog "
+                    "(\"my feeds\"). Time window: last 24 hours. "
+                    "Append the result to the workspace file at workspace/politics/US Politics.md."
+                ),
+                "task_type": "recurring",
+                "schedule": "daily at 08:30 America/New_York",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.profile is None
+        assert task.executor_config["kind"] == "configured_executor"
+
+
+@pytest.mark.asyncio
+async def test_update_task_can_switch_from_watcher_to_daily_briefing_recipe():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        created = json.loads(
+            await tools_module._create_task(
+                {
+                    "title": "Politics Watcher",
+                    "instruction": "Watch politics news in my RSS feeds.",
+                    "task_type": "recurring",
+                    "schedule": "every:2h",
+                    "deliver": True,
+                },
+                ctx,
+            )
+        )
+        updated = json.loads(
+            await tools_module._update_task(
+                {
+                    "task_id": created["task_id"],
+                    "title": "US Politics Daily Briefing",
+                    "instruction": (
+                        "Generate a grounded daily research briefing on US politics using only cached RSS items from the "
+                        "last 24 hours and append it to workspace/politics/US Politics.md."
+                    ),
+                    "recipe_family": "daily_research_briefing",
+                    "recipe_params": {
+                        "topic": "US Politics",
+                        "window_hours": 24,
+                        "path": "workspace/politics/US Politics.md",
+                    },
+                },
+                ctx,
+            )
+        )
+
+    assert updated["task_recipe"]["family"] == "daily_research_briefing"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, created["task_id"])
+        assert task is not None
+        assert task.profile is None
+        assert task.executor_config["kind"] == "configured_executor"
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_normalizes_maintenance_recipe():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Refresh feeds",
+                "instruction": "Refresh the RSS cache.",
+                "task_type": "one_shot",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["profile"] == "maintenance"
+    assert payload["task_recipe"]["family"] == "maintenance"
+    assert "maintenance task" in payload["task_confirmation"].lower()
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.profile == "maintenance"
+        assert task.instruction.startswith("tool: refresh_rss_cache")
+        assert task.task_recipe["family"] == "maintenance"
+
+
+@pytest.mark.asyncio
 async def test_update_task_tool_updates_schedule_and_marks_plan_change():
     import app.agent.tools as tools_module
     from app.db.models import Task
@@ -675,11 +1150,51 @@ async def test_update_task_tool_updates_schedule_and_marks_plan_change():
     assert updated["updated"] is True
     assert updated["schedule"] == "every:2h"
     assert updated["plan_inputs_changed"] is True
+    assert "schedule: every:2h" in updated["task_confirmation"].lower()
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, created["task_id"])
         assert task is not None
         assert task.schedule == "every:2h"
+
+
+@pytest.mark.asyncio
+async def test_update_task_tool_preserves_recipe_identity_when_only_schedule_changes():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        created = json.loads(
+            await tools_module._create_task(
+                {
+                    "title": "Iran Watch",
+                    "instruction": "Watch Iran and Middle East news for major updates.",
+                    "task_type": "recurring",
+                    "schedule": "every:4h",
+                    "deliver": True,
+                },
+                ctx,
+            )
+        )
+
+        updated = json.loads(
+            await tools_module._update_task(
+                {"task_id": created["task_id"], "schedule": "every:2h"},
+                ctx,
+            )
+        )
+
+    assert updated["updated"] is True
+    assert updated["task_recipe"]["family"] == "topic_watcher"
+    assert "topic watcher" in updated["task_confirmation"].lower()
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, created["task_id"])
+        assert task is not None
+        assert task.schedule == "every:2h"
+        assert task.task_recipe["family"] == "topic_watcher"
 
 
 @pytest.mark.asyncio
