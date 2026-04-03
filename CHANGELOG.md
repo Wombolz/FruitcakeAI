@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.7.8
+
+Release date:
+- 2026-04-02
+
+This release lands the first chat task runtime groundwork: recipe-backed task normalization, stronger confirmation text, broader daily briefing inference, and safer task-family switching ahead of the dedicated task creator/editor sprint.
+
+### Added
+
+- recipe-backed task normalization and persisted `task_recipe` metadata for supported chat-created task families
+- stronger task confirmation summaries and handoff text for chat-created tasks
+- broader recurring daily briefing inference coverage for:
+  - spaced workspace paths
+  - `previous 24 hours` phrasing
+  - `summary` / `analysis` / `briefing` title variants
+- focused regression coverage for briefing creation, planner setup-step filtering, and recipe-family switching
+
+### Fixed
+
+- daily briefing requests are less likely to fall through to generic planning or watcher-shaped tasks
+- planner-generated task steps no longer include redundant setup/reminder steps for already-created recurring tasks
+- switching a task from one recipe family to another now clears stale profile carryover correctly
+- watcher recipe source handling remains hardened when chat suggests brittle or unmapped source restrictions
+
+### Operator Notes
+
+- this release improves chat-to-task runtime reliability but does not finish the task creator/editor UX
+- existing malformed tasks created before these fixes may still need manual repair or recreation
+
 ## v0.7.7
 
 Release date:
