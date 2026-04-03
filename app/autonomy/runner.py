@@ -62,9 +62,20 @@ class TaskRunner:
         self._active_runs: dict[int, asyncio.Task] = {}
         self._active_lock = asyncio.Lock()
 
-    async def execute(self, task: Task) -> None:
+    async def execute(self, task: Task, *, trigger_source: str = "direct") -> None:
+        expected_next_run_at = getattr(task, "next_run_at", None)
+        if expected_next_run_at is None:
+            from app.db.session import AsyncSessionLocal
+
+            async with AsyncSessionLocal() as db:
+                task_row = await db.get(Task, task.id)
+                expected_next_run_at = task_row.next_run_at if task_row is not None else None
         async with _semaphore:
-            await self._run(task.id)
+            await self._run(
+                task.id,
+                expected_next_run_at=expected_next_run_at,
+                trigger_source=trigger_source,
+            )
 
     async def request_stop(self, task_id: int) -> bool:
         """
@@ -83,7 +94,13 @@ class TaskRunner:
     # Core execution pipeline
     # ------------------------------------------------------------------
 
-    async def _run(self, task_id: int) -> None:
+    async def _run(
+        self,
+        task_id: int,
+        *,
+        expected_next_run_at: datetime | None = None,
+        trigger_source: str = "direct",
+    ) -> None:
         from sqlalchemy import select
         from app.db.session import AsyncSessionLocal
 
@@ -117,7 +134,11 @@ class TaskRunner:
             async with AsyncSessionLocal() as db:
                 claim = await db.execute(
                     update(Task)
-                    .where(Task.id == task_id, Task.status == "pending")
+                    .where(
+                        Task.id == task_id,
+                        Task.status == "pending",
+                        Task.next_run_at == expected_next_run_at,
+                    )
                     .values(
                         status="running",
                         error=None,
@@ -127,7 +148,30 @@ class TaskRunner:
                 if (claim.rowcount or 0) == 0:
                     task = await db.get(Task, task_id)
                     status = task.status if task is not None else "missing"
-                    log.info("task.skip_non_pending", task_id=task_id, status=status)
+                    current_next_run_at = getattr(task, "next_run_at", None) if task is not None else None
+                    if task is not None and status == "pending" and current_next_run_at != expected_next_run_at:
+                        log.info(
+                            "task.skip_stale_queued_dispatch",
+                            task_id=task_id,
+                            status=status,
+                            trigger_source=trigger_source,
+                            expected_next_run_at=expected_next_run_at.isoformat()
+                            if expected_next_run_at is not None
+                            else None,
+                            current_next_run_at=current_next_run_at.isoformat()
+                            if current_next_run_at is not None
+                            else None,
+                        )
+                    else:
+                        log.info(
+                            "task.skip_non_pending",
+                            task_id=task_id,
+                            status=status,
+                            trigger_source=trigger_source,
+                            expected_next_run_at=expected_next_run_at.isoformat()
+                            if expected_next_run_at is not None
+                            else None,
+                        )
                     await db.rollback()
                     return
 
