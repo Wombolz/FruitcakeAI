@@ -935,6 +935,158 @@ async def test_create_task_tool_normalizes_recurring_briefing_recipe_into_config
 
 
 @pytest.mark.asyncio
+async def test_create_task_tool_normalizes_recurring_briefing_recipe_with_spaced_workspace_path():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Daily NASA & Artemis II 24-Hour Summary",
+                "instruction": (
+                    "Each day at 08:00 America/New_York, gather all cached/news items from the user's curated RSS/cache "
+                    "for the previous 24 hours that match NASA and Artemis II. "
+                    "Produce the daily summary in markdown format to /workspace/NASA Artemis Mission/daily-summary-YYYY-MM-DD.md."
+                ),
+                "task_type": "recurring",
+                "schedule": "daily at 08:00 America/New_York",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert "research briefing task" in payload["task_confirmation"].lower()
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.executor_config["kind"] == "configured_executor"
+        assert task.task_recipe["family"] == "daily_research_briefing"
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_normalizes_daily_analysis_request_into_configured_executor():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "Daily Trump 24-Hour Analysis",
+                "instruction": (
+                    "Each day at 08:00 America/New_York, gather all cached/news items from the user's curated RSS feeds "
+                    "covering the previous 24 hours that mention \"Trump\" or directly relate to Donald Trump. "
+                    "Append the analysis to workspace/Politics/Trump/Trump_summary.md."
+                ),
+                "task_type": "recurring",
+                "schedule": "daily at 08:00 America/New_York",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.executor_config["kind"] == "configured_executor"
+        assert task.task_recipe["family"] == "daily_research_briefing"
+
+
+@pytest.mark.asyncio
+async def test_create_task_tool_prefers_daily_briefing_recipe_over_topic_watcher_for_cached_rss_briefing():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._create_task(
+            {
+                "title": "US Politics Daily Briefing (cached RSS, last 24h)",
+                "instruction": (
+                    "Generate a brief, source-grounded US politics roundup using ONLY cached items from my curated RSS catalog "
+                    "(\"my feeds\"). Time window: last 24 hours. "
+                    "Append the result to the workspace file at workspace/politics/US Politics.md."
+                ),
+                "task_type": "recurring",
+                "schedule": "daily at 08:30 America/New_York",
+                "deliver": True,
+            },
+            ctx,
+        )
+
+    payload = json.loads(result)
+    assert payload["created"] is True
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, payload["task_id"])
+        assert task is not None
+        assert task.profile is None
+        assert task.executor_config["kind"] == "configured_executor"
+
+
+@pytest.mark.asyncio
+async def test_update_task_can_switch_from_watcher_to_daily_briefing_recipe():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        created = json.loads(
+            await tools_module._create_task(
+                {
+                    "title": "Politics Watcher",
+                    "instruction": "Watch politics news in my RSS feeds.",
+                    "task_type": "recurring",
+                    "schedule": "every:2h",
+                    "deliver": True,
+                },
+                ctx,
+            )
+        )
+        updated = json.loads(
+            await tools_module._update_task(
+                {
+                    "task_id": created["task_id"],
+                    "title": "US Politics Daily Briefing",
+                    "instruction": (
+                        "Generate a grounded daily research briefing on US politics using only cached RSS items from the "
+                        "last 24 hours and append it to workspace/politics/US Politics.md."
+                    ),
+                    "recipe_family": "daily_research_briefing",
+                    "recipe_params": {
+                        "topic": "US Politics",
+                        "window_hours": 24,
+                        "path": "workspace/politics/US Politics.md",
+                    },
+                },
+                ctx,
+            )
+        )
+
+    assert updated["task_recipe"]["family"] == "daily_research_briefing"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, created["task_id"])
+        assert task is not None
+        assert task.profile is None
+        assert task.executor_config["kind"] == "configured_executor"
+
+
+@pytest.mark.asyncio
 async def test_create_task_tool_normalizes_maintenance_recipe():
     import app.agent.tools as tools_module
     from app.db.models import Task

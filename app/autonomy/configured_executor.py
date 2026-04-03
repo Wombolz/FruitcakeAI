@@ -491,7 +491,7 @@ def infer_configured_executor(
         return InferredConfiguredExecutor(profile=None, executor_config={})
 
     lowered = f"{title}\n{instruction}".lower()
-    if not any(marker in lowered for marker in ("append", "write")):
+    if not any(marker in lowered for marker in ("append", "write", "save", "produce")):
         return InferredConfiguredExecutor(profile=None, executor_config={})
     path = _extract_workspace_report_path(instruction)
     if not path:
@@ -529,12 +529,12 @@ def infer_configured_executor(
 def _extract_workspace_report_path(instruction: str) -> str:
     text = str(instruction or "")
     match = re.search(
-        r"(?:append|write)(?:\s+\w+){0,6}\s+(?:to|into)\s+(?:the\s+)?(?:workspace\s+)?(?:file\s+)?['\"`]?([A-Za-z0-9_./-]+\.md)['\"`]?",
+        r"(?:append|write|save|produce)(?:\s+\w+){0,10}\s+(?:to|into)\s+(?:the\s+)?(?:workspace\s+)?(?:file\s+|folder\s+|path\s+)?['\"`]?([A-Za-z0-9_./ \-]+\.md)['\"`]?",
         text,
         flags=re.IGNORECASE,
     )
     if not match:
-        match = re.search(r"\b([A-Za-z0-9_./-]+\.md)\b", text)
+        match = re.search(r"([A-Za-z0-9_./ \-]+\.md)\b", text)
     if not match:
         return ""
     return _normalize_workspace_path(match.group(1))
@@ -544,7 +544,11 @@ def _extract_topic(title: str, instruction: str) -> str:
     text = re.sub(r"\s+", " ", str(instruction or "").strip())
     patterns = [
         r"(?:news|developments|briefing|research)\s+about\s+(.+?)\s+from\s+the\s+past\s+\d+\s+hours",
+        r"(?:news|developments|briefing|research)\s+about\s+(.+?)\s+from\s+the\s+previous\s+\d+\s*hours",
+        r"collect(?:s|ing)?\s+the\s+(?:previous|past)\s+\d+\s*hours?\s+of\s+news.+?\s+about\s+(.+?)(?:\s+and\s+(?:provide|write|append)|[.])",
+        r"covering\s+the\s+(?:previous|past)\s+\d+\s*hours\s+that\s+mention\s+[\"']?(.+?)[\"']?(?:\s+or\s+directly\s+relate|\s*[).,])",
         r"analyze\s+the\s+news\s+about\s+(.+?)\s+from\s+the\s+past\s+\d+\s+hours",
+        r"analyze\s+the\s+news\s+about\s+(.+?)\s+from\s+the\s+previous\s+\d+\s*hours",
         r"for\s+(.+?)\s+from\s+the\s+past\s+\d+\s+hours",
     ]
     for pattern in patterns:
@@ -553,7 +557,32 @@ def _extract_topic(title: str, instruction: str) -> str:
             candidate = _clean_topic(match.group(1))
             if candidate:
                 return candidate
+    title_match = re.search(r"daily\s+(.+?)\s+(?:24[\-‑ ]hour\s+)?summary", title, flags=re.IGNORECASE)
+    if title_match:
+        candidate = _clean_topic(title_match.group(1))
+        if candidate:
+            return candidate
+    title_match = re.search(r"(.+?)\s+daily\s+(?:24[\-‑ ]hour\s+)?summary", title, flags=re.IGNORECASE)
+    if title_match:
+        candidate = _clean_topic(title_match.group(1))
+        if candidate:
+            return candidate
+    title_match = re.search(r"daily\s+(.+?)\s+(?:24[\-‑ ]hour\s+)?analysis", title, flags=re.IGNORECASE)
+    if title_match:
+        candidate = _clean_topic(title_match.group(1))
+        if candidate:
+            return candidate
+    title_match = re.search(r"(.+?)\s+daily\s+(?:24[\-‑ ]hour\s+)?analysis", title, flags=re.IGNORECASE)
+    if title_match:
+        candidate = _clean_topic(title_match.group(1))
+        if candidate:
+            return candidate
     title_match = re.search(r"daily\s+(.+?)\s+(?:developments\s+)?briefing", title, flags=re.IGNORECASE)
+    if title_match:
+        candidate = _clean_topic(title_match.group(1))
+        if candidate:
+            return candidate
+    title_match = re.search(r"(.+?)\s+daily\s+(?:developments\s+)?briefing", title, flags=re.IGNORECASE)
     if title_match:
         candidate = _clean_topic(title_match.group(1))
         if candidate:
@@ -742,6 +771,7 @@ def _render_preserved_runtime_prompt(state: dict[str, Any]) -> str:
 
 def _normalize_workspace_path(value: Any) -> str:
     path = str(value or "").strip().replace("\\", "/")
+    path = re.sub(r"^(?:at\s+)+", "", path, flags=re.IGNORECASE)
     path = path.lstrip("/")
     if ".." in path.split("/"):
         return ""

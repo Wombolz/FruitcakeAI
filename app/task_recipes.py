@@ -219,10 +219,6 @@ def _resolve_recipe_family(
         return preferred
 
     lowered = f"{title}\n{instruction}".lower()
-    if task_type == "recurring" and any(marker in lowered for marker in ("watch", "monitor", "track", "follow")) and any(
-        marker in lowered for marker in ("news", "rss", "feed", "headline", "topic", "developments")
-    ):
-        return "topic_watcher"
     if "morning briefing" in lowered or (
         "calendar" in lowered and any(marker in lowered for marker in ("briefing", "headlines", "agenda"))
     ):
@@ -243,6 +239,14 @@ def _resolve_recipe_family(
     )
     if inferred.executor_config:
         return "daily_research_briefing"
+    if any(marker in lowered for marker in ("daily briefing", "daily summary", "daily analysis")) and any(
+        marker in lowered for marker in ("cached", "rss", "feed", "feeds", "last 24 hours", "past 24 hours", "previous 24 hours")
+    ):
+        return "daily_research_briefing"
+    if task_type == "recurring" and any(marker in lowered for marker in ("watch", "monitor", "track", "follow")) and any(
+        marker in lowered for marker in ("news", "rss", "feed", "headline", "topic", "developments")
+    ):
+        return "topic_watcher"
     return None
 
 

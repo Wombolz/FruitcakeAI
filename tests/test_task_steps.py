@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import select
 
 from app.config import settings
+from app.autonomy.planner import _normalize_steps
 from app.db.models import AuditLog, ChatSession, LLMUsageEvent, Memory, MemoryProposal, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
 from app.autonomy.profiles.news_magazine import _ground_output
 from app.autonomy.runner import _format_result_for_inbox, _persist_run_artifacts
@@ -163,6 +164,26 @@ async def test_maintenance_plan_uses_single_deterministic_step(client):
     rows = steps.json()
     assert [row["title"] for row in rows] == ["Execute Maintenance Action"]
     assert all(row["requires_approval"] is False for row in rows)
+
+
+def test_normalize_steps_drops_redundant_task_setup_steps():
+    rows = _normalize_steps(
+        [
+            {
+                "title": "Set Daily Reminder",
+                "instruction": "Create a daily reminder for 08:00 America/New_York to start the data collection process.",
+                "requires_approval": False,
+            },
+            {
+                "title": "Collect Data",
+                "instruction": "Gather cached RSS items for the previous 24 hours.",
+                "requires_approval": False,
+            },
+        ],
+        max_steps=8,
+    )
+
+    assert [row["title"] for row in rows] == ["Collect Data"]
 
 
 @pytest.mark.asyncio

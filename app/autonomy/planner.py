@@ -105,6 +105,9 @@ async def _generate_plan_steps(
         f"Goal: {goal}\n"
         f"Task instruction: {task_instruction}\n"
         f"Notes: {notes or 'None'}\n"
+        "The task row and schedule already exist.\n"
+        "Do not create steps that create another task, reminder, schedule, automation, or calendar event unless the task instruction explicitly asks for that.\n"
+        "For recurring tasks, start with the core work of the task itself, not setup.\n"
         "Keep steps actionable and ordered."
     )
 
@@ -153,6 +156,8 @@ def _normalize_steps(data: Any, max_steps: int) -> List[Dict[str, Any]]:
         instruction = str(item.get("instruction", "")).strip()
         if not title or not instruction:
             continue
+        if _is_redundant_setup_step(title=title, instruction=instruction):
+            continue
         out.append(
             {
                 "title": title[:255],
@@ -172,3 +177,28 @@ def _fallback_steps(goal: str, task_instruction: str, max_steps: int) -> List[Di
         {"title": "Summarize result", "instruction": "Provide a concise final summary and next actions.", "requires_approval": False},
     ]
     return steps[:max_steps]
+
+
+def _is_redundant_setup_step(*, title: str, instruction: str) -> bool:
+    text = f"{title} {instruction}".lower()
+    explicit_allowed_markers = (
+        "calendar event",
+        "create_event",
+        "remind me to",
+        "schedule a meeting",
+        "set an alarm",
+    )
+    if any(marker in text for marker in explicit_allowed_markers):
+        return False
+    blocked_phrases = (
+        "create a daily reminder",
+        "set daily reminder",
+        "set reminder",
+        "create reminder",
+        "create another task",
+        "create task",
+        "schedule task",
+        "set up schedule",
+        "create automation",
+    )
+    return any(phrase in text for phrase in blocked_phrases)

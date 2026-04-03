@@ -392,6 +392,13 @@ async def update_task_record(
             user_id=int(task.user_id),
             recipe=normalized_recipe,
         )
+        if (
+            normalized_recipe is not None
+            and recipe_family is not UNSET
+            and normalized_recipe.family != str(existing_recipe.get("family") or "").strip().lower()
+            and normalized_recipe.profile is None
+        ):
+            requested_profile_value = None
         if normalized_recipe is not None:
             if not title_changed:
                 task.title = normalized_recipe.title
