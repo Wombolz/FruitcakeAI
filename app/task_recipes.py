@@ -62,7 +62,12 @@ def normalize_task_recipe(
             params=params,
         )
     if family == "morning_briefing":
-        return _build_morning_briefing_recipe(task_type=task_type)
+        return _build_morning_briefing_recipe(
+            title=title,
+            instruction=instruction,
+            task_type=task_type,
+            params=params,
+        )
     if family == "iss_pass_watcher":
         return _build_iss_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
     if family == "weather_conditions":
@@ -191,6 +196,28 @@ def build_task_confirmation_text(
         profile=profile,
     )
     return f"Created task summary: {summary}."
+
+
+def build_task_draft_confirmation_text(
+    *,
+    title: str,
+    task_type: str,
+    schedule: str | None,
+    task_recipe: dict[str, Any] | None,
+    profile: str | None,
+) -> str:
+    created_text = build_task_confirmation_text(
+        title=title,
+        task_type=task_type,
+        schedule=schedule,
+        task_recipe=task_recipe,
+        profile=profile,
+    )
+    if created_text.startswith("Created "):
+        return "Draft ready: " + created_text[len("Created ") :]
+    if created_text.startswith("Created task summary:"):
+        return created_text.replace("Created task summary:", "Draft summary:", 1)
+    return created_text
 
 
 def _schedule_suffix(schedule: str | None) -> str:
@@ -328,18 +355,33 @@ def _build_daily_research_briefing_recipe(
     )
 
 
-def _build_morning_briefing_recipe(*, task_type: str) -> NormalizedTaskRecipe:
+def _build_morning_briefing_recipe(
+    *,
+    title: str,
+    instruction: str,
+    task_type: str,
+    params: dict[str, Any],
+) -> NormalizedTaskRecipe:
+    base_instruction = (
+        "Prepare a morning briefing for today using my calendar and current headlines.\n"
+        "Include today's schedule, notable headlines, and any important conflicts or priorities."
+    )
+    custom_guidance = _extract_morning_briefing_custom_guidance(
+        instruction=instruction,
+        params=params,
+        base_instruction=base_instruction,
+    )
+    normalized_instruction = base_instruction
+    if custom_guidance:
+        normalized_instruction = f"{base_instruction}\nAdditional guidance: {custom_guidance}"
     return NormalizedTaskRecipe(
         family="morning_briefing",
         confidence="high",
-        title="Morning Briefing",
-        instruction=(
-            "Prepare a morning briefing for today using my calendar and current headlines.\n"
-            "Include today's schedule, notable headlines, and any important conflicts or priorities."
-        ),
+        title=_string_param(params, "title") or title or "Morning Briefing",
+        instruction=normalized_instruction,
         task_type=task_type,
         profile="morning_briefing",
-        params={},
+        params={"custom_guidance": custom_guidance} if custom_guidance else {},
         assumptions=[],
     )
 
@@ -495,6 +537,32 @@ def _extract_timezone(instruction: str) -> str | None:
         return None
     candidate = str(match.group(1)).strip()
     return candidate if is_valid_timezone_name(candidate) else None
+
+
+def _extract_morning_briefing_custom_guidance(
+    *,
+    instruction: str,
+    params: dict[str, Any],
+    base_instruction: str,
+) -> str:
+    explicit = _string_param(params, "custom_guidance")
+    if explicit:
+        return explicit
+
+    cleaned = (instruction or "").strip()
+    if not cleaned:
+        return ""
+
+    cleaned_lower = cleaned.lower()
+    base_lower = base_instruction.lower()
+    if cleaned_lower == base_lower:
+        return ""
+
+    remainder = cleaned
+    if cleaned_lower.startswith(base_lower):
+        remainder = cleaned[len(base_instruction):].strip()
+    remainder = remainder.lstrip(":- \n")
+    return remainder.strip()
 
 
 def _extract_float(text: str, pattern: str) -> float | None:

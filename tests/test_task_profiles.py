@@ -127,6 +127,56 @@ def test_morning_briefing_validate_finalize_accepts_calendar_only():
     assert "Today at a glance" in result
 
 
+def test_morning_briefing_validate_finalize_accepts_standard_section_headings_with_content():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Today at a glance\n\n"
+            "- 09:00 Doctor appointment\n\n"
+            "## Headlines\n\n"
+            "- Market rallies after jobs report — [Read More](https://example.com/story)\n\n"
+            "## Worth your attention\n\n"
+            "- Leave early for the afternoon appointment."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "calendar_events": [{"title": "Doctor appointment"}],
+                "rss_items": [{"url": "https://example.com/story"}],
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is False
+    assert report["has_calendar_section"] is True
+    assert report["has_headlines_section"] is True
+
+
+def test_morning_briefing_validate_finalize_requires_calendar_section_when_events_present():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Headlines\n\n"
+            "- Market rallies after jobs report — [Read More](https://example.com/story)\n\n"
+            "## Worth your attention\n\n"
+            "- Leave early for the afternoon appointment."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "calendar_events": [{"title": "Doctor appointment"}],
+                "rss_items": [{"url": "https://example.com/story"}],
+            }
+        },
+        is_final_step=True,
+    )
+    assert result.startswith("## Headlines")
+    assert report is not None
+    assert report["fatal"] is True
+    assert "required calendar section" in report["fatal_reason"].lower()
+
+
 @pytest.mark.asyncio
 async def test_maintenance_profile_plan_steps_are_deterministic():
     profile = MaintenanceExecutionProfile()

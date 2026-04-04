@@ -50,6 +50,8 @@ class TaskCreate(BaseModel):
     active_hours_start: Optional[str] = None
     active_hours_end: Optional[str] = None
     active_hours_tz: Optional[str] = None
+    recipe_family: Optional[str] = None
+    recipe_params: Optional[Dict[str, Any]] = None
 
 
 class TaskPatch(BaseModel):
@@ -64,6 +66,8 @@ class TaskPatch(BaseModel):
     active_hours_start: Optional[str] = None
     active_hours_end: Optional[str] = None
     active_hours_tz: Optional[str] = None
+    recipe_family: Optional[str] = None
+    recipe_params: Optional[Dict[str, Any]] = None
     # Approval flow: set approved=True/False to resume or cancel a waiting_approval task
     approved: Optional[bool] = None
 
@@ -148,6 +152,8 @@ async def create_task(
             active_hours_start=body.active_hours_start,
             active_hours_end=body.active_hours_end,
             active_hours_tz=body.active_hours_tz,
+            recipe_family=body.recipe_family,
+            recipe_params=body.recipe_params,
             user_timezone=current_user.active_hours_tz,
         )
     except TaskValidationError as exc:
@@ -224,6 +230,8 @@ async def update_task(
             active_hours_start=body.active_hours_start if body.active_hours_start is not None else UNSET,
             active_hours_end=body.active_hours_end if body.active_hours_end is not None else UNSET,
             active_hours_tz=body.active_hours_tz if body.active_hours_tz is not None else UNSET,
+            recipe_family=body.recipe_family if "recipe_family" in fields_set else UNSET,
+            recipe_params=body.recipe_params if "recipe_params" in fields_set else UNSET,
             user_timezone=current_user.active_hours_tz,
         )
     except TaskValidationError as exc:

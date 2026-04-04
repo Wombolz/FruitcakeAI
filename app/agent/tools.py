@@ -445,9 +445,55 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "propose_task_draft",
+            "description": (
+                "Build a normalized task draft for the current user without saving it. "
+                "Use this when the user wants to create a task but should review the inferred family, schedule, topic, path, or assumptions before anything is persisted. "
+                "Prefer this over create_task when the task needs a reviewable draft in the task editor first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "task_type": {"type": "string", "enum": ["one_shot", "recurring"], "default": "one_shot"},
+                    "schedule": {"type": "string", "description": "Optional schedule like every:2h, cron, or ISO timestamp."},
+                    "deliver": {"type": "boolean", "default": True},
+                    "profile": {"type": "string", "description": "Optional built-in task profile name."},
+                    "recipe_family": {
+                        "type": "string",
+                        "enum": [
+                            "topic_watcher",
+                            "daily_research_briefing",
+                            "morning_briefing",
+                            "iss_pass_watcher",
+                            "weather_conditions",
+                            "maintenance",
+                        ],
+                        "description": "Optional high-confidence internal recipe family for stronger draft normalization.",
+                    },
+                    "recipe_params": {
+                        "type": "object",
+                        "description": "Optional structured task recipe params such as topic, path, location, or timezone.",
+                    },
+                    "llm_model_override": {"type": "string", "description": "Optional explicit model override for all LLM stages of this task."},
+                    "persona": {"type": "string", "description": "Optional persona override."},
+                    "requires_approval": {"type": "boolean", "default": True},
+                    "active_hours_start": {"type": "string"},
+                    "active_hours_end": {"type": "string"},
+                    "active_hours_tz": {"type": "string"},
+                },
+                "required": ["title", "instruction", "task_type", "deliver"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_task",
             "description": (
                 "Create a real persistent task for the current user. "
+                "Do not use this as the first step for a brand-new inferred task request when propose_task_draft can be used. "
                 "Before calling it, present a short normalized draft with what the task will do, when it will run, and any key assumptions. "
                 "Use this only after the user has explicitly confirmed those details. "
                 "Use it for recurring watchers, briefings, maintenance tasks, or one-shot tasks the user wants saved. "
@@ -833,6 +879,9 @@ async def _call_tool(
 
     if name == "create_task":
         return await _create_task(arguments, user_context)
+
+    if name == "propose_task_draft":
+        return await _propose_task_draft(arguments, user_context)
 
     if name == "update_task":
         return await _update_task(arguments, user_context)
@@ -1609,6 +1658,84 @@ async def _create_task(arguments: Dict[str, Any], user_context: UserContext) -> 
             "deliver": task.deliver,
             "requires_approval": task.requires_approval,
             "next_run_at": task.next_run_at.isoformat() if task.next_run_at is not None else None,
+        }
+    )
+
+
+async def _propose_task_draft(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    from app.db.session import AsyncSessionLocal
+    from app.task_recipes import build_task_draft_confirmation_text, build_task_recipe_summary
+    from app.task_service import TaskValidationError, build_task_draft_payload
+
+    title = str(arguments.get("title", "") or "").strip()
+    instruction = str(arguments.get("instruction", "") or "").strip()
+    task_type = str(arguments.get("task_type", "one_shot") or "one_shot").strip()
+
+    if not title:
+        return "title is required."
+    if not instruction:
+        return "instruction is required."
+    if task_type not in {"one_shot", "recurring"}:
+        return "task_type must be one_shot or recurring."
+
+    async with AsyncSessionLocal() as db:
+        try:
+            draft = await build_task_draft_payload(
+                db,
+                user_id=user_context.user_id,
+                title=title,
+                instruction=instruction,
+                persona=arguments.get("persona"),
+                profile=arguments.get("profile"),
+                recipe_family=arguments.get("recipe_family"),
+                recipe_params=arguments.get("recipe_params"),
+                llm_model_override=arguments.get("llm_model_override"),
+                task_type=task_type,
+                schedule=arguments.get("schedule"),
+                deliver=bool(arguments.get("deliver", True)),
+                requires_approval=bool(arguments.get("requires_approval", True)),
+                active_hours_start=arguments.get("active_hours_start"),
+                active_hours_end=arguments.get("active_hours_end"),
+                active_hours_tz=arguments.get("active_hours_tz"),
+                user_timezone=user_context.timezone,
+            )
+        except TaskValidationError as exc:
+            await db.rollback()
+            return str(exc)
+
+    return json.dumps(
+        {
+            "proposed": True,
+            "title": draft.title,
+            "instruction": draft.instruction,
+            "persona": draft.persona,
+            "profile": draft.profile,
+            "task_recipe": draft.task_recipe or None,
+            "task_summary": build_task_recipe_summary(
+                title=draft.title,
+                task_type=draft.task_type,
+                schedule=draft.schedule,
+                task_recipe=draft.task_recipe,
+                profile=draft.profile,
+            ),
+            "task_confirmation": build_task_draft_confirmation_text(
+                title=draft.title,
+                task_type=draft.task_type,
+                schedule=draft.schedule,
+                task_recipe=draft.task_recipe,
+                profile=draft.profile,
+            ),
+            "executor_kind": str((draft.executor_config or {}).get("kind") or "") or None,
+            "llm_model_override": draft.llm_model_override,
+            "task_type": draft.task_type,
+            "schedule": draft.schedule,
+            "deliver": draft.deliver,
+            "requires_approval": draft.requires_approval,
+            "active_hours_start": draft.active_hours_start,
+            "active_hours_end": draft.active_hours_end,
+            "active_hours_tz": draft.active_hours_tz,
+            "effective_timezone": draft.effective_timezone,
+            "next_run_at": draft.next_run_at.isoformat() if draft.next_run_at is not None else None,
         }
     )
 

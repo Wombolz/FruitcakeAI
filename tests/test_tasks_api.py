@@ -120,6 +120,89 @@ async def test_create_task_returns_recipe_metadata_for_normalized_watcher(client
 
 
 @pytest.mark.asyncio
+async def test_create_task_accepts_explicit_recipe_family_from_editor(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskeditoruser",
+            "email": "taskeditor@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskeditoruser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Daily Photography Briefing",
+            "instruction": "Append a daily research briefing about photography from the past 24 hours to workspace/photography/daily.md.",
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": True,
+            "recipe_family": "daily_research_briefing",
+            "recipe_params": {
+                "topic": "Photography",
+                "path": "workspace/photography/daily.md",
+                "window_hours": 24,
+            },
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert payload["task_recipe"]["selected_executor_kind"] == "configured_executor"
+    assert "append a daily research briefing" in payload["instruction"].lower()
+
+
+@pytest.mark.asyncio
+async def test_create_task_preserves_custom_guidance_for_morning_briefing(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskmorningeditoruser",
+            "email": "taskmorningeditor@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskmorningeditoruser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Morning Briefing",
+            "instruction": (
+                "Prepare a morning briefing for today using my calendar and current headlines.\n"
+                "Include today's schedule, notable headlines, and any important conflicts or priorities.\n"
+                "Also include a short bit of trivia about this day in history."
+            ),
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": True,
+            "recipe_family": "morning_briefing",
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["task_recipe"]["family"] == "morning_briefing"
+    assert "day in history" in payload["instruction"].lower()
+    assert payload["task_recipe"]["params"]["custom_guidance"].lower().startswith("also include")
+
+
+@pytest.mark.asyncio
 async def test_create_task_uses_user_timezone_when_task_timezone_missing(client):
     await client.post(
         "/auth/register",

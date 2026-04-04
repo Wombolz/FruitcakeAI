@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -122,6 +122,115 @@ class TaskUpdateResult:
     plan_inputs_changed: bool
 
 
+@dataclass(frozen=True)
+class TaskDraftPayload:
+    title: str
+    instruction: str
+    persona: Optional[str]
+    profile: Optional[str]
+    executor_config: dict[str, Any]
+    task_recipe: dict[str, Any]
+    llm_model_override: Optional[str]
+    task_type: str
+    schedule: Optional[str]
+    deliver: bool
+    requires_approval: bool
+    active_hours_start: Optional[str]
+    active_hours_end: Optional[str]
+    active_hours_tz: Optional[str]
+    next_run_at: datetime | None
+    effective_timezone: str
+
+
+async def build_task_draft_payload(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    title: str,
+    instruction: str,
+    persona: Optional[str] = None,
+    profile: Optional[str] = None,
+    llm_model_override: Optional[str] = None,
+    task_type: str = "one_shot",
+    schedule: Optional[str] = None,
+    deliver: bool = True,
+    requires_approval: bool = True,
+    active_hours_start: Optional[str] = None,
+    active_hours_end: Optional[str] = None,
+    active_hours_tz: Optional[str] = None,
+    user_timezone: Optional[str] = None,
+    recipe_family: Optional[str] = None,
+    recipe_params: Optional[dict] = None,
+) -> TaskDraftPayload:
+    if task_type not in {"one_shot", "recurring"}:
+        raise TaskValidationError("task_type must be one_shot or recurring.")
+
+    normalized_recipe = normalize_task_recipe(
+        title=title,
+        instruction=instruction,
+        task_type=task_type,
+        requested_profile=profile,
+        recipe_family=recipe_family,
+        recipe_params=recipe_params,
+    )
+    normalized_recipe = await _align_topic_watcher_sources(
+        db,
+        user_id=user_id,
+        recipe=normalized_recipe,
+    )
+    normalized_title = normalized_recipe.title if normalized_recipe is not None else title
+    normalized_instruction = normalized_recipe.instruction if normalized_recipe is not None else instruction
+    normalized_task_type = normalized_recipe.task_type if normalized_recipe is not None else task_type
+    normalized_profile = normalized_recipe.profile if normalized_recipe is not None and normalized_recipe.profile else profile
+    resolved_persona = resolve_task_persona(
+        title=normalized_title,
+        instruction=normalized_instruction,
+        requested_persona=persona,
+    )
+    inferred = infer_configured_executor(
+        title=normalized_title,
+        instruction=normalized_instruction,
+        task_type=normalized_task_type,
+        requested_profile=normalized_profile,
+    )
+    resolved_profile = inferred.profile if inferred.executor_config else infer_task_profile(
+        title=normalized_title,
+        instruction=normalized_instruction,
+        task_type=normalized_task_type,
+        requested_profile=normalized_profile,
+    )
+
+    return TaskDraftPayload(
+        title=normalized_title,
+        instruction=normalized_instruction,
+        persona=resolved_persona,
+        profile=resolved_profile,
+        executor_config=inferred.executor_config or {},
+        task_recipe=build_task_recipe_metadata(
+            normalized_recipe,
+            selected_profile=resolved_profile,
+            executor_config=inferred.executor_config,
+        ),
+        llm_model_override=(str(llm_model_override).strip() or None) if llm_model_override is not None else None,
+        task_type=normalized_task_type,
+        schedule=schedule,
+        deliver=deliver,
+        requires_approval=requires_approval,
+        active_hours_start=active_hours_start,
+        active_hours_end=active_hours_end,
+        active_hours_tz=active_hours_tz,
+        next_run_at=compute_next_run_at(
+            schedule,
+            task_timezone=active_hours_tz,
+            user_timezone=user_timezone,
+        ),
+        effective_timezone=effective_task_timezone(
+            task_timezone=active_hours_tz,
+            user_timezone=user_timezone,
+        ),
+    )
+
+
 async def _align_topic_watcher_sources(
     db: AsyncSession,
     *,
@@ -232,68 +341,43 @@ async def create_task_record(
     recipe_family: Optional[str] = None,
     recipe_params: Optional[dict] = None,
 ) -> Task:
-    if task_type not in {"one_shot", "recurring"}:
-        raise TaskValidationError("task_type must be one_shot or recurring.")
-    normalized_recipe = normalize_task_recipe(
-        title=title,
-        instruction=instruction,
-        task_type=task_type,
-        requested_profile=profile,
-        recipe_family=recipe_family,
-        recipe_params=recipe_params,
-    )
-    normalized_recipe = await _align_topic_watcher_sources(
+    draft = await build_task_draft_payload(
         db,
         user_id=user_id,
-        recipe=normalized_recipe,
-    )
-    normalized_title = normalized_recipe.title if normalized_recipe is not None else title
-    normalized_instruction = normalized_recipe.instruction if normalized_recipe is not None else instruction
-    normalized_task_type = normalized_recipe.task_type if normalized_recipe is not None else task_type
-    normalized_profile = normalized_recipe.profile if normalized_recipe is not None and normalized_recipe.profile else profile
-    resolved_persona = resolve_task_persona(
-        title=normalized_title,
-        instruction=normalized_instruction,
-        requested_persona=persona,
-    )
-    inferred = infer_configured_executor(
-        title=normalized_title,
-        instruction=normalized_instruction,
-        task_type=normalized_task_type,
-        requested_profile=normalized_profile,
-    )
-    resolved_profile = inferred.profile if inferred.executor_config else infer_task_profile(
-        title=normalized_title,
-        instruction=normalized_instruction,
-        task_type=normalized_task_type,
-        requested_profile=normalized_profile,
-    )
-    task = Task(
-        user_id=user_id,
-        title=normalized_title,
-        instruction=normalized_instruction,
-        persona=resolved_persona,
-        profile=resolved_profile,
-        executor_config=inferred.executor_config,
-        task_recipe=build_task_recipe_metadata(
-            normalized_recipe,
-            selected_profile=resolved_profile,
-            executor_config=inferred.executor_config,
-        ),
-        llm_model_override=(str(llm_model_override).strip() or None) if llm_model_override is not None else None,
-        task_type=normalized_task_type,
-        status="pending",
+        title=title,
+        instruction=instruction,
+        persona=persona,
+        profile=profile,
+        recipe_family=recipe_family,
+        recipe_params=recipe_params,
+        llm_model_override=llm_model_override,
+        task_type=task_type,
         schedule=schedule,
         deliver=deliver,
         requires_approval=requires_approval,
         active_hours_start=active_hours_start,
         active_hours_end=active_hours_end,
         active_hours_tz=active_hours_tz,
-        next_run_at=compute_next_run_at(
-            schedule,
-            task_timezone=active_hours_tz,
-            user_timezone=user_timezone,
-        ),
+        user_timezone=user_timezone,
+    )
+    task = Task(
+        user_id=user_id,
+        title=draft.title,
+        instruction=draft.instruction,
+        persona=draft.persona,
+        profile=draft.profile,
+        executor_config=draft.executor_config,
+        task_recipe=draft.task_recipe,
+        llm_model_override=draft.llm_model_override,
+        task_type=draft.task_type,
+        status="pending",
+        schedule=draft.schedule,
+        deliver=draft.deliver,
+        requires_approval=draft.requires_approval,
+        active_hours_start=draft.active_hours_start,
+        active_hours_end=draft.active_hours_end,
+        active_hours_tz=draft.active_hours_tz,
+        next_run_at=draft.next_run_at,
     )
     db.add(task)
     await db.flush()
