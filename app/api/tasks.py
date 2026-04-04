@@ -59,6 +59,7 @@ class TaskPatch(BaseModel):
     instruction: Optional[str] = None
     persona: Optional[str] = None
     profile: Optional[str] = None
+    task_type: Optional[str] = None
     llm_model_override: Optional[str] = None
     schedule: Optional[str] = None
     deliver: Optional[bool] = None
@@ -219,17 +220,18 @@ async def update_task(
         await update_task_record(
             db,
             task,
-            title=body.title if body.title is not None else UNSET,
-            instruction=body.instruction if body.instruction is not None else UNSET,
-            persona=body.persona if body.persona is not None else UNSET,
-            profile=body.profile if body.profile is not None else UNSET,
+            title=body.title if "title" in fields_set else UNSET,
+            instruction=body.instruction if "instruction" in fields_set else UNSET,
+            persona=body.persona if "persona" in fields_set else UNSET,
+            profile=body.profile if "profile" in fields_set else UNSET,
+            task_type=body.task_type if "task_type" in fields_set else UNSET,
             llm_model_override=body.llm_model_override if "llm_model_override" in fields_set else UNSET,
-            schedule=body.schedule if body.schedule is not None else UNSET,
-            deliver=body.deliver if body.deliver is not None else UNSET,
-            requires_approval=body.requires_approval if body.requires_approval is not None else UNSET,
-            active_hours_start=body.active_hours_start if body.active_hours_start is not None else UNSET,
-            active_hours_end=body.active_hours_end if body.active_hours_end is not None else UNSET,
-            active_hours_tz=body.active_hours_tz if body.active_hours_tz is not None else UNSET,
+            schedule=body.schedule if "schedule" in fields_set else UNSET,
+            deliver=body.deliver if "deliver" in fields_set else UNSET,
+            requires_approval=body.requires_approval if "requires_approval" in fields_set else UNSET,
+            active_hours_start=body.active_hours_start if "active_hours_start" in fields_set else UNSET,
+            active_hours_end=body.active_hours_end if "active_hours_end" in fields_set else UNSET,
+            active_hours_tz=body.active_hours_tz if "active_hours_tz" in fields_set else UNSET,
             recipe_family=body.recipe_family if "recipe_family" in fields_set else UNSET,
             recipe_params=body.recipe_params if "recipe_params" in fields_set else UNSET,
             user_timezone=current_user.active_hours_tz,

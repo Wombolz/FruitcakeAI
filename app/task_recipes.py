@@ -234,6 +234,8 @@ def _resolve_recipe_family(
     preferred_family: Optional[str],
 ) -> str | None:
     explicit_family = (recipe_family or "").strip().lower()
+    if recipe_family is not None and explicit_family == "":
+        return None
     if explicit_family in _RECIPE_FAMILIES:
         return explicit_family
 
