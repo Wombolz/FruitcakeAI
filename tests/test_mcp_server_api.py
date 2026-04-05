@@ -71,6 +71,7 @@ async def test_mcp_tools_list_includes_task_and_library_tools(client):
     assert "fruitcake_get_scheduler_health" in names
     assert "fruitcake_list_task_runs" in names
     assert "fruitcake_get_task_run_artifacts" in names
+    assert "fruitcake_get_memory_candidates" in names
 
 
 @pytest.mark.asyncio
@@ -353,3 +354,71 @@ async def test_mcp_get_task_run_artifacts_returns_owned_run_outputs(client):
     payload = json.loads(resp.json()["result"]["content"][0]["text"])
     assert payload["count"] >= 1
     assert any(artifact["artifact_type"] == "report_markdown" for artifact in payload["artifacts"])
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_memory_candidates_returns_decoded_candidates(client):
+    token = await _token(client, "mcpmemorycandidatesuser")
+    headers = _auth_headers(token)
+
+    me = await client.get("/auth/me", headers=headers)
+    user_id = int(me.json()["id"])
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=user_id,
+            title="Memory candidate task",
+            instruction="Inspect my memory candidates.",
+            task_type="recurring",
+            status="completed",
+            schedule="every:24h",
+            deliver=True,
+            requires_approval=True,
+        )
+        db.add(task)
+        await db.flush()
+        run = TaskRun(
+            task_id=task.id,
+            status="completed",
+            summary="Memory candidates emitted",
+        )
+        db.add(run)
+        await db.flush()
+        artifact = TaskRunArtifact(
+            task_run_id=run.id,
+            artifact_type="memory_candidates",
+            content_json=json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "proposal_key": "topic_openclaw_1",
+                            "content": "OpenClaw is becoming a recurring family discussion topic.",
+                            "status": "proposed",
+                        }
+                    ]
+                }
+            ),
+        )
+        db.add(artifact)
+        await db.commit()
+        task_id = task.id
+        run_id = run.id
+
+    resp = await client.post(
+        "/mcp/fruitcake/tools/call",
+        json={
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "fruitcake_get_memory_candidates",
+                "arguments": {"task_id": task_id, "run_id": run_id},
+            },
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    payload = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert payload["count"] == 1
+    assert payload["candidates"][0]["proposal_key"] == "topic_openclaw_1"

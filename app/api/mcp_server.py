@@ -209,6 +209,18 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["task_id", "run_id"],
         },
     },
+    {
+        "name": "fruitcake_get_memory_candidates",
+        "description": "Return decoded memory candidates for a user-owned task run when available.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer"},
+                "run_id": {"type": "integer"},
+            },
+            "required": ["task_id", "run_id"],
+        },
+    },
 ]
 
 
@@ -365,6 +377,41 @@ async def _tool_get_task_run_artifacts(arguments: Dict[str, Any], user: User) ->
     return json.dumps({"count": len(artifacts), "artifacts": artifacts}, ensure_ascii=False)
 
 
+async def _tool_get_memory_candidates(arguments: Dict[str, Any], user: User) -> str:
+    from sqlalchemy import select
+
+    from app.db.models import Task, TaskRun
+    from app.db.session import AsyncSessionLocal
+    from app.memory.review_service import decode_proposal_payload, latest_memory_candidates_artifact
+
+    try:
+        task_id = int(arguments.get("task_id"))
+        run_id = int(arguments.get("run_id"))
+    except Exception:
+        return "task_id and run_id are required integers."
+
+    async with AsyncSessionLocal() as db:
+        run_result = await db.execute(
+            select(TaskRun, Task)
+            .join(Task, TaskRun.task_id == Task.id)
+            .where(Task.id == task_id, TaskRun.id == run_id, Task.user_id == user.id)
+        )
+        owned_run = run_result.first()
+        if owned_run is None:
+            return "Task run not found."
+
+        artifact = await latest_memory_candidates_artifact(db, task_run_id=run_id)
+        if artifact is None:
+            return json.dumps({"count": 0, "candidates": []}, ensure_ascii=False)
+
+        payload = decode_proposal_payload(artifact.content_json)
+        candidates = payload.get("candidates") or []
+        if not isinstance(candidates, list):
+            candidates = []
+
+    return json.dumps({"count": len(candidates), "candidates": candidates}, ensure_ascii=False)
+
+
 _TOOL_HANDLERS: dict[str, Callable[[Dict[str, Any], User], Awaitable[str]]] = {
     "fruitcake_list_tasks": _tool_list_tasks,
     "fruitcake_get_task": _tool_get_task,
@@ -377,6 +424,7 @@ _TOOL_HANDLERS: dict[str, Callable[[Dict[str, Any], User], Awaitable[str]]] = {
     "fruitcake_get_scheduler_health": _tool_get_scheduler_health,
     "fruitcake_list_task_runs": _tool_list_task_runs,
     "fruitcake_get_task_run_artifacts": _tool_get_task_run_artifacts,
+    "fruitcake_get_memory_candidates": _tool_get_memory_candidates,
 }
 
 
