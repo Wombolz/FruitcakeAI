@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -986,3 +987,159 @@ async def test_mcp_get_task_health_rollup_summarizes_recent_run_patterns(client)
     assert "repeated_error_pattern_detected" in payload["findings"]
     assert "cancellation_churn_detected" in payload["findings"]
     assert "failed_or_cancelled_runs_missing_artifacts" in payload["findings"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_task_health_rollup_accepts_named_window_aliases(client):
+    from sqlalchemy import select
+
+    from app.db.models import Task, TaskRun, User
+
+    token = await _token(client, "mcpwindowaliasuser")
+    headers = _auth_headers(token)
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "mcpwindowaliasuser"))
+        ).scalar_one()
+        task = Task(
+            user_id=user.id,
+            title="Window alias task",
+            instruction="Inspect window alias handling.",
+            profile="topic_watcher",
+            task_type="recurring",
+            status="pending",
+            schedule="every:6h",
+            deliver=True,
+            requires_approval=False,
+        )
+        db.add(task)
+        await db.flush()
+        now = datetime.now(timezone.utc)
+        db.add_all(
+            [
+                TaskRun(
+                    task_id=task.id,
+                    status="completed",
+                    started_at=now - timedelta(hours=12),
+                    finished_at=now - timedelta(hours=11),
+                ),
+                TaskRun(
+                    task_id=task.id,
+                    status="completed",
+                    started_at=now - timedelta(days=3),
+                    finished_at=now - timedelta(days=3) + timedelta(minutes=5),
+                ),
+            ]
+        )
+        await db.commit()
+        task_id = task.id
+
+    resp = await client.post(
+        "/mcp/fruitcake/tools/call",
+        json={
+            "jsonrpc": "2.0",
+            "id": 19,
+            "method": "tools/call",
+            "params": {
+                "name": "fruitcake_get_task_health_rollup",
+                "arguments": {"task_id": task_id, "window": "rollup_7d"},
+            },
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()["result"]["structuredContent"]
+    assert payload["found"] is True
+    assert payload["window_hours"] == 168
+    assert payload["run_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_task_health_rollup_flags_memory_candidate_source_contradiction(client):
+    token = await _token(client, "mcprollupoverlapuser")
+    headers = _auth_headers(token)
+
+    me = await client.get("/auth/me", headers=headers)
+    user_id = int(me.json()["id"])
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=user_id,
+            title="NASA rollup watcher",
+            instruction="Inspect rollup candidate/source mismatch.",
+            profile="topic_watcher",
+            task_type="recurring",
+            status="completed",
+            schedule="every:24h",
+            deliver=True,
+            requires_approval=False,
+        )
+        db.add(task)
+        await db.flush()
+        run = TaskRun(
+            task_id=task.id,
+            status="completed",
+            started_at=datetime.now(timezone.utc) - timedelta(days=3),
+            finished_at=datetime.now(timezone.utc) - timedelta(days=3) + timedelta(minutes=2),
+        )
+        db.add(run)
+        await db.flush()
+        db.add_all(
+            [
+                TaskRunArtifact(
+                    task_run_id=run.id,
+                    artifact_type="prepared_dataset",
+                    content_json=json.dumps(
+                        {
+                            "topic": "NASA",
+                            "notes": "Artemis and orbital photography",
+                            "rss_items": [
+                                {"title": "Artemis imagery update"},
+                                {"title": "NASA shares new orbital photography"},
+                            ],
+                            "source_inventory": {"active_sources": [{"name": "NASA"}]},
+                        }
+                    ),
+                ),
+                TaskRunArtifact(
+                    task_run_id=run.id,
+                    artifact_type="memory_candidates",
+                    content_json=json.dumps(
+                        {
+                            "candidates": [
+                                {
+                                    "proposal_key": "nasa_bad_candidate",
+                                    "topic": "NASA",
+                                    "content": "On 2026-04-05, reports about NASA indicated military activity, based on coverage from NASA.",
+                                }
+                            ]
+                        }
+                    ),
+                ),
+            ]
+        )
+        await db.commit()
+        task_id = task.id
+
+    resp = await client.post(
+        "/mcp/fruitcake/tools/call",
+        json={
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "fruitcake_get_task_health_rollup",
+                "arguments": {"task_id": task_id, "window": "7d"},
+            },
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()["result"]["structuredContent"]
+    assert payload["found"] is True
+    assert payload["memory_candidate_run_count"] == 1
+    assert payload["inspection_finding_counts"]["memory_candidate_low_source_overlap"] == 1
+    assert "memory_candidate_source_contradiction_detected" in payload["findings"]

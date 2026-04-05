@@ -254,6 +254,7 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "task_id": {"type": "integer"},
                 "window_hours": {"type": "integer", "default": 24},
+                "window": {"type": "string"},
             },
             "required": ["task_id"],
         },
@@ -294,6 +295,42 @@ def _bool_arg(arguments: Dict[str, Any], key: str, default: bool = False) -> boo
         if lowered in {"0", "false", "no", "off"}:
             return False
     return bool(value)
+
+
+def _window_hours_arg(arguments: Dict[str, Any], *, default: int = 24) -> int:
+    raw = arguments.get("window_hours")
+    if raw is None:
+        raw = arguments.get("window")
+    if raw is None:
+        return default
+
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        hours = int(raw)
+        return max(1, min(24 * 14, hours))
+
+    value = str(raw).strip().lower()
+    aliases = {
+        "24h": 24,
+        "48h": 48,
+        "72h": 72,
+        "7d": 24 * 7,
+        "14d": 24 * 14,
+        "rollup_24h": 24,
+        "rollup_48h": 48,
+        "rollup_72h": 72,
+        "rollup_7d": 24 * 7,
+        "rollup_14d": 24 * 14,
+    }
+    if value in aliases:
+        return aliases[value]
+    try:
+        if value.endswith("h"):
+            return max(1, min(24 * 14, int(value[:-1].strip())))
+        if value.endswith("d"):
+            return max(1, min(24 * 14, int(value[:-1].strip()) * 24))
+        return max(1, min(24 * 14, int(value)))
+    except Exception:
+        return default
 
 
 def _preview(value: str | None, *, limit: int = _SUMMARY_PREVIEW_LIMIT) -> str | None:
@@ -966,10 +1003,7 @@ async def _tool_get_task_health_rollup(arguments: Dict[str, Any], user: User) ->
         task_id = int(arguments.get("task_id"))
     except Exception:
         return "task_id is required and must be an integer."
-    try:
-        window_hours = max(1, min(24 * 14, int(arguments.get("window_hours", 24))))
-    except Exception:
-        window_hours = 24
+    window_hours = _window_hours_arg(arguments, default=24)
 
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(hours=window_hours)
@@ -990,17 +1024,21 @@ async def _tool_get_task_health_rollup(arguments: Dict[str, Any], user: User) ->
         run_ids = [run.id for run in run_rows]
         artifact_run_ids: set[int] = set()
         memory_candidate_run_ids: set[int] = set()
+        artifact_rows_by_run: dict[int, list[Any]] = {}
         if run_ids:
             artifact_rows = (
                 await db.execute(
-                    select(TaskRunArtifact.task_run_id, TaskRunArtifact.artifact_type)
+                    select(TaskRunArtifact)
                     .where(TaskRunArtifact.task_run_id.in_(run_ids))
+                    .order_by(desc(TaskRunArtifact.created_at), desc(TaskRunArtifact.id))
                 )
-            ).all()
-            for task_run_id, artifact_type in artifact_rows:
-                artifact_run_ids.add(int(task_run_id))
-                if artifact_type == "memory_candidates":
-                    memory_candidate_run_ids.add(int(task_run_id))
+            ).scalars().all()
+            for artifact in artifact_rows:
+                task_run_id = int(artifact.task_run_id)
+                artifact_rows_by_run.setdefault(task_run_id, []).append(artifact)
+                artifact_run_ids.add(task_run_id)
+                if artifact.artifact_type == "memory_candidates":
+                    memory_candidate_run_ids.add(task_run_id)
 
     status_counts = Counter(str(run.status or "") for run in run_rows)
     total_runs = len(run_rows)
@@ -1035,12 +1073,30 @@ async def _tool_get_task_health_rollup(arguments: Dict[str, Any], user: User) ->
             summary_bits.append(f"{cancelled_count} cancelled")
 
     findings: list[str] = []
+    per_run_findings: Counter[str] = Counter()
+    for run in run_rows:
+        raw_artifacts = artifact_rows_by_run.get(int(run.id), [])
+        artifacts = [
+            _summarize_artifact(artifact, detail="summary", include_raw=False)
+            for artifact in raw_artifacts
+        ]
+        memory_candidates = _collect_memory_candidates_from_artifacts(raw_artifacts)
+        for finding in _inspection_findings(
+            task=task,
+            run=run,
+            artifacts=artifacts,
+            memory_candidates=memory_candidates,
+        ):
+            per_run_findings[finding] += 1
+
     if failed_count and repeated_error_messages and repeated_error_messages[0]["count"] >= 2:
         findings.append("repeated_error_pattern_detected")
     if cancelled_count >= 2:
         findings.append("cancellation_churn_detected")
     if no_artifact_failures:
         findings.append("failed_or_cancelled_runs_missing_artifacts")
+    if per_run_findings.get("memory_candidate_low_source_overlap", 0):
+        findings.append("memory_candidate_source_contradiction_detected")
 
     return {
         "found": True,
@@ -1056,6 +1112,7 @@ async def _tool_get_task_health_rollup(arguments: Dict[str, Any], user: User) ->
         "waiting_approval_count": waiting_approval_count,
         "running_count": running_count,
         "memory_candidate_run_count": len(memory_candidate_run_ids),
+        "inspection_finding_counts": dict(per_run_findings),
         "success_rate": success_rate,
         "cancellation_rate": cancellation_rate,
         "average_duration_seconds": average_duration_seconds,
