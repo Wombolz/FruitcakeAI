@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -14,12 +15,13 @@ from app.autonomy.profiles.maintenance import (
 from app.autonomy.profiles.morning_briefing import MorningBriefingExecutionProfile
 from app.autonomy.profiles.iss_pass_watcher import ISSPassWatcherExecutionProfile
 from app.autonomy.profiles.weather_conditions import WeatherConditionsExecutionProfile
+from app.autonomy.profiles.base import TaskExecutionProfile
 from app.autonomy.profiles.topic_watcher import (
     TopicWatcherExecutionProfile,
     _parse_topic_watcher_instruction,
 )
 from app.autonomy.runner import TaskRunner
-from app.db.models import Memory, MemoryProposal, RSSPublishedItem, Task
+from app.db.models import Memory, MemoryProposal, RSSPublishedItem, Task, TaskRun, TaskRunArtifact, TaskStep
 from tests.conftest import TestSessionLocal
 
 
@@ -1220,6 +1222,124 @@ async def test_topic_watcher_runner_does_not_push_nothing_new(client):
         assert task.status == "completed"
         assert task.result == "NOTHING_NEW"
     push_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_briefing_runner_persists_artifacts_for_fatal_validation_failure(client):
+    headers = await _headers(client, "briefingartifactowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Morning briefing",
+            "instruction": "Prepare a morning briefing for today using my calendar and current headlines.",
+            "deliver": False,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+    runner = TaskRunner()
+
+    class _FatalArtifactProfile(TaskExecutionProfile):
+        name = "briefing"
+
+        async def plan_steps(
+            self,
+            *,
+            goal,
+            user_id,
+            task_id,
+            task_instruction,
+            max_steps,
+            notes,
+            style,
+            model_override,
+            default_planner,
+        ):
+            del goal, user_id, task_id, task_instruction, max_steps, notes, style, model_override, default_planner
+            return [
+                {
+                    "title": "Assemble Briefing",
+                    "instruction": "Assemble the briefing from the prepared dataset only.",
+                    "requires_approval": False,
+                }
+            ]
+
+        async def prepare_run_context(self, *, db, user_id, task_id, task_run_id):
+            del db, user_id, task_id, task_run_id
+            return {
+                "dataset": {"briefing_mode": "morning", "rss_items": [{"url": "https://example.com/story"}]},
+                "dataset_stats": {"rss_count": 1},
+                "refresh_stats": {"sources_refreshed": 1},
+            }
+
+        def effective_blocked_tools(self, *, run_context):
+            del run_context
+            return {"web_search"}
+
+        def validate_finalize(self, *, result, prior_full_outputs, run_context, is_final_step):
+            del prior_full_outputs, is_final_step
+            return result, {
+                "fatal": True,
+                "fatal_reason": "Morning briefing did not produce any publishable section.",
+                "briefing_mode": "morning",
+                "rss_count": len((run_context.get("dataset") or {}).get("rss_items") or []),
+            }
+
+        def artifact_payloads(self, *, final_markdown, run_debug):
+            return [
+                {"artifact_type": "prepared_dataset", "content_json": run_debug.get("dataset", {})},
+                {"artifact_type": "final_output", "content_text": final_markdown},
+                {"artifact_type": "validation_report", "content_json": run_debug.get("grounding_report", {})},
+                {"artifact_type": "run_diagnostics", "content_json": {"dataset_stats": run_debug.get("dataset_stats", {})}},
+            ]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.has_plan = True
+        task.current_step_index = 1
+        task.status = "running"
+        db.add(
+            TaskStep(
+                task_id=task_id,
+                step_index=1,
+                title="Assemble Briefing",
+                instruction="Assemble the briefing from the prepared dataset only.",
+                status="pending",
+                requires_approval=False,
+            )
+        )
+        run = TaskRun(task_id=task_id, status="running")
+        db.add(run)
+        await db.commit()
+        await db.refresh(run)
+        task_run_id = run.id
+
+    with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+        with patch("app.autonomy.runner.resolve_task_execution_contract", return_value=_FatalArtifactProfile()):
+            with patch("app.agent.core.run_agent", new=AsyncMock(return_value="Briefing with no valid sections.")):
+                with pytest.raises(RuntimeError, match="publishable section"):
+                    await runner._execute_agent(task_id, task_run_id=task_run_id)
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "failed"
+        runs = await db.execute(
+            select(TaskRun).where(TaskRun.task_id == task_id).order_by(TaskRun.started_at.desc())
+        )
+        latest = runs.scalars().first()
+        assert latest is not None
+        artifacts = await db.execute(
+            select(TaskRunArtifact).where(TaskRunArtifact.task_run_id == latest.id)
+        )
+        by_type = {a.artifact_type: a for a in artifacts.scalars().all()}
+        assert "prepared_dataset" in by_type
+        assert "final_output" in by_type
+        assert "validation_report" in by_type
+        validation_payload = json.loads(by_type["validation_report"].content_json)
+        assert validation_payload["fatal"] is True
+        assert "publishable section" in validation_payload["fatal_reason"].lower()
 
 
 async def _headers(client, username: str) -> dict[str, str]:
