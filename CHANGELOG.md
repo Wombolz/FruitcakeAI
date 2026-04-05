@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.7.11
+
+Release date:
+- 2026-04-05
+
+This release turns the new Fruitcake MCP surface into a practical developer-loop and operator inspection tool: Codex can now inspect real task/library/runtime state directly, and aggregate task health rollups make recurring failures, cancellation churn, and suspicious memory-candidate contradictions easier to spot.
+
+### Added
+
+- bounded authenticated Fruitcake MCP HTTP surface for:
+  - task list / get / draft / create / update
+  - library list / search / summarize
+  - scheduler health and recent task runs
+- higher-level run inspection tools with summarized artifacts, structured content, and memory-candidate visibility
+- aggregate task health rollups with success/failure/cancellation summaries over a selected time window
+- MCP-friendly rollup window aliases like `24h`, `7d`, and `rollup_7d`
+- direct inspection signals for repeated errors, no-artifact failed/cancelled runs, and aggregate contradiction-style memory candidate findings
+
+### Fixed
+
+- direct Codex MCP testing no longer requires stitching raw artifacts together just to understand task health
+- rollup windows now honor friendly live MCP values instead of silently collapsing back to the default 24-hour window
+- aggregate rollups now surface contradiction-style memory candidate issues that were previously only visible in single-run inspection
+
+### Operator Notes
+
+- this slice is primarily enabling infrastructure for the development loop; it shortens diagnosis time while the roadmap returns to product/runtime work
+- the MCP surface is also the early shape of a future admin/control plane, but it should remain bounded and expanded only when it materially improves testing or operator visibility
+
 ## v0.7.10
 
 Release date:
