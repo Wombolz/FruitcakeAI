@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.autonomy.profiles.default import DefaultTaskExecutionProfile
 from app.autonomy.profiles.iss_pass_watcher import ISSPassWatcherExecutionProfile
 from app.autonomy.profiles.maintenance import MaintenanceExecutionProfile
-from app.autonomy.profiles.morning_briefing import MorningBriefingExecutionProfile
+from app.autonomy.profiles.morning_briefing import BriefingExecutionProfile, MorningBriefingExecutionProfile
 from app.autonomy.profiles.news_magazine import NewsMagazineExecutionProfile
 from app.autonomy.profiles.weather_conditions import WeatherConditionsExecutionProfile
 from app.autonomy.profiles.topic_watcher import TopicWatcherExecutionProfile
@@ -14,6 +14,7 @@ ALLOWED_TASK_PROFILES = {
     "rss_newspaper",
     "news_magazine",
     "maintenance",
+    "briefing",
     "morning_briefing",
     "weather_conditions",
     "topic_watcher",
@@ -30,8 +31,8 @@ def resolve_task_profile_by_name(value: str | None):
     value = (value or "").strip().lower()
     if value in _RSS_NEWSPAPER_ALIASES:
         return NewsMagazineExecutionProfile()
-    if value == "morning_briefing":
-        return MorningBriefingExecutionProfile()
+    if value in {"briefing", "morning_briefing"}:
+        return BriefingExecutionProfile() if value == "briefing" else MorningBriefingExecutionProfile()
     if value == "weather_conditions":
         return WeatherConditionsExecutionProfile()
     if value == "topic_watcher":
@@ -53,8 +54,10 @@ def normalize_task_profile(value: str | None) -> str | None:
         raise ValueError(
             "Unknown profile "
             f"'{value}'. Allowed: default, rss_newspaper, news_magazine, maintenance, "
-            "morning_briefing, weather_conditions, topic_watcher, iss_pass_watcher"
+            "briefing, morning_briefing, weather_conditions, topic_watcher, iss_pass_watcher"
         )
     if v in _RSS_NEWSPAPER_ALIASES:
         return "rss_newspaper"
+    if v == "morning_briefing":
+        return "briefing"
     return v

@@ -499,7 +499,7 @@ def _task_handoff_message(
             schedule = str(payload.get("schedule") or "").strip()
             profile = str(payload.get("profile") or "").strip()
             recipe_family = str(((payload.get("task_recipe") or {}).get("family") or "")).strip()
-            if saw_plan or task_type == "recurring" or profile in {"topic_watcher", "iss_pass_watcher", "rss_newspaper", "maintenance", "morning_briefing"}:
+            if saw_plan or task_type == "recurring" or profile in {"topic_watcher", "iss_pass_watcher", "rss_newspaper", "maintenance", "morning_briefing", "briefing"}:
                 details = []
                 if schedule:
                     details.append(f"schedule={schedule}")

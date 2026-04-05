@@ -464,6 +464,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "string",
                         "enum": [
                             "topic_watcher",
+                            "briefing",
                             "daily_research_briefing",
                             "morning_briefing",
                             "iss_pass_watcher",
@@ -513,6 +514,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "string",
                         "enum": [
                             "topic_watcher",
+                            "briefing",
                             "daily_research_briefing",
                             "morning_briefing",
                             "iss_pass_watcher",
@@ -560,6 +562,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "string",
                         "enum": [
                             "topic_watcher",
+                            "briefing",
                             "daily_research_briefing",
                             "morning_briefing",
                             "iss_pass_watcher",

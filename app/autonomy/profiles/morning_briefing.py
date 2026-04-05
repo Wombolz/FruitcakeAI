@@ -12,7 +12,7 @@ from app.db.models import Task, User
 from app.mcp.servers.calendar import _dedupe_events, _get_provider
 
 _MAX_RSS_ITEMS = 8
-_MAX_WORDS = 600
+_MAX_WORDS = 650
 _PLACEHOLDER_HEADINGS = {
     "today",
     "news",
@@ -22,8 +22,8 @@ _PLACEHOLDER_HEADINGS = {
 _EMPTY_RESULT = "Nothing to brief today - no calendar events and no fresh headlines."
 
 
-class MorningBriefingExecutionProfile(TaskExecutionProfile):
-    name = "morning_briefing"
+class BriefingExecutionProfile(TaskExecutionProfile):
+    name = "briefing"
 
     async def plan_steps(
         self,
@@ -41,8 +41,8 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
         del goal, user_id, task_id, task_instruction, max_steps, notes, style, model_override, default_planner
         return [
             {
-                "title": "Assemble Morning Briefing",
-                "instruction": "Assemble the morning briefing from the prepared calendar and RSS datasets only.",
+                "title": "Assemble Briefing",
+                "instruction": "Assemble the briefing from the prepared calendar and RSS datasets only.",
                 "requires_approval": False,
             }
         ]
@@ -57,23 +57,37 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
     ) -> Dict[str, Any]:
         task = await db.get(Task, task_id)
         user = await db.get(User, user_id)
+        recipe = task.task_recipe if isinstance(getattr(task, "task_recipe", None), dict) else {}
+        params = recipe.get("params") if isinstance(recipe.get("params"), dict) else {}
+        briefing_mode = _resolve_briefing_mode(task=task, params=params)
+
         tz_name = getattr(task, "active_hours_tz", None) or getattr(user, "active_hours_tz", None) or "UTC"
         local_now = datetime.now(ZoneInfo(tz_name))
         day_start = datetime.combine(local_now.date(), time.min, tzinfo=local_now.tzinfo)
         day_end = day_start + timedelta(days=1)
+        tomorrow_start = day_end
+        tomorrow_end = tomorrow_start + timedelta(days=1)
 
         provider = _get_provider()
-        events: list[dict[str, Any]] = []
+        today_events: list[dict[str, Any]] = []
+        tomorrow_events: list[dict[str, Any]] = []
         calendar_error = ""
         if provider is not None:
             try:
-                events = await provider.list_events(
+                today_events = await provider.list_events(
                     calendar_id=None,
                     start=day_start.astimezone(timezone.utc).isoformat(),
                     end=day_end.astimezone(timezone.utc).isoformat(),
                     max_results=20,
                 )
-                events = _dedupe_events(events)
+                tomorrow_events = await provider.list_events(
+                    calendar_id=None,
+                    start=tomorrow_start.astimezone(timezone.utc).isoformat(),
+                    end=tomorrow_end.astimezone(timezone.utc).isoformat(),
+                    max_results=20,
+                )
+                today_events = _dedupe_events(today_events)
+                tomorrow_events = _dedupe_events(tomorrow_events)
             except Exception as exc:
                 calendar_error = str(exc)
 
@@ -88,7 +102,9 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
         )
         rss_items = list(rss_dataset.get("items") or [])[:_MAX_RSS_ITEMS]
         dataset = {
-            "calendar_events": [_normalize_event(ev, local_now) for ev in events],
+            "briefing_mode": briefing_mode,
+            "calendar_events": [_normalize_event(ev, local_now) for ev in today_events],
+            "tomorrow_events": [_normalize_event(ev, local_now) for ev in tomorrow_events],
             "rss_items": rss_items,
             "timezone": tz_name,
             "local_date": local_now.date().isoformat(),
@@ -97,7 +113,9 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
             "dataset": dataset,
             "dataset_prompt": _format_prompt_dataset(dataset),
             "dataset_stats": {
+                "briefing_mode": briefing_mode,
                 "calendar_count": len(dataset["calendar_events"]),
+                "tomorrow_calendar_count": len(dataset["tomorrow_events"]),
                 "rss_count": len(rss_items),
                 "rss_dataset_stats": rss_dataset.get("stats", {}),
             },
@@ -110,9 +128,6 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
     def effective_blocked_tools(self, *, run_context: Dict[str, Any]) -> set[str]:
         del run_context
         return {
-            # This profile should synthesize only from the prepared calendar and
-            # RSS datasets. Leaving unrelated task/memory/admin tools visible
-            # makes local models more brittle without improving the result.
             "add_memory_observations",
             "api_request",
             "create_and_run_task_plan",
@@ -149,9 +164,14 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
         is_final_step: bool,
     ) -> None:
         del is_final_step
-        prompt_parts.append(load_profile_spec_text(self.name))
+        prompt_parts.append(load_profile_spec_text("morning_briefing"))
         dataset = run_context.get("dataset") or {}
-        if dataset.get("calendar_events"):
+        briefing_mode = str(dataset.get("briefing_mode") or "morning")
+        if briefing_mode == "evening":
+            prompt_parts.append(
+                "This is an evening briefing. Prefer a `## Day in review` section, then `## Tomorrow at a glance` when tomorrow events exist, followed by headlines and attention items."
+            )
+        elif dataset.get("calendar_events"):
             prompt_parts.append(
                 "Calendar events are present in the prepared dataset. You must include a `## Today at a glance` section before any headlines."
             )
@@ -172,18 +192,21 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
             return result, None
 
         dataset = run_context.get("dataset") or {}
+        briefing_mode = str(dataset.get("briefing_mode") or "morning")
         events = list(dataset.get("calendar_events") or [])
+        tomorrow_events = list(dataset.get("tomorrow_events") or [])
         rss_items = list(dataset.get("rss_items") or [])
         allowed_urls = {str(item.get("url") or "").strip() for item in rss_items if item.get("url")}
         text = (result or "").strip()
         if not text:
             text = _EMPTY_RESULT if not events and not rss_items else text
 
-        if not events and not rss_items:
+        if not events and not rss_items and not tomorrow_events:
             return _EMPTY_RESULT, {
                 "fatal": False,
                 "publish_mode": "empty",
                 "empty_result": True,
+                "briefing_mode": briefing_mode,
                 "calendar_count": 0,
                 "rss_count": 0,
             }
@@ -197,35 +220,50 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
             if _is_placeholder_heading(match)
         )
         has_calendar = "## Today at a glance" in text
+        has_day_review = "## Day in review" in text
+        has_tomorrow = "## Tomorrow at a glance" in text
         has_headlines = "## Headlines" in text
         has_attention = "## Worth your attention" in text
         fatal = False
         fatal_reason = ""
         if invalid_urls:
             fatal = True
-            fatal_reason = "Morning briefing contains URL(s) not present in prepared RSS dataset."
+            fatal_reason = "Briefing contains URL(s) not present in prepared RSS dataset."
         elif word_count > _MAX_WORDS:
             fatal = True
-            fatal_reason = f"Morning briefing exceeded {_MAX_WORDS} words."
+            fatal_reason = f"Briefing exceeded {_MAX_WORDS} words."
         elif placeholder_hits:
             fatal = True
-            fatal_reason = "Morning briefing contains placeholder section headings."
-        elif events and not has_calendar:
+            fatal_reason = "Briefing contains placeholder section headings."
+        elif briefing_mode == "morning" and events and not has_calendar:
             fatal = True
             fatal_reason = "Morning briefing omitted the required calendar section despite prepared calendar events."
-        elif not has_calendar and not has_headlines:
+        elif briefing_mode == "evening" and not has_day_review:
+            fatal = True
+            fatal_reason = "Evening briefing omitted the required day-in-review section."
+        elif briefing_mode == "evening" and tomorrow_events and not has_tomorrow:
+            fatal = True
+            fatal_reason = "Evening briefing omitted the required tomorrow section despite prepared next-day events."
+        elif briefing_mode == "morning" and not has_calendar and not has_headlines:
             fatal = True
             fatal_reason = "Morning briefing did not produce any publishable section."
+        elif briefing_mode == "evening" and not has_day_review and not has_headlines:
+            fatal = True
+            fatal_reason = "Evening briefing did not produce any publishable section."
 
         report = {
             "fatal": fatal,
             "fatal_reason": fatal_reason,
             "publish_mode": "full" if not fatal else "invalid",
+            "briefing_mode": briefing_mode,
             "calendar_count": len(events),
+            "tomorrow_calendar_count": len(tomorrow_events),
             "rss_count": len(rss_items),
             "word_count": word_count,
             "invalid_urls": invalid_urls,
             "has_calendar_section": has_calendar,
+            "has_day_review_section": has_day_review,
+            "has_tomorrow_section": has_tomorrow,
             "has_headlines_section": has_headlines,
             "has_attention_section": has_attention,
         }
@@ -248,6 +286,22 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
             out.append({"artifact_type": "validation_report", "content_json": grounding})
         out.extend(super().artifact_payloads(final_markdown="", run_debug=run_debug))
         return out
+
+
+MorningBriefingExecutionProfile = BriefingExecutionProfile
+
+
+def _resolve_briefing_mode(*, task: Task, params: Dict[str, Any]) -> str:
+    explicit = str(params.get("briefing_mode") or "").strip().lower()
+    if explicit in {"morning", "evening"}:
+        return explicit
+    title = str(getattr(task, "title", "") or "").lower()
+    instruction = str(getattr(task, "instruction", "") or "").lower()
+    if getattr(task, "profile", "") == "morning_briefing":
+        return "morning"
+    if "evening" in title or "evening" in instruction or "tonight" in instruction:
+        return "evening"
+    return "morning"
 
 
 def _normalize_event(event: Dict[str, Any], now_local: datetime) -> Dict[str, Any]:
@@ -283,6 +337,7 @@ def _coerce_dt(value: str, tzinfo) -> Optional[datetime]:
 
 def _format_prompt_dataset(dataset: Dict[str, Any]) -> str:
     lines = [
+        f"Briefing mode: {dataset.get('briefing_mode')}",
         f"Local date: {dataset.get('local_date')}",
         f"Timezone: {dataset.get('timezone')}",
         "",
@@ -295,6 +350,16 @@ def _format_prompt_dataset(dataset: Dict[str, Any]) -> str:
         for event in events:
             lines.append(
                 f"- {event.get('start')} title={event.get('title')} location={event.get('location') or '-'} starts_within_2h={event.get('starts_within_2h')}"
+            )
+    lines.append("")
+    lines.append("Tomorrow events:")
+    tomorrow_events = list(dataset.get("tomorrow_events") or [])
+    if not tomorrow_events:
+        lines.append("- none")
+    else:
+        for event in tomorrow_events:
+            lines.append(
+                f"- {event.get('start')} title={event.get('title')} location={event.get('location') or '-'}"
             )
     lines.append("")
     lines.append("RSS items:")

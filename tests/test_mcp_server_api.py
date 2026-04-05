@@ -94,8 +94,9 @@ async def test_mcp_propose_task_draft_returns_recipe_payload(client):
                     "instruction": "Create a daily cached RSS briefing about US politics and save it to workspace/politics/us-politics.md",
                     "task_type": "recurring",
                     "schedule": "every:24h",
-                    "recipe_family": "daily_research_briefing",
+                    "recipe_family": "briefing",
                     "recipe_params": {
+                        "briefing_mode": "morning",
                         "topic": "US Politics",
                         "path": "workspace/politics/us-politics.md",
                         "window_hours": 24,
@@ -110,7 +111,8 @@ async def test_mcp_propose_task_draft_returns_recipe_payload(client):
     text_payload = resp.json()["result"]["content"][0]["text"]
     draft = json.loads(text_payload)
     assert draft["proposed"] is True
-    assert draft["task_recipe"]["family"] == "daily_research_briefing"
+    assert draft["task_recipe"]["family"] == "briefing"
+    assert draft["task_recipe"]["params"]["briefing_mode"] == "morning"
 
 
 @pytest.mark.asyncio

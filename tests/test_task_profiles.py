@@ -177,6 +177,31 @@ def test_morning_briefing_validate_finalize_requires_calendar_section_when_event
     assert "required calendar section" in report["fatal_reason"].lower()
 
 
+def test_briefing_validate_finalize_requires_day_in_review_for_evening_mode():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Headlines\n\n"
+            "- Artemis imagery update — [Read More](https://example.com/story)\n\n"
+            "## Worth your attention\n\n"
+            "- Review tomorrow's launch schedule."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "briefing_mode": "evening",
+                "calendar_events": [],
+                "tomorrow_events": [{"title": "Launch prep"}],
+                "rss_items": [{"url": "https://example.com/story"}],
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is True
+    assert "day-in-review" in report["fatal_reason"].lower()
+
+
 @pytest.mark.asyncio
 async def test_maintenance_profile_plan_steps_are_deterministic():
     profile = MaintenanceExecutionProfile()
