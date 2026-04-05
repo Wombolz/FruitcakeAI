@@ -165,6 +165,48 @@ async def test_create_task_accepts_explicit_recipe_family_from_editor(client):
 
 
 @pytest.mark.asyncio
+async def test_create_task_accepts_explicit_watcher_recipe_params_from_editor(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskwatchereditoruser",
+            "email": "taskwatchereditor@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskwatchereditoruser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "NASA Artemis Watcher",
+            "instruction": "Keep this focused on major launches and mission updates.",
+            "task_type": "recurring",
+            "schedule": "every:2h",
+            "deliver": True,
+            "recipe_family": "topic_watcher",
+            "recipe_params": {
+                "topic": "NASA + Artemis",
+                "threshold": "high",
+                "sources": ["NASA Breaking News", "SpaceNews"],
+            },
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["task_recipe"]["family"] == "topic_watcher"
+    assert payload["task_recipe"]["params"]["topic"] == "NASA + Artemis"
+    assert payload["task_recipe"]["params"]["threshold"] == "high"
+
+
+@pytest.mark.asyncio
 async def test_create_task_respects_explicit_generic_family_from_editor(client):
     await client.post(
         "/auth/register",

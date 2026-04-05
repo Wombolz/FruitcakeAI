@@ -290,7 +290,7 @@ def _build_topic_watcher_recipe(
     if not topic:
         return None
     threshold = _string_param(params, "threshold") or _extract_threshold(instruction) or "medium"
-    sources = _extract_sources(instruction)
+    sources = _string_list_param(params, "sources") or _extract_sources(instruction)
     assumptions: list[str] = []
     if not _string_param(params, "threshold") and "threshold:" not in instruction.lower():
         assumptions.append("defaulted watcher threshold to medium")
@@ -652,6 +652,22 @@ def _timezone_param(params: dict[str, Any], key: str) -> str | None:
     if not candidate or not is_valid_timezone_name(candidate):
         return None
     return candidate
+
+
+def _string_list_param(params: dict[str, Any], key: str) -> list[str]:
+    value = params.get(key)
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+    values: list[str] = []
+    for item in items:
+        candidate = str(item or "").strip()
+        if candidate and candidate not in values:
+            values.append(candidate)
+    return values
 
 
 def _clean_topic(value: str) -> str:
