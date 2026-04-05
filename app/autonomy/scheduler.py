@@ -205,6 +205,7 @@ _log = structlog.get_logger(__name__)
 _scheduler: "AsyncIOScheduler | None" = None
 _llm_unhealthy_until: datetime | None = None
 _llm_last_error: str | None = None
+_last_dispatch_at: datetime | None = None
 
 
 def _as_utc_aware(dt: datetime | None) -> datetime | None:
@@ -273,7 +274,9 @@ async def tick() -> None:
     from app.db.models import Task, User
     from app.autonomy.runner import get_task_runner
 
+    global _last_dispatch_at
     now = datetime.now(timezone.utc)
+    _last_dispatch_at = now
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(Task).where(
@@ -338,6 +341,7 @@ def get_llm_dispatch_health(now: datetime | None = None) -> dict[str, object]:
         "blocked": blocked,
         "unhealthy_until": unhealthy_until.isoformat() if unhealthy_until else None,
         "last_error": _llm_last_error,
+        "last_dispatch_at": _as_utc_aware(_last_dispatch_at).isoformat() if _last_dispatch_at else None,
     }
 
 
