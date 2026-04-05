@@ -153,6 +153,34 @@ def test_morning_briefing_validate_finalize_accepts_standard_section_headings_wi
     assert report["has_headlines_section"] is True
 
 
+def test_morning_briefing_validate_finalize_accepts_new_briefing_heading_style():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Today context\n\n"
+            "- 09:00 Doctor appointment\n\n"
+            "## What to watch today\n\n"
+            "- Leave early for the afternoon appointment.\n\n"
+            "## Links (from cached feeds)\n\n"
+            "- Reuters update — https://example.com/story"
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "calendar_events": [{"title": "Doctor appointment"}],
+                "rss_items": [{"url": "https://example.com/story"}],
+            }
+        },
+        is_final_step=True,
+    )
+    assert result.startswith("## Today context")
+    assert report is not None
+    assert report["fatal"] is False
+    assert report["has_calendar_section"] is True
+    assert report["has_headlines_section"] is True
+    assert report["has_attention_section"] is True
+
+
 def test_morning_briefing_validate_finalize_requires_calendar_section_when_events_present():
     profile = MorningBriefingExecutionProfile()
     result, report = profile.validate_finalize(

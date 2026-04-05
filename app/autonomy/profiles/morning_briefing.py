@@ -169,11 +169,11 @@ class BriefingExecutionProfile(TaskExecutionProfile):
         briefing_mode = str(dataset.get("briefing_mode") or "morning")
         if briefing_mode == "evening":
             prompt_parts.append(
-                "This is an evening briefing. Prefer a `## Day in review` section, then `## Tomorrow at a glance` when tomorrow events exist, followed by headlines and attention items."
+                "This is an evening briefing. Prefer `## Day in review`, then `## What to watch tomorrow` or `## Tomorrow at a glance` when tomorrow events exist, followed by `## Links (from cached feeds)` or equivalent grounded headline sections."
             )
         elif dataset.get("calendar_events"):
             prompt_parts.append(
-                "Calendar events are present in the prepared dataset. You must include a `## Today at a glance` section before any headlines."
+                "Calendar events are present in the prepared dataset. You must include either `## Today context` or `## Today at a glance` before any headlines or watch items."
             )
         prepared = (run_context.get("dataset_prompt") or "").strip()
         if prepared:
@@ -219,11 +219,11 @@ class BriefingExecutionProfile(TaskExecutionProfile):
             for match in re.findall(r"^##\s+(.+)$", text, flags=re.MULTILINE)
             if _is_placeholder_heading(match)
         )
-        has_calendar = "## Today at a glance" in text
+        has_calendar = "## Today at a glance" in text or "## Today context" in text
         has_day_review = "## Day in review" in text
-        has_tomorrow = "## Tomorrow at a glance" in text
-        has_headlines = "## Headlines" in text
-        has_attention = "## Worth your attention" in text
+        has_tomorrow = "## Tomorrow at a glance" in text or "## What to watch tomorrow" in text
+        has_headlines = "## Headlines" in text or "## Links (from cached feeds)" in text
+        has_attention = "## Worth your attention" in text or "## What to watch today" in text
         fatal = False
         fatal_reason = ""
         if invalid_urls:
@@ -244,10 +244,10 @@ class BriefingExecutionProfile(TaskExecutionProfile):
         elif briefing_mode == "evening" and tomorrow_events and not has_tomorrow:
             fatal = True
             fatal_reason = "Evening briefing omitted the required tomorrow section despite prepared next-day events."
-        elif briefing_mode == "morning" and not has_calendar and not has_headlines:
+        elif briefing_mode == "morning" and not has_calendar and not has_headlines and not has_attention:
             fatal = True
             fatal_reason = "Morning briefing did not produce any publishable section."
-        elif briefing_mode == "evening" and not has_day_review and not has_headlines:
+        elif briefing_mode == "evening" and not has_day_review and not has_tomorrow and not has_headlines:
             fatal = True
             fatal_reason = "Evening briefing did not produce any publishable section."
 
