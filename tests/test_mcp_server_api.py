@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.db.models import Document
+from app.db.models import Document, Task, TaskRun
 from tests.conftest import TestSessionLocal
 
 
@@ -68,6 +68,8 @@ async def test_mcp_tools_list_includes_task_and_library_tools(client):
     assert "fruitcake_propose_task_draft" in names
     assert "fruitcake_create_task" in names
     assert "fruitcake_list_library_documents" in names
+    assert "fruitcake_get_scheduler_health" in names
+    assert "fruitcake_list_task_runs" in names
 
 
 @pytest.mark.asyncio
@@ -220,3 +222,74 @@ async def test_mcp_list_library_documents_and_search(client):
     text = searched.json()["result"]["content"][0]["text"]
     assert "manual.pdf" in text
     assert "OpenClaw is mentioned here." in text
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_scheduler_health_returns_dispatch_state(client):
+    token = await _token(client, "mcpscheduleruser")
+
+    resp = await client.post(
+        "/mcp/fruitcake/tools/call",
+        json={
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {"name": "fruitcake_get_scheduler_health", "arguments": {}},
+        },
+        headers=_auth_headers(token),
+    )
+
+    assert resp.status_code == 200
+    payload = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert payload["status"] in {"ready", "blocked"}
+    assert "blocked" in payload
+
+
+@pytest.mark.asyncio
+async def test_mcp_list_task_runs_returns_recent_runs_for_user(client):
+    token = await _token(client, "mcprunsuser")
+    headers = _auth_headers(token)
+
+    me = await client.get("/auth/me", headers=headers)
+    user_id = int(me.json()["id"])
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=user_id,
+            title="Run-inspect task",
+            instruction="Inspect my recent runs.",
+            task_type="recurring",
+            status="completed",
+            schedule="every:6h",
+            deliver=True,
+            requires_approval=True,
+        )
+        db.add(task)
+        await db.flush()
+        run = TaskRun(
+            task_id=task.id,
+            status="completed",
+            summary="Completed successfully",
+        )
+        db.add(run)
+        await db.commit()
+        task_id = task.id
+
+    resp = await client.post(
+        "/mcp/fruitcake/tools/call",
+        json={
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "fruitcake_list_task_runs",
+                "arguments": {"limit": 10, "task_id": task_id},
+            },
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    payload = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert payload["count"] >= 1
+    assert any(int(run["task_id"]) == int(task_id) for run in payload["runs"])

@@ -178,6 +178,25 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["document_name"],
         },
     },
+    {
+        "name": "fruitcake_get_scheduler_health",
+        "description": "Return Fruitcake task scheduler dispatch health.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "fruitcake_list_task_runs",
+        "description": "List recent runs for the current user's Fruitcake tasks.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 10},
+                "task_id": {"type": "integer"},
+            },
+        },
+    },
 ]
 
 
@@ -229,6 +248,68 @@ async def _tool_summarize_document(arguments: Dict[str, Any], user: User) -> str
     return await _summarize_document(arguments, UserContext.from_user(user))
 
 
+async def _tool_get_scheduler_health(arguments: Dict[str, Any], user: User) -> str:
+    _ = arguments, user
+    from app.autonomy.scheduler import get_llm_dispatch_health
+
+    state = get_llm_dispatch_health()
+    return json.dumps(
+        {
+            "status": "blocked" if state.get("blocked") else "ready",
+            "blocked": bool(state.get("blocked")),
+            "unhealthy_until": state.get("unhealthy_until"),
+            "last_error": state.get("last_error"),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+async def _tool_list_task_runs(arguments: Dict[str, Any], user: User) -> str:
+    from sqlalchemy import desc, select
+
+    from app.db.models import Task, TaskRun
+    from app.db.session import AsyncSessionLocal
+
+    try:
+        limit = max(1, min(50, int(arguments.get("limit", 10))))
+    except Exception:
+        limit = 10
+    task_id = arguments.get("task_id")
+
+    async with AsyncSessionLocal() as db:
+        query = (
+            select(TaskRun, Task)
+            .join(Task, TaskRun.task_id == Task.id)
+            .where(Task.user_id == user.id)
+            .order_by(desc(TaskRun.started_at))
+            .limit(limit)
+        )
+        if task_id is not None:
+            try:
+                normalized_task_id = int(task_id)
+            except Exception:
+                return "task_id must be an integer."
+            query = query.where(Task.id == normalized_task_id)
+        rows = (await db.execute(query)).all()
+
+    runs = [
+        {
+            "run_id": run.id,
+            "task_id": task.id,
+            "task_title": task.title,
+            "status": run.status,
+            "started_at": run.started_at.isoformat() if run.started_at is not None else None,
+            "finished_at": run.finished_at.isoformat() if run.finished_at is not None else None,
+            "summary": run.summary,
+            "error": run.error,
+            "session_id": run.session_id,
+        }
+        for run, task in rows
+    ]
+    return json.dumps({"count": len(runs), "runs": runs}, ensure_ascii=False)
+
+
 _TOOL_HANDLERS: dict[str, Callable[[Dict[str, Any], User], Awaitable[str]]] = {
     "fruitcake_list_tasks": _tool_list_tasks,
     "fruitcake_get_task": _tool_get_task,
@@ -238,6 +319,8 @@ _TOOL_HANDLERS: dict[str, Callable[[Dict[str, Any], User], Awaitable[str]]] = {
     "fruitcake_list_library_documents": _tool_list_library_documents,
     "fruitcake_search_library": _tool_search_library,
     "fruitcake_summarize_document": _tool_summarize_document,
+    "fruitcake_get_scheduler_health": _tool_get_scheduler_health,
+    "fruitcake_list_task_runs": _tool_list_task_runs,
 }
 
 
