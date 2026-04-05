@@ -324,27 +324,40 @@ def _build_daily_research_briefing_recipe(
     requested_profile: Optional[str],
     params: dict[str, Any],
 ) -> NormalizedTaskRecipe | None:
-    inferred = infer_configured_executor(
-        title=title,
-        instruction=instruction,
-        task_type=task_type,
-        requested_profile=requested_profile,
-    )
-    config = inferred.executor_config or {}
-    input_config = config.get("input") or {}
-    persistence = config.get("persistence") or {}
-    topic = str(input_config.get("topic") or "").strip()
-    path = str(persistence.get("path") or "").strip()
+    topic = _string_param(params, "topic")
+    path = _string_param(params, "path")
+    window_hours = _int_param(params, "window_hours")
+    custom_guidance = _extract_daily_briefing_custom_guidance(instruction=instruction, params=params)
+
+    if not topic or not path:
+        inferred = infer_configured_executor(
+            title=title,
+            instruction=instruction,
+            task_type=task_type,
+            requested_profile=requested_profile,
+        )
+        config = inferred.executor_config or {}
+        input_config = config.get("input") or {}
+        persistence = config.get("persistence") or {}
+        topic = topic or str(input_config.get("topic") or "").strip()
+        path = path or str(persistence.get("path") or "").strip()
+        window_hours = window_hours or int(input_config.get("window_hours") or 24)
+
     if not topic or not path:
         return None
-    window_hours = int(input_config.get("window_hours") or 24)
+    window_hours = window_hours or 24
     assumptions: list[str] = []
-    if "past" not in instruction.lower():
+    if "past" not in instruction.lower() and _int_param(params, "window_hours") is None:
         assumptions.append("defaulted research window to 24 hours")
     normalized_instruction = (
         f"Analyze the news about {topic} from the past {window_hours} hours using cached RSS feeds and "
         f"append a daily research briefing to {path}."
     )
+    if custom_guidance:
+        normalized_instruction = f"{normalized_instruction}\nAdditional guidance: {custom_guidance}"
+    normalized_params = {"topic": topic, "window_hours": window_hours, "path": path}
+    if custom_guidance:
+        normalized_params["custom_guidance"] = custom_guidance
     return NormalizedTaskRecipe(
         family="daily_research_briefing",
         confidence="high",
@@ -352,7 +365,7 @@ def _build_daily_research_briefing_recipe(
         instruction=normalized_instruction,
         task_type=task_type,
         profile=None,
-        params={"topic": topic, "window_hours": window_hours, "path": path},
+        params=normalized_params,
         assumptions=assumptions,
     )
 
@@ -565,6 +578,25 @@ def _extract_morning_briefing_custom_guidance(
         remainder = cleaned[len(base_instruction):].strip()
     remainder = remainder.lstrip(":- \n")
     return remainder.strip()
+
+
+def _extract_daily_briefing_custom_guidance(
+    *,
+    instruction: str,
+    params: dict[str, Any],
+) -> str:
+    explicit = _string_param(params, "custom_guidance")
+    if explicit:
+        return explicit
+
+    cleaned = (instruction or "").strip()
+    if not cleaned:
+        return ""
+
+    match = re.search(r"additional guidance:\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return str(match.group(1)).strip()
+    return ""
 
 
 def _extract_float(text: str, pattern: str) -> float | None:

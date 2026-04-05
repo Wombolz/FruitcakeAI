@@ -140,7 +140,7 @@ async def test_create_task_accepts_explicit_recipe_family_from_editor(client):
         "/tasks",
         json={
             "title": "Daily Photography Briefing",
-            "instruction": "Append a daily research briefing about photography from the past 24 hours to workspace/photography/daily.md.",
+            "instruction": "Keep it concise and emphasize photo-industry business news.",
             "task_type": "recurring",
             "schedule": "every:1d",
             "deliver": True,
@@ -149,6 +149,7 @@ async def test_create_task_accepts_explicit_recipe_family_from_editor(client):
                 "topic": "Photography",
                 "path": "workspace/photography/daily.md",
                 "window_hours": 24,
+                "custom_guidance": "Keep it concise and emphasize photo-industry business news.",
             },
         },
         headers=headers,
@@ -159,6 +160,8 @@ async def test_create_task_accepts_explicit_recipe_family_from_editor(client):
     assert payload["task_recipe"]["family"] == "daily_research_briefing"
     assert payload["task_recipe"]["selected_executor_kind"] == "configured_executor"
     assert "append a daily research briefing" in payload["instruction"].lower()
+    assert "photo-industry business news" in payload["instruction"].lower()
+    assert payload["task_recipe"]["params"]["custom_guidance"].lower().startswith("keep it concise")
 
 
 @pytest.mark.asyncio
@@ -229,7 +232,7 @@ async def test_create_task_rejects_explicit_briefing_family_when_required_fields
     )
 
     assert created.status_code == 400
-    assert "could not build the selected task family 'daily_research_briefing'" in created.json()["detail"].lower()
+    assert "could not build the selected task family 'daily_research_briefing'" in created.text.lower()
 
 
 @pytest.mark.asyncio
@@ -372,6 +375,62 @@ async def test_patch_task_can_change_one_shot_to_recurring(client):
     assert payload["task_type"] == "recurring"
     assert payload["schedule"] == "every:1d"
     assert payload["next_run_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_patch_task_can_repair_generic_task_into_daily_briefing(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskpatchbriefinguser",
+            "email": "taskpatchbriefing@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskpatchbriefinguser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "US Politics Daily Briefing",
+            "instruction": "Keep me updated on US politics.",
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": True,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    patched = await client.patch(
+        f"/tasks/{task_id}",
+        json={
+            "title": "US Politics Daily Briefing",
+            "instruction": "Focus on policy, elections, and congressional movement.",
+            "recipe_family": "daily_research_briefing",
+            "recipe_params": {
+                "topic": "US Politics",
+                "path": "workspace/politics/US Politics.md",
+                "window_hours": 24,
+                "custom_guidance": "Focus on policy, elections, and congressional movement.",
+            },
+        },
+        headers=headers,
+    )
+
+    assert patched.status_code == 200
+    payload = patched.json()
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert payload["task_recipe"]["params"]["topic"] == "US Politics"
+    assert payload["task_recipe"]["params"]["path"] == "workspace/politics/US Politics.md"
+    assert payload["task_recipe"]["params"]["custom_guidance"].lower().startswith("focus on policy")
+    assert "congressional movement" in payload["instruction"].lower()
 
 
 @pytest.mark.asyncio
