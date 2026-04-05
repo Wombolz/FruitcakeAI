@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.db.models import Document, Task, TaskRun
+from app.db.models import Document, Task, TaskRun, TaskRunArtifact
 from tests.conftest import TestSessionLocal
 
 
@@ -70,6 +70,7 @@ async def test_mcp_tools_list_includes_task_and_library_tools(client):
     assert "fruitcake_list_library_documents" in names
     assert "fruitcake_get_scheduler_health" in names
     assert "fruitcake_list_task_runs" in names
+    assert "fruitcake_get_task_run_artifacts" in names
 
 
 @pytest.mark.asyncio
@@ -293,3 +294,62 @@ async def test_mcp_list_task_runs_returns_recent_runs_for_user(client):
     payload = json.loads(resp.json()["result"]["content"][0]["text"])
     assert payload["count"] >= 1
     assert any(int(run["task_id"]) == int(task_id) for run in payload["runs"])
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_task_run_artifacts_returns_owned_run_outputs(client):
+    token = await _token(client, "mcpartifactsuser")
+    headers = _auth_headers(token)
+
+    me = await client.get("/auth/me", headers=headers)
+    user_id = int(me.json()["id"])
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=user_id,
+            title="Artifact task",
+            instruction="Inspect my run artifacts.",
+            task_type="recurring",
+            status="completed",
+            schedule="every:24h",
+            deliver=True,
+            requires_approval=True,
+        )
+        db.add(task)
+        await db.flush()
+        run = TaskRun(
+            task_id=task.id,
+            status="completed",
+            summary="Artifacts written",
+        )
+        db.add(run)
+        await db.flush()
+        artifact = TaskRunArtifact(
+            task_run_id=run.id,
+            artifact_type="report_markdown",
+            content_text="# Artifact output",
+            content_json='{"path":"workspace/reports/artifact.md"}',
+        )
+        db.add(artifact)
+        await db.commit()
+        task_id = task.id
+        run_id = run.id
+
+    resp = await client.post(
+        "/mcp/fruitcake/tools/call",
+        json={
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "fruitcake_get_task_run_artifacts",
+                "arguments": {"task_id": task_id, "run_id": run_id},
+            },
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    payload = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert payload["count"] >= 1
+    assert any(artifact["artifact_type"] == "report_markdown" for artifact in payload["artifacts"])

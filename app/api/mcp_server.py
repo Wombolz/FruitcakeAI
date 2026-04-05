@@ -197,6 +197,18 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "fruitcake_get_task_run_artifacts",
+        "description": "Return artifacts for a task run owned by the current user.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer"},
+                "run_id": {"type": "integer"},
+            },
+            "required": ["task_id", "run_id"],
+        },
+    },
 ]
 
 
@@ -310,6 +322,49 @@ async def _tool_list_task_runs(arguments: Dict[str, Any], user: User) -> str:
     return json.dumps({"count": len(runs), "runs": runs}, ensure_ascii=False)
 
 
+async def _tool_get_task_run_artifacts(arguments: Dict[str, Any], user: User) -> str:
+    from sqlalchemy import select
+
+    from app.db.models import Task, TaskRun, TaskRunArtifact
+    from app.db.session import AsyncSessionLocal
+
+    try:
+        task_id = int(arguments.get("task_id"))
+        run_id = int(arguments.get("run_id"))
+    except Exception:
+        return "task_id and run_id are required integers."
+
+    async with AsyncSessionLocal() as db:
+        run_result = await db.execute(
+            select(TaskRun, Task)
+            .join(Task, TaskRun.task_id == Task.id)
+            .where(Task.id == task_id, TaskRun.id == run_id, Task.user_id == user.id)
+        )
+        owned_run = run_result.first()
+        if owned_run is None:
+            return "Task run not found."
+
+        artifact_rows = (
+            await db.execute(
+                select(TaskRunArtifact)
+                .where(TaskRunArtifact.task_run_id == run_id)
+                .order_by(TaskRunArtifact.created_at.desc(), TaskRunArtifact.id.desc())
+            )
+        ).scalars().all()
+
+    artifacts = [
+        {
+            "id": artifact.id,
+            "artifact_type": artifact.artifact_type,
+            "content_json": artifact.content_json,
+            "content_text": artifact.content_text,
+            "created_at": artifact.created_at.isoformat() if artifact.created_at is not None else None,
+        }
+        for artifact in artifact_rows
+    ]
+    return json.dumps({"count": len(artifacts), "artifacts": artifacts}, ensure_ascii=False)
+
+
 _TOOL_HANDLERS: dict[str, Callable[[Dict[str, Any], User], Awaitable[str]]] = {
     "fruitcake_list_tasks": _tool_list_tasks,
     "fruitcake_get_task": _tool_get_task,
@@ -321,6 +376,7 @@ _TOOL_HANDLERS: dict[str, Callable[[Dict[str, Any], User], Awaitable[str]]] = {
     "fruitcake_summarize_document": _tool_summarize_document,
     "fruitcake_get_scheduler_health": _tool_get_scheduler_health,
     "fruitcake_list_task_runs": _tool_list_task_runs,
+    "fruitcake_get_task_run_artifacts": _tool_get_task_run_artifacts,
 }
 
 
