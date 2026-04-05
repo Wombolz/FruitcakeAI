@@ -13,7 +13,12 @@ from app.mcp.servers.calendar import _dedupe_events, _get_provider
 
 _MAX_RSS_ITEMS = 8
 _MAX_WORDS = 600
-_PLACEHOLDER_HEADINGS = {"today", "news", "update", "updates", "headlines"}
+_PLACEHOLDER_HEADINGS = {
+    "today",
+    "news",
+    "update",
+    "updates",
+}
 _EMPTY_RESULT = "Nothing to brief today - no calendar events and no fresh headlines."
 
 
@@ -145,6 +150,11 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
     ) -> None:
         del is_final_step
         prompt_parts.append(load_profile_spec_text(self.name))
+        dataset = run_context.get("dataset") or {}
+        if dataset.get("calendar_events"):
+            prompt_parts.append(
+                "Calendar events are present in the prepared dataset. You must include a `## Today at a glance` section before any headlines."
+            )
         prepared = (run_context.get("dataset_prompt") or "").strip()
         if prepared:
             prompt_parts.append(f"Prepared briefing dataset:\n{prepared[:18000]}")
@@ -181,7 +191,11 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
         urls = [u.rstrip('.,;"\'') for u in re.findall(r"https?://[^\s)\]]+", text)]
         invalid_urls = sorted({u for u in urls if u and u not in allowed_urls})
         word_count = len(re.findall(r"\S+", text))
-        placeholder_hits = sum(1 for match in re.findall(r"^##\s+(.+)$", text, flags=re.MULTILINE) if match.strip().lower() in _PLACEHOLDER_HEADINGS)
+        placeholder_hits = sum(
+            1
+            for match in re.findall(r"^##\s+(.+)$", text, flags=re.MULTILINE)
+            if _is_placeholder_heading(match)
+        )
         has_calendar = "## Today at a glance" in text
         has_headlines = "## Headlines" in text
         has_attention = "## Worth your attention" in text
@@ -196,6 +210,9 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
         elif placeholder_hits:
             fatal = True
             fatal_reason = "Morning briefing contains placeholder section headings."
+        elif events and not has_calendar:
+            fatal = True
+            fatal_reason = "Morning briefing omitted the required calendar section despite prepared calendar events."
         elif not has_calendar and not has_headlines:
             fatal = True
             fatal_reason = "Morning briefing did not produce any publishable section."
@@ -290,3 +307,8 @@ def _format_prompt_dataset(dataset: Dict[str, Any]) -> str:
                 f"- source={item.get('source')} section={item.get('section')} title={item.get('title')} url={item.get('url')}"
             )
     return "\n".join(lines)
+
+
+def _is_placeholder_heading(value: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (value or "").strip().lower()).strip(" :.-")
+    return normalized in _PLACEHOLDER_HEADINGS

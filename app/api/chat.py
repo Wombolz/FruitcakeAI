@@ -39,7 +39,13 @@ from app.agent.chat_validation import (
     build_chat_retry_instruction,
     validate_chat_response,
 )
-from app.agent.core import run_agent, stream_agent
+from app.agent.core import (
+    get_task_handoff_payload,
+    reset_task_handoff_payload,
+    restore_task_handoff_payload,
+    run_agent,
+    stream_agent,
+)
 from app.auth.dependencies import get_current_user
 from app.config import settings
 from app.db.models import ChatMessage, ChatSession, User
@@ -511,12 +517,15 @@ async def send_message(
 
     usage_token = None
     record_token = None
+    handoff_token = None
+    handoff_metadata: Dict[str, Any] = {}
     chat_run_manager = get_chat_run_manager()
     current_task = asyncio.current_task()
     try:
         if current_task is not None:
             await chat_run_manager.register(session_id, current_task)
         record_token = reset_tool_execution_records()
+        handoff_token = reset_task_handoff_payload()
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
             session_id=session_id,
@@ -538,6 +547,7 @@ async def send_message(
             reply,
             get_tool_execution_records(),
         )
+        handoff_metadata = get_task_handoff_payload() or {}
     except asyncio.CancelledError:
         log.info("Chat REST run stopped", session_id=session_id, user_id=current_user.id)
         return JSONResponse(status_code=409, content={"detail": "Chat stopped by user"})
@@ -557,6 +567,11 @@ async def send_message(
         if usage_token is not None:
             try:
                 reset_llm_usage_context(usage_token)
+            except Exception:
+                pass
+        if handoff_token is not None:
+            try:
+                restore_task_handoff_payload(handoff_token)
             except Exception:
                 pass
 
@@ -579,6 +594,7 @@ async def send_message(
         "metadata": {
             "active_skills": list(user_context.active_skill_slugs or []),
             "skill_selection_mode": user_context.skill_selection_mode or "",
+            **handoff_metadata,
         },
     }
 
@@ -792,6 +808,8 @@ async def _run_websocket_message(
             metrics.inc_chat_complexity_simple_count()
 
         record_token = reset_tool_execution_records()
+        handoff_token = reset_task_handoff_payload()
+        handoff_metadata: Dict[str, Any] = {}
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
             session_id=session_id,
@@ -839,6 +857,7 @@ async def _run_websocket_message(
                 "".join(full_response),
                 get_tool_execution_records(),
             )
+        handoff_metadata = get_task_handoff_payload() or {}
         assistant_msg = ChatMessage(
             session_id=session_id, role="assistant", content=complete
         )
@@ -859,6 +878,7 @@ async def _run_websocket_message(
                 "metadata": {
                     "active_skills": list(user_context.active_skill_slugs or []),
                     "skill_selection_mode": user_context.skill_selection_mode or "",
+                    **handoff_metadata,
                 },
             }
         )
@@ -900,6 +920,8 @@ async def _run_websocket_message(
             restore_tool_execution_records(record_token)
         if "usage_token" in locals():
             reset_llm_usage_context(usage_token)
+        if "handoff_token" in locals():
+            restore_task_handoff_payload(handoff_token)
 
 
 # ── WebSocket /chat/sessions/{id}/ws (streaming) ─────────────────────────────

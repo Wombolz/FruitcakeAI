@@ -62,7 +62,12 @@ def normalize_task_recipe(
             params=params,
         )
     if family == "morning_briefing":
-        return _build_morning_briefing_recipe(task_type=task_type)
+        return _build_morning_briefing_recipe(
+            title=title,
+            instruction=instruction,
+            task_type=task_type,
+            params=params,
+        )
     if family == "iss_pass_watcher":
         return _build_iss_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
     if family == "weather_conditions":
@@ -193,6 +198,28 @@ def build_task_confirmation_text(
     return f"Created task summary: {summary}."
 
 
+def build_task_draft_confirmation_text(
+    *,
+    title: str,
+    task_type: str,
+    schedule: str | None,
+    task_recipe: dict[str, Any] | None,
+    profile: str | None,
+) -> str:
+    created_text = build_task_confirmation_text(
+        title=title,
+        task_type=task_type,
+        schedule=schedule,
+        task_recipe=task_recipe,
+        profile=profile,
+    )
+    if created_text.startswith("Created "):
+        return "Draft ready: " + created_text[len("Created ") :]
+    if created_text.startswith("Created task summary:"):
+        return created_text.replace("Created task summary:", "Draft summary:", 1)
+    return created_text
+
+
 def _schedule_suffix(schedule: str | None) -> str:
     return f" Schedule: {schedule}." if schedule else ""
 
@@ -207,6 +234,8 @@ def _resolve_recipe_family(
     preferred_family: Optional[str],
 ) -> str | None:
     explicit_family = (recipe_family or "").strip().lower()
+    if recipe_family is not None and explicit_family == "":
+        return None
     if explicit_family in _RECIPE_FAMILIES:
         return explicit_family
 
@@ -261,7 +290,7 @@ def _build_topic_watcher_recipe(
     if not topic:
         return None
     threshold = _string_param(params, "threshold") or _extract_threshold(instruction) or "medium"
-    sources = _extract_sources(instruction)
+    sources = _string_list_param(params, "sources") or _extract_sources(instruction)
     assumptions: list[str] = []
     if not _string_param(params, "threshold") and "threshold:" not in instruction.lower():
         assumptions.append("defaulted watcher threshold to medium")
@@ -295,27 +324,40 @@ def _build_daily_research_briefing_recipe(
     requested_profile: Optional[str],
     params: dict[str, Any],
 ) -> NormalizedTaskRecipe | None:
-    inferred = infer_configured_executor(
-        title=title,
-        instruction=instruction,
-        task_type=task_type,
-        requested_profile=requested_profile,
-    )
-    config = inferred.executor_config or {}
-    input_config = config.get("input") or {}
-    persistence = config.get("persistence") or {}
-    topic = str(input_config.get("topic") or "").strip()
-    path = str(persistence.get("path") or "").strip()
+    topic = _string_param(params, "topic")
+    path = _string_param(params, "path")
+    window_hours = _int_param(params, "window_hours")
+    custom_guidance = _extract_daily_briefing_custom_guidance(instruction=instruction, params=params)
+
+    if not topic or not path:
+        inferred = infer_configured_executor(
+            title=title,
+            instruction=instruction,
+            task_type=task_type,
+            requested_profile=requested_profile,
+        )
+        config = inferred.executor_config or {}
+        input_config = config.get("input") or {}
+        persistence = config.get("persistence") or {}
+        topic = topic or str(input_config.get("topic") or "").strip()
+        path = path or str(persistence.get("path") or "").strip()
+        window_hours = window_hours or int(input_config.get("window_hours") or 24)
+
     if not topic or not path:
         return None
-    window_hours = int(input_config.get("window_hours") or 24)
+    window_hours = window_hours or 24
     assumptions: list[str] = []
-    if "past" not in instruction.lower():
+    if "past" not in instruction.lower() and _int_param(params, "window_hours") is None:
         assumptions.append("defaulted research window to 24 hours")
     normalized_instruction = (
         f"Analyze the news about {topic} from the past {window_hours} hours using cached RSS feeds and "
         f"append a daily research briefing to {path}."
     )
+    if custom_guidance:
+        normalized_instruction = f"{normalized_instruction}\nAdditional guidance: {custom_guidance}"
+    normalized_params = {"topic": topic, "window_hours": window_hours, "path": path}
+    if custom_guidance:
+        normalized_params["custom_guidance"] = custom_guidance
     return NormalizedTaskRecipe(
         family="daily_research_briefing",
         confidence="high",
@@ -323,23 +365,38 @@ def _build_daily_research_briefing_recipe(
         instruction=normalized_instruction,
         task_type=task_type,
         profile=None,
-        params={"topic": topic, "window_hours": window_hours, "path": path},
+        params=normalized_params,
         assumptions=assumptions,
     )
 
 
-def _build_morning_briefing_recipe(*, task_type: str) -> NormalizedTaskRecipe:
+def _build_morning_briefing_recipe(
+    *,
+    title: str,
+    instruction: str,
+    task_type: str,
+    params: dict[str, Any],
+) -> NormalizedTaskRecipe:
+    base_instruction = (
+        "Prepare a morning briefing for today using my calendar and current headlines.\n"
+        "Include today's schedule, notable headlines, and any important conflicts or priorities."
+    )
+    custom_guidance = _extract_morning_briefing_custom_guidance(
+        instruction=instruction,
+        params=params,
+        base_instruction=base_instruction,
+    )
+    normalized_instruction = base_instruction
+    if custom_guidance:
+        normalized_instruction = f"{base_instruction}\nAdditional guidance: {custom_guidance}"
     return NormalizedTaskRecipe(
         family="morning_briefing",
         confidence="high",
-        title="Morning Briefing",
-        instruction=(
-            "Prepare a morning briefing for today using my calendar and current headlines.\n"
-            "Include today's schedule, notable headlines, and any important conflicts or priorities."
-        ),
+        title=_string_param(params, "title") or title or "Morning Briefing",
+        instruction=normalized_instruction,
         task_type=task_type,
         profile="morning_briefing",
-        params={},
+        params={"custom_guidance": custom_guidance} if custom_guidance else {},
         assumptions=[],
     )
 
@@ -497,6 +554,51 @@ def _extract_timezone(instruction: str) -> str | None:
     return candidate if is_valid_timezone_name(candidate) else None
 
 
+def _extract_morning_briefing_custom_guidance(
+    *,
+    instruction: str,
+    params: dict[str, Any],
+    base_instruction: str,
+) -> str:
+    explicit = _string_param(params, "custom_guidance")
+    if explicit:
+        return explicit
+
+    cleaned = (instruction or "").strip()
+    if not cleaned:
+        return ""
+
+    cleaned_lower = cleaned.lower()
+    base_lower = base_instruction.lower()
+    if cleaned_lower == base_lower:
+        return ""
+
+    remainder = cleaned
+    if cleaned_lower.startswith(base_lower):
+        remainder = cleaned[len(base_instruction):].strip()
+    remainder = remainder.lstrip(":- \n")
+    return remainder.strip()
+
+
+def _extract_daily_briefing_custom_guidance(
+    *,
+    instruction: str,
+    params: dict[str, Any],
+) -> str:
+    explicit = _string_param(params, "custom_guidance")
+    if explicit:
+        return explicit
+
+    cleaned = (instruction or "").strip()
+    if not cleaned:
+        return ""
+
+    match = re.search(r"additional guidance:\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return str(match.group(1)).strip()
+    return ""
+
+
 def _extract_float(text: str, pattern: str) -> float | None:
     match = re.search(pattern, text, flags=re.IGNORECASE)
     if not match:
@@ -550,6 +652,22 @@ def _timezone_param(params: dict[str, Any], key: str) -> str | None:
     if not candidate or not is_valid_timezone_name(candidate):
         return None
     return candidate
+
+
+def _string_list_param(params: dict[str, Any], key: str) -> list[str]:
+    value = params.get(key)
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+    values: list[str] = []
+    for item in items:
+        candidate = str(item or "").strip()
+        if candidate and candidate not in values:
+            values.append(candidate)
+    return values
 
 
 def _clean_topic(value: str) -> str:

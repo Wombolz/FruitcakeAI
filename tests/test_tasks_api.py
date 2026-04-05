@@ -120,6 +120,362 @@ async def test_create_task_returns_recipe_metadata_for_normalized_watcher(client
 
 
 @pytest.mark.asyncio
+async def test_create_task_accepts_explicit_recipe_family_from_editor(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskeditoruser",
+            "email": "taskeditor@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskeditoruser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Daily Photography Briefing",
+            "instruction": "Keep it concise and emphasize photo-industry business news.",
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": True,
+            "recipe_family": "daily_research_briefing",
+            "recipe_params": {
+                "topic": "Photography",
+                "path": "workspace/photography/daily.md",
+                "window_hours": 24,
+                "custom_guidance": "Keep it concise and emphasize photo-industry business news.",
+            },
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert payload["task_recipe"]["selected_executor_kind"] == "configured_executor"
+    assert "append a daily research briefing" in payload["instruction"].lower()
+    assert "photo-industry business news" in payload["instruction"].lower()
+    assert payload["task_recipe"]["params"]["custom_guidance"].lower().startswith("keep it concise")
+
+
+@pytest.mark.asyncio
+async def test_create_task_accepts_explicit_watcher_recipe_params_from_editor(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskwatchereditoruser",
+            "email": "taskwatchereditor@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskwatchereditoruser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "NASA Artemis Watcher",
+            "instruction": "Keep this focused on major launches and mission updates.",
+            "task_type": "recurring",
+            "schedule": "every:2h",
+            "deliver": True,
+            "recipe_family": "topic_watcher",
+            "recipe_params": {
+                "topic": "NASA + Artemis",
+                "threshold": "high",
+                "sources": ["NASA Breaking News", "SpaceNews"],
+            },
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["task_recipe"]["family"] == "topic_watcher"
+    assert payload["task_recipe"]["params"]["topic"] == "NASA + Artemis"
+    assert payload["task_recipe"]["params"]["threshold"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_create_task_respects_explicit_generic_family_from_editor(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskgenericeditoruser",
+            "email": "taskgenericeditor@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskgenericeditoruser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Daily Photography Briefing",
+            "instruction": "Append a daily research briefing about photography from the past 24 hours to workspace/photography/daily.md.",
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": True,
+            "recipe_family": "",
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["profile"] is None
+    assert payload["task_recipe"] is None
+    assert payload["instruction"].startswith("Append a daily research briefing")
+
+
+@pytest.mark.asyncio
+async def test_create_task_rejects_explicit_briefing_family_when_required_fields_missing(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskbriefinginvaliduser",
+            "email": "taskbriefinginvalid@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskbriefinginvaliduser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "US Politics Briefing",
+            "instruction": "Keep me up to date on US politics.",
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": True,
+            "recipe_family": "daily_research_briefing",
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 400
+    assert "could not build the selected task family 'daily_research_briefing'" in created.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_create_task_preserves_custom_guidance_for_morning_briefing(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskmorningeditoruser",
+            "email": "taskmorningeditor@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskmorningeditoruser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Morning Briefing",
+            "instruction": (
+                "Prepare a morning briefing for today using my calendar and current headlines.\n"
+                "Include today's schedule, notable headlines, and any important conflicts or priorities.\n"
+                "Also include a short bit of trivia about this day in history."
+            ),
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": True,
+            "recipe_family": "morning_briefing",
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["task_recipe"]["family"] == "morning_briefing"
+    assert "day in history" in payload["instruction"].lower()
+    assert payload["task_recipe"]["params"]["custom_guidance"].lower().startswith("also include")
+
+
+@pytest.mark.asyncio
+async def test_patch_task_can_clear_active_hours_and_recipe_family(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskpatchclearuser",
+            "email": "taskpatchclear@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskpatchclearuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Morning local task",
+            "instruction": "Watch Iran and Middle East news for major updates.",
+            "task_type": "recurring",
+            "schedule": "every:2h",
+            "active_hours_start": "07:00",
+            "active_hours_end": "22:00",
+            "active_hours_tz": "America/New_York",
+            "recipe_family": "topic_watcher",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    patched = await client.patch(
+        f"/tasks/{task_id}",
+        json={
+            "active_hours_start": None,
+            "active_hours_end": None,
+            "active_hours_tz": None,
+            "recipe_family": "",
+            "recipe_params": None,
+        },
+        headers=headers,
+    )
+
+    assert patched.status_code == 200
+    payload = patched.json()
+    assert payload["active_hours_start"] is None
+    assert payload["active_hours_end"] is None
+    assert payload["active_hours_tz"] is None
+    assert payload["profile"] is None
+    assert payload["task_recipe"] is None
+
+
+@pytest.mark.asyncio
+async def test_patch_task_can_change_one_shot_to_recurring(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskpatchtypeuser",
+            "email": "taskpatchtype@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskpatchtypeuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "One-time task",
+            "instruction": "Do this once.",
+            "task_type": "one_shot",
+            "deliver": True,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    patched = await client.patch(
+        f"/tasks/{task_id}",
+        json={
+            "task_type": "recurring",
+            "schedule": "every:1d",
+        },
+        headers=headers,
+    )
+
+    assert patched.status_code == 200
+    payload = patched.json()
+    assert payload["task_type"] == "recurring"
+    assert payload["schedule"] == "every:1d"
+    assert payload["next_run_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_patch_task_can_repair_generic_task_into_daily_briefing(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskpatchbriefinguser",
+            "email": "taskpatchbriefing@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskpatchbriefinguser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "US Politics Daily Briefing",
+            "instruction": "Keep me updated on US politics.",
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": True,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    patched = await client.patch(
+        f"/tasks/{task_id}",
+        json={
+            "title": "US Politics Daily Briefing",
+            "instruction": "Focus on policy, elections, and congressional movement.",
+            "recipe_family": "daily_research_briefing",
+            "recipe_params": {
+                "topic": "US Politics",
+                "path": "workspace/politics/US Politics.md",
+                "window_hours": 24,
+                "custom_guidance": "Focus on policy, elections, and congressional movement.",
+            },
+        },
+        headers=headers,
+    )
+
+    assert patched.status_code == 200
+    payload = patched.json()
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert payload["task_recipe"]["params"]["topic"] == "US Politics"
+    assert payload["task_recipe"]["params"]["path"] == "workspace/politics/US Politics.md"
+    assert payload["task_recipe"]["params"]["custom_guidance"].lower().startswith("focus on policy")
+    assert "congressional movement" in payload["instruction"].lower()
+
+
+@pytest.mark.asyncio
 async def test_create_task_uses_user_timezone_when_task_timezone_missing(client):
     await client.post(
         "/auth/register",

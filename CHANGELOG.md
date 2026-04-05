@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.7.10
+
+Release date:
+- 2026-04-05
+
+This release lands the first usable task creator/editor flow: chat can propose task drafts, the client can open a native editor for review before save, and existing tasks can reopen in the same shared editor for correction.
+
+### Added
+
+- `TaskDraftPayload`-based draft handoff so chat can propose task creation without persisting immediately
+- native task editor popup flow for chat-created drafts with family-aware review before save
+- shared create/edit task editor support so existing tasks can reopen in the same focused native surface
+- briefing-specific and watcher-specific editor fields with structured recipe params instead of relying only on prose inference
+- read-only task recipe and assumptions visibility in task detail/editor flows
+
+### Fixed
+
+- explicit family selections now fail honestly instead of silently downgrading malformed tasks back to generic
+- one-shot tasks can now be edited into recurring tasks and keep the chosen schedule after save
+- `/tasks` create/update paths now persist editor-selected recipe family and params correctly
+- websocket task-draft handoff is more resilient to partial payloads and date decoding drift on the client side
+- task rows/detail surfaces now show clearer family and schedule identity for easier scanning and review
+
+### Operator Notes
+
+- this release materially improves the chat-to-task and post-creation correction loop, but some v1 families like `maintenance` remain intentionally rigid until the later recipe/ingredient generalization work
+- older malformed tasks created before the editor flow may still need structured repair through the new editor or later cleanup work
+
 ## v0.7.9
 
 Release date:

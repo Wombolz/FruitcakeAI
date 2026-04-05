@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import contextvars
 from typing import Any, AsyncGenerator, Dict, List
 
 import litellm
@@ -20,6 +21,10 @@ from app.llm_usage import record_llm_usage_event, stream_usage_enabled
 from app.metrics import metrics
 
 log = structlog.get_logger(__name__)
+_task_handoff_payload: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "task_handoff_payload",
+    default=None,
+)
 
 # Silence LiteLLM's verbose request logging in production
 litellm.suppress_debug_info = True
@@ -406,6 +411,19 @@ def _parse_tool_json_result(content: str) -> Dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def reset_task_handoff_payload() -> contextvars.Token:
+    return _task_handoff_payload.set(None)
+
+
+def restore_task_handoff_payload(token: contextvars.Token) -> None:
+    _task_handoff_payload.reset(token)
+
+
+def get_task_handoff_payload() -> dict[str, Any] | None:
+    payload = _task_handoff_payload.get()
+    return dict(payload) if isinstance(payload, dict) else None
+
+
 def _task_handoff_message(
     messages: List[Dict[str, Any]],
     tool_calls: List[Any],
@@ -431,6 +449,22 @@ def _task_handoff_message(
         if tool_name == "create_and_run_task_plan" and payload and payload.get("run_enqueued") is True:
             task_id = payload.get("task_id")
             return f"Created a plan for task {task_id} and queued it to run now."
+
+    for tool_name, payload in paired:
+        if tool_name == "propose_task_draft" and payload and payload.get("proposed") is True:
+            _task_handoff_payload.set({"task_draft": payload})
+            confirmation = str(payload.get("task_confirmation") or "").strip()
+            if confirmation:
+                return confirmation
+            title = str(payload.get("title") or "").strip()
+            schedule = str(payload.get("schedule") or "").strip()
+            recipe_family = str(((payload.get("task_recipe") or {}).get("family") or "")).strip()
+            suffix = f" Schedule: {schedule}." if schedule else ""
+            if recipe_family:
+                suffix = f" Draft family: {recipe_family}.{suffix}"
+            if title:
+                return f"Prepared task draft '{title}'.{suffix}"
+            return f"Prepared a task draft.{suffix}"
 
     for tool_name, payload in paired:
         if tool_name == "update_task" and payload and payload.get("updated") is True:

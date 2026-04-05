@@ -18,6 +18,7 @@ import json
 
 import pytest
 from unittest.mock import AsyncMock, patch
+from sqlalchemy import select
 
 from app.agent.context import UserContext
 from app.agent.tools import TOOL_SCHEMAS, _parse_iso_datetime, get_tools_for_user
@@ -115,9 +116,9 @@ def test_system_prompt_requires_confirmation_before_calendar_delete():
 def test_system_prompt_requires_task_draft_before_create_or_update():
     ctx = _make_context(persona="family_assistant", blocked=[])
     prompt = ctx.to_system_prompt().lower()
-    assert "before using create_task or update_task" in prompt
-    assert "short normalized task draft" in prompt
-    assert "what it will do, when it will run" in prompt
+    assert "for a new task request, use propose_task_draft first" in prompt
+    assert "propose_task_draft" in prompt
+    assert "review the draft in the task editor before anything is persisted" in prompt
     assert "high-confidence task recipe" in prompt
 
 
@@ -159,6 +160,19 @@ def test_create_and_run_task_plan_schema_has_required_fields():
 
 def test_create_task_schema_has_required_fields():
     schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_task")
+    props = schema["function"]["parameters"]["properties"]
+    required = schema["function"]["parameters"].get("required", [])
+    assert "title" in props
+    assert "instruction" in props
+    assert "task_type" in props
+    assert "deliver" in props
+    assert "recipe_family" in props
+    assert "recipe_params" in props
+    assert set(["title", "instruction", "task_type", "deliver"]).issubset(set(required))
+
+
+def test_propose_task_draft_schema_has_required_fields():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "propose_task_draft")
     props = schema["function"]["parameters"]["properties"]
     required = schema["function"]["parameters"].get("required", [])
     assert "title" in props
@@ -241,6 +255,13 @@ def test_create_task_schema_description_mentions_normalized_draft():
     description = schema["function"]["description"].lower()
     assert "normalized draft" in description
     assert "recipe_family" in description
+
+
+def test_propose_task_draft_schema_description_mentions_not_saving():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "propose_task_draft")
+    description = schema["function"]["description"].lower()
+    assert "without saving it" in description
+    assert "task editor" in description
 
 
 def test_update_task_schema_description_mentions_restate_before_save():
@@ -922,7 +943,7 @@ async def test_create_task_tool_normalizes_recurring_briefing_recipe_into_config
     assert payload["created"] is True
     assert payload["task_recipe"]["family"] == "daily_research_briefing"
     assert "research briefing task" in payload["task_confirmation"].lower()
-    assert "append the briefing to reports/iran_middle_east_developments.md" in payload["task_confirmation"].lower()
+    assert "reports/iran_middle_east_developments.md" in payload["task_confirmation"].lower()
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, payload["task_id"])
@@ -1261,6 +1282,42 @@ async def test_run_task_now_tool_rejects_when_active_run_exists():
 
     assert result["queued"] is False
     assert result["detail"] == "Task is already running"
+
+
+@pytest.mark.asyncio
+async def test_propose_task_draft_tool_returns_normalized_draft_without_persisting():
+    import app.agent.tools as tools_module
+    from app.db.models import Task
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        payload = json.loads(
+            await tools_module._propose_task_draft(
+                {
+                    "title": "Daily Iran & Middle East 24-Hour Briefing",
+                    "instruction": (
+                        "Create a daily briefing covering the previous 24 hours about Iran and the Middle East "
+                        "and append it to reports/iran_middle_east_developments.md"
+                    ),
+                    "task_type": "recurring",
+                    "schedule": "every:24h",
+                    "deliver": True,
+                },
+                ctx,
+            )
+        )
+
+    assert payload["proposed"] is True
+    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert payload["executor_kind"] == "configured_executor"
+    assert payload["task_type"] == "recurring"
+    assert "draft ready" in payload["task_confirmation"].lower()
+    assert "reports/iran_middle_east_developments.md" in payload["task_confirmation"]
+
+    async with TestSessionLocal() as db:
+        rows = await db.execute(select(Task))
+        assert rows.scalars().all() == []
 
 
 @pytest.mark.asyncio
