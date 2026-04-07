@@ -167,8 +167,29 @@ async def test_morning_briefing_prepare_run_context_includes_market_and_weather_
                                             "observed_at_utc": "2026-04-06T12:00:00+00:00",
                                             "temperature_c": 22.3,
                                             "feels_like_c": 23.1,
+                                            "humidity_percent": 64,
+                                            "pressure_hpa": 1014,
+                                            "wind_speed_mps": 4.5,
                                             "description": "scattered clouds",
                                             "weather_main": "Clouds",
+                                        },
+                                        "forecast": {
+                                            "today": {
+                                                "high_c": 26.0,
+                                                "low_c": 17.0,
+                                                "max_precip_probability": 0.35,
+                                                "summary": "light rain",
+                                            },
+                                            "next_periods": [
+                                                {
+                                                    "time_local": "2026-04-06 11:00 AM EDT",
+                                                    "temperature_c": 24.0,
+                                                    "feels_like_c": 24.5,
+                                                    "precip_probability": 0.10,
+                                                    "description": "broken clouds",
+                                                    "wind_speed_mps": 3.8,
+                                                }
+                                            ],
                                         },
                                     }
                                 }
@@ -186,6 +207,7 @@ async def test_morning_briefing_prepare_run_context_includes_market_and_weather_
     assert out["dataset"]["market_snapshot"]["close"] == 71.92
     assert out["dataset"]["weather_snapshot"]["location"]["city_name"] == "Statesboro"
     assert out["dataset"]["weather_snapshot"]["current_weather"]["description"] == "scattered clouds"
+    assert out["dataset"]["weather_snapshot"]["forecast"]["today"]["high_c"] == 26.0
     assert out["dataset_stats"]["has_market_snapshot"] is True
     assert out["dataset_stats"]["has_weather_snapshot"] is True
     assert out["dataset"]["ingredients"] == [
@@ -201,7 +223,14 @@ async def test_morning_briefing_prepare_run_context_includes_market_and_weather_
     assert "Ingredients: calendar, rss_news, history, tomorrow_prep, market_snapshot, weather" in out["dataset_prompt"]
     assert "temp_f=72.1" in out["dataset_prompt"]
     assert "feels_like_f=73.6" in out["dataset_prompt"]
+    assert "humidity=64" in out["dataset_prompt"]
+    assert "wind_mph=10.1" in out["dataset_prompt"]
     assert "observed_local=2026-04-06 08:00 AM EDT" in out["dataset_prompt"]
+    assert "today_high_f=78.8" in out["dataset_prompt"]
+    assert "today_low_f=62.6" in out["dataset_prompt"]
+    assert "max_precip_chance=35%" in out["dataset_prompt"]
+    assert "forecast_summary=light rain" in out["dataset_prompt"]
+    assert "time_local=2026-04-06 11:00 AM EDT" in out["dataset_prompt"]
 
 
 @pytest.mark.asyncio
@@ -566,6 +595,78 @@ def test_morning_briefing_validate_finalize_accepts_model_written_history_sectio
     assert report is not None
     assert report["fatal"] is False
     assert report["has_history_section"] is True
+
+
+def test_morning_briefing_validate_finalize_rewrites_weather_section_from_snapshot():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Today at a glance\n\n"
+            "No events scheduled today.\n\n"
+            "## KO market snapshot\n\n"
+            "No update available in prepared data.\n\n"
+            "## Weather\n\n"
+            "Statesboro, GA - overcast clouds; 60.2F, observed 8:44 PM EDT. Today high/low 60.5/60.1. Next periods 11:00 PM EDT and 2:00 AM EDT.\n\n"
+            "## Today in history\n\n"
+            "On this day in 1896, the first modern Olympic Games opened in Athens.\n\n"
+            "## Headlines\n\n"
+            "- **Market rallies after jobs report** — Reuters — Stocks climbed after a stronger-than-expected jobs report. — [Read More](https://example.com/story)\n\n"
+            "## Worth your attention\n\n"
+            "- Watch for any follow-through in rates and risk appetite today.\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "timezone": "America/New_York",
+                "calendar_events": [],
+                "tomorrow_events": [],
+                "rss_items": [{"url": "https://example.com/story"}],
+                "weather_snapshot": {
+                    "location": {"city_name": "Statesboro", "country": "US", "requested_label": "Statesboro, GA 30458"},
+                    "current_weather": {
+                        "observed_at_utc": "2026-04-06T23:44:00+00:00",
+                        "temperature_c": 15.7,
+                        "feels_like_c": 14.5,
+                        "humidity_percent": 46,
+                        "wind_speed_mps": 4.0,
+                        "description": "overcast clouds",
+                    },
+                    "forecast": {
+                        "today": {
+                            "high_c": 15.8,
+                            "low_c": 15.6,
+                            "max_precip_probability": 0.0,
+                        },
+                        "next_periods": [
+                            {
+                                "time_local": "2026-04-06 11:00 PM EDT",
+                                "temperature_c": 15.6,
+                                "description": "overcast",
+                                "precip_probability": 0.0,
+                            },
+                            {
+                                "time_local": "2026-04-07 02:00 AM EDT",
+                                "temperature_c": 14.4,
+                                "description": "overcast",
+                                "precip_probability": 0.0,
+                            },
+                        ],
+                    },
+                },
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is False
+    assert "## Weather\n\n- Statesboro, GA 30458 - overcast clouds" in result
+    assert "- Observed 2026-04-06 07:44 PM EDT - Temp 60.3°F - Feels like 58.1°F - Humidity 46% - Wind 8.9 mph" in result
+    assert "- Today: high 60.4°F / low 60.1°F - Precipitation chance 0%" in result
+    assert "- Next periods:" in result
+    assert "  - 2026-04-06 11:00 PM EDT / overcast / 60.1°F / 0% precip" in result
+    assert "  - 2026-04-07 02:00 AM EDT / overcast / 57.9°F / 0% precip" in result
 
 
 def test_morning_briefing_validate_finalize_accepts_new_briefing_heading_style():

@@ -23,6 +23,14 @@ KO market / weather rules:
 - Always include these sections.
 - If the prepared dataset does not contain grounded information for one of them, say `No update available in prepared data.`
 - For weather, prefer Fahrenheit in the final output for U.S. locations and present observed times in clean local time rather than raw UTC timestamps when the prepared dataset includes them.
+- When grounded weather forecast data is present, use it directly for same-day high, low, and precipitation chance instead of falling back to `No update available in prepared data.`
+- Prefer a compact but information-dense weather section: current conditions, same-day range/precipitation, and a brief note about the next few forecast periods when they materially change the day.
+- Format the weather section as short markdown bullets, not one long paragraph.
+- Prefer this shape when data is available:
+  - location and current conditions
+  - observed time, temperature, feels-like temperature, humidity, and wind
+  - today's high/low and precipitation chance
+  - one short bullet for upcoming periods only when they materially change the day
 
 Today in history rules:
 - Always include this section.

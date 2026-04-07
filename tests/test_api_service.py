@@ -186,6 +186,75 @@ async def test_execute_api_request_accepts_lat_lon_aliases_for_weather():
 
 
 @pytest.mark.asyncio
+async def test_execute_api_request_normalizes_weather_briefing_snapshot():
+    user_id, task_id = await _seed_user_task_and_secret()
+    current_payload = {
+        "coord": {"lat": 32.4485, "lon": -81.7832},
+        "weather": [{"id": 802, "main": "Clouds", "description": "scattered clouds", "icon": "03d"}],
+        "main": {"temp": 22.3, "feels_like": 23.1, "pressure": 1014, "humidity": 64},
+        "wind": {"speed": 4.5, "deg": 270},
+        "dt": 1775037600,
+        "sys": {"country": "US", "sunrise": 1775006400, "sunset": 1775052000},
+        "timezone": -14400,
+        "name": "Statesboro",
+    }
+    forecast_payload = {
+        "city": {
+            "name": "Statesboro",
+            "country": "US",
+            "timezone": -14400,
+            "coord": {"lat": 32.4485, "lon": -81.7832},
+        },
+        "list": [
+            {
+                "dt": 1775048400,
+                "main": {"temp": 24.0, "feels_like": 24.8, "temp_min": 22.0, "temp_max": 26.0, "pressure": 1012, "humidity": 62},
+                "weather": [{"id": 500, "main": "Rain", "description": "light rain", "icon": "10d"}],
+                "wind": {"speed": 3.8, "deg": 250},
+                "pop": 0.35,
+            },
+            {
+                "dt": 1775059200,
+                "main": {"temp": 19.0, "feels_like": 18.5, "temp_min": 17.0, "temp_max": 21.0, "pressure": 1015, "humidity": 70},
+                "weather": [{"id": 803, "main": "Clouds", "description": "broken clouds", "icon": "04d"}],
+                "wind": {"speed": 2.6, "deg": 220},
+                "pop": 0.10,
+            },
+        ],
+    }
+
+    async with TestSessionLocal() as db:
+        with patch(
+            "app.api_adapters.weather.fetch_json",
+            new=AsyncMock(side_effect=[current_payload, forecast_payload]),
+        ):
+            result = await execute_api_request(
+                db,
+                user_id=user_id,
+                service="weather",
+                endpoint="briefing_snapshot",
+                query_params={
+                    "latitude": 32.4485,
+                    "longitude": -81.7832,
+                    "display_timezone": "America/New_York",
+                },
+                task_id=task_id,
+                secret_name="openweathermap_api_key",
+                response_fields={
+                    "location": "location",
+                    "current_weather": "current_weather",
+                    "forecast": "forecast",
+                },
+            )
+
+    assert '"city_name": "Statesboro"' in result
+    assert '"forecast"' in result
+    assert '"high_c": 26.0' in result
+    assert '"low_c": 17.0' in result
+    assert '"max_precip_probability": 0.35' in result
+
+
+@pytest.mark.asyncio
 async def test_execute_api_request_honors_weather_units_argument():
     user_id, task_id = await _seed_user_task_and_secret()
     payload = {

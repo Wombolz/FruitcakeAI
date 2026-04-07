@@ -188,7 +188,12 @@ def _extract_timezone_name(text: str, *, default: Optional[str] = None) -> str:
     return "UTC"
 
 
-def _build_contract(instruction: str, *, task_timezone: Optional[str]) -> Dict[str, Any]:
+def _build_contract(
+    instruction: str,
+    *,
+    task_timezone: Optional[str],
+    endpoint: str = "current_conditions",
+) -> Dict[str, Any]:
     latitude = _extract_number(r"lat(?:itude)?\s*=\s*(-?\d+(?:\.\d+)?)", instruction, cast=float, default=32.4485)
     longitude = _extract_number(r"lon(?:gitude)?\s*=\s*(-?\d+(?:\.\d+)?)", instruction, cast=float, default=-81.7832)
     explicit_match = re.search(r"timezone\s*=\s*([A-Za-z_/\-]+)", instruction, flags=re.IGNORECASE)
@@ -201,18 +206,22 @@ def _build_contract(instruction: str, *, task_timezone: Optional[str]) -> Dict[s
         display_timezone = str(task_timezone).strip()
     if not display_timezone:
         display_timezone = _infer_timezone_from_coordinates(latitude=latitude, longitude=longitude) or "UTC"
+    response_fields = {
+        "location": "location",
+        "current_weather": "current_weather",
+    }
+    if endpoint == "briefing_snapshot":
+        response_fields["forecast"] = "forecast"
     return {
         "service": "weather",
-        "endpoint": "current_conditions",
+        "endpoint": endpoint,
         "secret_name": _extract_secret_name(instruction),
         "display_timezone": display_timezone,
-        "response_fields": {
-            "location": "location",
-            "current_weather": "current_weather",
-        },
+        "response_fields": response_fields,
         "query_params": {
             "latitude": latitude,
             "longitude": longitude,
+            "display_timezone": display_timezone,
         },
     }
 

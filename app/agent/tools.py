@@ -170,7 +170,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "description": (
                     "Call an approved backend-owned JSON API integration. "
                     "Use this for structured external API workflows instead of shell or web search. "
-                    "Current supported service/endpoint combinations: n2yo + iss_visual_passes; alphavantage + global_quote, time_series_daily, or time_series_intraday; weather + current_conditions."
+                    "Current supported service/endpoint combinations: n2yo + iss_visual_passes; alphavantage + global_quote, time_series_daily, or time_series_intraday; weather + current_conditions or briefing_snapshot."
                 ),
             "parameters": {
                 "type": "object",

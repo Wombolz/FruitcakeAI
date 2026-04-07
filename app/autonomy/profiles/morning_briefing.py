@@ -268,6 +268,7 @@ class BriefingExecutionProfile(TaskExecutionProfile):
         text = (result or "").strip()
         if not text:
             text = _EMPTY_RESULT if not events and not rss_items else text
+        text = _normalize_weather_section(text, dataset)
 
         if not events and not rss_items and not tomorrow_events:
             return _EMPTY_RESULT, {
@@ -470,6 +471,9 @@ def _format_prompt_dataset(dataset: Dict[str, Any]) -> str:
     if isinstance(weather_snapshot, dict) and weather_snapshot:
         location = weather_snapshot.get("location") if isinstance(weather_snapshot.get("location"), dict) else {}
         current_weather = weather_snapshot.get("current_weather") if isinstance(weather_snapshot.get("current_weather"), dict) else {}
+        forecast = weather_snapshot.get("forecast") if isinstance(weather_snapshot.get("forecast"), dict) else {}
+        today_forecast = forecast.get("today") if isinstance(forecast.get("today"), dict) else {}
+        next_periods = forecast.get("next_periods") if isinstance(forecast.get("next_periods"), list) else []
         observed_local = _format_weather_observed_local(
             current_weather.get("observed_at_utc"),
             timezone_name=str(dataset.get("timezone") or "UTC"),
@@ -478,9 +482,30 @@ def _format_prompt_dataset(dataset: Dict[str, Any]) -> str:
             "- "
             f"city={location.get('city_name') or '-'} country={location.get('country') or '-'} "
             f"temp_f={_c_to_f(current_weather.get('temperature_c'))} feels_like_f={_c_to_f(current_weather.get('feels_like_c'))} "
+            f"humidity={current_weather.get('humidity_percent') or '-'} pressure_hpa={current_weather.get('pressure_hpa') or '-'} "
+            f"wind_mph={_mps_to_mph(current_weather.get('wind_speed_mps'))} "
             f"description={current_weather.get('description') or current_weather.get('weather_main') or '-'} "
             f"observed_local={observed_local}"
         )
+        lines.append(
+            "- "
+            f"today_high_f={_c_to_f(today_forecast.get('high_c'))} "
+            f"today_low_f={_c_to_f(today_forecast.get('low_c'))} "
+            f"max_precip_chance={_probability_to_percent(today_forecast.get('max_precip_probability'))} "
+            f"forecast_summary={today_forecast.get('summary') or '-'}"
+        )
+        if next_periods:
+            lines.append("- next_periods:")
+            for period in next_periods[:4]:
+                lines.append(
+                    "  - "
+                    f"time_local={period.get('time_local') or '-'} "
+                    f"temp_f={_c_to_f(period.get('temperature_c'))} "
+                    f"feels_like_f={_c_to_f(period.get('feels_like_c'))} "
+                    f"precip_chance={_probability_to_percent(period.get('precip_probability'))} "
+                    f"description={period.get('description') or period.get('weather_main') or '-'} "
+                    f"wind_mph={_mps_to_mph(period.get('wind_speed_mps'))}"
+                )
     else:
         lines.append("- none")
     lines.extend([
@@ -618,7 +643,7 @@ async def _load_weather_snapshot(
     instruction: str,
     task_timezone: str | None,
 ) -> tuple[dict[str, Any], str]:
-    contract = _build_weather_contract(instruction, task_timezone=task_timezone)
+    contract = _build_weather_contract(instruction, task_timezone=task_timezone, endpoint="briefing_snapshot")
     try:
         raw = await execute_api_request(
             db,
@@ -639,11 +664,17 @@ async def _load_weather_snapshot(
         return {}, ""
     location = fields.get("location") if isinstance(fields.get("location"), dict) else {}
     current_weather = fields.get("current_weather") if isinstance(fields.get("current_weather"), dict) else {}
-    if not location and not current_weather:
+    forecast = fields.get("forecast") if isinstance(fields.get("forecast"), dict) else {}
+    if not location and not current_weather and not forecast:
         return {}, ""
+    requested_label = _extract_requested_location_label(instruction)
+    if requested_label:
+        location = dict(location)
+        location["requested_label"] = requested_label
     return {
         "location": location,
         "current_weather": current_weather,
+        "forecast": forecast,
     }, ""
 
 
@@ -665,6 +696,24 @@ def _c_to_f(value: Any) -> str:
         return "-"
     fahrenheit = (celsius * 9.0 / 5.0) + 32.0
     return f"{fahrenheit:.1f}"
+
+
+def _mps_to_mph(value: Any) -> str:
+    try:
+        meters_per_second = float(value)
+    except Exception:
+        return "-"
+    return f"{meters_per_second * 2.23694:.1f}"
+
+
+def _probability_to_percent(value: Any) -> str:
+    try:
+        probability = float(value)
+    except Exception:
+        return "-"
+    if probability <= 1.0:
+        probability *= 100.0
+    return f"{probability:.0f}%"
 
 
 def _format_weather_observed_local(value: Any, *, timezone_name: str) -> str:
@@ -743,4 +792,115 @@ def _section_body(text: str, name: str) -> str:
         match = re.search(pattern, text, flags=re.DOTALL)
         if match:
             return match.group(1).strip()
+    return ""
+
+
+def _normalize_weather_section(text: str, dataset: Dict[str, Any]) -> str:
+    if not _has_section(text, "weather"):
+        return text
+    weather_snapshot = dataset.get("weather_snapshot")
+    if not isinstance(weather_snapshot, dict) or not weather_snapshot:
+        return text
+
+    replacement = _render_weather_section(weather_snapshot, timezone_name=str(dataset.get("timezone") or "UTC"))
+    if not replacement:
+        return text
+
+    for alias in _SECTION_ALIASES.get("weather", ()):
+        pattern = rf"({re.escape(alias)}\s*\n)(.*?)(?=\n##\s|\Z)"
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if not match:
+            continue
+        prefix = match.group(1)
+        return text[:match.start()] + prefix + replacement + text[match.end():]
+    return text
+
+
+def _render_weather_section(weather_snapshot: Dict[str, Any], *, timezone_name: str) -> str:
+    location = weather_snapshot.get("location") if isinstance(weather_snapshot.get("location"), dict) else {}
+    current_weather = weather_snapshot.get("current_weather") if isinstance(weather_snapshot.get("current_weather"), dict) else {}
+    forecast = weather_snapshot.get("forecast") if isinstance(weather_snapshot.get("forecast"), dict) else {}
+    today_forecast = forecast.get("today") if isinstance(forecast.get("today"), dict) else {}
+    next_periods = forecast.get("next_periods") if isinstance(forecast.get("next_periods"), list) else []
+
+    requested_label = str(location.get("requested_label") or "").strip()
+    location_bits = [str(location.get("city_name") or "").strip(), str(location.get("country") or "").strip()]
+    location_label = requested_label or ", ".join(bit for bit in location_bits if bit)
+    current_description = str(current_weather.get("description") or current_weather.get("weather_main") or "").strip()
+
+    lines: list[str] = []
+    if location_label or current_description:
+        headline = location_label or "Current conditions"
+        if current_description:
+            headline = f"{headline} - {current_description}"
+        lines.append(f"- {headline}")
+
+    observed_local = _format_weather_observed_local(current_weather.get("observed_at_utc"), timezone_name=timezone_name)
+    current_bits: list[str] = []
+    if observed_local != "-":
+        current_bits.append(f"Observed {observed_local}")
+    temperature_f = _c_to_f(current_weather.get("temperature_c"))
+    if temperature_f != "-":
+        current_bits.append(f"Temp {temperature_f}°F")
+    feels_like_f = _c_to_f(current_weather.get("feels_like_c"))
+    if feels_like_f != "-":
+        current_bits.append(f"Feels like {feels_like_f}°F")
+    humidity = current_weather.get("humidity_percent")
+    if humidity not in (None, ""):
+        current_bits.append(f"Humidity {humidity}%")
+    wind_mph = _mps_to_mph(current_weather.get("wind_speed_mps"))
+    if wind_mph != "-":
+        current_bits.append(f"Wind {wind_mph} mph")
+    if current_bits:
+        lines.append("- " + " - ".join(current_bits))
+
+    today_bits: list[str] = []
+    high_f = _c_to_f(today_forecast.get("high_c"))
+    low_f = _c_to_f(today_forecast.get("low_c"))
+    precip = _probability_to_percent(today_forecast.get("max_precip_probability"))
+    if high_f != "-" or low_f != "-":
+        today_bits.append(f"Today: high {high_f}°F / low {low_f}°F")
+    if precip != "-":
+        today_bits.append(f"Precipitation chance {precip}")
+    summary = str(today_forecast.get("summary") or "").strip()
+    if summary and summary != "-":
+        today_bits.append(summary)
+    if today_bits:
+        lines.append("- " + " - ".join(today_bits))
+
+    upcoming_lines: list[str] = []
+    for period in next_periods[:2]:
+        if not isinstance(period, dict):
+            continue
+        period_time = str(period.get("time_local") or "").strip()
+        period_temp = _c_to_f(period.get("temperature_c"))
+        period_desc = str(period.get("description") or period.get("weather_main") or "").strip()
+        if not period_time and not period_desc and period_temp == "-":
+            continue
+        period_bits = [bit for bit in [period_time, period_desc] if bit]
+        if period_temp != "-":
+            period_bits.append(f"{period_temp}°F")
+        period_precip = _probability_to_percent(period.get("precip_probability"))
+        if period_precip != "-":
+            period_bits.append(f"{period_precip} precip")
+        if period_bits:
+            upcoming_lines.append(" / ".join(period_bits))
+    if upcoming_lines:
+        lines.append("- Next periods:")
+        for period_line in upcoming_lines:
+            lines.append(f"  - {period_line}")
+
+    return "\n".join(lines).strip()
+
+
+def _extract_requested_location_label(instruction: str) -> str:
+    text = str(instruction or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"\bfor\s+([A-Za-z][A-Za-z .'-]+,\s*[A-Z]{2}(?:\s+\d{5})?)", text)
+    if match:
+        return str(match.group(1)).strip().rstrip(".,")
+    match = re.search(r"\b([A-Za-z][A-Za-z .'-]+,\s*[A-Z]{2}(?:\s+\d{5})?)", text)
+    if match:
+        return str(match.group(1)).strip().rstrip(".,")
     return ""
