@@ -178,3 +178,16 @@ Current field interpretation:
 - The broader naming pass, fully schema-driven editor behavior, and richer ingredient/add-on UI remain later follow-on work.
 - MCP expansion in this slice is justified only when it directly improves briefing debugging or validation.
 - Existing runtime axes remain valid; this fold-in is a design-contract clarification, not a stored schema rewrite.
+
+## Validation Notes
+
+### 2026-04-06
+
+Focused backend validation rerun:
+- command: `./.venv/bin/pytest -q tests/test_task_profiles.py`
+- result: `45 passed`
+- warnings: `20` deprecation/config warnings unrelated to the current briefing slice
+
+Interpretation:
+- the current in-progress briefing runtime/profile changes still satisfy the focused profile test suite
+- this does not yet validate end-to-end live briefing quality, but it does confirm that the current profile contract changes remain internally consistent at the focused test level

@@ -590,8 +590,8 @@ def _default_briefing_ingredients(*, briefing_mode: str, topic: str | None, path
     if topic and path:
         return ["rss_news"]
     if briefing_mode == "evening":
-        return ["calendar", "rss_news"]
-    return ["calendar", "rss_news"]
+        return ["calendar", "rss_news", "market_snapshot", "weather", "history", "tomorrow_prep"]
+    return ["calendar", "rss_news", "market_snapshot", "weather", "history", "tomorrow_prep"]
 
 
 def _default_briefing_sections(*, briefing_mode: str, topic: str | None, path: str | None) -> list[str]:
@@ -600,8 +600,8 @@ def _default_briefing_sections(*, briefing_mode: str, topic: str | None, path: s
             return ["headline_bullets", "day_in_review", "watch_tomorrow", "links"]
         return ["headline_bullets", "today_context", "watch_today", "links"]
     if briefing_mode == "evening":
-        return ["day_in_review", "tomorrow_at_a_glance", "headlines", "worth_attention"]
-    return ["today_at_a_glance", "headlines", "worth_attention"]
+        return ["day_in_review", "market_snapshot", "weather", "history", "headlines", "worth_attention", "tomorrow_at_a_glance"]
+    return ["today_at_a_glance", "market_snapshot", "weather", "history", "headlines", "worth_attention", "tomorrow_at_a_glance"]
 
 
 def _default_briefing_title(*, briefing_mode: str, topic: str | None) -> str:
@@ -615,11 +615,11 @@ def _briefing_profile_instruction(*, briefing_mode: str) -> str:
     if briefing_mode == "evening":
         return (
             "Prepare an evening briefing using today's calendar context and current headlines.\n"
-            "Include a short day-in-review, tomorrow's schedule preview when available, and any notable developments or priorities."
+            "Include a short day-in-review, a compact KO market snapshot, a weather note, a today-in-history note, current headlines with one-line summaries, and tomorrow's schedule preview."
         )
     return (
         "Prepare a morning briefing for today using my calendar and current headlines.\n"
-        "Include today's schedule, notable headlines, and any important conflicts or priorities."
+        "Include today's schedule, a compact KO market snapshot, a weather note, a today-in-history note, five top headlines with one-line summaries, and tomorrow's schedule preview."
     )
 
 
