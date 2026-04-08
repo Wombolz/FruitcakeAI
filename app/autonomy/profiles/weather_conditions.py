@@ -188,24 +188,59 @@ def _extract_timezone_name(text: str, *, default: Optional[str] = None) -> str:
     return "UTC"
 
 
-def _build_contract(instruction: str, *, task_timezone: Optional[str]) -> Dict[str, Any]:
+def _build_contract(
+    instruction: str,
+    *,
+    task_timezone: Optional[str],
+    endpoint: str = "current_conditions",
+) -> Dict[str, Any]:
     latitude = _extract_number(r"lat(?:itude)?\s*=\s*(-?\d+(?:\.\d+)?)", instruction, cast=float, default=32.4485)
     longitude = _extract_number(r"lon(?:gitude)?\s*=\s*(-?\d+(?:\.\d+)?)", instruction, cast=float, default=-81.7832)
-    display_timezone = _extract_timezone_name(instruction, default=task_timezone)
+    explicit_match = re.search(r"timezone\s*=\s*([A-Za-z_/\-]+)", instruction, flags=re.IGNORECASE)
+    display_timezone = ""
+    if explicit_match:
+        candidate = str(explicit_match.group(1)).strip()
+        if is_valid_timezone_name(candidate):
+            display_timezone = candidate
+    if not display_timezone and is_valid_timezone_name(task_timezone):
+        display_timezone = str(task_timezone).strip()
+    if not display_timezone:
+        display_timezone = _infer_timezone_from_coordinates(latitude=latitude, longitude=longitude) or "UTC"
+    response_fields = {
+        "location": "location",
+        "current_weather": "current_weather",
+    }
+    if endpoint == "briefing_snapshot":
+        response_fields["forecast"] = "forecast"
     return {
         "service": "weather",
-        "endpoint": "current_conditions",
+        "endpoint": endpoint,
         "secret_name": _extract_secret_name(instruction),
         "display_timezone": display_timezone,
-        "response_fields": {
-            "location": "location",
-            "current_weather": "current_weather",
-        },
+        "response_fields": response_fields,
         "query_params": {
             "latitude": latitude,
             "longitude": longitude,
+            "display_timezone": display_timezone,
         },
     }
+
+
+def _infer_timezone_from_coordinates(*, latitude: float, longitude: float) -> str | None:
+    # Lightweight fallback for U.S.-based weather/briefing contexts when no explicit timezone exists.
+    if 18.0 <= latitude <= 23.0 and -161.0 <= longitude <= -154.0:
+        return "Pacific/Honolulu"
+    if 51.0 <= latitude <= 72.0 and -170.0 <= longitude <= -129.0:
+        return "America/Anchorage"
+    if 24.0 <= latitude <= 50.0 and -125.0 <= longitude <= -66.0:
+        if longitude <= -115.0:
+            return "America/Los_Angeles"
+        if longitude <= -100.0:
+            return "America/Denver"
+        if longitude <= -85.0:
+            return "America/Chicago"
+        return "America/New_York"
+    return None
 
 
 def _parse_structured_api_result(text: str) -> Dict[str, Any] | None:

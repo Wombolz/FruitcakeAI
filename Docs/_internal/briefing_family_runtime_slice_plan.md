@@ -42,6 +42,28 @@ Implementation shape:
 - generate a predictable section order based on mode
 - keep morning/evening differences as framing/config, not separate hardcoded families
 
+Structural interpretation for this slice:
+- `source/join`
+  - where the inputs come from
+  - especially whether the task combines multiple sources such as calendar + RSS
+- `reshape`
+  - filtering, trimming, source restriction, ingredient gating, dataset normalization, headline limits
+- `aggregate`
+  - section assembly
+  - section order
+  - required sections
+  - empty-state behavior
+  - morning/evening framing
+- `effect`
+  - return only
+  - notify
+  - append/write/publish
+
+Important note:
+- the current runtime axes remain the operational surface
+- this structural layer is meant to clarify how briefing behavior should be reasoned about
+- `tool_policy` remains a capability boundary, not one of the four transform classes
+
 Expected v1 mode behavior:
 - `morning`
   - emphasize day start, schedule, forecast, market open context, top developments
@@ -49,6 +71,13 @@ Expected v1 mode behavior:
   - emphasize summary of day, tomorrow-facing prep, closing market/weather context, notable developments
 
 This should replace the current “evening briefing ran but produced a sub-par briefing” problem with a clearer, structured assembly path.
+
+Aggregate contract focus for this slice:
+- make required section set explicit
+- make section order explicit by `briefing_mode`
+- make empty-state section behavior explicit
+- make headline count and summary rules explicit
+- make ingredient-to-section expectations explicit enough that validation is confirming a visible contract rather than discovering the structure for the first time
 
 ### 3. Preserve backward compatibility with current briefing tasks
 Existing tasks using current briefing families should continue to work through a compatibility layer.
@@ -101,6 +130,20 @@ Possible payload additions:
 - normalized briefing config in task recipe metadata
 - optional bounded ingredient/section flags in recipe params
 
+Current field interpretation:
+- `briefing_mode`
+  - aggregate framing input
+- `ingredients`
+  - mostly reshape/join selectors
+- `required_sections`
+  - aggregate contract
+- `headline_limit`
+  - reshape constraint on aggregate output
+- `path`
+  - effect target
+- `custom_guidance`
+  - prompt/context modifier, not a primitive class by itself
+
 ## Test Plan
 
 1. Backward compatibility
@@ -134,3 +177,17 @@ Possible payload additions:
 - Ingredient selection stays built-in and intentionally limited in v1.
 - The broader naming pass, fully schema-driven editor behavior, and richer ingredient/add-on UI remain later follow-on work.
 - MCP expansion in this slice is justified only when it directly improves briefing debugging or validation.
+- Existing runtime axes remain valid; this fold-in is a design-contract clarification, not a stored schema rewrite.
+
+## Validation Notes
+
+### 2026-04-06
+
+Focused backend validation rerun:
+- command: `./.venv/bin/pytest -q tests/test_task_profiles.py`
+- result: `45 passed`
+- warnings: `20` deprecation/config warnings unrelated to the current briefing slice
+
+Interpretation:
+- the current in-progress briefing runtime/profile changes still satisfy the focused profile test suite
+- this does not yet validate end-to-end live briefing quality, but it does confirm that the current profile contract changes remain internally consistent at the focused test level

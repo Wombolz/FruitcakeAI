@@ -286,6 +286,91 @@ async def test_tasks_summary_includes_current_step_and_waiting_tool(client):
 
 
 @pytest.mark.asyncio
+async def test_task_detail_exposes_markdown_result_sections_from_final_output_artifact(client):
+    headers = await _headers(client, "resultsectionsowner")
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Morning Briefing", "instruction": "Prepare a briefing"},
+        headers=headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    final_markdown = (
+        "## Today at a glance\n"
+        "- No events scheduled today.\n\n"
+        "## Headlines\n"
+        "- **Headline** — Source — Short summary — [Read More](https://example.com/story)\n"
+    )
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.result = "flattened fallback"
+        run = TaskRun(task_id=task_id, status="completed", summary="done")
+        db.add(run)
+        await db.flush()
+        db.add(
+            TaskRunArtifact(
+                task_run_id=run.id,
+                artifact_type="final_output",
+                content_text=final_markdown,
+            )
+        )
+        await db.commit()
+
+    detail_resp = await client.get(f"/tasks/{task_id}", headers=headers)
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert detail["result"] == "flattened fallback"
+    assert detail["result_format"] == "markdown"
+    assert detail["result_markdown"] == final_markdown.strip()
+    assert [section["heading"] for section in detail["result_sections"]] == [
+        "Today at a glance",
+        "Headlines",
+    ]
+    assert detail["result_sections"][0]["is_empty_state"] is True
+    assert "Short summary" in detail["result_sections"][1]["body"]
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_includes_latest_final_output_sections(client):
+    headers = await _headers(client, "resultsectionslistowner")
+    first = await client.post(
+        "/tasks",
+        json={"title": "Task One", "instruction": "Do one"},
+        headers=headers,
+    )
+    second = await client.post(
+        "/tasks",
+        json={"title": "Task Two", "instruction": "Do two"},
+        headers=headers,
+    )
+    first_id = first.json()["id"]
+    second_id = second.json()["id"]
+
+    async with TestSessionLocal() as db:
+        run = TaskRun(task_id=first_id, status="completed", summary="done")
+        db.add(run)
+        await db.flush()
+        db.add(
+            TaskRunArtifact(
+                task_run_id=run.id,
+                artifact_type="final_output",
+                content_text="## Headlines\n- **Item** — Source — Summary — [Read More](https://example.com)\n",
+            )
+        )
+        await db.commit()
+
+    list_resp = await client.get("/tasks", headers=headers)
+    assert list_resp.status_code == 200
+    by_id = {item["id"]: item for item in list_resp.json()}
+    assert by_id[first_id]["result_format"] == "markdown"
+    assert by_id[first_id]["result_sections"][0]["heading"] == "Headlines"
+    assert by_id[second_id]["result_markdown"] is None
+    assert by_id[second_id]["result_sections"] == []
+
+
+@pytest.mark.asyncio
 async def test_recurring_task_auto_plans_once_when_missing_plan(client):
     from app.autonomy.runner import TaskRunner
 

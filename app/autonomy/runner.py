@@ -811,6 +811,18 @@ class TaskRunner:
                         task.status = "failed"
                         step_row.status = "failed"
                         step_row.error = message
+                        if task_run_id:
+                            run = await db.get(TaskRun, task_run_id)
+                            if run is not None:
+                                run.status = "failed"
+                                run.finished_at = datetime.now(timezone.utc)
+                                run.error = message
+                            await _persist_run_artifacts(
+                                db,
+                                task_run_id=task_run_id,
+                                final_markdown=result,
+                                run_debug=run_debug,
+                            )
                         await db.commit()
                     raise RuntimeError(message)
 

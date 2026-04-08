@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -14,12 +15,13 @@ from app.autonomy.profiles.maintenance import (
 from app.autonomy.profiles.morning_briefing import MorningBriefingExecutionProfile
 from app.autonomy.profiles.iss_pass_watcher import ISSPassWatcherExecutionProfile
 from app.autonomy.profiles.weather_conditions import WeatherConditionsExecutionProfile
+from app.autonomy.profiles.base import TaskExecutionProfile
 from app.autonomy.profiles.topic_watcher import (
     TopicWatcherExecutionProfile,
     _parse_topic_watcher_instruction,
 )
 from app.autonomy.runner import TaskRunner
-from app.db.models import Memory, MemoryProposal, RSSPublishedItem, Task
+from app.db.models import Memory, MemoryProposal, RSSPublishedItem, Task, TaskRun, TaskRunArtifact, TaskStep
 from tests.conftest import TestSessionLocal
 
 
@@ -112,6 +114,412 @@ async def test_morning_briefing_prepare_run_context_uses_calendar_and_rss():
     assert "Headline" in out["dataset_prompt"]
 
 
+@pytest.mark.asyncio
+async def test_morning_briefing_prepare_run_context_includes_market_and_weather_snapshots():
+    profile = MorningBriefingExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Morning",
+            instruction="Prepare a morning briefing for Statesboro, GA 30458.",
+            profile="briefing",
+            active_hours_tz="America/New_York",
+            task_recipe={
+                "family": "briefing",
+                "params": {
+                    "briefing_mode": "morning",
+                    "market_symbol": "NVDA",
+                },
+            },
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        with patch("app.autonomy.profiles.morning_briefing._get_provider", return_value=None):
+            with patch(
+                "app.autonomy.profiles.morning_briefing.build_magazine_dataset",
+                new=AsyncMock(return_value={"items": [], "stats": {}, "refresh": {}}),
+            ):
+                with patch(
+                    "app.autonomy.profiles.morning_briefing.fetch_daily_market_data_payload",
+                    new=AsyncMock(
+                        return_value={
+                            "symbol": "NVDA",
+                            "provider": "alphavantage",
+                            "days": [
+                                {
+                                    "date": "2026-04-06",
+                                    "open": 71.01,
+                                    "high": 72.34,
+                                    "low": 70.88,
+                                    "close": 71.92,
+                                    "volume": 123456,
+                                }
+                            ],
+                        }
+                    ),
+                ):
+                    with patch(
+                        "app.autonomy.profiles.morning_briefing.execute_api_request",
+                        new=AsyncMock(
+                            return_value=json.dumps(
+                                {
+                                    "fields": {
+                                        "location": {
+                                            "city_name": "Statesboro",
+                                            "country": "US",
+                                        },
+                                        "current_weather": {
+                                            "observed_at_utc": "2026-04-06T12:00:00+00:00",
+                                            "temperature_c": 22.3,
+                                            "feels_like_c": 23.1,
+                                            "humidity_percent": 64,
+                                            "pressure_hpa": 1014,
+                                            "wind_speed_mps": 4.5,
+                                            "description": "scattered clouds",
+                                            "weather_main": "Clouds",
+                                        },
+                                        "forecast": {
+                                            "today": {
+                                                "high_c": 26.0,
+                                                "low_c": 17.0,
+                                                "max_precip_probability": 0.35,
+                                                "summary": "light rain",
+                                            },
+                                            "next_periods": [
+                                                {
+                                                    "time_local": "2026-04-06 11:00 AM EDT",
+                                                    "temperature_c": 24.0,
+                                                    "feels_like_c": 24.5,
+                                                    "precip_probability": 0.10,
+                                                    "description": "broken clouds",
+                                                    "wind_speed_mps": 3.8,
+                                                }
+                                            ],
+                                        },
+                                    }
+                                }
+                            )
+                        ),
+                    ):
+                        out = await profile.prepare_run_context(
+                            db=db,
+                            user_id=1,
+                            task_id=task.id,
+                            task_run_id=101,
+                        )
+
+    assert out["dataset"]["market_snapshot"]["symbol"] == "NVDA"
+    assert out["dataset"]["market_snapshot"]["close"] == 71.92
+    assert out["dataset"]["weather_snapshot"]["location"]["city_name"] == "Statesboro"
+    assert out["dataset"]["weather_snapshot"]["current_weather"]["description"] == "scattered clouds"
+    assert out["dataset"]["weather_snapshot"]["forecast"]["today"]["high_c"] == 26.0
+    assert out["dataset_stats"]["has_market_snapshot"] is True
+    assert out["dataset_stats"]["has_weather_snapshot"] is True
+    assert out["dataset"]["ingredients"] == [
+        "calendar",
+        "rss_news",
+        "history",
+        "tomorrow_prep",
+        "market_snapshot",
+        "weather",
+    ]
+    assert "NVDA market snapshot:" in out["dataset_prompt"]
+    assert "Weather snapshot:" in out["dataset_prompt"]
+    assert "Ingredients: calendar, rss_news, history, tomorrow_prep, market_snapshot, weather" in out["dataset_prompt"]
+    assert "temp_f=72.1" in out["dataset_prompt"]
+    assert "feels_like_f=73.6" in out["dataset_prompt"]
+    assert "humidity=64" in out["dataset_prompt"]
+    assert "wind_mph=10.1" in out["dataset_prompt"]
+    assert "observed_local=2026-04-06 08:00 AM EDT" in out["dataset_prompt"]
+    assert "today_high_f=78.8" in out["dataset_prompt"]
+    assert "today_low_f=62.6" in out["dataset_prompt"]
+    assert "max_precip_chance=35%" in out["dataset_prompt"]
+    assert "forecast_summary=light rain" in out["dataset_prompt"]
+    assert "time_local=2026-04-06 11:00 AM EDT" in out["dataset_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_morning_briefing_prepare_run_context_upgrades_stale_legacy_ingredients():
+    profile = MorningBriefingExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Morning",
+            instruction="Prepare a morning briefing for Statesboro, GA 30458.",
+            profile="briefing",
+            active_hours_tz="America/New_York",
+            task_recipe={
+                "family": "briefing",
+                "params": {
+                    "briefing_mode": "morning",
+                    "ingredients": ["calendar", "rss_news"],
+                },
+            },
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        with patch("app.autonomy.profiles.morning_briefing._get_provider", return_value=None):
+            with patch(
+                "app.autonomy.profiles.morning_briefing.build_magazine_dataset",
+                new=AsyncMock(return_value={"items": [], "stats": {}, "refresh": {}}),
+            ):
+                with patch(
+                    "app.autonomy.profiles.morning_briefing.fetch_daily_market_data_payload",
+                    new=AsyncMock(
+                        return_value={
+                            "symbol": "KO",
+                            "provider": "alphavantage",
+                            "days": [{"date": "2026-04-06", "open": 71.0, "high": 72.0, "low": 70.5, "close": 71.5, "volume": 123}],
+                        }
+                    ),
+                ):
+                    with patch(
+                        "app.autonomy.profiles.morning_briefing.execute_api_request",
+                        new=AsyncMock(
+                            return_value=json.dumps(
+                                {
+                                    "fields": {
+                                        "location": {"city_name": "Statesboro", "country": "US"},
+                                        "current_weather": {
+                                            "observed_at_utc": "2026-04-06T12:00:00+00:00",
+                                            "temperature_c": 20.0,
+                                            "feels_like_c": 19.0,
+                                            "description": "clear sky",
+                                        },
+                                    }
+                                }
+                            )
+                        ),
+                    ):
+                        out = await profile.prepare_run_context(db=db, user_id=1, task_id=task.id, task_run_id=102)
+
+    assert out["dataset"]["ingredients"] == [
+        "calendar",
+        "rss_news",
+        "history",
+        "tomorrow_prep",
+        "market_snapshot",
+        "weather",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_morning_briefing_prepare_run_context_formats_event_times_in_local_timezone():
+    profile = MorningBriefingExecutionProfile()
+
+    class _Provider:
+        async def list_events(self, calendar_id, start, end, max_results):
+            return [
+                {
+                    "id": "evt1",
+                    "summary": "School meeting",
+                    "start": "2026-03-24T13:00:00+00:00",
+                    "end": "2026-03-24T14:00:00+00:00",
+                    "location": "Office",
+                }
+            ]
+
+    async with TestSessionLocal() as db:
+        task = Task(user_id=1, title="Morning", instruction="Brief me", profile="morning_briefing", active_hours_tz="America/New_York")
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        with patch("app.autonomy.profiles.morning_briefing._get_provider", return_value=_Provider()):
+            with patch(
+                "app.autonomy.profiles.morning_briefing.build_magazine_dataset",
+                new=AsyncMock(return_value={"items": [], "stats": {}, "refresh": {}}),
+            ):
+                out = await profile.prepare_run_context(db=db, user_id=1, task_id=task.id, task_run_id=103)
+
+    assert out["dataset"]["calendar_events"][0]["start"] == "2026-03-24 09:00 AM EDT"
+    assert out["dataset"]["tomorrow_events"][0]["start"] == "2026-03-24 09:00 AM EDT"
+
+
+@pytest.mark.asyncio
+async def test_morning_briefing_prepare_run_context_falls_back_to_weather_inferred_timezone():
+    profile = MorningBriefingExecutionProfile()
+
+    class _Provider:
+        async def list_events(self, calendar_id, start, end, max_results):
+            return [
+                {
+                    "id": "evt1",
+                    "summary": "Psychology appointment",
+                    "start": "2026-04-07T22:30:00+00:00",
+                    "end": "2026-04-07T23:00:00+00:00",
+                    "location": "",
+                }
+            ]
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Morning",
+            instruction="Prepare a morning briefing for Statesboro, GA 30458.",
+            profile="briefing",
+            active_hours_tz="UTC",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        with patch("app.autonomy.profiles.morning_briefing._get_provider", return_value=_Provider()):
+            with patch(
+                "app.autonomy.profiles.morning_briefing.build_magazine_dataset",
+                new=AsyncMock(return_value={"items": [], "stats": {}, "refresh": {}}),
+            ):
+                with patch(
+                    "app.autonomy.profiles.morning_briefing.fetch_daily_market_data_payload",
+                    new=AsyncMock(return_value={"symbol": "KO", "provider": "alphavantage", "days": []}),
+                ):
+                    with patch(
+                        "app.autonomy.profiles.morning_briefing.execute_api_request",
+                        new=AsyncMock(
+                            return_value=json.dumps(
+                                {
+                                    "fields": {
+                                        "location": {
+                                            "city_name": "Statesboro",
+                                            "country": "US",
+                                            "latitude": 32.4485,
+                                            "longitude": -81.7832,
+                                        },
+                                        "current_weather": {
+                                            "observed_at_utc": "2026-04-06T23:52:00+00:00",
+                                            "temperature_c": 16.7,
+                                            "feels_like_c": 15.6,
+                                            "description": "overcast clouds",
+                                        },
+                                    }
+                                }
+                            )
+                        ),
+                    ):
+                        out = await profile.prepare_run_context(db=db, user_id=1, task_id=task.id, task_run_id=104)
+
+    assert out["dataset"]["timezone"] == "America/New_York"
+    assert out["dataset"]["calendar_events"][0]["start"] == "2026-04-07 06:30 PM EDT"
+    assert "observed_local=2026-04-06 07:52 PM EDT" in out["dataset_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_weather_profile_prepare_run_context_infers_timezone_from_coordinates_when_missing():
+    profile = WeatherConditionsExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Weather",
+            instruction="Check current conditions at lat=32.4485 lon=-81.7832",
+            profile="weather_conditions",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        context = await profile.prepare_run_context(
+            db=db,
+            user_id=1,
+            task_id=task.id,
+            task_run_id=101,
+        )
+
+    assert context["api_contract"]["display_timezone"] == "America/New_York"
+
+
+@pytest.mark.asyncio
+async def test_morning_briefing_prepare_run_context_upgrades_legacy_required_sections():
+    profile = MorningBriefingExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Morning",
+            instruction="Brief me",
+            profile="briefing",
+            active_hours_tz="UTC",
+            task_recipe={
+                "family": "briefing",
+                "params": {
+                    "briefing_mode": "morning",
+                    "sections": ["today_at_a_glance", "headlines", "worth_attention"],
+                },
+            },
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        with patch("app.autonomy.profiles.morning_briefing._get_provider", return_value=None):
+            with patch(
+                "app.autonomy.profiles.morning_briefing.build_magazine_dataset",
+                new=AsyncMock(return_value={"items": [], "stats": {}, "refresh": {}}),
+            ):
+                out = await profile.prepare_run_context(
+                    db=db,
+                    user_id=1,
+                    task_id=task.id,
+                    task_run_id=101,
+                )
+
+    assert out["dataset"]["required_sections"] == [
+        "today_at_a_glance",
+        "market_snapshot",
+        "weather",
+        "history",
+        "headlines",
+        "worth_attention",
+        "tomorrow_at_a_glance",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_morning_briefing_prepare_run_context_canonicalizes_legacy_section_aliases():
+    profile = MorningBriefingExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Morning",
+            instruction="Brief me",
+            profile="briefing",
+            active_hours_tz="UTC",
+            task_recipe={
+                "family": "briefing",
+                "params": {
+                    "briefing_mode": "morning",
+                    "sections": ["today_context", "headline_bullets", "watch_today", "links"],
+                },
+            },
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        with patch("app.autonomy.profiles.morning_briefing._get_provider", return_value=None):
+            with patch(
+                "app.autonomy.profiles.morning_briefing.build_magazine_dataset",
+                new=AsyncMock(return_value={"items": [], "stats": {}, "refresh": {}}),
+            ):
+                out = await profile.prepare_run_context(
+                    db=db,
+                    user_id=1,
+                    task_id=task.id,
+                    task_run_id=101,
+                )
+
+    assert out["dataset"]["required_sections"] == [
+        "today_at_a_glance",
+        "market_snapshot",
+        "weather",
+        "history",
+        "headlines",
+        "worth_attention",
+        "tomorrow_at_a_glance",
+    ]
+
+
 def test_morning_briefing_validate_finalize_accepts_calendar_only():
     profile = MorningBriefingExecutionProfile()
     result, report = profile.validate_finalize(
@@ -133,15 +541,24 @@ def test_morning_briefing_validate_finalize_accepts_standard_section_headings_wi
         result=(
             "## Today at a glance\n\n"
             "- 09:00 Doctor appointment\n\n"
+            "## KO market snapshot\n\n"
+            "No update available in prepared data.\n\n"
+            "## Weather\n\n"
+            "No update available in prepared data.\n\n"
+            "## Today in history\n\n"
+            "No update available in prepared data.\n\n"
             "## Headlines\n\n"
-            "- Market rallies after jobs report — [Read More](https://example.com/story)\n\n"
+            "- **Market rallies after jobs report** — Reuters — Stocks climbed after a stronger-than-expected jobs report. — [Read More](https://example.com/story)\n\n"
             "## Worth your attention\n\n"
-            "- Leave early for the afternoon appointment."
+            "- Leave early for the afternoon appointment.\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
         ),
         prior_full_outputs=[],
         run_context={
             "dataset": {
                 "calendar_events": [{"title": "Doctor appointment"}],
+                "tomorrow_events": [],
                 "rss_items": [{"url": "https://example.com/story"}],
             }
         },
@@ -151,6 +568,149 @@ def test_morning_briefing_validate_finalize_accepts_standard_section_headings_wi
     assert report["fatal"] is False
     assert report["has_calendar_section"] is True
     assert report["has_headlines_section"] is True
+
+
+def test_morning_briefing_validate_finalize_accepts_model_written_history_section():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Today at a glance\n\n"
+            "No events scheduled today.\n\n"
+            "## KO market snapshot\n\n"
+            "No update available in prepared data.\n\n"
+            "## Weather\n\n"
+            "No update available in prepared data.\n\n"
+            "## Today in history\n\n"
+            "On this day in 1896, the first modern Olympic Games opened in Athens, marking the revival of the Olympic tradition.\n\n"
+            "## Headlines\n\n"
+            "- **Market rallies after jobs report** — Reuters — Stocks climbed after a stronger-than-expected jobs report. — [Read More](https://example.com/story)\n\n"
+            "## Worth your attention\n\n"
+            "- Watch for any follow-through in rates and risk appetite today.\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "calendar_events": [],
+                "tomorrow_events": [],
+                "rss_items": [{"url": "https://example.com/story"}],
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is False
+    assert report["has_history_section"] is True
+
+
+def test_morning_briefing_validate_finalize_rewrites_weather_section_from_snapshot():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Today at a glance\n\n"
+            "No events scheduled today.\n\n"
+            "## KO market snapshot\n\n"
+            "No update available in prepared data.\n\n"
+            "## Weather\n\n"
+            "Statesboro, GA - overcast clouds; 60.2F, observed 8:44 PM EDT. Today high/low 60.5/60.1. Next periods 11:00 PM EDT and 2:00 AM EDT.\n\n"
+            "## Today in history\n\n"
+            "On this day in 1896, the first modern Olympic Games opened in Athens.\n\n"
+            "## Headlines\n\n"
+            "- **Market rallies after jobs report** — Reuters — Stocks climbed after a stronger-than-expected jobs report. — [Read More](https://example.com/story)\n\n"
+            "## Worth your attention\n\n"
+            "- Watch for any follow-through in rates and risk appetite today.\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "timezone": "America/New_York",
+                "calendar_events": [],
+                "tomorrow_events": [],
+                "rss_items": [{"url": "https://example.com/story"}],
+                "weather_snapshot": {
+                    "location": {"city_name": "Statesboro", "country": "US", "requested_label": "Statesboro, GA 30458"},
+                    "current_weather": {
+                        "observed_at_utc": "2026-04-06T23:44:00+00:00",
+                        "temperature_c": 15.7,
+                        "feels_like_c": 14.5,
+                        "humidity_percent": 46,
+                        "wind_speed_mps": 4.0,
+                        "description": "overcast clouds",
+                    },
+                    "forecast": {
+                        "today": {
+                            "high_c": 15.8,
+                            "low_c": 15.6,
+                            "max_precip_probability": 0.0,
+                        },
+                        "next_periods": [
+                            {
+                                "time_local": "2026-04-06 11:00 PM EDT",
+                                "temperature_c": 15.6,
+                                "description": "overcast",
+                                "precip_probability": 0.0,
+                            },
+                            {
+                                "time_local": "2026-04-07 02:00 AM EDT",
+                                "temperature_c": 14.4,
+                                "description": "overcast",
+                                "precip_probability": 0.0,
+                            },
+                        ],
+                    },
+                },
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is False
+    assert "## Weather\n\n- Statesboro, GA 30458 - overcast clouds" in result
+    assert "- Observed 2026-04-06 07:44 PM EDT - Temp 60.3°F - Feels like 58.1°F - Humidity 46% - Wind 8.9 mph" in result
+    assert "- Today: high 60.4°F / low 60.1°F - Precipitation chance 0%" in result
+    assert "- Next periods:" in result
+    assert "  - 2026-04-06 11:00 PM EDT / overcast / 60.1°F / 0% precip" in result
+    assert "  - 2026-04-07 02:00 AM EDT / overcast / 57.9°F / 0% precip" in result
+
+
+def test_morning_briefing_validate_finalize_accepts_new_briefing_heading_style():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Today context\n\n"
+            "- 09:00 Doctor appointment\n\n"
+            "## KO market snapshot\n\n"
+            "No update available in prepared data.\n\n"
+            "## Weather\n\n"
+            "No update available in prepared data.\n\n"
+            "## Today in history\n\n"
+            "No update available in prepared data.\n\n"
+            "## What to watch today\n\n"
+            "- Leave early for the afternoon appointment.\n\n"
+            "## Links (from cached feeds)\n\n"
+            "- Reuters update — Reuters — A one-line summary of the latest development. — https://example.com/story\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "calendar_events": [{"title": "Doctor appointment"}],
+                "tomorrow_events": [],
+                "rss_items": [{"url": "https://example.com/story"}],
+            }
+        },
+        is_final_step=True,
+    )
+    assert result.startswith("## Today context")
+    assert report is not None
+    assert report["fatal"] is False
+    assert report["has_calendar_section"] is True
+    assert report["has_headlines_section"] is True
+    assert report["has_attention_section"] is True
 
 
 def test_morning_briefing_validate_finalize_requires_calendar_section_when_events_present():
@@ -175,6 +735,164 @@ def test_morning_briefing_validate_finalize_requires_calendar_section_when_event
     assert report is not None
     assert report["fatal"] is True
     assert "required calendar section" in report["fatal_reason"].lower()
+
+
+def test_briefing_validate_finalize_requires_day_in_review_for_evening_mode():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Headlines\n\n"
+            "- Artemis imagery update — [Read More](https://example.com/story)\n\n"
+            "## Worth your attention\n\n"
+            "- Review tomorrow's launch schedule."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "briefing_mode": "evening",
+                "calendar_events": [],
+                "tomorrow_events": [{"title": "Launch prep"}],
+                "rss_items": [{"url": "https://example.com/story"}],
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is True
+    assert "day-in-review" in report["fatal_reason"].lower()
+
+
+def test_briefing_validate_finalize_requires_evening_headline_summaries():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Day in review\n\n"
+            "No events were on the calendar today.\n\n"
+            "## KO market snapshot\n\n"
+            "No update available in prepared data.\n\n"
+            "## Weather\n\n"
+            "No update available in prepared data.\n\n"
+            "## Today in history\n\n"
+            "No update available in prepared data.\n\n"
+            "## Headlines\n\n"
+            "- **Artemis update** — Reuters — [Read More](https://example.com/story)\n\n"
+            "## Worth your attention\n\n"
+            "No additional cross-source priorities today.\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "briefing_mode": "evening",
+                "calendar_events": [],
+                "tomorrow_events": [],
+                "rss_items": [{"url": "https://example.com/story"}],
+                "required_sections": [
+                    "day_in_review",
+                    "market_snapshot",
+                    "weather",
+                    "history",
+                    "headlines",
+                    "worth_attention",
+                    "tomorrow_at_a_glance",
+                ],
+                "headline_limit": 6,
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is True
+    assert "headline bullets must include one-line summaries" in report["fatal_reason"].lower()
+
+
+def test_briefing_validate_finalize_enforces_evening_headline_limit():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Day in review\n\n"
+            "No events were on the calendar today.\n\n"
+            "## KO market snapshot\n\n"
+            "No update available in prepared data.\n\n"
+            "## Weather\n\n"
+            "No update available in prepared data.\n\n"
+            "## Today in history\n\n"
+            "No update available in prepared data.\n\n"
+            "## Headlines\n\n"
+            "- **One** — Reuters — Summary one. — [Read More](https://example.com/1)\n"
+            "- **Two** — Reuters — Summary two. — [Read More](https://example.com/2)\n"
+            "- **Three** — Reuters — Summary three. — [Read More](https://example.com/3)\n"
+            "- **Four** — Reuters — Summary four. — [Read More](https://example.com/4)\n"
+            "- **Five** — Reuters — Summary five. — [Read More](https://example.com/5)\n"
+            "- **Six** — Reuters — Summary six. — [Read More](https://example.com/6)\n"
+            "- **Seven** — Reuters — Summary seven. — [Read More](https://example.com/7)\n\n"
+            "## Worth your attention\n\n"
+            "No additional cross-source priorities today.\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "briefing_mode": "evening",
+                "calendar_events": [],
+                "tomorrow_events": [],
+                "rss_items": [{"url": f"https://example.com/{i}"} for i in range(1, 8)],
+                "required_sections": [
+                    "day_in_review",
+                    "market_snapshot",
+                    "weather",
+                    "history",
+                    "headlines",
+                    "worth_attention",
+                    "tomorrow_at_a_glance",
+                ],
+                "headline_limit": 6,
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is True
+    assert "exceeded the allowed 6 headlines" in report["fatal_reason"].lower()
+
+
+def test_briefing_validate_finalize_requires_evening_required_sections():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Day in review\n\n"
+            "No events were on the calendar today.\n\n"
+            "## Headlines\n\n"
+            "- **Artemis update** — Reuters — Summary one. — [Read More](https://example.com/story)\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "briefing_mode": "evening",
+                "calendar_events": [],
+                "tomorrow_events": [],
+                "rss_items": [{"url": "https://example.com/story"}],
+                "required_sections": [
+                    "day_in_review",
+                    "market_snapshot",
+                    "weather",
+                    "history",
+                    "headlines",
+                    "worth_attention",
+                    "tomorrow_at_a_glance",
+                ],
+                "headline_limit": 6,
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is True
+    assert "evening briefing omitted required sections" in report["fatal_reason"].lower()
 
 
 @pytest.mark.asyncio
@@ -1167,6 +1885,124 @@ async def test_topic_watcher_runner_does_not_push_nothing_new(client):
         assert task.status == "completed"
         assert task.result == "NOTHING_NEW"
     push_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_briefing_runner_persists_artifacts_for_fatal_validation_failure(client):
+    headers = await _headers(client, "briefingartifactowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Morning briefing",
+            "instruction": "Prepare a morning briefing for today using my calendar and current headlines.",
+            "deliver": False,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+    runner = TaskRunner()
+
+    class _FatalArtifactProfile(TaskExecutionProfile):
+        name = "briefing"
+
+        async def plan_steps(
+            self,
+            *,
+            goal,
+            user_id,
+            task_id,
+            task_instruction,
+            max_steps,
+            notes,
+            style,
+            model_override,
+            default_planner,
+        ):
+            del goal, user_id, task_id, task_instruction, max_steps, notes, style, model_override, default_planner
+            return [
+                {
+                    "title": "Assemble Briefing",
+                    "instruction": "Assemble the briefing from the prepared dataset only.",
+                    "requires_approval": False,
+                }
+            ]
+
+        async def prepare_run_context(self, *, db, user_id, task_id, task_run_id):
+            del db, user_id, task_id, task_run_id
+            return {
+                "dataset": {"briefing_mode": "morning", "rss_items": [{"url": "https://example.com/story"}]},
+                "dataset_stats": {"rss_count": 1},
+                "refresh_stats": {"sources_refreshed": 1},
+            }
+
+        def effective_blocked_tools(self, *, run_context):
+            del run_context
+            return {"web_search"}
+
+        def validate_finalize(self, *, result, prior_full_outputs, run_context, is_final_step):
+            del prior_full_outputs, is_final_step
+            return result, {
+                "fatal": True,
+                "fatal_reason": "Morning briefing did not produce any publishable section.",
+                "briefing_mode": "morning",
+                "rss_count": len((run_context.get("dataset") or {}).get("rss_items") or []),
+            }
+
+        def artifact_payloads(self, *, final_markdown, run_debug):
+            return [
+                {"artifact_type": "prepared_dataset", "content_json": run_debug.get("dataset", {})},
+                {"artifact_type": "final_output", "content_text": final_markdown},
+                {"artifact_type": "validation_report", "content_json": run_debug.get("grounding_report", {})},
+                {"artifact_type": "run_diagnostics", "content_json": {"dataset_stats": run_debug.get("dataset_stats", {})}},
+            ]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.has_plan = True
+        task.current_step_index = 1
+        task.status = "running"
+        db.add(
+            TaskStep(
+                task_id=task_id,
+                step_index=1,
+                title="Assemble Briefing",
+                instruction="Assemble the briefing from the prepared dataset only.",
+                status="pending",
+                requires_approval=False,
+            )
+        )
+        run = TaskRun(task_id=task_id, status="running")
+        db.add(run)
+        await db.commit()
+        await db.refresh(run)
+        task_run_id = run.id
+
+    with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+        with patch("app.autonomy.runner.resolve_task_execution_contract", return_value=_FatalArtifactProfile()):
+            with patch("app.agent.core.run_agent", new=AsyncMock(return_value="Briefing with no valid sections.")):
+                with pytest.raises(RuntimeError, match="publishable section"):
+                    await runner._execute_agent(task_id, task_run_id=task_run_id)
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "failed"
+        runs = await db.execute(
+            select(TaskRun).where(TaskRun.task_id == task_id).order_by(TaskRun.started_at.desc())
+        )
+        latest = runs.scalars().first()
+        assert latest is not None
+        artifacts = await db.execute(
+            select(TaskRunArtifact).where(TaskRunArtifact.task_run_id == latest.id)
+        )
+        by_type = {a.artifact_type: a for a in artifacts.scalars().all()}
+        assert "prepared_dataset" in by_type
+        assert "final_output" in by_type
+        assert "validation_report" in by_type
+        validation_payload = json.loads(by_type["validation_report"].content_json)
+        assert validation_payload["fatal"] is True
+        assert "publishable section" in validation_payload["fatal_reason"].lower()
 
 
 async def _headers(client, username: str) -> dict[str, str]:

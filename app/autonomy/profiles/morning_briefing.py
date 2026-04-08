@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from app.api_service import execute_api_request, fetch_daily_market_data_payload
 from app.autonomy.magazine_pipeline import build_magazine_dataset
 from app.autonomy.profiles.base import TaskExecutionProfile
 from app.autonomy.profiles.spec_loader import load_profile_spec_text
+from app.autonomy.profiles.weather_conditions import _build_contract as _build_weather_contract
 from app.db.models import Task, User
 from app.mcp.servers.calendar import _dedupe_events, _get_provider
+from app.time_utils import is_valid_timezone_name, resolve_effective_timezone
 
 _MAX_RSS_ITEMS = 8
-_MAX_WORDS = 600
+_MAX_WORDS = 650
 _PLACEHOLDER_HEADINGS = {
     "today",
     "news",
@@ -20,10 +24,28 @@ _PLACEHOLDER_HEADINGS = {
     "updates",
 }
 _EMPTY_RESULT = "Nothing to brief today - no calendar events and no fresh headlines."
+_SECTION_ALIASES = {
+    "today_at_a_glance": ("## Today at a glance", "## Today context"),
+    "market_snapshot": ("## Market snapshot", "## KO market snapshot"),
+    "weather": ("## Weather",),
+    "history": ("## Today in history",),
+    "headlines": ("## Headlines", "## Links (from cached feeds)"),
+    "worth_attention": ("## Worth your attention", "## What to watch today"),
+    "tomorrow_at_a_glance": ("## Tomorrow at a glance", "## What to watch tomorrow"),
+    "day_in_review": ("## Day in review",),
+}
+_LEGACY_SECTION_NAME_MAP = {
+    "today_context": "today_at_a_glance",
+    "headline_bullets": "headlines",
+    "links": "headlines",
+    "watch_today": "worth_attention",
+    "watch_tomorrow": "tomorrow_at_a_glance",
+}
+_DEFAULT_HEADLINE_LIMIT = 5
 
 
-class MorningBriefingExecutionProfile(TaskExecutionProfile):
-    name = "morning_briefing"
+class BriefingExecutionProfile(TaskExecutionProfile):
+    name = "briefing"
 
     async def plan_steps(
         self,
@@ -41,8 +63,8 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
         del goal, user_id, task_id, task_instruction, max_steps, notes, style, model_override, default_planner
         return [
             {
-                "title": "Assemble Morning Briefing",
-                "instruction": "Assemble the morning briefing from the prepared calendar and RSS datasets only.",
+                "title": "Assemble Briefing",
+                "instruction": "Assemble the briefing from the prepared calendar and RSS datasets only.",
                 "requires_approval": False,
             }
         ]
@@ -57,23 +79,37 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
     ) -> Dict[str, Any]:
         task = await db.get(Task, task_id)
         user = await db.get(User, user_id)
-        tz_name = getattr(task, "active_hours_tz", None) or getattr(user, "active_hours_tz", None) or "UTC"
+        recipe = task.task_recipe if isinstance(getattr(task, "task_recipe", None), dict) else {}
+        params = recipe.get("params") if isinstance(recipe.get("params"), dict) else {}
+        briefing_mode = _resolve_briefing_mode(task=task, params=params)
+
+        tz_name = _resolve_briefing_timezone(task=task, user=user)
         local_now = datetime.now(ZoneInfo(tz_name))
         day_start = datetime.combine(local_now.date(), time.min, tzinfo=local_now.tzinfo)
         day_end = day_start + timedelta(days=1)
+        tomorrow_start = day_end
+        tomorrow_end = tomorrow_start + timedelta(days=1)
 
         provider = _get_provider()
-        events: list[dict[str, Any]] = []
+        today_events: list[dict[str, Any]] = []
+        tomorrow_events: list[dict[str, Any]] = []
         calendar_error = ""
         if provider is not None:
             try:
-                events = await provider.list_events(
+                today_events = await provider.list_events(
                     calendar_id=None,
                     start=day_start.astimezone(timezone.utc).isoformat(),
                     end=day_end.astimezone(timezone.utc).isoformat(),
                     max_results=20,
                 )
-                events = _dedupe_events(events)
+                tomorrow_events = await provider.list_events(
+                    calendar_id=None,
+                    start=tomorrow_start.astimezone(timezone.utc).isoformat(),
+                    end=tomorrow_end.astimezone(timezone.utc).isoformat(),
+                    max_results=20,
+                )
+                today_events = _dedupe_events(today_events)
+                tomorrow_events = _dedupe_events(tomorrow_events)
             except Exception as exc:
                 calendar_error = str(exc)
 
@@ -87,9 +123,33 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
             max_items=24,
         )
         rss_items = list(rss_dataset.get("items") or [])[:_MAX_RSS_ITEMS]
+        market_snapshot, market_error = await _load_market_snapshot(
+            db=db,
+            user_id=user_id,
+            symbol=_resolve_market_symbol(params=params),
+        )
+        weather_snapshot, weather_error = await _load_weather_snapshot(
+            db=db,
+            user_id=user_id,
+            task_id=task_id,
+            instruction=str(getattr(task, "instruction", "") or ""),
+            task_timezone=getattr(task, "active_hours_tz", None) or getattr(user, "active_hours_tz", None),
+        )
         dataset = {
-            "calendar_events": [_normalize_event(ev, local_now) for ev in events],
+            "briefing_mode": briefing_mode,
+            "calendar_events": [_normalize_event(ev, local_now) for ev in today_events],
+            "tomorrow_events": [_normalize_event(ev, local_now) for ev in tomorrow_events],
             "rss_items": rss_items,
+            "market_snapshot": market_snapshot,
+            "weather_snapshot": weather_snapshot,
+            "ingredients": _effective_ingredients(
+                briefing_mode=briefing_mode,
+                provided=_normalize_string_list(params.get("ingredients")),
+                has_market_snapshot=bool(market_snapshot),
+                has_weather_snapshot=bool(weather_snapshot),
+            ),
+            "required_sections": _effective_required_sections(params.get("sections"), briefing_mode=briefing_mode),
+            "headline_limit": _resolve_headline_limit(task=task, params=params, briefing_mode=briefing_mode),
             "timezone": tz_name,
             "local_date": local_now.date().isoformat(),
         }
@@ -97,22 +157,25 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
             "dataset": dataset,
             "dataset_prompt": _format_prompt_dataset(dataset),
             "dataset_stats": {
+                "briefing_mode": briefing_mode,
                 "calendar_count": len(dataset["calendar_events"]),
+                "tomorrow_calendar_count": len(dataset["tomorrow_events"]),
                 "rss_count": len(rss_items),
                 "rss_dataset_stats": rss_dataset.get("stats", {}),
-            },
+                "has_market_snapshot": bool(market_snapshot),
+                "has_weather_snapshot": bool(weather_snapshot),
+                },
             "refresh_stats": {
                 "rss_refresh": rss_dataset.get("refresh", {}),
                 "calendar_error": calendar_error,
+                "market_error": market_error,
+                "weather_error": weather_error,
             },
         }
 
     def effective_blocked_tools(self, *, run_context: Dict[str, Any]) -> set[str]:
         del run_context
         return {
-            # This profile should synthesize only from the prepared calendar and
-            # RSS datasets. Leaving unrelated task/memory/admin tools visible
-            # makes local models more brittle without improving the result.
             "add_memory_observations",
             "api_request",
             "create_and_run_task_plan",
@@ -149,11 +212,61 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
         is_final_step: bool,
     ) -> None:
         del is_final_step
-        prompt_parts.append(load_profile_spec_text(self.name))
+        prompt_parts.append(load_profile_spec_text("morning_briefing"))
         dataset = run_context.get("dataset") or {}
-        if dataset.get("calendar_events"):
+        briefing_mode = str(dataset.get("briefing_mode") or "morning")
+        if briefing_mode == "evening":
             prompt_parts.append(
-                "Calendar events are present in the prepared dataset. You must include a `## Today at a glance` section before any headlines."
+                "This is an evening briefing. Prefer `## Day in review`, then `## What to watch tomorrow` or `## Tomorrow at a glance` when tomorrow events exist, followed by `## Links (from cached feeds)` or equivalent grounded headline sections."
+            )
+        elif dataset.get("calendar_events"):
+            prompt_parts.append(
+                "Calendar events are present in the prepared dataset. You must include either `## Today context` or `## Today at a glance` before any headlines or watch items."
+            )
+        required_sections = [str(item).strip() for item in (dataset.get("required_sections") or []) if str(item).strip()]
+        headline_limit = int(dataset.get("headline_limit") or _DEFAULT_HEADLINE_LIMIT)
+        if briefing_mode == "morning":
+            prompt_parts.append(
+                "Morning briefing contract: include the required section set with explicit empty-state stubs when prepared data is unavailable."
+            )
+            if required_sections:
+                prompt_parts.append(
+                    "Required morning sections:\n- " + "\n- ".join(_display_section_name(name) for name in required_sections)
+                )
+            prompt_parts.append(
+                f"Include at most {headline_limit} headline bullets, and each headline bullet must include a one-line summary before the read-more link."
+            )
+            prompt_parts.append(
+                "If market or weather data is not available in the prepared dataset, include those sections and write `No update available in prepared data.`"
+            )
+            prompt_parts.append(
+                "For `## Today in history`, prefer any prepared history fact when present. If none is prepared, you may write a short 1-2 sentence item from general model knowledge for the current calendar date."
+            )
+            prompt_parts.append(
+                "If there are no events today or tomorrow, still include the calendar sections with `No events scheduled today.` and `No events scheduled tomorrow.`"
+            )
+        elif briefing_mode == "evening":
+            prompt_parts.append(
+                "Evening briefing contract: include the required section set with explicit empty-state stubs when prepared data is unavailable."
+            )
+            if required_sections:
+                prompt_parts.append(
+                    "Required evening sections:\n- " + "\n- ".join(_display_section_name(name) for name in required_sections)
+                )
+            prompt_parts.append(
+                f"Include at most {headline_limit} headline bullets, and each headline bullet must include a one-line summary before the read-more link."
+            )
+            prompt_parts.append(
+                "For `## Day in review`, summarize today using prepared calendar context when present. If there were no events today, include the section and write `No events were on the calendar today.`"
+            )
+            prompt_parts.append(
+                "For `## Tomorrow at a glance`, frame tomorrow as a preparation view. If there are no tomorrow events, still include the section and write `No events scheduled tomorrow.`"
+            )
+            prompt_parts.append(
+                "If market or weather data is not available in the prepared dataset, include those sections and write `No update available in prepared data.`"
+            )
+            prompt_parts.append(
+                "For `## Today in history`, prefer any prepared history fact when present. If none is prepared, you may write a short 1-2 sentence item from general model knowledge for the current calendar date."
             )
         prepared = (run_context.get("dataset_prompt") or "").strip()
         if prepared:
@@ -172,18 +285,24 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
             return result, None
 
         dataset = run_context.get("dataset") or {}
+        briefing_mode = str(dataset.get("briefing_mode") or "morning")
         events = list(dataset.get("calendar_events") or [])
+        tomorrow_events = list(dataset.get("tomorrow_events") or [])
         rss_items = list(dataset.get("rss_items") or [])
+        required_sections = [str(item).strip() for item in (dataset.get("required_sections") or []) if str(item).strip()]
+        headline_limit = int(dataset.get("headline_limit") or _DEFAULT_HEADLINE_LIMIT)
         allowed_urls = {str(item.get("url") or "").strip() for item in rss_items if item.get("url")}
         text = (result or "").strip()
         if not text:
             text = _EMPTY_RESULT if not events and not rss_items else text
+        text = _normalize_weather_section(text, dataset)
 
-        if not events and not rss_items:
+        if not events and not rss_items and not tomorrow_events:
             return _EMPTY_RESULT, {
                 "fatal": False,
                 "publish_mode": "empty",
                 "empty_result": True,
+                "briefing_mode": briefing_mode,
                 "calendar_count": 0,
                 "rss_count": 0,
             }
@@ -196,38 +315,80 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
             for match in re.findall(r"^##\s+(.+)$", text, flags=re.MULTILINE)
             if _is_placeholder_heading(match)
         )
-        has_calendar = "## Today at a glance" in text
-        has_headlines = "## Headlines" in text
-        has_attention = "## Worth your attention" in text
+        has_calendar = _has_section(text, "today_at_a_glance")
+        has_market = _has_section(text, "market_snapshot")
+        has_weather = _has_section(text, "weather")
+        has_history = _has_section(text, "history")
+        has_day_review = _has_section(text, "day_in_review")
+        has_tomorrow = _has_section(text, "tomorrow_at_a_glance")
+        has_headlines = _has_section(text, "headlines")
+        has_attention = _has_section(text, "worth_attention")
+        headline_count = _count_headline_bullets(text)
+        headline_bullets_have_summaries = _headline_bullets_have_summaries(text)
+        missing_required_sections = [name for name in required_sections if not _has_section(text, name)]
         fatal = False
         fatal_reason = ""
         if invalid_urls:
             fatal = True
-            fatal_reason = "Morning briefing contains URL(s) not present in prepared RSS dataset."
+            fatal_reason = "Briefing contains URL(s) not present in prepared RSS dataset."
         elif word_count > _MAX_WORDS:
             fatal = True
-            fatal_reason = f"Morning briefing exceeded {_MAX_WORDS} words."
+            fatal_reason = f"Briefing exceeded {_MAX_WORDS} words."
         elif placeholder_hits:
             fatal = True
-            fatal_reason = "Morning briefing contains placeholder section headings."
-        elif events and not has_calendar:
+            fatal_reason = "Briefing contains placeholder section headings."
+        elif briefing_mode == "morning" and events and not has_calendar:
             fatal = True
             fatal_reason = "Morning briefing omitted the required calendar section despite prepared calendar events."
-        elif not has_calendar and not has_headlines:
+        elif briefing_mode == "evening" and not has_day_review:
+            fatal = True
+            fatal_reason = "Evening briefing omitted the required day-in-review section."
+        elif briefing_mode == "evening" and tomorrow_events and not has_tomorrow:
+            fatal = True
+            fatal_reason = "Evening briefing omitted the required tomorrow section despite prepared next-day events."
+        elif missing_required_sections:
+            fatal = True
+            mode_label = "Morning" if briefing_mode == "morning" else "Evening"
+            fatal_reason = f"{mode_label} briefing omitted required sections: " + ", ".join(
+                _display_section_name(name) for name in missing_required_sections
+            )
+        elif briefing_mode == "morning" and not has_calendar and not has_headlines and not has_attention:
             fatal = True
             fatal_reason = "Morning briefing did not produce any publishable section."
+        elif briefing_mode == "evening" and not has_day_review and not has_tomorrow and not has_headlines:
+            fatal = True
+            fatal_reason = "Evening briefing did not produce any publishable section."
+        elif headline_count > headline_limit:
+            fatal = True
+            mode_label = "Morning" if briefing_mode == "morning" else "Evening"
+            fatal_reason = f"{mode_label} briefing exceeded the allowed {headline_limit} headlines."
+        elif has_headlines and not headline_bullets_have_summaries:
+            fatal = True
+            mode_label = "Morning" if briefing_mode == "morning" else "Evening"
+            fatal_reason = f"{mode_label} briefing headline bullets must include one-line summaries."
 
         report = {
             "fatal": fatal,
             "fatal_reason": fatal_reason,
             "publish_mode": "full" if not fatal else "invalid",
+            "briefing_mode": briefing_mode,
             "calendar_count": len(events),
+            "tomorrow_calendar_count": len(tomorrow_events),
             "rss_count": len(rss_items),
             "word_count": word_count,
             "invalid_urls": invalid_urls,
             "has_calendar_section": has_calendar,
+            "has_market_section": has_market,
+            "has_weather_section": has_weather,
+            "has_history_section": has_history,
+            "has_day_review_section": has_day_review,
+            "has_tomorrow_section": has_tomorrow,
             "has_headlines_section": has_headlines,
             "has_attention_section": has_attention,
+            "headline_count": headline_count,
+            "headline_limit": headline_limit,
+            "headline_bullets_have_summaries": headline_bullets_have_summaries,
+            "required_sections": required_sections,
         }
         return text, report
 
@@ -250,6 +411,36 @@ class MorningBriefingExecutionProfile(TaskExecutionProfile):
         return out
 
 
+MorningBriefingExecutionProfile = BriefingExecutionProfile
+
+
+def _resolve_briefing_mode(*, task: Task, params: Dict[str, Any]) -> str:
+    explicit = str(params.get("briefing_mode") or "").strip().lower()
+    if explicit in {"morning", "evening"}:
+        return explicit
+    title = str(getattr(task, "title", "") or "").lower()
+    instruction = str(getattr(task, "instruction", "") or "").lower()
+    if getattr(task, "profile", "") == "morning_briefing":
+        return "morning"
+    if "evening" in title or "evening" in instruction or "tonight" in instruction:
+        return "evening"
+    return "morning"
+
+
+def _resolve_briefing_timezone(*, task: Task, user: User) -> str:
+    task_tz = getattr(task, "active_hours_tz", None)
+    user_tz = getattr(user, "active_hours_tz", None)
+    effective = resolve_effective_timezone(task_tz, user_tz)
+    if effective != "UTC":
+        return effective
+    instruction = str(getattr(task, "instruction", "") or "")
+    weather_contract = _build_weather_contract(instruction, task_timezone=None)
+    inferred = str(weather_contract.get("display_timezone") or "").strip()
+    if inferred and inferred != "UTC" and is_valid_timezone_name(inferred):
+        return inferred
+    return effective
+
+
 def _normalize_event(event: Dict[str, Any], now_local: datetime) -> Dict[str, Any]:
     start_raw = str(event.get("start") or "")
     end_raw = str(event.get("end") or "")
@@ -261,8 +452,8 @@ def _normalize_event(event: Dict[str, Any], now_local: datetime) -> Dict[str, An
     return {
         "id": event.get("id") or "",
         "title": str(event.get("summary") or "Untitled").strip(),
-        "start": start_raw,
-        "end": end_raw,
+        "start": _format_local_event_dt(start_dt, fallback=start_raw),
+        "end": _format_local_event_dt(_coerce_dt(end_raw, now_local.tzinfo or timezone.utc), fallback=end_raw),
         "location": str(event.get("location") or "").strip(),
         "description": str(event.get("description") or "").strip(),
         "starts_within_2h": within_2h,
@@ -283,11 +474,75 @@ def _coerce_dt(value: str, tzinfo) -> Optional[datetime]:
 
 def _format_prompt_dataset(dataset: Dict[str, Any]) -> str:
     lines = [
+        f"Briefing mode: {dataset.get('briefing_mode')}",
+        f"Ingredients: {', '.join(str(item) for item in (dataset.get('ingredients') or [])) or '-'}",
+        f"Required sections: {', '.join(str(item) for item in (dataset.get('required_sections') or [])) or '-'}",
+        f"Headline limit: {dataset.get('headline_limit')}",
         f"Local date: {dataset.get('local_date')}",
         f"Timezone: {dataset.get('timezone')}",
         "",
-        "Calendar events:",
+        _market_section_label(dataset.get("market_snapshot")) + ":",
     ]
+    market_snapshot = dataset.get("market_snapshot")
+    if isinstance(market_snapshot, dict) and market_snapshot:
+        lines.append(
+            "- "
+            f"symbol={market_snapshot.get('symbol')} date={market_snapshot.get('date')} "
+            f"open={market_snapshot.get('open')} high={market_snapshot.get('high')} "
+            f"low={market_snapshot.get('low')} close={market_snapshot.get('close')} "
+            f"provider={market_snapshot.get('provider')}"
+        )
+    else:
+        lines.append("- none")
+    lines.extend([
+        "",
+        "Weather snapshot:",
+    ])
+    weather_snapshot = dataset.get("weather_snapshot")
+    if isinstance(weather_snapshot, dict) and weather_snapshot:
+        location = weather_snapshot.get("location") if isinstance(weather_snapshot.get("location"), dict) else {}
+        current_weather = weather_snapshot.get("current_weather") if isinstance(weather_snapshot.get("current_weather"), dict) else {}
+        forecast = weather_snapshot.get("forecast") if isinstance(weather_snapshot.get("forecast"), dict) else {}
+        today_forecast = forecast.get("today") if isinstance(forecast.get("today"), dict) else {}
+        next_periods = forecast.get("next_periods") if isinstance(forecast.get("next_periods"), list) else []
+        observed_local = _format_weather_observed_local(
+            current_weather.get("observed_at_utc"),
+            timezone_name=str(dataset.get("timezone") or "UTC"),
+        )
+        lines.append(
+            "- "
+            f"city={location.get('city_name') or '-'} country={location.get('country') or '-'} "
+            f"temp_f={_c_to_f(current_weather.get('temperature_c'))} feels_like_f={_c_to_f(current_weather.get('feels_like_c'))} "
+            f"humidity={current_weather.get('humidity_percent') or '-'} pressure_hpa={current_weather.get('pressure_hpa') or '-'} "
+            f"wind_mph={_mps_to_mph(current_weather.get('wind_speed_mps'))} "
+            f"description={current_weather.get('description') or current_weather.get('weather_main') or '-'} "
+            f"observed_local={observed_local}"
+        )
+        lines.append(
+            "- "
+            f"today_high_f={_c_to_f(today_forecast.get('high_c'))} "
+            f"today_low_f={_c_to_f(today_forecast.get('low_c'))} "
+            f"max_precip_chance={_probability_to_percent(today_forecast.get('max_precip_probability'))} "
+            f"forecast_summary={today_forecast.get('summary') or '-'}"
+        )
+        if next_periods:
+            lines.append("- next_periods:")
+            for period in next_periods[:4]:
+                lines.append(
+                    "  - "
+                    f"time_local={period.get('time_local') or '-'} "
+                    f"temp_f={_c_to_f(period.get('temperature_c'))} "
+                    f"feels_like_f={_c_to_f(period.get('feels_like_c'))} "
+                    f"precip_chance={_probability_to_percent(period.get('precip_probability'))} "
+                    f"description={period.get('description') or period.get('weather_main') or '-'} "
+                    f"wind_mph={_mps_to_mph(period.get('wind_speed_mps'))}"
+                )
+    else:
+        lines.append("- none")
+    lines.extend([
+        "",
+        "Calendar events:",
+    ])
     events = list(dataset.get("calendar_events") or [])
     if not events:
         lines.append("- none")
@@ -295,6 +550,16 @@ def _format_prompt_dataset(dataset: Dict[str, Any]) -> str:
         for event in events:
             lines.append(
                 f"- {event.get('start')} title={event.get('title')} location={event.get('location') or '-'} starts_within_2h={event.get('starts_within_2h')}"
+            )
+    lines.append("")
+    lines.append("Tomorrow events:")
+    tomorrow_events = list(dataset.get("tomorrow_events") or [])
+    if not tomorrow_events:
+        lines.append("- none")
+    else:
+        for event in tomorrow_events:
+            lines.append(
+                f"- {event.get('start')} title={event.get('title')} location={event.get('location') or '-'}"
             )
     lines.append("")
     lines.append("RSS items:")
@@ -312,3 +577,381 @@ def _format_prompt_dataset(dataset: Dict[str, Any]) -> str:
 def _is_placeholder_heading(value: str) -> bool:
     normalized = re.sub(r"\s+", " ", (value or "").strip().lower()).strip(" :.-")
     return normalized in _PLACEHOLDER_HEADINGS
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _default_ingredients(briefing_mode: str) -> list[str]:
+    if briefing_mode == "evening":
+        return ["calendar", "rss_news", "market_snapshot", "weather", "history", "tomorrow_prep"]
+    return ["calendar", "rss_news", "market_snapshot", "weather", "history", "tomorrow_prep"]
+
+
+def _effective_ingredients(
+    *,
+    briefing_mode: str,
+    provided: list[str],
+    has_market_snapshot: bool,
+    has_weather_snapshot: bool,
+) -> list[str]:
+    baseline = ["calendar", "rss_news", "history", "tomorrow_prep"]
+    if has_market_snapshot:
+        baseline.append("market_snapshot")
+    if has_weather_snapshot:
+        baseline.append("weather")
+    merged: list[str] = []
+    for item in [*baseline, *provided]:
+        normalized = str(item or "").strip()
+        if not normalized or normalized in merged:
+            continue
+        merged.append(normalized)
+    return merged
+
+
+def _default_required_sections(briefing_mode: str) -> list[str]:
+    if briefing_mode == "evening":
+        return ["day_in_review", "market_snapshot", "weather", "history", "headlines", "worth_attention", "tomorrow_at_a_glance"]
+    return ["today_at_a_glance", "market_snapshot", "weather", "history", "headlines", "worth_attention", "tomorrow_at_a_glance"]
+
+
+def _effective_required_sections(raw_sections: Any, *, briefing_mode: str) -> list[str]:
+    baseline = _default_required_sections(briefing_mode)
+    provided = _normalize_string_list(raw_sections)
+    canonical_provided = [_canonical_section_name(name) for name in provided]
+    merged: list[str] = []
+    for name in [*baseline, *canonical_provided]:
+        if not name or name in merged:
+            continue
+        if name not in _SECTION_ALIASES:
+            continue
+        merged.append(name)
+    return merged
+
+
+def _canonical_section_name(name: str) -> str:
+    normalized = str(name or "").strip().lower()
+    return _LEGACY_SECTION_NAME_MAP.get(normalized, normalized)
+
+
+async def _load_market_snapshot(*, db, user_id: int, symbol: str) -> tuple[dict[str, Any], str]:
+    try:
+        payload = await fetch_daily_market_data_payload(
+            db,
+            user_id=user_id,
+            provider="alphavantage",
+            symbol=symbol,
+            days=1,
+            secret_name="alphavantage_api_key",
+        )
+    except Exception as exc:
+        return {}, str(exc)
+
+    days = list(payload.get("days") or [])
+    if not days:
+        return {}, ""
+    latest = days[0]
+    return {
+        "symbol": payload.get("symbol") or symbol,
+        "provider": payload.get("provider") or "alphavantage",
+        "date": latest.get("date"),
+        "open": latest.get("open"),
+        "high": latest.get("high"),
+        "low": latest.get("low"),
+        "close": latest.get("close"),
+        "volume": latest.get("volume"),
+    }, ""
+
+
+def _resolve_market_symbol(*, params: Dict[str, Any]) -> str:
+    candidate = str(params.get("market_symbol") or "").strip().upper()
+    if not candidate:
+        return "KO"
+    normalized = re.sub(r"[^A-Z0-9._-]", "", candidate)
+    return normalized or "KO"
+
+
+def _market_section_label(snapshot: Any) -> str:
+    if isinstance(snapshot, dict):
+        symbol = str(snapshot.get("symbol") or "").strip().upper()
+        if symbol:
+            return f"{symbol} market snapshot"
+    return "Market snapshot"
+
+
+async def _load_weather_snapshot(
+    *,
+    db,
+    user_id: int,
+    task_id: int,
+    instruction: str,
+    task_timezone: str | None,
+) -> tuple[dict[str, Any], str]:
+    contract = _build_weather_contract(instruction, task_timezone=task_timezone, endpoint="briefing_snapshot")
+    try:
+        raw = await execute_api_request(
+            db,
+            user_id=user_id,
+            service=str(contract.get("service") or "weather"),
+            endpoint=str(contract.get("endpoint") or "current_conditions"),
+            query_params=dict(contract.get("query_params") or {}),
+            secret_name=str(contract.get("secret_name") or "openweathermap_api_key"),
+            response_fields=dict(contract.get("response_fields") or {}),
+            task_id=task_id,
+        )
+    except Exception as exc:
+        return {}, str(exc)
+
+    parsed = _parse_structured_api_result(raw)
+    fields = parsed.get("fields") if isinstance(parsed, dict) else {}
+    if not isinstance(fields, dict):
+        return {}, ""
+    location = fields.get("location") if isinstance(fields.get("location"), dict) else {}
+    current_weather = fields.get("current_weather") if isinstance(fields.get("current_weather"), dict) else {}
+    forecast = fields.get("forecast") if isinstance(fields.get("forecast"), dict) else {}
+    if not location and not current_weather and not forecast:
+        return {}, ""
+    requested_label = _extract_requested_location_label(instruction)
+    if requested_label:
+        location = dict(location)
+        location["requested_label"] = requested_label
+    return {
+        "location": location,
+        "current_weather": current_weather,
+        "forecast": forecast,
+    }, ""
+
+
+def _parse_structured_api_result(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _c_to_f(value: Any) -> str:
+    try:
+        celsius = float(value)
+    except Exception:
+        return "-"
+    fahrenheit = (celsius * 9.0 / 5.0) + 32.0
+    return f"{fahrenheit:.1f}"
+
+
+def _mps_to_mph(value: Any) -> str:
+    try:
+        meters_per_second = float(value)
+    except Exception:
+        return "-"
+    return f"{meters_per_second * 2.23694:.1f}"
+
+
+def _probability_to_percent(value: Any) -> str:
+    try:
+        probability = float(value)
+    except Exception:
+        return "-"
+    if probability <= 1.0:
+        probability *= 100.0
+    return f"{probability:.0f}%"
+
+
+def _format_weather_observed_local(value: Any, *, timezone_name: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return raw
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        local_dt = dt.astimezone(ZoneInfo(timezone_name or "UTC"))
+    except Exception:
+        local_dt = dt.astimezone(timezone.utc)
+    return local_dt.strftime("%Y-%m-%d %I:%M %p %Z")
+
+
+def _format_local_event_dt(value: Optional[datetime], *, fallback: str) -> str:
+    if value is None:
+        return fallback
+    return value.strftime("%Y-%m-%d %I:%M %p %Z")
+
+
+def _resolve_headline_limit(*, task: Task, params: Dict[str, Any], briefing_mode: str) -> int:
+    explicit = params.get("headline_limit")
+    try:
+        if explicit is not None:
+            return max(1, min(int(explicit), 10))
+    except Exception:
+        pass
+    lowered = f"{getattr(task, 'title', '')}\n{getattr(task, 'instruction', '')}".lower()
+    word_to_int = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8}
+    digit_match = re.search(r"\b(\d+)\s+(?:top\s+)?headlines?\b", lowered)
+    if digit_match:
+        return max(1, min(int(digit_match.group(1)), 10))
+    for word, value in word_to_int.items():
+        if re.search(rf"\b{word}\s+(?:top\s+)?headlines?\b", lowered):
+            return value
+    return _DEFAULT_HEADLINE_LIMIT if briefing_mode == "morning" else 6
+
+
+def _display_section_name(name: str) -> str:
+    aliases = _SECTION_ALIASES.get(name, ())
+    return aliases[0] if aliases else name
+
+
+def _has_section(text: str, name: str) -> bool:
+    return any(alias in text for alias in _SECTION_ALIASES.get(name, ()))
+
+
+def _count_headline_bullets(text: str) -> int:
+    body = _section_body(text, "headlines")
+    if not body:
+        return 0
+    return sum(1 for line in body.splitlines() if line.strip().startswith("- "))
+
+
+def _headline_bullets_have_summaries(text: str) -> bool:
+    body = _section_body(text, "headlines")
+    if not body:
+        return False
+    bullets = [line.strip() for line in body.splitlines() if line.strip().startswith("- ")]
+    if not bullets:
+        return False
+    for bullet in bullets:
+        segments = [segment.strip() for segment in bullet[2:].split("—")]
+        if len(segments) < 4:
+            return False
+        summary = segments[-2] if len(segments) >= 2 else ""
+        if not summary or "[read more]" in summary.lower():
+            return False
+    return True
+
+
+def _section_body(text: str, name: str) -> str:
+    for alias in _SECTION_ALIASES.get(name, ()):
+        pattern = rf"{re.escape(alias)}\s*\n(.*?)(?=\n##\s|\Z)"
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _normalize_weather_section(text: str, dataset: Dict[str, Any]) -> str:
+    if not _has_section(text, "weather"):
+        return text
+    weather_snapshot = dataset.get("weather_snapshot")
+    if not isinstance(weather_snapshot, dict) or not weather_snapshot:
+        return text
+
+    replacement = _render_weather_section(weather_snapshot, timezone_name=str(dataset.get("timezone") or "UTC"))
+    if not replacement:
+        return text
+
+    for alias in _SECTION_ALIASES.get("weather", ()):
+        pattern = rf"({re.escape(alias)}\s*\n)(.*?)(?=\n##\s|\Z)"
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if not match:
+            continue
+        prefix = match.group(1)
+        return text[:match.start()] + prefix + replacement + text[match.end():]
+    return text
+
+
+def _render_weather_section(weather_snapshot: Dict[str, Any], *, timezone_name: str) -> str:
+    location = weather_snapshot.get("location") if isinstance(weather_snapshot.get("location"), dict) else {}
+    current_weather = weather_snapshot.get("current_weather") if isinstance(weather_snapshot.get("current_weather"), dict) else {}
+    forecast = weather_snapshot.get("forecast") if isinstance(weather_snapshot.get("forecast"), dict) else {}
+    today_forecast = forecast.get("today") if isinstance(forecast.get("today"), dict) else {}
+    next_periods = forecast.get("next_periods") if isinstance(forecast.get("next_periods"), list) else []
+
+    requested_label = str(location.get("requested_label") or "").strip()
+    location_bits = [str(location.get("city_name") or "").strip(), str(location.get("country") or "").strip()]
+    location_label = requested_label or ", ".join(bit for bit in location_bits if bit)
+    current_description = str(current_weather.get("description") or current_weather.get("weather_main") or "").strip()
+
+    lines: list[str] = []
+    if location_label or current_description:
+        headline = location_label or "Current conditions"
+        if current_description:
+            headline = f"{headline} - {current_description}"
+        lines.append(f"- {headline}")
+
+    observed_local = _format_weather_observed_local(current_weather.get("observed_at_utc"), timezone_name=timezone_name)
+    current_bits: list[str] = []
+    if observed_local != "-":
+        current_bits.append(f"Observed {observed_local}")
+    temperature_f = _c_to_f(current_weather.get("temperature_c"))
+    if temperature_f != "-":
+        current_bits.append(f"Temp {temperature_f}°F")
+    feels_like_f = _c_to_f(current_weather.get("feels_like_c"))
+    if feels_like_f != "-":
+        current_bits.append(f"Feels like {feels_like_f}°F")
+    humidity = current_weather.get("humidity_percent")
+    if humidity not in (None, ""):
+        current_bits.append(f"Humidity {humidity}%")
+    wind_mph = _mps_to_mph(current_weather.get("wind_speed_mps"))
+    if wind_mph != "-":
+        current_bits.append(f"Wind {wind_mph} mph")
+    if current_bits:
+        lines.append("- " + " - ".join(current_bits))
+
+    today_bits: list[str] = []
+    high_f = _c_to_f(today_forecast.get("high_c"))
+    low_f = _c_to_f(today_forecast.get("low_c"))
+    precip = _probability_to_percent(today_forecast.get("max_precip_probability"))
+    if high_f != "-" or low_f != "-":
+        today_bits.append(f"Today: high {high_f}°F / low {low_f}°F")
+    if precip != "-":
+        today_bits.append(f"Precipitation chance {precip}")
+    summary = str(today_forecast.get("summary") or "").strip()
+    if summary and summary != "-":
+        today_bits.append(summary)
+    if today_bits:
+        lines.append("- " + " - ".join(today_bits))
+
+    upcoming_lines: list[str] = []
+    for period in next_periods[:2]:
+        if not isinstance(period, dict):
+            continue
+        period_time = str(period.get("time_local") or "").strip()
+        period_temp = _c_to_f(period.get("temperature_c"))
+        period_desc = str(period.get("description") or period.get("weather_main") or "").strip()
+        if not period_time and not period_desc and period_temp == "-":
+            continue
+        period_bits = [bit for bit in [period_time, period_desc] if bit]
+        if period_temp != "-":
+            period_bits.append(f"{period_temp}°F")
+        period_precip = _probability_to_percent(period.get("precip_probability"))
+        if period_precip != "-":
+            period_bits.append(f"{period_precip} precip")
+        if period_bits:
+            upcoming_lines.append(" / ".join(period_bits))
+    if upcoming_lines:
+        lines.append("- Next periods:")
+        for period_line in upcoming_lines:
+            lines.append(f"  - {period_line}")
+
+    return "\n".join(lines).strip()
+
+
+def _extract_requested_location_label(instruction: str) -> str:
+    text = str(instruction or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"\bfor\s+([A-Za-z][A-Za-z .'-]+,\s*[A-Z]{2}(?:\s+\d{5})?)", text)
+    if match:
+        return str(match.group(1)).strip().rstrip(".,")
+    match = re.search(r"\b([A-Za-z][A-Za-z .'-]+,\s*[A-Z]{2}(?:\s+\d{5})?)", text)
+    if match:
+        return str(match.group(1)).strip().rstrip(".,")
+    return ""

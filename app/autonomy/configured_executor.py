@@ -48,6 +48,32 @@ Daily research briefing contract:
 - Preserve exact URLs from the dataset. Do not invent, rewrite, or shorten URLs.
 - If there are no meaningful developments, return ONLY NO_SIGNIFICANT_UPDATES.
 """
+_MORNING_RESEARCH_BRIEFING_SPEC = """
+Morning research briefing contract:
+- Use only the prepared RSS dataset provided in the prompt.
+- Do not call external search, browser, or task-management tools.
+- If there are meaningful developments, return:
+  ## Today context
+  ## What to watch today
+  ## Links (from cached feeds)
+- Before those sections, include 1-6 concise bullet lines beginning with "- ".
+- Every factual claim must be grounded in the prepared dataset.
+- Preserve exact URLs from the dataset. Do not invent, rewrite, or shorten URLs.
+- If there are no meaningful developments, return ONLY NO_SIGNIFICANT_UPDATES.
+"""
+_EVENING_RESEARCH_BRIEFING_SPEC = """
+Evening research briefing contract:
+- Use only the prepared RSS dataset provided in the prompt.
+- Do not call external search, browser, or task-management tools.
+- If there are meaningful developments, return:
+  ## Day in review
+  ## What to watch tomorrow
+  ## Links (from cached feeds)
+- Before those sections, include 1-6 concise bullet lines beginning with "- ".
+- Every factual claim must be grounded in the prepared dataset.
+- Preserve exact URLs from the dataset. Do not invent, rewrite, or shorten URLs.
+- If there are no meaningful developments, return ONLY NO_SIGNIFICANT_UPDATES.
+"""
 
 _TOOL_POLICY_BLOCKED_TOOLS: dict[str, set[str]] = {
     "dataset_plus_workspace_append": {
@@ -177,6 +203,7 @@ class ConfiguredDailyResearchBriefingExecution(TaskExecutionProfile):
         threshold = str(input_config.get("threshold") or "medium")
         topic = str(input_config.get("topic") or "").strip()
         window_hours = int(input_config.get("window_hours") or 24)
+        briefing_mode = _normalize_briefing_mode(input_config.get("briefing_mode"))
         source_filters = [str(item).strip().lower() for item in (input_config.get("sources") or []) if str(item).strip()]
         dataset = await build_magazine_dataset(
             db,
@@ -217,6 +244,7 @@ class ConfiguredDailyResearchBriefingExecution(TaskExecutionProfile):
         topic_items, cluster_stats = _apply_light_title_cluster_diversity(topic_items)
         duplicate_filter_stats.update(cluster_stats)
         prepared_dataset = {
+            "briefing_mode": briefing_mode,
             "topic": topic,
             "threshold": threshold,
             "window_hours": window_hours,
@@ -229,6 +257,7 @@ class ConfiguredDailyResearchBriefingExecution(TaskExecutionProfile):
             "dataset": prepared_dataset,
             "dataset_prompt": _format_topic_prompt_dataset(prepared_dataset),
             "dataset_stats": {
+                "briefing_mode": briefing_mode,
                 "rss_count": len(topic_items),
                 "window_hours": window_hours,
                 "topic": topic,
@@ -258,7 +287,10 @@ class ConfiguredDailyResearchBriefingExecution(TaskExecutionProfile):
             prompt_parts.append(_render_preserved_runtime_prompt(preserved_state))
         if is_final_step:
             prompt_parts.append(load_profile_spec_text("topic_watcher"))
-            prompt_parts.append(_RESEARCH_BRIEFING_SPEC.strip())
+            briefing_mode = str(((run_context.get("dataset") or {}).get("briefing_mode") or "morning")).strip().lower() or "morning"
+            prompt_parts.append(
+                (_EVENING_RESEARCH_BRIEFING_SPEC if briefing_mode == "evening" else _MORNING_RESEARCH_BRIEFING_SPEC).strip()
+            )
         else:
             prompt_parts.append(_DATASET_REVIEW_SPEC.strip())
         prepared = str(run_context.get("dataset_prompt") or "").strip()
@@ -281,6 +313,7 @@ class ConfiguredDailyResearchBriefingExecution(TaskExecutionProfile):
         config = normalize_executor_config(run_context.get("executor_config") or self.config)
         dataset = run_context.get("dataset") or {}
         rss_items = list(dataset.get("rss_items") or [])
+        briefing_mode = str(dataset.get("briefing_mode") or "morning").strip().lower() or "morning"
         allowed_urls = {str(item.get("url") or "").strip() for item in rss_items if str(item.get("url") or "").strip()}
         topic = str((config.get("input") or {}).get("topic") or "").strip()
         text = (result or "").strip()
@@ -311,9 +344,14 @@ class ConfiguredDailyResearchBriefingExecution(TaskExecutionProfile):
         if not (1 <= len(bullet_lines) <= 6):
             return "", {
                 "fatal": True,
-                "fatal_reason": "Briefing must contain 1-6 bullet lines before the Implications section.",
+                "fatal_reason": "Briefing must contain 1-6 bullet lines before the first required section.",
             }
-        if "Implications:" not in remaining or "Key indicators to watch:" not in remaining or "Links (from cached feeds):" not in remaining:
+        required_sections = (
+            ["## Day in review", "## What to watch tomorrow", "## Links (from cached feeds)"]
+            if briefing_mode == "evening"
+            else ["## Today context", "## What to watch today", "## Links (from cached feeds)"]
+        )
+        if any(section not in remaining for section in required_sections):
             return "", {
                 "fatal": True,
                 "fatal_reason": "Briefing is missing one or more required sections.",
@@ -343,6 +381,7 @@ class ConfiguredDailyResearchBriefingExecution(TaskExecutionProfile):
         return entry, {
             "fatal": False,
             "no_update": False,
+            "briefing_mode": briefing_mode,
             "topic": topic,
             "selected_count": len(deduped_urls),
             "grounded_urls": deduped_urls,
@@ -465,6 +504,7 @@ def normalize_executor_config(value: Any) -> dict[str, Any] | None:
         input={
             "topic": str(((value.get("input") or {}).get("topic") or "")).strip(),
             "window_hours": max(1, min(int(((value.get("input") or {}).get("window_hours") or 24)), 168)),
+            "briefing_mode": _normalize_briefing_mode((value.get("input") or {}).get("briefing_mode")),
             "threshold": _normalize_threshold((value.get("input") or {}).get("threshold")),
             "sources": [str(item).strip() for item in ((value.get("input") or {}).get("sources") or []) if str(item).strip()],
         },
@@ -515,6 +555,7 @@ def infer_configured_executor(
         "input": {
             "topic": topic,
             "window_hours": _extract_window_hours(instruction),
+            "briefing_mode": _infer_briefing_mode(title=title, instruction=instruction),
             "threshold": "medium",
             "sources": [],
         },
@@ -611,6 +652,20 @@ def _normalize_threshold(value: Any) -> str:
     if threshold not in {"low", "medium", "high"}:
         return "medium"
     return threshold
+
+
+def _normalize_briefing_mode(value: Any) -> str:
+    mode = str(value or "morning").strip().lower()
+    if mode not in {"morning", "evening"}:
+        return "morning"
+    return mode
+
+
+def _infer_briefing_mode(*, title: str, instruction: str) -> str:
+    lowered = f"{title}\n{instruction}".lower()
+    if "evening" in lowered or "tonight" in lowered:
+        return "evening"
+    return "morning"
 
 
 def _normalize_tool_policy(value: Any) -> str:
@@ -919,15 +974,21 @@ def _is_similar_recent_entry(candidate: str, previous: str) -> bool:
 
 
 def _extract_briefing_sections(text: str) -> tuple[list[str], str]:
-    if "Implications:" not in text:
+    markers = [
+        "## Today context",
+        "## Day in review",
+        "Implications:",
+    ]
+    marker = next((candidate for candidate in markers if candidate in text), None)
+    if marker is None:
         return [], text
-    before, after = text.split("Implications:", 1)
+    before, after = text.split(marker, 1)
     bullets = [
         line.strip()
         for line in before.splitlines()
         if line.strip().startswith("- ")
     ]
-    return bullets, f"Implications:{after}".strip()
+    return bullets, f"{marker}{after}".strip()
 
 
 def _render_briefing_entry(body: str) -> str:
@@ -940,11 +1001,11 @@ def _render_no_update_entry(*, topic: str) -> str:
     return (
         f"{stamp}\n"
         f"- No significant developments were identified for {topic} in the prepared cached feeds during this window.\n\n"
-        "Implications:\n"
+        "## Today context\n"
         "- No material shift met the configured threshold in the cached source set.\n\n"
-        "Key indicators to watch:\n"
+        "## What to watch today\n"
         "- Escalation, diplomatic, sanctions, energy, or leadership developments in the next window.\n\n"
-        "Links (from cached feeds):\n"
+        "## Links (from cached feeds)\n"
         "- none"
     )
 

@@ -86,6 +86,9 @@ class TaskOut(BaseModel):
     deliver: bool
     requires_approval: bool
     result: Optional[str]
+    result_markdown: Optional[str]
+    result_format: Optional[str]
+    result_sections: List[Dict[str, Any]]
     error: Optional[str]
     active_hours_start: Optional[str]
     active_hours_end: Optional[str]
@@ -174,8 +177,14 @@ async def list_tasks(
     )
     tasks = result.scalars().all()
     step_lookup = await _load_current_steps(db, tasks)
+    final_output_lookup = await _load_latest_final_outputs(db, tasks)
     return [
-        _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
+        _to_task_out(
+            task,
+            step_lookup.get((task.id, task.current_step_index)),
+            user_timezone=current_user.active_hours_tz,
+            final_output=final_output_lookup.get(task.id),
+        )
         for task in tasks
     ]
 
@@ -188,7 +197,13 @@ async def get_task(
 ):
     task = await _get_owned_task(task_id, current_user.id, db)
     step_lookup = await _load_current_steps(db, [task])
-    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
+    final_output_lookup = await _load_latest_final_outputs(db, [task])
+    return _to_task_out(
+        task,
+        step_lookup.get((task.id, task.current_step_index)),
+        user_timezone=current_user.active_hours_tz,
+        final_output=final_output_lookup.get(task.id),
+    )
 
 
 @router.patch("/tasks/{task_id}", response_model=TaskOut)
@@ -686,11 +701,19 @@ def _parse_optional_iso_datetime(raw: str | None) -> Optional[datetime]:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def _to_task_out(task: Task, current_step: Optional[TaskStep], *, user_timezone: Optional[str]) -> TaskOut:
+def _to_task_out(
+    task: Task,
+    current_step: Optional[TaskStep],
+    *,
+    user_timezone: Optional[str],
+    final_output: Optional[str] = None,
+) -> TaskOut:
     waiting_tool: Optional[str] = None
     if task.status == "waiting_approval" and current_step is not None:
         waiting_tool = current_step.waiting_approval_tool
     effective_timezone = resolve_effective_timezone(task.active_hours_tz, user_timezone)
+    result_markdown = _normalize_result_markdown(final_output or task.result)
+    result_format = "markdown" if result_markdown else None
 
     return TaskOut(
         id=task.id,
@@ -705,6 +728,9 @@ def _to_task_out(task: Task, current_step: Optional[TaskStep], *, user_timezone:
         deliver=task.deliver,
         requires_approval=task.requires_approval,
         result=task.result,
+        result_markdown=result_markdown,
+        result_format=result_format,
+        result_sections=_split_result_sections(result_markdown),
         error=task.error,
         active_hours_start=task.active_hours_start,
         active_hours_end=task.active_hours_end,
@@ -740,3 +766,95 @@ async def _load_current_steps(db: AsyncSession, tasks: List[Task]) -> Dict[tuple
     )
     steps = rows.scalars().all()
     return {(step.task_id, step.step_index): step for step in steps}
+
+
+async def _load_latest_final_outputs(db: AsyncSession, tasks: List[Task]) -> Dict[int, str]:
+    task_ids = [int(task.id) for task in tasks if getattr(task, "id", None) is not None]
+    if not task_ids:
+        return {}
+
+    rows = await db.execute(
+        select(TaskRun.task_id, TaskRunArtifact.content_text, TaskRunArtifact.content_json)
+        .join(TaskRun, TaskRunArtifact.task_run_id == TaskRun.id)
+        .where(
+            TaskRun.task_id.in_(task_ids),
+            TaskRunArtifact.artifact_type == "final_output",
+        )
+        .order_by(TaskRun.task_id, desc(TaskRun.started_at), desc(TaskRun.id), desc(TaskRunArtifact.id))
+    )
+
+    out: Dict[int, str] = {}
+    for task_id, content_text, content_json in rows.all():
+        task_id = int(task_id)
+        if task_id in out:
+            continue
+        text = _coerce_artifact_text(content_text, content_json)
+        if text:
+            out[task_id] = text
+    return out
+
+
+def _coerce_artifact_text(content_text: Any, content_json: Any) -> str:
+    text = str(content_text or "").strip()
+    if text:
+        return text
+    if content_json is None:
+        return ""
+    if isinstance(content_json, str):
+        return content_json.strip()
+    try:
+        return json.dumps(content_json, ensure_ascii=False, indent=2).strip()
+    except Exception:
+        return str(content_json).strip()
+
+
+def _normalize_result_markdown(text: Optional[str]) -> Optional[str]:
+    value = str(text or "").strip()
+    return value or None
+
+
+def _split_result_sections(text: Optional[str]) -> List[Dict[str, Any]]:
+    value = str(text or "").strip()
+    if not value:
+        return []
+
+    heading_re = re.compile(r"^##\s+(.+?)\s*$")
+    sections: List[Dict[str, Any]] = []
+    current_heading: Optional[str] = None
+    current_lines: List[str] = []
+
+    def flush() -> None:
+        nonlocal current_heading, current_lines
+        body = "\n".join(current_lines).strip()
+        if current_heading is None and not body:
+            current_lines = []
+            return
+        if current_heading is not None or body:
+            lowered = body.lower()
+            sections.append(
+                {
+                    "heading": current_heading,
+                    "body": body,
+                    "is_empty_state": any(
+                        marker in lowered
+                        for marker in (
+                            "no events scheduled",
+                            "no update available",
+                            "unavailable",
+                            "no items",
+                        )
+                    ),
+                }
+            )
+        current_lines = []
+
+    for line in value.splitlines():
+        match = heading_re.match(line.strip())
+        if match:
+            flush()
+            current_heading = match.group(1).strip()
+            continue
+        current_lines.append(line)
+
+    flush()
+    return sections

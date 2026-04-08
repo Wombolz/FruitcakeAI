@@ -941,8 +941,9 @@ async def test_create_task_tool_normalizes_recurring_briefing_recipe_into_config
 
     payload = json.loads(result)
     assert payload["created"] is True
-    assert payload["task_recipe"]["family"] == "daily_research_briefing"
-    assert "research briefing task" in payload["task_confirmation"].lower()
+    assert payload["task_recipe"]["family"] == "briefing"
+    assert payload["task_recipe"]["params"]["briefing_mode"] == "morning"
+    assert "morning briefing task" in payload["task_confirmation"].lower()
     assert "reports/iran_middle_east_developments.md" in payload["task_confirmation"].lower()
 
     async with TestSessionLocal() as db:
@@ -950,9 +951,9 @@ async def test_create_task_tool_normalizes_recurring_briefing_recipe_into_config
         assert task is not None
         assert task.profile is None
         assert task.executor_config["kind"] == "configured_executor"
-        assert task.task_recipe["family"] == "daily_research_briefing"
+        assert task.task_recipe["family"] == "briefing"
         assert "cached RSS feeds" in task.instruction
-        assert "append a daily research briefing" in task.instruction
+        assert "append a morning briefing" in task.instruction
 
 
 @pytest.mark.asyncio
@@ -980,14 +981,14 @@ async def test_create_task_tool_normalizes_recurring_briefing_recipe_with_spaced
 
     payload = json.loads(result)
     assert payload["created"] is True
-    assert payload["task_recipe"]["family"] == "daily_research_briefing"
-    assert "research briefing task" in payload["task_confirmation"].lower()
+    assert payload["task_recipe"]["family"] == "briefing"
+    assert "morning briefing task" in payload["task_confirmation"].lower()
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, payload["task_id"])
         assert task is not None
         assert task.executor_config["kind"] == "configured_executor"
-        assert task.task_recipe["family"] == "daily_research_briefing"
+        assert task.task_recipe["family"] == "briefing"
 
 
 @pytest.mark.asyncio
@@ -1015,13 +1016,13 @@ async def test_create_task_tool_normalizes_daily_analysis_request_into_configure
 
     payload = json.loads(result)
     assert payload["created"] is True
-    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert payload["task_recipe"]["family"] == "briefing"
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, payload["task_id"])
         assert task is not None
         assert task.executor_config["kind"] == "configured_executor"
-        assert task.task_recipe["family"] == "daily_research_briefing"
+        assert task.task_recipe["family"] == "briefing"
 
 
 @pytest.mark.asyncio
@@ -1049,7 +1050,7 @@ async def test_create_task_tool_prefers_daily_briefing_recipe_over_topic_watcher
 
     payload = json.loads(result)
     assert payload["created"] is True
-    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert payload["task_recipe"]["family"] == "briefing"
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, payload["task_id"])
@@ -1087,8 +1088,9 @@ async def test_update_task_can_switch_from_watcher_to_daily_briefing_recipe():
                         "Generate a grounded daily research briefing on US politics using only cached RSS items from the "
                         "last 24 hours and append it to workspace/politics/US Politics.md."
                     ),
-                    "recipe_family": "daily_research_briefing",
+                    "recipe_family": "briefing",
                     "recipe_params": {
+                        "briefing_mode": "morning",
                         "topic": "US Politics",
                         "window_hours": 24,
                         "path": "workspace/politics/US Politics.md",
@@ -1098,7 +1100,7 @@ async def test_update_task_can_switch_from_watcher_to_daily_briefing_recipe():
             )
         )
 
-    assert updated["task_recipe"]["family"] == "daily_research_briefing"
+    assert updated["task_recipe"]["family"] == "briefing"
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, created["task_id"])
@@ -1309,7 +1311,7 @@ async def test_propose_task_draft_tool_returns_normalized_draft_without_persisti
         )
 
     assert payload["proposed"] is True
-    assert payload["task_recipe"]["family"] == "daily_research_briefing"
+    assert payload["task_recipe"]["family"] == "briefing"
     assert payload["executor_kind"] == "configured_executor"
     assert payload["task_type"] == "recurring"
     assert "draft ready" in payload["task_confirmation"].lower()

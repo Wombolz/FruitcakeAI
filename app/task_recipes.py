@@ -9,6 +9,7 @@ from app.autonomy.configured_executor import infer_configured_executor
 from app.time_utils import is_valid_timezone_name
 
 _RECIPE_FAMILIES = {
+    "briefing",
     "topic_watcher",
     "daily_research_briefing",
     "morning_briefing",
@@ -53,20 +54,14 @@ def normalize_task_recipe(
     params = dict(recipe_params or {})
     if family == "topic_watcher":
         return _build_topic_watcher_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
-    if family == "daily_research_briefing":
-        return _build_daily_research_briefing_recipe(
+    if family in {"briefing", "daily_research_briefing", "morning_briefing"}:
+        return _build_briefing_recipe(
             title=title,
             instruction=instruction,
             task_type=task_type,
             requested_profile=requested_profile,
             params=params,
-        )
-    if family == "morning_briefing":
-        return _build_morning_briefing_recipe(
-            title=title,
-            instruction=instruction,
-            task_type=task_type,
-            params=params,
+            requested_family=family,
         )
     if family == "iss_pass_watcher":
         return _build_iss_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
@@ -137,25 +132,24 @@ def build_task_confirmation_text(
         detail = f" It will watch your feeds for meaningful changes at {threshold} sensitivity."
         return summary + detail + _schedule_suffix(schedule)
 
-    if family == "daily_research_briefing":
+    if family == "briefing":
+        mode = str(params.get("briefing_mode") or "morning").strip().lower() or "morning"
         topic = str(params.get("topic") or title).strip()
         path = str(params.get("path") or "").strip()
         window_hours = params.get("window_hours")
-        summary = f"Created a {cadence} research briefing task, '{title}', for {topic}."
-        parts = []
-        if window_hours:
-            parts.append(f"it will analyze the past {window_hours} hours")
-        else:
-            parts.append("it will analyze recent coverage")
-        if path:
+        if path and topic:
+            summary = f"Created a {cadence} {mode} briefing task, '{title}', for {topic}."
+            parts = []
+            if window_hours:
+                parts.append(f"analyze the past {window_hours} hours")
+            else:
+                parts.append("analyze recent coverage")
             parts.append(f"append the briefing to {path}")
-        detail = " It will " + " and ".join(parts) + "."
-        return summary + detail + _schedule_suffix(schedule)
-
-    if family == "morning_briefing":
+            return summary + " It will " + " and ".join(parts) + "." + _schedule_suffix(schedule)
+        framing = "start-of-day" if mode == "morning" else "end-of-day"
         return (
-            f"Created a {cadence} morning briefing task, '{title}'."
-            " It will prepare a daily agenda and headline summary."
+            f"Created a {cadence} {mode} briefing task, '{title}'."
+            f" It will prepare a {framing} agenda and headline summary."
             + _schedule_suffix(schedule)
         )
 
@@ -233,17 +227,17 @@ def _resolve_recipe_family(
     recipe_family: Optional[str],
     preferred_family: Optional[str],
 ) -> str | None:
-    explicit_family = (recipe_family or "").strip().lower()
+    explicit_family = _canonical_recipe_family(recipe_family)
     if recipe_family is not None and explicit_family == "":
         return None
     if explicit_family in _RECIPE_FAMILIES:
         return explicit_family
 
-    explicit_profile = (requested_profile or "").strip().lower()
+    explicit_profile = _canonical_recipe_family(requested_profile)
     if explicit_profile in _RECIPE_FAMILIES:
         return explicit_profile
 
-    preferred = (preferred_family or "").strip().lower()
+    preferred = _canonical_recipe_family(preferred_family)
     if preferred in _RECIPE_FAMILIES:
         return preferred
 
@@ -251,7 +245,9 @@ def _resolve_recipe_family(
     if "morning briefing" in lowered or (
         "calendar" in lowered and any(marker in lowered for marker in ("briefing", "headlines", "agenda"))
     ):
-        return "morning_briefing"
+        return "briefing"
+    if "evening briefing" in lowered or ("tonight" in lowered and "briefing" in lowered):
+        return "briefing"
     if "iss" in lowered and any(marker in lowered for marker in ("pass", "passes", "visual")):
         return "iss_pass_watcher"
     if any(marker in lowered for marker in ("weather", "current conditions")) and (
@@ -267,11 +263,11 @@ def _resolve_recipe_family(
         requested_profile=requested_profile,
     )
     if inferred.executor_config:
-        return "daily_research_briefing"
+        return "briefing"
     if any(marker in lowered for marker in ("daily briefing", "daily summary", "daily analysis")) and any(
         marker in lowered for marker in ("cached", "rss", "feed", "feeds", "last 24 hours", "past 24 hours", "previous 24 hours")
     ):
-        return "daily_research_briefing"
+        return "briefing"
     if task_type == "recurring" and any(marker in lowered for marker in ("watch", "monitor", "track", "follow")) and any(
         marker in lowered for marker in ("news", "rss", "feed", "headline", "topic", "developments")
     ):
@@ -316,18 +312,37 @@ def _build_topic_watcher_recipe(
     )
 
 
-def _build_daily_research_briefing_recipe(
+def _build_briefing_recipe(
     *,
     title: str,
     instruction: str,
     task_type: str,
     requested_profile: Optional[str],
     params: dict[str, Any],
+    requested_family: str,
 ) -> NormalizedTaskRecipe | None:
+    briefing_mode = _resolve_briefing_mode(
+        title=title,
+        instruction=instruction,
+        params=params,
+        requested_family=requested_family,
+    )
     topic = _string_param(params, "topic")
     path = _string_param(params, "path")
     window_hours = _int_param(params, "window_hours")
-    custom_guidance = _extract_daily_briefing_custom_guidance(instruction=instruction, params=params)
+    market_symbol = _normalize_market_symbol(_string_param(params, "market_symbol")) or "KO"
+    custom_guidance = _extract_briefing_custom_guidance(
+        instruction=instruction,
+        params=params,
+        briefing_mode=briefing_mode,
+    )
+
+    ingredients = _string_list_param(params, "ingredients") or _default_briefing_ingredients(
+        briefing_mode=briefing_mode,
+        topic=topic,
+        path=path,
+    )
+    sections = _string_list_param(params, "sections") or _default_briefing_sections(briefing_mode=briefing_mode, topic=topic, path=path)
 
     if not topic or not path:
         inferred = infer_configured_executor(
@@ -342,62 +357,62 @@ def _build_daily_research_briefing_recipe(
         topic = topic or str(input_config.get("topic") or "").strip()
         path = path or str(persistence.get("path") or "").strip()
         window_hours = window_hours or int(input_config.get("window_hours") or 24)
+        briefing_mode = str(input_config.get("briefing_mode") or briefing_mode or "morning").strip().lower() or "morning"
 
-    if not topic or not path:
-        return None
-    window_hours = window_hours or 24
     assumptions: list[str] = []
-    if "past" not in instruction.lower() and _int_param(params, "window_hours") is None:
-        assumptions.append("defaulted research window to 24 hours")
-    normalized_instruction = (
-        f"Analyze the news about {topic} from the past {window_hours} hours using cached RSS feeds and "
-        f"append a daily research briefing to {path}."
-    )
+    normalized_params: dict[str, Any] = {
+        "briefing_mode": briefing_mode,
+        "ingredients": ingredients,
+        "sections": sections,
+        "market_symbol": market_symbol,
+    }
+
+    if topic and path:
+        window_hours = window_hours or 24
+        if "past" not in instruction.lower() and _int_param(params, "window_hours") is None:
+            assumptions.append("defaulted briefing window to 24 hours")
+        normalized_instruction = (
+            f"Analyze the news about {topic} from the past {window_hours} hours using cached RSS feeds and "
+            f"append a {briefing_mode} briefing to {path}."
+        )
+        if custom_guidance:
+            normalized_instruction = f"{normalized_instruction}\nAdditional guidance: {custom_guidance}"
+        normalized_params.update(
+            {
+                "topic": topic,
+                "window_hours": window_hours,
+                "path": path,
+            }
+        )
+        if custom_guidance:
+            normalized_params["custom_guidance"] = custom_guidance
+        return NormalizedTaskRecipe(
+            family="briefing",
+            confidence="high",
+            title=_string_param(params, "title") or _default_briefing_title(briefing_mode=briefing_mode, topic=topic),
+            instruction=normalized_instruction,
+            task_type=task_type,
+            profile=None,
+            params=normalized_params,
+            assumptions=assumptions,
+        )
+
+    base_instruction = _briefing_profile_instruction(briefing_mode=briefing_mode)
     if custom_guidance:
-        normalized_instruction = f"{normalized_instruction}\nAdditional guidance: {custom_guidance}"
-    normalized_params = {"topic": topic, "window_hours": window_hours, "path": path}
+        normalized_instruction = f"{base_instruction}\nAdditional guidance: {custom_guidance}"
+    else:
+        normalized_instruction = base_instruction
     if custom_guidance:
         normalized_params["custom_guidance"] = custom_guidance
     return NormalizedTaskRecipe(
-        family="daily_research_briefing",
+        family="briefing",
         confidence="high",
-        title=_string_param(params, "title") or f"Daily {topic} Briefing",
+        title=_string_param(params, "title") or title or _default_briefing_title(briefing_mode=briefing_mode, topic=None),
         instruction=normalized_instruction,
         task_type=task_type,
-        profile=None,
+        profile="briefing",
         params=normalized_params,
         assumptions=assumptions,
-    )
-
-
-def _build_morning_briefing_recipe(
-    *,
-    title: str,
-    instruction: str,
-    task_type: str,
-    params: dict[str, Any],
-) -> NormalizedTaskRecipe:
-    base_instruction = (
-        "Prepare a morning briefing for today using my calendar and current headlines.\n"
-        "Include today's schedule, notable headlines, and any important conflicts or priorities."
-    )
-    custom_guidance = _extract_morning_briefing_custom_guidance(
-        instruction=instruction,
-        params=params,
-        base_instruction=base_instruction,
-    )
-    normalized_instruction = base_instruction
-    if custom_guidance:
-        normalized_instruction = f"{base_instruction}\nAdditional guidance: {custom_guidance}"
-    return NormalizedTaskRecipe(
-        family="morning_briefing",
-        confidence="high",
-        title=_string_param(params, "title") or title or "Morning Briefing",
-        instruction=normalized_instruction,
-        task_type=task_type,
-        profile="morning_briefing",
-        params={"custom_guidance": custom_guidance} if custom_guidance else {},
-        assumptions=[],
     )
 
 
@@ -546,6 +561,79 @@ def _build_topic_watcher_title(topic: str) -> str:
     return f"{topic} Watcher"
 
 
+def _canonical_recipe_family(value: Optional[str]) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in {"morning_briefing", "daily_research_briefing"}:
+        return "briefing"
+    return candidate
+
+
+def _resolve_briefing_mode(
+    *,
+    title: str,
+    instruction: str,
+    params: dict[str, Any],
+    requested_family: str,
+) -> str:
+    explicit = _string_param(params, "briefing_mode")
+    if explicit:
+        value = explicit.strip().lower()
+        if value in {"morning", "evening"}:
+            return value
+    if requested_family == "morning_briefing":
+        return "morning"
+    lowered = f"{title}\n{instruction}".lower()
+    if "evening" in lowered or "tonight" in lowered:
+        return "evening"
+    return "morning"
+
+
+def _default_briefing_ingredients(*, briefing_mode: str, topic: str | None, path: str | None) -> list[str]:
+    if topic and path:
+        return ["rss_news"]
+    if briefing_mode == "evening":
+        return ["calendar", "rss_news", "market_snapshot", "weather", "history", "tomorrow_prep"]
+    return ["calendar", "rss_news", "market_snapshot", "weather", "history", "tomorrow_prep"]
+
+
+def _default_briefing_sections(*, briefing_mode: str, topic: str | None, path: str | None) -> list[str]:
+    if topic and path:
+        if briefing_mode == "evening":
+            return ["headline_bullets", "day_in_review", "watch_tomorrow", "links"]
+        return ["headline_bullets", "today_context", "watch_today", "links"]
+    if briefing_mode == "evening":
+        return ["day_in_review", "market_snapshot", "weather", "history", "headlines", "worth_attention", "tomorrow_at_a_glance"]
+    return ["today_at_a_glance", "market_snapshot", "weather", "history", "headlines", "worth_attention", "tomorrow_at_a_glance"]
+
+
+def _default_briefing_title(*, briefing_mode: str, topic: str | None) -> str:
+    if topic:
+        label = "Evening" if briefing_mode == "evening" else "Daily"
+        return f"{label} {topic} Briefing"
+    return "Evening Briefing" if briefing_mode == "evening" else "Morning Briefing"
+
+
+def _briefing_profile_instruction(*, briefing_mode: str) -> str:
+    if briefing_mode == "evening":
+        return (
+            "Prepare an evening briefing using today's calendar context and current headlines.\n"
+            "Include a short day-in-review, a compact market snapshot for the configured symbol, a weather note, a today-in-history note, current headlines with one-line summaries, and tomorrow's schedule preview.\n"
+            "If today's calendar is empty, still include `## Day in review` with a clear empty-state stub. If tomorrow's calendar is empty, still include `## Tomorrow at a glance` with a clear empty-state stub."
+        )
+    return (
+        "Prepare a morning briefing for today using my calendar and current headlines.\n"
+        "Include today's schedule, a compact market snapshot for the configured symbol, a weather note, a today-in-history note, five top headlines with one-line summaries, and tomorrow's schedule preview."
+    )
+
+
+def _normalize_market_symbol(value: str | None) -> str | None:
+    candidate = str(value or "").strip().upper()
+    if not candidate:
+        return None
+    candidate = re.sub(r"[^A-Z0-9._-]", "", candidate)
+    return candidate or None
+
+
 def _extract_timezone(instruction: str) -> str | None:
     match = re.search(r"timezone\s*=\s*([A-Za-z_/\-]+)", instruction, flags=re.IGNORECASE)
     if not match:
@@ -554,11 +642,11 @@ def _extract_timezone(instruction: str) -> str | None:
     return candidate if is_valid_timezone_name(candidate) else None
 
 
-def _extract_morning_briefing_custom_guidance(
+def _extract_briefing_custom_guidance(
     *,
     instruction: str,
     params: dict[str, Any],
-    base_instruction: str,
+    briefing_mode: str,
 ) -> str:
     explicit = _string_param(params, "custom_guidance")
     if explicit:
@@ -568,6 +656,7 @@ def _extract_morning_briefing_custom_guidance(
     if not cleaned:
         return ""
 
+    base_instruction = _briefing_profile_instruction(briefing_mode=briefing_mode)
     cleaned_lower = cleaned.lower()
     base_lower = base_instruction.lower()
     if cleaned_lower == base_lower:
@@ -576,27 +665,19 @@ def _extract_morning_briefing_custom_guidance(
     remainder = cleaned
     if cleaned_lower.startswith(base_lower):
         remainder = cleaned[len(base_instruction):].strip()
+    elif briefing_mode == "morning" and cleaned_lower.startswith("prepare a morning briefing"):
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        if len(lines) > 1:
+            remainder = "\n".join(lines[1:]).strip()
+    elif briefing_mode == "evening" and cleaned_lower.startswith("prepare an evening briefing"):
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        if len(lines) > 1:
+            remainder = "\n".join(lines[1:]).strip()
     remainder = remainder.lstrip(":- \n")
-    return remainder.strip()
-
-
-def _extract_daily_briefing_custom_guidance(
-    *,
-    instruction: str,
-    params: dict[str, Any],
-) -> str:
-    explicit = _string_param(params, "custom_guidance")
-    if explicit:
-        return explicit
-
-    cleaned = (instruction or "").strip()
-    if not cleaned:
-        return ""
-
     match = re.search(r"additional guidance:\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if match:
         return str(match.group(1)).strip()
-    return ""
+    return remainder.strip()
 
 
 def _extract_float(text: str, pattern: str) -> float | None:
