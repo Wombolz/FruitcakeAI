@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.12
+
+- Introduced the new `briefing` family runtime as the shared path for morning and evening briefings while preserving compatibility with older briefing tasks.
+- Tightened morning and evening briefing contracts with richer structured sections, grounded validation, configurable market symbols, and better custom-guidance preservation.
+- Improved briefing runtime visibility by persisting fatal-validation artifacts, exposing structured result sections, and making prepared inputs easier to inspect and trust.
+- Enriched weather preparation and presentation with forecast-aware briefing snapshots, local-time rendering, Fahrenheit-first U.S. output, and cleaner final briefing formatting.
+- Updated the client task experience to support briefing market symbols, better recurring timezone defaults, and richer structured task result display.
+
 ## v0.7.11
 
 Release date:
