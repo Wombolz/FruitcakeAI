@@ -26,6 +26,7 @@ class UserContext:
     persona: str = "family_assistant"
     persona_description: str = ""
     persona_tone: str = "helpful"
+    behavior_instructions: List[str] = field(default_factory=list)
     library_scopes: List[str] = field(default_factory=lambda: ["family_docs"])
     calendar_access: List[str] = field(default_factory=list)
     blocked_tools: List[str] = field(default_factory=list)
@@ -68,6 +69,7 @@ class UserContext:
             persona=name,
             persona_description=pc.get("description", ""),
             persona_tone=pc.get("tone", "helpful"),
+            behavior_instructions=[str(item).strip() for item in (pc.get("behavior_instructions") or []) if str(item).strip()],
             library_scopes=library_scopes,
             calendar_access=calendar_access,
             blocked_tools=pc.get("blocked_tools", []),
@@ -100,6 +102,9 @@ class UserContext:
             lines.append(f"Persona: {self.persona_description}")
         if self.persona_tone:
             lines.append(f"Tone: be {self.persona_tone}")
+        if self.behavior_instructions:
+            lines += ["", "Behavior guidance:"]
+            lines.extend(f"- {instruction}" for instruction in self.behavior_instructions)
 
         lines += [
             "",

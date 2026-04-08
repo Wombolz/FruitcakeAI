@@ -5,6 +5,7 @@ from unittest.mock import patch
 from app.agent.persona_router import infer_persona_for_task
 from app.autonomy.execution_profile import resolve_execution_profile
 from app.db.models import Task, User
+from app.task_service import resolve_agent_behavior_persona
 
 
 def _make_user(persona: str = "family_assistant") -> User:
@@ -68,3 +69,27 @@ def test_resolve_execution_profile_falls_back_to_family_assistant_when_missing()
 
     assert profile.persona == "family_assistant"
     assert profile.allowed_tools == ["search_library"]
+
+
+def test_resolve_agent_behavior_persona_maps_known_agent_role():
+    persona = resolve_agent_behavior_persona(
+        requested_persona=None,
+        recipe_family="agent",
+        recipe_params={"agent_role": "roadmap_verifier"},
+    )
+    assert persona == "roadmap_verifier"
+
+
+def test_resolve_agent_behavior_persona_respects_explicit_persona_and_unknown_role():
+    explicit = resolve_agent_behavior_persona(
+        requested_persona="family_assistant",
+        recipe_family="agent",
+        recipe_params={"agent_role": "roadmap_verifier"},
+    )
+    unknown = resolve_agent_behavior_persona(
+        requested_persona=None,
+        recipe_family="agent",
+        recipe_params={"agent_role": "unknown_specialist"},
+    )
+    assert explicit is None
+    assert unknown is None

@@ -122,6 +122,23 @@ def test_system_prompt_requires_task_draft_before_create_or_update():
     assert "high-confidence task recipe" in prompt
 
 
+def test_system_prompt_includes_persona_behavior_instructions():
+    ctx = UserContext(
+        user_id=1,
+        username="tester",
+        role="parent",
+        persona="roadmap_verifier",
+        behavior_instructions=[
+            "Classify issues as parser gap, roadmap drift, or real implementation gap.",
+            "Prefer direct evidence over formatting assumptions.",
+        ],
+    )
+    prompt = ctx.to_system_prompt().lower()
+    assert "behavior guidance:" in prompt
+    assert "parser gap, roadmap drift, or real implementation gap" in prompt
+    assert "prefer direct evidence over formatting assumptions" in prompt
+
+
 def test_parse_iso_datetime_accepts_z_suffix():
     dt = _parse_iso_datetime("2026-04-01T00:00:00Z")
     assert dt.isoformat() == "2026-04-01T00:00:00+00:00"

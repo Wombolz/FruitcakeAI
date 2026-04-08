@@ -2254,6 +2254,43 @@ async def test_runner_retries_non_final_step_once_with_large_model(client, monke
 
 
 @pytest.mark.asyncio
+async def test_runner_uses_agent_behavior_persona_for_known_agent_role(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "agentpersonarunner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Roadmap Verification Agent",
+            "instruction": "Review roadmap drift against the codebase and classify findings.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "roadmap_verifier",
+            },
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    seen = {}
+
+    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None):
+        seen["persona"] = user_context.persona
+        seen["message"] = messages[0]["content"]
+        return "VERIFIED"
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_fake_run_agent)):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    assert seen["persona"] == "roadmap_verifier"
+    assert "review roadmap drift against the codebase" in seen["message"].lower()
+
+
+@pytest.mark.asyncio
 async def test_runner_suppresses_repeated_identical_tool_failures(client, monkeypatch):
     from app.autonomy.runner import TaskRunner
 

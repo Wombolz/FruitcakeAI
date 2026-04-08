@@ -289,7 +289,45 @@ async def test_create_task_accepts_explicit_agent_recipe_family_from_editor(clie
     assert payload["task_recipe"]["params"]["agent_role"] == "roadmap_verifier"
     assert payload["task_recipe"]["params"]["source_context_hint"] == "roadmap_coordination"
     assert payload["profile"] is None
+    assert payload["persona"] == "roadmap_verifier"
     assert payload["instruction"].startswith("Review pending roadmap phases")
+
+
+@pytest.mark.asyncio
+async def test_create_agent_task_preserves_explicit_persona_override(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskagentpersonauser",
+            "email": "taskagentpersona@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskagentpersonauser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Roadmap Verification Agent",
+            "instruction": "Review pending roadmap phases against the code and summarize any drift.",
+            "task_type": "one_shot",
+            "deliver": True,
+            "persona": "family_assistant",
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "roadmap_verifier",
+            },
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    assert created.json()["persona"] == "family_assistant"
 
 
 @pytest.mark.asyncio

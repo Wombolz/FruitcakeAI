@@ -83,6 +83,24 @@ def resolve_task_persona(*, title: str, instruction: str, requested_persona: Opt
     return inferred
 
 
+def resolve_agent_behavior_persona(
+    *,
+    requested_persona: Optional[str],
+    recipe_family: Optional[str],
+    recipe_params: Optional[dict[str, Any]],
+) -> Optional[str]:
+    explicit = (requested_persona or "").strip()
+    if explicit:
+        return None
+    if _explicit_recipe_family_value(recipe_family) != "agent":
+        return None
+    params = recipe_params if isinstance(recipe_params, dict) else {}
+    agent_role = str(params.get("agent_role") or "").strip()
+    if not agent_role:
+        return None
+    return agent_role if persona_exists(agent_role) else None
+
+
 def resolve_task_profile(requested_profile: Optional[str]) -> Optional[str]:
     try:
         return normalize_task_profile(requested_profile)
@@ -206,7 +224,11 @@ async def build_task_draft_payload(
         normalized_instruction = normalized_recipe.instruction if normalized_recipe is not None else instruction
         normalized_task_type = normalized_recipe.task_type if normalized_recipe is not None else task_type
         normalized_profile = normalized_recipe.profile if normalized_recipe is not None and normalized_recipe.profile else profile
-    resolved_persona = resolve_task_persona(
+    resolved_persona = resolve_agent_behavior_persona(
+        requested_persona=persona,
+        recipe_family=normalized_recipe.family if normalized_recipe is not None else explicit_recipe_family,
+        recipe_params=normalized_recipe.params if normalized_recipe is not None else (recipe_params if isinstance(recipe_params, dict) else None),
+    ) or resolve_task_persona(
         title=normalized_title,
         instruction=normalized_instruction,
         requested_persona=persona,
@@ -487,8 +509,14 @@ async def update_task_record(
         )
 
     if persona is UNSET and (title_changed or instruction_changed) and not task.persona:
-        inferred, _, _ = infer_persona_for_task(task.title, task.instruction)
-        task.persona = inferred
+        task.persona = resolve_agent_behavior_persona(
+            requested_persona=None,
+            recipe_family=(task.task_recipe or {}).get("family") if isinstance(task.task_recipe, dict) else None,
+            recipe_params=(task.task_recipe or {}).get("params") if isinstance(task.task_recipe, dict) else None,
+        )
+        if not task.persona:
+            inferred, _, _ = infer_persona_for_task(task.title, task.instruction)
+            task.persona = inferred
         plan_inputs_changed = True
 
     if title_changed or instruction_changed or profile is not UNSET or recipe_inputs_changed:
@@ -556,6 +584,15 @@ async def update_task_record(
                 selected_profile=task.profile,
                 executor_config=inferred.executor_config,
             )
+            if persona is UNSET and not task.persona:
+                task.persona = resolve_agent_behavior_persona(
+                    requested_persona=None,
+                    recipe_family=(task.task_recipe or {}).get("family") if isinstance(task.task_recipe, dict) else None,
+                    recipe_params=(task.task_recipe or {}).get("params") if isinstance(task.task_recipe, dict) else None,
+                )
+                if not task.persona:
+                    inferred, _, _ = infer_persona_for_task(task.title, task.instruction)
+                    task.persona = inferred
 
     return TaskUpdateResult(
         title_changed=title_changed,
