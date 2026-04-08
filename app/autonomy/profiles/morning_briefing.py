@@ -26,7 +26,7 @@ _PLACEHOLDER_HEADINGS = {
 _EMPTY_RESULT = "Nothing to brief today - no calendar events and no fresh headlines."
 _SECTION_ALIASES = {
     "today_at_a_glance": ("## Today at a glance", "## Today context"),
-    "market_snapshot": ("## KO market snapshot",),
+    "market_snapshot": ("## Market snapshot", "## KO market snapshot"),
     "weather": ("## Weather",),
     "history": ("## Today in history",),
     "headlines": ("## Headlines", "## Links (from cached feeds)"),
@@ -123,7 +123,11 @@ class BriefingExecutionProfile(TaskExecutionProfile):
             max_items=24,
         )
         rss_items = list(rss_dataset.get("items") or [])[:_MAX_RSS_ITEMS]
-        market_snapshot, market_error = await _load_market_snapshot(db=db, user_id=user_id)
+        market_snapshot, market_error = await _load_market_snapshot(
+            db=db,
+            user_id=user_id,
+            symbol=_resolve_market_symbol(params=params),
+        )
         weather_snapshot, weather_error = await _load_weather_snapshot(
             db=db,
             user_id=user_id,
@@ -241,6 +245,29 @@ class BriefingExecutionProfile(TaskExecutionProfile):
             prompt_parts.append(
                 "If there are no events today or tomorrow, still include the calendar sections with `No events scheduled today.` and `No events scheduled tomorrow.`"
             )
+        elif briefing_mode == "evening":
+            prompt_parts.append(
+                "Evening briefing contract: include the required section set with explicit empty-state stubs when prepared data is unavailable."
+            )
+            if required_sections:
+                prompt_parts.append(
+                    "Required evening sections:\n- " + "\n- ".join(_display_section_name(name) for name in required_sections)
+                )
+            prompt_parts.append(
+                f"Include at most {headline_limit} headline bullets, and each headline bullet must include a one-line summary before the read-more link."
+            )
+            prompt_parts.append(
+                "For `## Day in review`, summarize today using prepared calendar context when present. If there were no events today, include the section and write `No events were on the calendar today.`"
+            )
+            prompt_parts.append(
+                "For `## Tomorrow at a glance`, frame tomorrow as a preparation view. If there are no tomorrow events, still include the section and write `No events scheduled tomorrow.`"
+            )
+            prompt_parts.append(
+                "If market or weather data is not available in the prepared dataset, include those sections and write `No update available in prepared data.`"
+            )
+            prompt_parts.append(
+                "For `## Today in history`, prefer any prepared history fact when present. If none is prepared, you may write a short 1-2 sentence item from general model knowledge for the current calendar date."
+            )
         prepared = (run_context.get("dataset_prompt") or "").strip()
         if prepared:
             prompt_parts.append(f"Prepared briefing dataset:\n{prepared[:18000]}")
@@ -298,6 +325,7 @@ class BriefingExecutionProfile(TaskExecutionProfile):
         has_attention = _has_section(text, "worth_attention")
         headline_count = _count_headline_bullets(text)
         headline_bullets_have_summaries = _headline_bullets_have_summaries(text)
+        missing_required_sections = [name for name in required_sections if not _has_section(text, name)]
         fatal = False
         fatal_reason = ""
         if invalid_urls:
@@ -318,23 +346,26 @@ class BriefingExecutionProfile(TaskExecutionProfile):
         elif briefing_mode == "evening" and tomorrow_events and not has_tomorrow:
             fatal = True
             fatal_reason = "Evening briefing omitted the required tomorrow section despite prepared next-day events."
-        elif briefing_mode == "morning" and required_sections:
-            missing = [name for name in required_sections if not _has_section(text, name)]
-            if missing:
-                fatal = True
-                fatal_reason = "Morning briefing omitted required sections: " + ", ".join(_display_section_name(name) for name in missing)
+        elif missing_required_sections:
+            fatal = True
+            mode_label = "Morning" if briefing_mode == "morning" else "Evening"
+            fatal_reason = f"{mode_label} briefing omitted required sections: " + ", ".join(
+                _display_section_name(name) for name in missing_required_sections
+            )
         elif briefing_mode == "morning" and not has_calendar and not has_headlines and not has_attention:
             fatal = True
             fatal_reason = "Morning briefing did not produce any publishable section."
         elif briefing_mode == "evening" and not has_day_review and not has_tomorrow and not has_headlines:
             fatal = True
             fatal_reason = "Evening briefing did not produce any publishable section."
-        elif briefing_mode == "morning" and headline_count > headline_limit:
+        elif headline_count > headline_limit:
             fatal = True
-            fatal_reason = f"Morning briefing exceeded the allowed {headline_limit} headlines."
-        elif briefing_mode == "morning" and has_headlines and not headline_bullets_have_summaries:
+            mode_label = "Morning" if briefing_mode == "morning" else "Evening"
+            fatal_reason = f"{mode_label} briefing exceeded the allowed {headline_limit} headlines."
+        elif has_headlines and not headline_bullets_have_summaries:
             fatal = True
-            fatal_reason = "Morning briefing headline bullets must include one-line summaries."
+            mode_label = "Morning" if briefing_mode == "morning" else "Evening"
+            fatal_reason = f"{mode_label} briefing headline bullets must include one-line summaries."
 
         report = {
             "fatal": fatal,
@@ -450,7 +481,7 @@ def _format_prompt_dataset(dataset: Dict[str, Any]) -> str:
         f"Local date: {dataset.get('local_date')}",
         f"Timezone: {dataset.get('timezone')}",
         "",
-        "KO market snapshot:",
+        _market_section_label(dataset.get("market_snapshot")) + ":",
     ]
     market_snapshot = dataset.get("market_snapshot")
     if isinstance(market_snapshot, dict) and market_snapshot:
@@ -606,13 +637,13 @@ def _canonical_section_name(name: str) -> str:
     return _LEGACY_SECTION_NAME_MAP.get(normalized, normalized)
 
 
-async def _load_market_snapshot(*, db, user_id: int) -> tuple[dict[str, Any], str]:
+async def _load_market_snapshot(*, db, user_id: int, symbol: str) -> tuple[dict[str, Any], str]:
     try:
         payload = await fetch_daily_market_data_payload(
             db,
             user_id=user_id,
             provider="alphavantage",
-            symbol="KO",
+            symbol=symbol,
             days=1,
             secret_name="alphavantage_api_key",
         )
@@ -624,7 +655,7 @@ async def _load_market_snapshot(*, db, user_id: int) -> tuple[dict[str, Any], st
         return {}, ""
     latest = days[0]
     return {
-        "symbol": payload.get("symbol") or "KO",
+        "symbol": payload.get("symbol") or symbol,
         "provider": payload.get("provider") or "alphavantage",
         "date": latest.get("date"),
         "open": latest.get("open"),
@@ -633,6 +664,22 @@ async def _load_market_snapshot(*, db, user_id: int) -> tuple[dict[str, Any], st
         "close": latest.get("close"),
         "volume": latest.get("volume"),
     }, ""
+
+
+def _resolve_market_symbol(*, params: Dict[str, Any]) -> str:
+    candidate = str(params.get("market_symbol") or "").strip().upper()
+    if not candidate:
+        return "KO"
+    normalized = re.sub(r"[^A-Z0-9._-]", "", candidate)
+    return normalized or "KO"
+
+
+def _market_section_label(snapshot: Any) -> str:
+    if isinstance(snapshot, dict):
+        symbol = str(snapshot.get("symbol") or "").strip().upper()
+        if symbol:
+            return f"{symbol} market snapshot"
+    return "Market snapshot"
 
 
 async def _load_weather_snapshot(
@@ -781,7 +828,11 @@ def _headline_bullets_have_summaries(text: str) -> bool:
     if not bullets:
         return False
     for bullet in bullets:
-        if bullet.count("—") < 2:
+        segments = [segment.strip() for segment in bullet[2:].split("—")]
+        if len(segments) < 4:
+            return False
+        summary = segments[-2] if len(segments) >= 2 else ""
+        if not summary or "[read more]" in summary.lower():
             return False
     return True
 

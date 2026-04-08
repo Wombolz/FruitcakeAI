@@ -125,6 +125,13 @@ async def test_morning_briefing_prepare_run_context_includes_market_and_weather_
             instruction="Prepare a morning briefing for Statesboro, GA 30458.",
             profile="briefing",
             active_hours_tz="America/New_York",
+            task_recipe={
+                "family": "briefing",
+                "params": {
+                    "briefing_mode": "morning",
+                    "market_symbol": "NVDA",
+                },
+            },
         )
         db.add(task)
         await db.commit()
@@ -138,7 +145,7 @@ async def test_morning_briefing_prepare_run_context_includes_market_and_weather_
                     "app.autonomy.profiles.morning_briefing.fetch_daily_market_data_payload",
                     new=AsyncMock(
                         return_value={
-                            "symbol": "KO",
+                            "symbol": "NVDA",
                             "provider": "alphavantage",
                             "days": [
                                 {
@@ -203,7 +210,7 @@ async def test_morning_briefing_prepare_run_context_includes_market_and_weather_
                             task_run_id=101,
                         )
 
-    assert out["dataset"]["market_snapshot"]["symbol"] == "KO"
+    assert out["dataset"]["market_snapshot"]["symbol"] == "NVDA"
     assert out["dataset"]["market_snapshot"]["close"] == 71.92
     assert out["dataset"]["weather_snapshot"]["location"]["city_name"] == "Statesboro"
     assert out["dataset"]["weather_snapshot"]["current_weather"]["description"] == "scattered clouds"
@@ -218,7 +225,7 @@ async def test_morning_briefing_prepare_run_context_includes_market_and_weather_
         "market_snapshot",
         "weather",
     ]
-    assert "KO market snapshot:" in out["dataset_prompt"]
+    assert "NVDA market snapshot:" in out["dataset_prompt"]
     assert "Weather snapshot:" in out["dataset_prompt"]
     assert "Ingredients: calendar, rss_news, history, tomorrow_prep, market_snapshot, weather" in out["dataset_prompt"]
     assert "temp_f=72.1" in out["dataset_prompt"]
@@ -753,6 +760,139 @@ def test_briefing_validate_finalize_requires_day_in_review_for_evening_mode():
     assert report is not None
     assert report["fatal"] is True
     assert "day-in-review" in report["fatal_reason"].lower()
+
+
+def test_briefing_validate_finalize_requires_evening_headline_summaries():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Day in review\n\n"
+            "No events were on the calendar today.\n\n"
+            "## KO market snapshot\n\n"
+            "No update available in prepared data.\n\n"
+            "## Weather\n\n"
+            "No update available in prepared data.\n\n"
+            "## Today in history\n\n"
+            "No update available in prepared data.\n\n"
+            "## Headlines\n\n"
+            "- **Artemis update** — Reuters — [Read More](https://example.com/story)\n\n"
+            "## Worth your attention\n\n"
+            "No additional cross-source priorities today.\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "briefing_mode": "evening",
+                "calendar_events": [],
+                "tomorrow_events": [],
+                "rss_items": [{"url": "https://example.com/story"}],
+                "required_sections": [
+                    "day_in_review",
+                    "market_snapshot",
+                    "weather",
+                    "history",
+                    "headlines",
+                    "worth_attention",
+                    "tomorrow_at_a_glance",
+                ],
+                "headline_limit": 6,
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is True
+    assert "headline bullets must include one-line summaries" in report["fatal_reason"].lower()
+
+
+def test_briefing_validate_finalize_enforces_evening_headline_limit():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Day in review\n\n"
+            "No events were on the calendar today.\n\n"
+            "## KO market snapshot\n\n"
+            "No update available in prepared data.\n\n"
+            "## Weather\n\n"
+            "No update available in prepared data.\n\n"
+            "## Today in history\n\n"
+            "No update available in prepared data.\n\n"
+            "## Headlines\n\n"
+            "- **One** — Reuters — Summary one. — [Read More](https://example.com/1)\n"
+            "- **Two** — Reuters — Summary two. — [Read More](https://example.com/2)\n"
+            "- **Three** — Reuters — Summary three. — [Read More](https://example.com/3)\n"
+            "- **Four** — Reuters — Summary four. — [Read More](https://example.com/4)\n"
+            "- **Five** — Reuters — Summary five. — [Read More](https://example.com/5)\n"
+            "- **Six** — Reuters — Summary six. — [Read More](https://example.com/6)\n"
+            "- **Seven** — Reuters — Summary seven. — [Read More](https://example.com/7)\n\n"
+            "## Worth your attention\n\n"
+            "No additional cross-source priorities today.\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "briefing_mode": "evening",
+                "calendar_events": [],
+                "tomorrow_events": [],
+                "rss_items": [{"url": f"https://example.com/{i}"} for i in range(1, 8)],
+                "required_sections": [
+                    "day_in_review",
+                    "market_snapshot",
+                    "weather",
+                    "history",
+                    "headlines",
+                    "worth_attention",
+                    "tomorrow_at_a_glance",
+                ],
+                "headline_limit": 6,
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is True
+    assert "exceeded the allowed 6 headlines" in report["fatal_reason"].lower()
+
+
+def test_briefing_validate_finalize_requires_evening_required_sections():
+    profile = MorningBriefingExecutionProfile()
+    result, report = profile.validate_finalize(
+        result=(
+            "## Day in review\n\n"
+            "No events were on the calendar today.\n\n"
+            "## Headlines\n\n"
+            "- **Artemis update** — Reuters — Summary one. — [Read More](https://example.com/story)\n\n"
+            "## Tomorrow at a glance\n\n"
+            "No events scheduled tomorrow."
+        ),
+        prior_full_outputs=[],
+        run_context={
+            "dataset": {
+                "briefing_mode": "evening",
+                "calendar_events": [],
+                "tomorrow_events": [],
+                "rss_items": [{"url": "https://example.com/story"}],
+                "required_sections": [
+                    "day_in_review",
+                    "market_snapshot",
+                    "weather",
+                    "history",
+                    "headlines",
+                    "worth_attention",
+                    "tomorrow_at_a_glance",
+                ],
+                "headline_limit": 6,
+            }
+        },
+        is_final_step=True,
+    )
+    assert report is not None
+    assert report["fatal"] is True
+    assert "evening briefing omitted required sections" in report["fatal_reason"].lower()
 
 
 @pytest.mark.asyncio

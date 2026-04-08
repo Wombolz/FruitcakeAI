@@ -1,11 +1,19 @@
-Produce a concise morning briefing from the prepared dataset only.
+Produce a concise briefing from the prepared dataset only.
 
 Requirements:
 - Use markdown only.
 - Start directly with the content. No greeting or sign-off.
-- Use sections in this order:
+- When `briefing_mode` is `morning`, use sections in this order:
   1. `## Today at a glance`
-  2. `## KO market snapshot`
+  2. `## Market snapshot`
+  3. `## Weather`
+  4. `## Today in history`
+  5. `## Headlines`
+  6. `## Worth your attention`
+  7. `## Tomorrow at a glance`
+- When `briefing_mode` is `evening`, use sections in this order:
+  1. `## Day in review`
+  2. `## Market snapshot`
   3. `## Weather`
   4. `## Today in history`
   5. `## Headlines`
@@ -15,13 +23,18 @@ Requirements:
   `Nothing to brief today - no calendar events and no fresh headlines.`
 
 Calendar rules:
-- List each event with local time, title, and location if present.
-- If an event starts within 2 hours, flag it briefly.
-- If there are no events, still include the section and say `No events scheduled today.`
+- Morning:
+  - List each event with local time, title, and location if present.
+  - If an event starts within 2 hours, flag it briefly.
+  - If there are no events, still include the section and say `No events scheduled today.`
+- Evening:
+  - `## Day in review` should briefly summarize what happened today using prepared calendar context if it exists.
+  - If there are no events today, still include `## Day in review` and say `No events were on the calendar today.`
 
 KO market / weather rules:
 - Always include these sections.
 - If the prepared dataset does not contain grounded information for one of them, say `No update available in prepared data.`
+- For market, use the configured symbol from the task recipe rather than assuming `KO`.
 - For weather, prefer Fahrenheit in the final output for U.S. locations and present observed times in clean local time rather than raw UTC timestamps when the prepared dataset includes them.
 - When grounded weather forecast data is present, use it directly for same-day high, low, and precipitation chance instead of falling back to `No update available in prepared data.`
 - Prefer a compact but information-dense weather section: current conditions, same-day range/precipitation, and a brief note about the next few forecast periods when they materially change the day.
@@ -40,7 +53,7 @@ Today in history rules:
 
 Headline rules:
 - Use only URLs from the prepared dataset.
-- Include at most 5 headlines.
+- Include at most the prepared headline limit.
 - Format each as:
   `- **Title** — Source — one-line summary — [Read More](URL)`
 - Never invent URLs, titles, or sources.
@@ -54,7 +67,11 @@ Worth your attention rules:
 Tomorrow rules:
 - Always include `## Tomorrow at a glance`.
 - Present tomorrow event times in clean local time rather than raw offset notation.
-- If there are no tomorrow events, say `No events scheduled tomorrow.`
+- Morning:
+  - If there are no tomorrow events, say `No events scheduled tomorrow.`
+- Evening:
+  - Frame the section as a short preparation view for tomorrow.
+  - If there are no tomorrow events, still include the section and say `No events scheduled tomorrow.`
 
 Length:
 - Target under 500 words.

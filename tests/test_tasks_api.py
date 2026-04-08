@@ -160,10 +160,52 @@ async def test_create_task_accepts_explicit_recipe_family_from_editor(client):
     payload = created.json()
     assert payload["task_recipe"]["family"] == "briefing"
     assert payload["task_recipe"]["params"]["briefing_mode"] == "morning"
+    assert payload["task_recipe"]["params"]["market_symbol"] == "KO"
     assert payload["task_recipe"]["selected_executor_kind"] == "configured_executor"
     assert "append a morning briefing" in payload["instruction"].lower()
     assert "photo-industry business news" in payload["instruction"].lower()
     assert payload["task_recipe"]["params"]["custom_guidance"].lower().startswith("keep it concise")
+
+
+@pytest.mark.asyncio
+async def test_create_task_accepts_briefing_market_symbol_from_editor(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskbriefingsymboluser",
+            "email": "taskbriefingsymbol@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskbriefingsymboluser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Evening Market Briefing",
+            "instruction": "Summarize my watchlist.",
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": True,
+            "recipe_family": "briefing",
+            "recipe_params": {
+                "briefing_mode": "evening",
+                "market_symbol": "NVDA",
+            },
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["task_recipe"]["family"] == "briefing"
+    assert payload["task_recipe"]["params"]["briefing_mode"] == "evening"
+    assert payload["task_recipe"]["params"]["market_symbol"] == "NVDA"
 
 
 @pytest.mark.asyncio
@@ -325,7 +367,9 @@ async def test_create_task_preserves_custom_guidance_for_morning_briefing(client
     assert payload["task_recipe"]["family"] == "briefing"
     assert payload["task_recipe"]["params"]["briefing_mode"] == "morning"
     assert "day in history" in payload["instruction"].lower()
-    assert payload["task_recipe"]["params"]["custom_guidance"].lower().startswith("also include")
+    guidance = payload["task_recipe"]["params"]["custom_guidance"].lower()
+    assert guidance.startswith("include today's schedule")
+    assert "also include a short bit of trivia" in guidance
 
 
 @pytest.mark.asyncio

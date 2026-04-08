@@ -330,6 +330,7 @@ def _build_briefing_recipe(
     topic = _string_param(params, "topic")
     path = _string_param(params, "path")
     window_hours = _int_param(params, "window_hours")
+    market_symbol = _normalize_market_symbol(_string_param(params, "market_symbol")) or "KO"
     custom_guidance = _extract_briefing_custom_guidance(
         instruction=instruction,
         params=params,
@@ -363,6 +364,7 @@ def _build_briefing_recipe(
         "briefing_mode": briefing_mode,
         "ingredients": ingredients,
         "sections": sections,
+        "market_symbol": market_symbol,
     }
 
     if topic and path:
@@ -615,12 +617,21 @@ def _briefing_profile_instruction(*, briefing_mode: str) -> str:
     if briefing_mode == "evening":
         return (
             "Prepare an evening briefing using today's calendar context and current headlines.\n"
-            "Include a short day-in-review, a compact KO market snapshot, a weather note, a today-in-history note, current headlines with one-line summaries, and tomorrow's schedule preview."
+            "Include a short day-in-review, a compact market snapshot for the configured symbol, a weather note, a today-in-history note, current headlines with one-line summaries, and tomorrow's schedule preview.\n"
+            "If today's calendar is empty, still include `## Day in review` with a clear empty-state stub. If tomorrow's calendar is empty, still include `## Tomorrow at a glance` with a clear empty-state stub."
         )
     return (
         "Prepare a morning briefing for today using my calendar and current headlines.\n"
-        "Include today's schedule, a compact KO market snapshot, a weather note, a today-in-history note, five top headlines with one-line summaries, and tomorrow's schedule preview."
+        "Include today's schedule, a compact market snapshot for the configured symbol, a weather note, a today-in-history note, five top headlines with one-line summaries, and tomorrow's schedule preview."
     )
+
+
+def _normalize_market_symbol(value: str | None) -> str | None:
+    candidate = str(value or "").strip().upper()
+    if not candidate:
+        return None
+    candidate = re.sub(r"[^A-Z0-9._-]", "", candidate)
+    return candidate or None
 
 
 def _extract_timezone(instruction: str) -> str | None:
@@ -654,6 +665,14 @@ def _extract_briefing_custom_guidance(
     remainder = cleaned
     if cleaned_lower.startswith(base_lower):
         remainder = cleaned[len(base_instruction):].strip()
+    elif briefing_mode == "morning" and cleaned_lower.startswith("prepare a morning briefing"):
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        if len(lines) > 1:
+            remainder = "\n".join(lines[1:]).strip()
+    elif briefing_mode == "evening" and cleaned_lower.startswith("prepare an evening briefing"):
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        if len(lines) > 1:
+            remainder = "\n".join(lines[1:]).strip()
     remainder = remainder.lstrip(":- \n")
     match = re.search(r"additional guidance:\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if match:
