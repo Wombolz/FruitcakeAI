@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -283,6 +283,112 @@ async def test_tasks_summary_includes_current_step_and_waiting_tool(client):
     detail = detail_resp.json()
     assert detail["current_step_title"] == "Create calendar event"
     assert detail["waiting_approval_tool"] == "create_event"
+
+
+@pytest.mark.asyncio
+async def test_approving_waiting_task_dispatches_runner_immediately(client):
+    headers = await _headers(client, "approvalresumeowner")
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Approval resume task", "instruction": "Resume me after approval"},
+        headers=headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.status = "waiting_approval"
+        task.current_step_index = 1
+        step = TaskStep(
+            task_id=task_id,
+            step_index=1,
+            title="Needs approval",
+            instruction="Use an approval-gated tool",
+            requires_approval=True,
+            status="waiting_approval",
+            waiting_approval_tool="create_event",
+        )
+        db.add(step)
+        await db.commit()
+
+    runner = type("RunnerStub", (), {"execute": AsyncMock(return_value=None)})()
+    with patch("app.autonomy.runner.get_task_runner", return_value=runner):
+        approve_resp = await client.patch(
+            f"/tasks/{task_id}",
+            json={"approved": True},
+            headers=headers,
+        )
+
+    assert approve_resp.status_code == 200
+    body = approve_resp.json()
+    assert body["status"] == "pending"
+
+    runner.execute.assert_awaited_once()
+    dispatched_task = runner.execute.await_args.args[0]
+    assert getattr(dispatched_task, "id", None) == task_id
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "pending"
+        assert task.pre_approved is True
+        assert task.next_run_at is not None
+
+
+@pytest.mark.asyncio
+async def test_runner_resumes_waiting_approval_run_instead_of_skipping(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "approvalresumeexecowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Approval resume execution",
+            "instruction": "Continue after approval",
+            "task_type": "one_shot",
+            "deliver": False,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.status = "pending"
+        task.next_run_at = datetime.now(timezone.utc)
+        task.pre_approved = True
+        waiting_run = TaskRun(
+            task_id=task_id,
+            status="waiting_approval",
+            error="create_event",
+            finished_at=datetime.now(timezone.utc),
+        )
+        db.add(waiting_run)
+        await db.commit()
+        waiting_run_id = waiting_run.id
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(return_value="resumed ok")):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id, "next_run_at": None})())
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "completed"
+
+        resumed_run = await db.get(TaskRun, waiting_run_id)
+        assert resumed_run is not None
+        assert resumed_run.status == "completed"
+        assert resumed_run.error is None
+
+        rows = await db.execute(
+            select(TaskRun).where(TaskRun.task_id == task_id).order_by(TaskRun.id)
+        )
+        runs = rows.scalars().all()
+        assert [r.id for r in runs] == [waiting_run_id]
 
 
 @pytest.mark.asyncio
@@ -1005,6 +1111,250 @@ async def test_admin_task_run_inspect_returns_ordered_payloads_and_diagnostics(c
     assert payload["diagnostics"]["active_skills"] == ["rss-grounded-briefing"]
     assert payload["diagnostics"]["validation_report"]["publish_mode"] == "full"
     assert payload["execution"]["edition_export"]["pdf_relative_path"].endswith("edition.pdf")
+
+
+@pytest.mark.asyncio
+async def test_admin_agent_run_create_update_and_inspect(client):
+    admin_headers = await _admin_headers(client, "agentrunadmin")
+    owner_headers = await _headers(client, "agentrunowner")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={
+            "title": "Agent-backed task",
+            "instruction": "Build a first agent run.",
+        },
+        headers=owner_headers,
+    )
+    assert task_resp.status_code == 201
+    task_id = int(task_resp.json()["id"])
+
+    created = await client.post(
+        "/admin/agent-runs",
+        json={
+            "task_id": task_id,
+            "agent_role": "memory_reviewer",
+            "trigger_source": "manual_admin",
+            "source_context": {"proposal_id": 42, "reason": "review"},
+        },
+        headers=admin_headers,
+    )
+    assert created.status_code == 201
+    created_payload = created.json()
+    run_id = int(created_payload["run"]["id"])
+    assert created_payload["run"]["run_kind"] == "agent"
+    assert created_payload["run"]["agent_role"] == "memory_reviewer"
+    assert created_payload["run"]["trigger_source"] == "manual_admin"
+    assert created_payload["run"]["source_context"] == {"proposal_id": 42, "reason": "review"}
+    assert created_payload["run"]["status"] == "queued"
+
+    updated = await client.patch(
+        f"/admin/agent-runs/{run_id}",
+        json={
+            "status": "completed",
+            "summary": "Reviewed proposal and queued follow-up.",
+            "artifacts": [
+                {
+                    "artifact_type": "agent_output",
+                    "content_json": {"decision": "keep", "confidence": 0.8},
+                }
+            ],
+        },
+        headers=admin_headers,
+    )
+    assert updated.status_code == 200
+    updated_payload = updated.json()
+    assert updated_payload["updated"] is True
+    assert updated_payload["run"]["id"] == run_id
+    assert updated_payload["run"]["run_kind"] == "agent"
+    assert updated_payload["run"]["agent_role"] == "memory_reviewer"
+    assert updated_payload["run"]["status"] == "completed"
+    assert updated_payload["run"]["finished_at"] is not None
+    assert updated_payload["artifacts"][0]["artifact_type"] == "agent_output"
+    assert updated_payload["artifacts"][0]["content_json"] == {"decision": "keep", "confidence": 0.8}
+
+    async with TestSessionLocal() as db:
+        run = await db.get(TaskRun, run_id)
+        assert run is not None
+        assert run.run_kind == "agent"
+        assert run.agent_role == "memory_reviewer"
+        assert run.trigger_source == "manual_admin"
+        assert run.source_context == {"proposal_id": 42, "reason": "review"}
+
+
+@pytest.mark.asyncio
+async def test_admin_agent_run_update_rejects_non_agent_runs(client):
+    admin_headers = await _admin_headers(client, "nonagentrunadmin")
+    owner_headers = await _headers(client, "nonagentrunowner")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={
+            "title": "Normal task",
+            "instruction": "Run a normal task.",
+        },
+        headers=owner_headers,
+    )
+    assert task_resp.status_code == 201
+    task_id = int(task_resp.json()["id"])
+
+    async with TestSessionLocal() as db:
+        run = TaskRun(
+            task_id=task_id,
+            status="completed",
+            summary="Normal task run",
+            started_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+            finished_at=datetime.now(timezone.utc),
+        )
+        db.add(run)
+        await db.commit()
+        run_id = int(run.id)
+
+    resp = await client.patch(
+        f"/admin/agent-runs/{run_id}",
+        json={"status": "failed"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_admin_agent_run_can_export_findings_to_workspace_file(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    admin_headers = await _admin_headers(client, "agentexportadmin")
+    owner_headers = await _headers(client, "agentexportowner")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={
+            "title": "Agent export task",
+            "instruction": "Export findings.",
+        },
+        headers=owner_headers,
+    )
+    assert task_resp.status_code == 201
+    task_id = int(task_resp.json()["id"])
+
+    created = await client.post(
+        "/admin/agent-runs",
+        json={
+            "task_id": task_id,
+            "agent_role": "roadmap_verifier",
+            "trigger_source": "manual_admin",
+        },
+        headers=admin_headers,
+    )
+    assert created.status_code == 201
+    run_id = int(created.json()["run"]["id"])
+
+    updated = await client.patch(
+        f"/admin/agent-runs/{run_id}",
+        json={
+            "status": "completed",
+            "summary": "Fallback summary",
+            "artifacts": [
+                {
+                    "artifact_type": "final_output",
+                    "content_text": "# Findings\n\n- Exported from agent run.\n",
+                }
+            ],
+        },
+        headers=admin_headers,
+    )
+    assert updated.status_code == 200
+
+    exported = await client.post(
+        f"/admin/agent-runs/{run_id}/export-file",
+        json={
+            "path": "reports/roadmap_verification_findings.md",
+            "artifact_type": "final_output",
+        },
+        headers=admin_headers,
+    )
+    assert exported.status_code == 200
+    payload = exported.json()
+    assert payload["exported"] is True
+    assert payload["path"] == "reports/roadmap_verification_findings.md"
+    assert payload["source_artifact_type"] == "final_output"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        owner_id = int(task.user_id)
+
+    expected_path = tmp_path / str(owner_id) / "reports" / "roadmap_verification_findings.md"
+    assert expected_path.exists()
+    assert expected_path.read_text(encoding="utf-8") == "# Findings\n\n- Exported from agent run.\n"
+
+    async with TestSessionLocal() as db:
+        rows = await db.execute(
+            select(TaskRunArtifact)
+            .where(TaskRunArtifact.task_run_id == run_id)
+            .order_by(TaskRunArtifact.id.desc())
+        )
+        artifacts = rows.scalars().all()
+        assert artifacts[0].artifact_type == "workspace_export"
+        assert json.loads(artifacts[0].content_json)["path"] == "reports/roadmap_verification_findings.md"
+
+
+@pytest.mark.asyncio
+async def test_task_owner_can_export_latest_result_to_workspace_file(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    headers = await _headers(client, "taskexportowner")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={
+            "title": "Task export",
+            "instruction": "Export latest result.",
+            "recipe_family": "agent",
+            "recipe_params": {"agent_role": "roadmap_verifier"},
+        },
+        headers=headers,
+    )
+    assert task_resp.status_code == 201
+    task_id = int(task_resp.json()["id"])
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        run = TaskRun(
+            task_id=task_id,
+            status="completed",
+            summary="Fallback summary",
+            run_kind="agent",
+            agent_role="roadmap_verifier",
+            started_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+            finished_at=datetime.now(timezone.utc),
+        )
+        db.add(run)
+        await db.flush()
+        db.add(
+            TaskRunArtifact(
+                task_run_id=run.id,
+                artifact_type="final_output",
+                content_text="# Findings\n\n- Exported from owner route.\n",
+            )
+        )
+        await db.commit()
+        owner_id = int(task.user_id)
+        run_id = int(run.id)
+
+    exported = await client.post(
+        f"/tasks/{task_id}/export-result-file",
+        json={"path": "reports/owner_export.md", "artifact_type": "final_output"},
+        headers=headers,
+    )
+    assert exported.status_code == 200
+    payload = exported.json()
+    assert payload["exported"] is True
+    assert payload["task_id"] == task_id
+    assert payload["run_id"] == run_id
+    assert payload["path"] == "reports/owner_export.md"
+
+    expected_path = tmp_path / str(owner_id) / "reports" / "owner_export.md"
+    assert expected_path.exists()
+    assert expected_path.read_text(encoding="utf-8") == "# Findings\n\n- Exported from owner route.\n"
 
 
 @pytest.mark.asyncio

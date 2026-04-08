@@ -463,6 +463,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "recipe_family": {
                         "type": "string",
                         "enum": [
+                            "agent",
                             "topic_watcher",
                             "briefing",
                             "daily_research_briefing",
@@ -513,6 +514,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "recipe_family": {
                         "type": "string",
                         "enum": [
+                            "agent",
                             "topic_watcher",
                             "briefing",
                             "daily_research_briefing",
@@ -561,6 +563,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "recipe_family": {
                         "type": "string",
                         "enum": [
+                            "agent",
                             "topic_watcher",
                             "briefing",
                             "daily_research_briefing",

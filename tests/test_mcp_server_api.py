@@ -378,6 +378,84 @@ async def test_mcp_list_task_runs_supports_profile_status_and_memory_filters(cli
 
 
 @pytest.mark.asyncio
+async def test_mcp_list_task_runs_and_inspect_expose_agent_run_metadata(client):
+    token = await _token(client, "mcpagentrunsuser")
+    headers = _auth_headers(token)
+
+    me = await client.get("/auth/me", headers=headers)
+    user_id = int(me.json()["id"])
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=user_id,
+            title="Agent run task",
+            instruction="Inspect agent-style runs.",
+            profile="maintenance",
+            task_type="recurring",
+            status="pending",
+            schedule="every:6h",
+            deliver=True,
+            requires_approval=False,
+        )
+        db.add(task)
+        await db.flush()
+        run = TaskRun(
+            task_id=task.id,
+            status="completed",
+            summary="Agent summary",
+            run_kind="agent",
+            agent_role="memory_reviewer",
+            trigger_source="manual_admin",
+            source_context_json=json.dumps({"proposal_id": 42}),
+        )
+        db.add(run)
+        await db.commit()
+        task_id = int(task.id)
+        run_id = int(run.id)
+
+    listed = await client.post(
+        "/mcp/fruitcake/tools/call",
+        json={
+            "jsonrpc": "2.0",
+            "id": 911,
+            "method": "tools/call",
+            "params": {
+                "name": "fruitcake_list_task_runs",
+                "arguments": {"task_id": task_id, "run_kind": "agent", "agent_role": "memory_reviewer"},
+            },
+        },
+        headers=headers,
+    )
+    assert listed.status_code == 200
+    listed_payload = listed.json()["result"]["structuredContent"]
+    assert listed_payload["count"] == 1
+    assert listed_payload["runs"][0]["run_kind"] == "agent"
+    assert listed_payload["runs"][0]["agent_role"] == "memory_reviewer"
+    assert listed_payload["runs"][0]["trigger_source"] == "manual_admin"
+    assert listed_payload["runs"][0]["source_context"] == {"proposal_id": 42}
+
+    inspected = await client.post(
+        "/mcp/fruitcake/tools/call",
+        json={
+            "jsonrpc": "2.0",
+            "id": 912,
+            "method": "tools/call",
+            "params": {
+                "name": "fruitcake_inspect_task_run",
+                "arguments": {"task_id": task_id, "run_id": run_id},
+            },
+        },
+        headers=headers,
+    )
+    assert inspected.status_code == 200
+    inspected_payload = inspected.json()["result"]["structuredContent"]
+    assert inspected_payload["run"]["run_kind"] == "agent"
+    assert inspected_payload["run"]["agent_role"] == "memory_reviewer"
+    assert inspected_payload["run"]["trigger_source"] == "manual_admin"
+    assert inspected_payload["run"]["source_context"] == {"proposal_id": 42}
+
+
+@pytest.mark.asyncio
 async def test_mcp_get_task_run_artifacts_returns_owned_run_outputs(client):
     token = await _token(client, "mcpartifactsuser")
     headers = _auth_headers(token)

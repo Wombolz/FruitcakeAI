@@ -9,6 +9,7 @@ from app.autonomy.configured_executor import infer_configured_executor
 from app.time_utils import is_valid_timezone_name
 
 _RECIPE_FAMILIES = {
+    "agent",
     "briefing",
     "topic_watcher",
     "daily_research_briefing",
@@ -54,6 +55,8 @@ def normalize_task_recipe(
     params = dict(recipe_params or {})
     if family == "topic_watcher":
         return _build_topic_watcher_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
+    if family == "agent":
+        return _build_agent_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
     if family in {"briefing", "daily_research_briefing", "morning_briefing"}:
         return _build_briefing_recipe(
             title=title,
@@ -150,6 +153,14 @@ def build_task_confirmation_text(
         return (
             f"Created a {cadence} {mode} briefing task, '{title}'."
             f" It will prepare a {framing} agenda and headline summary."
+            + _schedule_suffix(schedule)
+        )
+
+    if family == "agent":
+        agent_role = str(params.get("agent_role") or "general_agent").strip()
+        return (
+            f"Created a {cadence} agent-style task, '{title}', for role '{agent_role}'."
+            " It will keep the task objective as freeform delegated work rather than a built-in profile recipe."
             + _schedule_suffix(schedule)
         )
 
@@ -413,6 +424,33 @@ def _build_briefing_recipe(
         profile="briefing",
         params=normalized_params,
         assumptions=assumptions,
+    )
+
+
+def _build_agent_recipe(
+    *,
+    title: str,
+    instruction: str,
+    task_type: str,
+    params: dict[str, Any],
+) -> NormalizedTaskRecipe | None:
+    normalized_instruction = str(instruction or "").strip()
+    if not normalized_instruction:
+        return None
+    agent_role = _string_param(params, "agent_role") or "general_agent"
+    source_context_hint = _string_param(params, "source_context_hint")
+    normalized_params: dict[str, Any] = {"agent_role": agent_role}
+    if source_context_hint:
+        normalized_params["source_context_hint"] = source_context_hint
+    return NormalizedTaskRecipe(
+        family="agent",
+        confidence="high",
+        title=_string_param(params, "title") or title or "Agent Task",
+        instruction=normalized_instruction,
+        task_type=task_type,
+        profile=None,
+        params=normalized_params,
+        assumptions=[],
     )
 
 

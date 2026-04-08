@@ -88,6 +88,25 @@ async def test_append_file_inside_user_workspace(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_write_file_strips_leading_workspace_user_prefix(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    user_context = UserContext(user_id=7, username="tester", role="parent")
+
+    write_result = await call_tool(
+        "write_file",
+        {"path": "workspace/7/reports/findings.md", "content": "normalized"},
+        user_context,
+    )
+
+    expected_path = Path(tmp_path) / "7" / "reports" / "findings.md"
+    doubled_path = Path(tmp_path) / "7" / "workspace" / "7" / "reports" / "findings.md"
+    assert "Wrote" in write_result
+    assert expected_path.exists()
+    assert expected_path.read_text() == "normalized"
+    assert not doubled_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_make_directory_creates_parents_and_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
     user_context = UserContext(user_id=10, username="tester", role="parent")

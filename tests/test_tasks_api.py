@@ -251,6 +251,48 @@ async def test_create_task_accepts_explicit_watcher_recipe_params_from_editor(cl
 
 
 @pytest.mark.asyncio
+async def test_create_task_accepts_explicit_agent_recipe_family_from_editor(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskagenteditoruser",
+            "email": "taskagenteditor@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskagenteditoruser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Roadmap Verification Agent",
+            "instruction": "Review pending roadmap phases against the code and summarize any drift.",
+            "task_type": "one_shot",
+            "deliver": True,
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "roadmap_verifier",
+                "source_context_hint": "roadmap_coordination",
+            },
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["task_recipe"]["family"] == "agent"
+    assert payload["task_recipe"]["params"]["agent_role"] == "roadmap_verifier"
+    assert payload["task_recipe"]["params"]["source_context_hint"] == "roadmap_coordination"
+    assert payload["profile"] is None
+    assert payload["instruction"].startswith("Review pending roadmap phases")
+
+
+@pytest.mark.asyncio
 async def test_create_task_respects_explicit_generic_family_from_editor(client):
     await client.post(
         "/auth/register",

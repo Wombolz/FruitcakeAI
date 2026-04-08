@@ -9,19 +9,21 @@ POST /admin/users          — create a new user
 PATCH /admin/users/{id}    — update user role / persona / scopes / active flag
 GET  /admin/audit          — recent agent tool-call audit log
 GET  /admin/task-runs      — Phase 4 debug: task run history with tool calls
+POST /admin/agent-runs     — create a backend-only agent-style run record
+PATCH /admin/agent-runs/{id} — update lifecycle/artifacts for an agent-style run
 """
 
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +49,7 @@ from app.db.models import TaskRunArtifact
 from app.db.session import get_db
 from app.metrics import metrics
 from app.memory.graph_service import get_graph_memory_service
+from app.mcp.servers.filesystem import resolve_workspace_path_for_user, write_workspace_text
 from app.skills.service import (
     SkillConflictError,
     SkillNotFoundError,
@@ -120,6 +123,37 @@ class SkillPreviewResponse(BaseModel):
     is_pinned: bool
     validation_warnings: List[str]
     preview_hash: str
+
+
+class AgentRunArtifactIn(BaseModel):
+    artifact_type: str
+    content_json: Optional[Any] = None
+    content_text: Optional[str] = None
+
+
+class AgentRunCreateRequest(BaseModel):
+    task_id: int
+    agent_role: str
+    trigger_source: Optional[str] = "manual"
+    source_context: Optional[Dict[str, Any]] = None
+    status: str = "queued"
+    summary: Optional[str] = None
+
+
+class AgentRunUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    summary: Optional[str] = None
+    error: Optional[str] = None
+    artifacts: List[AgentRunArtifactIn] = Field(default_factory=list)
+
+
+class AgentRunExportRequest(BaseModel):
+    path: str
+    artifact_type: Optional[str] = "final_output"
+    overwrite: bool = True
+
+
+_AGENT_RUN_ALLOWED_STATUSES = {"queued", "running", "completed", "failed", "cancelled"}
 
 
 class SkillInstallRequest(BaseModel):
@@ -487,6 +521,20 @@ def _serialize_artifact(artifact: TaskRunArtifact) -> Dict[str, Any]:
     }
 
 
+def _artifact_text_value(artifact: TaskRunArtifact) -> str:
+    if artifact.content_text:
+        return artifact.content_text
+    if artifact.content_json:
+        try:
+            payload = json.loads(artifact.content_json)
+        except Exception:
+            return artifact.content_json
+        if isinstance(payload, str):
+            return payload
+        return json.dumps(payload, indent=2, sort_keys=True)
+    return ""
+
+
 def _tool_call_payload(entry: AuditLog) -> Dict[str, Any]:
     return {
         "id": entry.id,
@@ -525,7 +573,22 @@ def _normalized_diagnostics(artifacts: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _duration_seconds(run: TaskRun) -> Optional[float]:
     if run.started_at is None or run.finished_at is None:
         return None
-    return round((run.finished_at - run.started_at).total_seconds(), 3)
+    started = run.started_at
+    finished = run.finished_at
+    if started.tzinfo is not None:
+        started = started.astimezone(timezone.utc).replace(tzinfo=None)
+    if finished.tzinfo is not None:
+        finished = finished.astimezone(timezone.utc).replace(tzinfo=None)
+    return round((finished - started).total_seconds(), 3)
+
+
+def _serialize_run_metadata(run: TaskRun) -> Dict[str, Any]:
+    return {
+        "run_kind": getattr(run, "run_kind", "task") or "task",
+        "agent_role": getattr(run, "agent_role", None),
+        "trigger_source": getattr(run, "trigger_source", None),
+        "source_context": getattr(run, "source_context", None),
+    }
 
 
 async def _load_task_run_bundle(
@@ -576,6 +639,7 @@ async def _build_task_run_inspect_payload(db: AsyncSession, run_id: int) -> Dict
             "session_id": run.session_id,
             "error": run.error,
             "summary": run.summary,
+            **_serialize_run_metadata(run),
         },
         "task": {
             "id": task.id,
@@ -615,6 +679,16 @@ def _edition_pdf_path_from_artifacts(artifacts: List[TaskRunArtifact]) -> Option
         path = Path(settings.storage_dir) / relative
         return path
     return None
+
+
+def _normalize_agent_run_status(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in _AGENT_RUN_ALLOWED_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"status must be one of {sorted(_AGENT_RUN_ALLOWED_STATUSES)}",
+        )
+    return normalized
 
 
 @router.post("/skills/preview", response_model=SkillPreviewResponse)
@@ -1235,10 +1309,162 @@ async def task_runs(
                 "retry_count": task.retry_count,
                 "tool_calls": tool_calls,
                 "artifacts": run_artifacts,
+                **_serialize_run_metadata(run),
             }
         )
 
     return {"count": len(output), "runs": output}
+
+
+@router.post("/agent-runs", tags=["admin"], status_code=status.HTTP_201_CREATED)
+async def create_agent_run(
+    body: AgentRunCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    task = await db.get(Task, body.task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    agent_role = str(body.agent_role or "").strip()
+    if not agent_role:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="agent_role is required")
+
+    run = TaskRun(
+        task_id=task.id,
+        status=_normalize_agent_run_status(body.status),
+        summary=body.summary,
+        run_kind="agent",
+        agent_role=agent_role,
+        trigger_source=str(body.trigger_source or "manual").strip() or "manual",
+    )
+    run.source_context = body.source_context
+    if run.status in {"completed", "failed", "cancelled"}:
+        run.finished_at = datetime.now(timezone.utc)
+
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
+
+    return {
+        "created": True,
+        "run": {
+            "id": run.id,
+            "task_id": run.task_id,
+            "status": run.status,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "summary": run.summary,
+            **_serialize_run_metadata(run),
+        },
+    }
+
+
+@router.patch("/agent-runs/{run_id}", tags=["admin"])
+async def update_agent_run(
+    run_id: int,
+    body: AgentRunUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    run = await db.get(TaskRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+    if (getattr(run, "run_kind", "task") or "task") != "agent":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Task run is not an agent run")
+
+    if body.status is not None:
+        run.status = _normalize_agent_run_status(body.status)
+        if run.status in {"completed", "failed", "cancelled"}:
+            run.finished_at = datetime.now(timezone.utc)
+        elif run.status == "running":
+            run.finished_at = None
+    if body.summary is not None:
+        run.summary = body.summary
+    if body.error is not None:
+        run.error = body.error
+
+    for artifact in body.artifacts:
+        artifact_type = str(artifact.artifact_type or "").strip()
+        if not artifact_type:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="artifact_type is required")
+        content_json = artifact.content_json
+        db.add(
+            TaskRunArtifact(
+                task_run_id=run.id,
+                artifact_type=artifact_type,
+                content_json=json.dumps(content_json) if content_json is not None else None,
+                content_text=artifact.content_text,
+            )
+        )
+
+    await db.commit()
+    payload = await _build_task_run_inspect_payload(db, run.id)
+    return {"updated": True, **payload}
+
+
+@router.post("/agent-runs/{run_id}/export-file", tags=["admin"])
+async def export_agent_run_file(
+    run_id: int,
+    body: AgentRunExportRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    run = await db.get(TaskRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+    if (getattr(run, "run_kind", "task") or "task") != "agent":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Task run is not an agent run")
+
+    artifact_type = str(body.artifact_type or "final_output").strip() or "final_output"
+    artifact_rows = await db.execute(
+        select(TaskRunArtifact)
+        .where(TaskRunArtifact.task_run_id == run.id, TaskRunArtifact.artifact_type == artifact_type)
+        .order_by(desc(TaskRunArtifact.created_at), desc(TaskRunArtifact.id))
+    )
+    artifact = artifact_rows.scalars().first()
+
+    content = _artifact_text_value(artifact) if artifact is not None else ""
+    if not content:
+        content = str(run.summary or "").strip()
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"No exportable content found for artifact_type={artifact_type}",
+        )
+
+    task = await db.get(Task, run.task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    workspace_root, workspace_path = resolve_workspace_path_for_user(task.user_id, body.path)
+    if workspace_path.exists() and not body.overwrite:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Target file already exists")
+
+    write_workspace_text(task.user_id, body.path, content.rstrip() + "\n")
+
+    relative_path = str(workspace_path.relative_to(workspace_root)).replace("\\", "/")
+    db.add(
+        TaskRunArtifact(
+            task_run_id=run.id,
+            artifact_type="workspace_export",
+            content_json=json.dumps(
+                {
+                    "path": relative_path,
+                    "source_artifact_type": artifact_type,
+                    "overwrite": bool(body.overwrite),
+                }
+            ),
+        )
+    )
+    await db.commit()
+
+    return {
+        "exported": True,
+        "run_id": run.id,
+        "path": relative_path,
+        "source_artifact_type": artifact_type,
+    }
 
 
 @router.get("/task-runs/{run_id}/inspect", tags=["admin"])

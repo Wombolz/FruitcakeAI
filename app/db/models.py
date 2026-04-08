@@ -774,10 +774,14 @@ class TaskRun(Base):
     started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     finished_at = Column(DateTime(timezone=True))
 
-    # "running" | "completed" | "failed" | "waiting_approval" | "cancelled"
+    # "queued" | "running" | "completed" | "failed" | "waiting_approval" | "cancelled"
     status = Column(String(30), nullable=False, default="running")
     error = Column(Text)
     summary = Column(Text)
+    run_kind = Column(String(30), nullable=False, default="task", index=True)
+    agent_role = Column(String(100), index=True)
+    trigger_source = Column(String(100))
+    source_context_json = Column(Text)
 
     task = relationship("Task", back_populates="runs")
     artifacts = relationship(
@@ -786,6 +790,24 @@ class TaskRun(Base):
         cascade="all, delete-orphan",
         order_by="TaskRunArtifact.created_at.desc()",
     )
+
+    @property
+    def source_context(self):
+        if not self.source_context_json:
+            return None
+        try:
+            return json.loads(self.source_context_json)
+        except Exception:
+            return self.source_context_json
+
+    @source_context.setter
+    def source_context(self, value):
+        if value is None:
+            self.source_context_json = None
+        elif isinstance(value, str):
+            self.source_context_json = value
+        else:
+            self.source_context_json = json.dumps(value)
 
     def __repr__(self):
         return f"<TaskRun(task_id={self.task_id}, status='{self.status}')>"

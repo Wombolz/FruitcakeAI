@@ -29,6 +29,7 @@ from app.config import settings
 from app.db.models import AuditLog, Task, TaskRun, TaskRunArtifact, TaskStep, User
 from app.db.session import get_db
 from app.memory.service import get_memory_service
+from app.mcp.servers.filesystem import resolve_workspace_path_for_user, write_workspace_text
 from app.task_service import TaskValidationError, UNSET, create_task_record, update_task_record
 from app.time_utils import format_localized_datetime, resolve_effective_timezone
 
@@ -210,6 +211,7 @@ async def get_task(
 async def update_task(
     task_id: int,
     body: TaskPatch,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -225,6 +227,13 @@ async def update_task(
             task.status = "pending"
             task.next_run_at = datetime.now(timezone.utc)
             task.pre_approved = True
+            await db.commit()
+            try:
+                from app.autonomy.runner import get_task_runner
+                runner = get_task_runner()
+                background_tasks.add_task(runner.execute, task)
+            except ImportError:
+                pass
         else:
             task.status = "cancelled"
         step_lookup = await _load_current_steps(db, [task])
@@ -450,6 +459,102 @@ class TaskPlanOut(BaseModel):
     steps_created: int
     titles: List[str]
     plan_version: int
+
+
+class TaskResultExportRequest(BaseModel):
+    path: str
+    artifact_type: Optional[str] = "final_output"
+    overwrite: bool = True
+
+
+class TaskResultExportOut(BaseModel):
+    exported: bool
+    task_id: int
+    run_id: int
+    path: str
+    source_artifact_type: str
+
+
+def _artifact_export_text(artifact: TaskRunArtifact | None) -> str:
+    if artifact is None:
+        return ""
+    if artifact.content_text:
+        return artifact.content_text
+    if artifact.content_json:
+        try:
+            payload = json.loads(artifact.content_json)
+        except Exception:
+            return artifact.content_json
+        if isinstance(payload, str):
+            return payload
+        return json.dumps(payload, indent=2, sort_keys=True)
+    return ""
+
+
+@router.post("/tasks/{task_id}/export-result-file", response_model=TaskResultExportOut)
+async def export_task_result_file(
+    task_id: int,
+    body: TaskResultExportRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TaskResultExportOut:
+    task = await _get_owned_task(task_id, current_user.id, db)
+
+    run_rows = await db.execute(
+        select(TaskRun)
+        .where(TaskRun.task_id == task.id)
+        .order_by(desc(TaskRun.started_at), desc(TaskRun.id))
+    )
+    run = run_rows.scalars().first()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Task has no runs to export")
+
+    artifact_type = str(body.artifact_type or "final_output").strip() or "final_output"
+    artifact_rows = await db.execute(
+        select(TaskRunArtifact)
+        .where(TaskRunArtifact.task_run_id == run.id, TaskRunArtifact.artifact_type == artifact_type)
+        .order_by(desc(TaskRunArtifact.created_at), desc(TaskRunArtifact.id))
+    )
+    artifact = artifact_rows.scalars().first()
+
+    content = _artifact_export_text(artifact)
+    if not content:
+        content = str(run.summary or task.result or "").strip()
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"No exportable content found for artifact_type={artifact_type}",
+        )
+
+    workspace_root, workspace_path = resolve_workspace_path_for_user(task.user_id, body.path)
+    if workspace_path.exists() and not body.overwrite:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Target file already exists")
+
+    write_workspace_text(task.user_id, body.path, content.rstrip() + "\n")
+
+    relative_path = str(workspace_path.relative_to(workspace_root)).replace("\\", "/")
+    db.add(
+        TaskRunArtifact(
+            task_run_id=run.id,
+            artifact_type="workspace_export",
+            content_json=json.dumps(
+                {
+                    "path": relative_path,
+                    "source_artifact_type": artifact_type,
+                    "overwrite": bool(body.overwrite),
+                }
+            ),
+        )
+    )
+    await db.commit()
+
+    return TaskResultExportOut(
+        exported=True,
+        task_id=task.id,
+        run_id=run.id,
+        path=relative_path,
+        source_artifact_type=artifact_type,
+    )
 
 @router.get("/tasks/{task_id}/audit", response_model=TaskAuditOut)
 async def get_task_audit(

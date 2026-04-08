@@ -225,6 +225,17 @@ def _workspace_root(user_context: Any) -> Path:
     return root
 
 
+def _strip_workspace_prefix(candidate_raw: str, workspace_root: Path) -> str:
+    text = str(candidate_raw or "").strip().replace("\\", "/")
+    if not text:
+        return text
+    parts = [part for part in text.split("/") if part not in {"", "."}]
+    root_parts = [part for part in workspace_root.parts if part not in {"", "."}]
+    if len(parts) >= 2 and parts[0].lower() == "workspace" and parts[1] == root_parts[-1]:
+        return "/".join(parts[2:])
+    return text
+
+
 def workspace_root_for_user(user_id: int) -> Path:
     root = (Path(settings.workspace_dir) / str(int(user_id))).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -233,7 +244,7 @@ def workspace_root_for_user(user_id: int) -> Path:
 
 def _resolve_workspace_path(raw_path: str, user_context: Any) -> tuple[Path, Path]:
     workspace_root = _workspace_root(user_context)
-    candidate_raw = (raw_path or "").strip()
+    candidate_raw = _strip_workspace_prefix((raw_path or "").strip(), workspace_root)
     if not candidate_raw:
         raise ValueError("Path is required")
 
@@ -253,7 +264,7 @@ def _resolve_workspace_path(raw_path: str, user_context: Any) -> tuple[Path, Pat
 
 def resolve_workspace_path_for_user(user_id: int, raw_path: str) -> tuple[Path, Path]:
     workspace_root = workspace_root_for_user(user_id)
-    candidate_raw = (raw_path or "").strip()
+    candidate_raw = _strip_workspace_prefix((raw_path or "").strip(), workspace_root)
     if not candidate_raw:
         raise ValueError("Path is required")
     raw = Path(candidate_raw)

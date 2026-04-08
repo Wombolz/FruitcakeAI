@@ -190,21 +190,28 @@ class TaskRunner:
                 )
                 active_run = active_run_rows.scalars().first()
                 if active_run is not None:
-                    task.status = "running"
-                    await db.commit()
-                    log.info(
-                        "task.skip_duplicate_active_run",
-                        task_id=task_id,
-                        active_run_id=active_run.id,
-                        active_status=active_run.status,
-                    )
-                    return
+                    if active_run.status == "waiting_approval":
+                        active_run.status = "running"
+                        active_run.finished_at = None
+                        active_run.error = None
+                        task_run_id = active_run.id
+                    else:
+                        task.status = "running"
+                        await db.commit()
+                        log.info(
+                            "task.skip_duplicate_active_run",
+                            task_id=task_id,
+                            active_run_id=active_run.id,
+                            active_status=active_run.status,
+                        )
+                        return
                 task_title = task.title
                 task_deliver = task.deliver
-                run = TaskRun(task_id=task.id, status="running")
-                db.add(run)
-                await db.flush()
-                task_run_id = run.id
+                if task_run_id is None:
+                    run = TaskRun(task_id=task.id, status="running")
+                    db.add(run)
+                    await db.flush()
+                    task_run_id = run.id
                 await db.commit()
 
             log.info("task.started", task_id=task_id, title=task_title)

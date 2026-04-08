@@ -199,6 +199,8 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "task_id": {"type": "integer"},
                 "status": {"type": "string"},
                 "profile": {"type": "string"},
+                "run_kind": {"type": "string"},
+                "agent_role": {"type": "string"},
                 "has_memory_candidates": {"type": "boolean"},
             },
         },
@@ -366,7 +368,13 @@ def _serialize_task(task: Any) -> Dict[str, Any]:
 def _serialize_run(run: Any, task: Any) -> Dict[str, Any]:
     duration_seconds = None
     if run.started_at is not None and run.finished_at is not None:
-        duration_seconds = round((run.finished_at - run.started_at).total_seconds(), 3)
+        started = run.started_at
+        finished = run.finished_at
+        if started.tzinfo is not None:
+            started = started.astimezone(timezone.utc).replace(tzinfo=None)
+        if finished.tzinfo is not None:
+            finished = finished.astimezone(timezone.utc).replace(tzinfo=None)
+        duration_seconds = round((finished - started).total_seconds(), 3)
     return {
         "run_id": run.id,
         "task_id": task.id,
@@ -375,6 +383,10 @@ def _serialize_run(run: Any, task: Any) -> Dict[str, Any]:
         "started_at": _iso(run.started_at),
         "finished_at": _iso(run.finished_at),
         "duration_seconds": duration_seconds,
+        "run_kind": getattr(run, "run_kind", "task") or "task",
+        "agent_role": getattr(run, "agent_role", None),
+        "trigger_source": getattr(run, "trigger_source", None),
+        "source_context": getattr(run, "source_context", None),
         "summary": run.summary,
         "summary_preview": _preview(run.summary),
         "error": run.error,
@@ -870,6 +882,8 @@ async def _tool_list_task_runs(arguments: Dict[str, Any], user: User) -> Dict[st
     task_id = arguments.get("task_id")
     status = str(arguments.get("status") or "").strip()
     profile = str(arguments.get("profile") or "").strip()
+    run_kind = str(arguments.get("run_kind") or "").strip()
+    agent_role = str(arguments.get("agent_role") or "").strip()
     has_memory_candidates = arguments.get("has_memory_candidates")
 
     async with AsyncSessionLocal() as db:
@@ -888,6 +902,10 @@ async def _tool_list_task_runs(arguments: Dict[str, Any], user: User) -> Dict[st
             query = query.where(TaskRun.status == status)
         if profile:
             query = query.where(Task.profile == profile)
+        if run_kind:
+            query = query.where(TaskRun.run_kind == run_kind)
+        if agent_role:
+            query = query.where(TaskRun.agent_role == agent_role)
         if has_memory_candidates is not None:
             memory_exists = exists(
                 select(TaskRunArtifact.id).where(
