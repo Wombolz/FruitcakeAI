@@ -278,6 +278,10 @@ async def test_create_task_accepts_explicit_agent_recipe_family_from_editor(clie
             "recipe_params": {
                 "agent_role": "roadmap_verifier",
                 "source_context_hint": "roadmap_coordination",
+                "context_paths": [
+                    "Docs/_internal/FruitcakeAi Roadmap.md",
+                    "Docs/_internal/roadmap_coordination.md",
+                ],
             },
         },
         headers=headers,
@@ -288,8 +292,15 @@ async def test_create_task_accepts_explicit_agent_recipe_family_from_editor(clie
     assert payload["task_recipe"]["family"] == "agent"
     assert payload["task_recipe"]["params"]["agent_role"] == "roadmap_verifier"
     assert payload["task_recipe"]["params"]["source_context_hint"] == "roadmap_coordination"
+    assert payload["task_recipe"]["params"]["context_paths"] == [
+        "Docs/_internal/FruitcakeAi Roadmap.md",
+        "Docs/_internal/roadmap_coordination.md",
+    ]
     assert payload["profile"] is None
     assert payload["persona"] == "roadmap_verifier"
+    assert payload["resolved_agent"]["id"] == "roadmap_verifier"
+    assert payload["resolved_agent"]["display_name"] == "Roadmap Verifier"
+    assert payload["resolved_agent"]["execution_mode"] == "task"
     assert payload["instruction"].startswith("Review pending roadmap phases")
 
 
@@ -328,6 +339,39 @@ async def test_create_agent_task_preserves_explicit_persona_override(client):
 
     assert created.status_code == 201
     assert created.json()["persona"] == "family_assistant"
+
+
+@pytest.mark.asyncio
+async def test_create_task_rejects_overlong_title_with_clear_validation_error(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "tasktitlelimituser",
+            "email": "tasktitlelimit@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "tasktitlelimituser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "x" * 256,
+            "instruction": "Keep the detailed prompt here.",
+            "task_type": "one_shot",
+            "deliver": True,
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 400
+    payload = created.json()
+    assert payload["error"] == "title must be 255 characters or fewer."
 
 
 @pytest.mark.asyncio

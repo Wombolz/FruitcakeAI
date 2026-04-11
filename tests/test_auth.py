@@ -539,6 +539,19 @@ async def test_personas_endpoint_uses_restricted_naming(client):
 
 
 @pytest.mark.asyncio
+async def test_agents_endpoint_lists_built_in_agent_definitions(client):
+    resp = await client.get("/chat/agents")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "roadmap_verifier" in data
+    assert "runtime_inspector" in data
+    assert "mcp_tester" not in data
+    assert "document_sync_manager" in data
+    assert data["roadmap_verifier"]["execution_mode"] == "task"
+    assert data["document_sync_manager"]["background"] is True
+
+
+@pytest.mark.asyncio
 async def test_chat_tools_endpoint_returns_tools(client):
     await client.post("/auth/register", json={
         "username": "tooluser",

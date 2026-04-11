@@ -440,8 +440,11 @@ def _build_agent_recipe(
     agent_role = _string_param(params, "agent_role") or "general_agent"
     source_context_hint = _string_param(params, "source_context_hint")
     normalized_params: dict[str, Any] = {"agent_role": agent_role}
+    context_paths = _string_list_param(params, "context_paths")
     if source_context_hint:
         normalized_params["source_context_hint"] = source_context_hint
+    if context_paths:
+        normalized_params["context_paths"] = context_paths
     return NormalizedTaskRecipe(
         family="agent",
         confidence="high",

@@ -2291,6 +2291,127 @@ async def test_runner_uses_agent_behavior_persona_for_known_agent_role(client):
 
 
 @pytest.mark.asyncio
+async def test_runner_merges_agent_definition_behavior_with_compat_persona(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "mcptestrunner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Runtime Inspector Agent",
+            "instruction": "Inspect the latest run and report what is directly observed.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "runtime_inspector",
+            },
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    seen = {}
+
+    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None):
+        seen["persona"] = user_context.persona
+        seen["behavior_instructions"] = list(user_context.behavior_instructions)
+        return "OBSERVED"
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_fake_run_agent)):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    assert seen["persona"] == "family_assistant"
+    assert any("separate direct observation from inference" in item.lower() for item in seen["behavior_instructions"])
+
+
+@pytest.mark.asyncio
+async def test_runner_stamps_agent_run_metadata_and_task_audit_resolves_agent(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "agentrunmetadata")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Roadmap Verification Agent",
+            "instruction": "Check Sprint 7.5 against the roadmap.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {"agent_role": "roadmap_verifier"},
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(return_value="VERIFIED")):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    async with TestSessionLocal() as db:
+        run = (
+            await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.id.desc())
+            )
+        ).scalars().first()
+        assert run is not None
+        assert run.run_kind == "agent"
+        assert run.agent_role == "roadmap_verifier"
+
+    audit = await client.get(f"/tasks/{task_id}/audit", headers=headers)
+    assert audit.status_code == 200
+    payload = audit.json()
+    assert payload["resolved_agent"]["id"] == "roadmap_verifier"
+    assert payload["resolved_agent"]["display_name"] == "Roadmap Verifier"
+
+
+@pytest.mark.asyncio
+async def test_runner_preloads_required_context_sources_for_agent_definition(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "requiredcontextowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Sprint 7.5 Verification Test",
+            "instruction": "Verify whether Sprint 7.5 exists and is implemented.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "roadmap_verifier",
+                "context_paths": ["app/task_recipes.py"],
+            },
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    seen = {}
+
+    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None):
+        seen["prompt"] = messages[0]["content"]
+        return "VERIFIED"
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_fake_run_agent)):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    prompt = seen["prompt"]
+    assert "Preloaded required context sources." in prompt
+    assert "Do not spend turns searching for or reopening these same files" in prompt
+    assert "[Source: app/task_recipes.py]" in prompt
+    assert "Docs/_internal/FruitcakeAi Roadmap.md" in prompt
+    assert "Docs/_internal/roadmap_coordination.md" in prompt
+
+
+@pytest.mark.asyncio
 async def test_runner_suppresses_repeated_identical_tool_failures(client, monkeypatch):
     from app.autonomy.runner import TaskRunner
 

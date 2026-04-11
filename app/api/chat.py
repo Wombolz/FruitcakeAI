@@ -156,6 +156,28 @@ async def list_personas() -> Dict[str, Any]:
     }
 
 
+@router.get("/agents")
+async def list_agents() -> Dict[str, Any]:
+    """Return all available Fruitcake agent definitions."""
+    from app.agent.definition_loader import list_agent_definitions as _list_agents
+
+    agents = _list_agents()
+    return {
+        name: {
+            "display_name": definition.display_name,
+            "when_to_use": definition.when_to_use,
+            "execution_mode": definition.execution_mode,
+            "background": definition.background,
+            "memory_scope": definition.memory_scope,
+            "persona_compatibility": definition.persona_compatibility or "",
+            "required_context_sources": list(definition.required_context_sources),
+            "output_contract": list(definition.output_contract),
+        }
+        for name, definition in agents.items()
+        if not definition.hidden_from_picker
+    }
+
+
 # ── GET /chat/tools ───────────────────────────────────────────────────────────
 
 @router.get("/tools")

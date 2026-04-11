@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import json
 import re
 
+from app.agent.definition_loader import FruitcakeAgentDefinition, get_agent_definition
 from app.autonomy.planner import create_task_plan_for_user
 from app.auth.dependencies import get_current_user
 from app.config import settings
@@ -108,6 +109,7 @@ class TaskOut(BaseModel):
     last_run_at_localized: Optional[str]
     next_run_at_localized: Optional[str]
     task_recipe: Optional[Dict[str, Any]]
+    resolved_agent: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -422,6 +424,7 @@ class TaskAuditOut(BaseModel):
     task_id: int
     title: str
     result: Optional[str]
+    resolved_agent: Optional[Dict[str, Any]] = None
     tool_calls: List[TaskAuditEntry]
 
 
@@ -584,6 +587,7 @@ async def get_task_audit(
         task_id=task.id,
         title=task.title,
         result=task.result,
+        resolved_agent=_resolved_agent_summary_for_task(task),
         tool_calls=tool_calls,
     )
 
@@ -819,6 +823,7 @@ def _to_task_out(
     effective_timezone = resolve_effective_timezone(task.active_hours_tz, user_timezone)
     result_markdown = _normalize_result_markdown(final_output or task.result)
     result_format = "markdown" if result_markdown else None
+    resolved_agent = _resolved_agent_summary_for_task(task)
 
     return TaskOut(
         id=task.id,
@@ -854,7 +859,34 @@ def _to_task_out(
         last_run_at_localized=format_localized_datetime(task.last_run_at, timezone_name=effective_timezone) or None,
         next_run_at_localized=format_localized_datetime(task.next_run_at, timezone_name=effective_timezone) or None,
         task_recipe=(task.task_recipe or None) if hasattr(task, "task_recipe") else None,
+        resolved_agent=resolved_agent,
     )
+
+
+def _resolved_agent_summary(definition: FruitcakeAgentDefinition | None) -> Optional[Dict[str, Any]]:
+    if definition is None:
+        return None
+    return {
+        "id": definition.agent_type,
+        "display_name": definition.display_name,
+        "execution_mode": definition.execution_mode,
+        "background": definition.background,
+        "memory_scope": definition.memory_scope,
+        "persona_compatibility": definition.persona_compatibility,
+        "when_to_use": definition.when_to_use,
+    }
+
+
+def _resolved_agent_summary_for_task(task: Task) -> Optional[Dict[str, Any]]:
+    recipe = task.task_recipe if isinstance(task.task_recipe, dict) else {}
+    family = str(recipe.get("family") or "").strip().lower()
+    if family != "agent":
+        return None
+    params = recipe.get("params") if isinstance(recipe.get("params"), dict) else {}
+    agent_role = str(params.get("agent_role") or "").strip()
+    if not agent_role:
+        return None
+    return _resolved_agent_summary(get_agent_definition(agent_role))
 
 
 async def _load_current_steps(db: AsyncSession, tasks: List[Task]) -> Dict[tuple[int, int], TaskStep]:

@@ -8,6 +8,7 @@ from typing import Any, Optional
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.definition_loader import get_agent_definition
 from app.agent.persona_loader import list_personas, persona_exists
 from app.agent.persona_router import infer_persona_for_task
 from app.autonomy.configured_executor import infer_configured_executor
@@ -22,6 +23,16 @@ class TaskValidationError(ValueError):
 
 
 UNSET = object()
+_TASK_TITLE_MAX_LENGTH = 255
+
+
+def _normalize_task_title(value: str) -> str:
+    title = str(value or "").strip()
+    if not title:
+        raise TaskValidationError("title is required.")
+    if len(title) > _TASK_TITLE_MAX_LENGTH:
+        raise TaskValidationError(f"title must be {_TASK_TITLE_MAX_LENGTH} characters or fewer.")
+    return title
 
 
 def compute_next_run_at(
@@ -98,6 +109,9 @@ def resolve_agent_behavior_persona(
     agent_role = str(params.get("agent_role") or "").strip()
     if not agent_role:
         return None
+    definition = get_agent_definition(agent_role)
+    if definition and definition.persona_compatibility and persona_exists(definition.persona_compatibility):
+        return definition.persona_compatibility
     return agent_role if persona_exists(agent_role) else None
 
 
@@ -189,6 +203,7 @@ async def build_task_draft_payload(
     recipe_family: Optional[str] = None,
     recipe_params: Optional[dict] = None,
 ) -> TaskDraftPayload:
+    title = _normalize_task_title(title)
     if task_type not in {"one_shot", "recurring"}:
         raise TaskValidationError("task_type must be one_shot or recurring.")
 
@@ -224,6 +239,7 @@ async def build_task_draft_payload(
         normalized_instruction = normalized_recipe.instruction if normalized_recipe is not None else instruction
         normalized_task_type = normalized_recipe.task_type if normalized_recipe is not None else task_type
         normalized_profile = normalized_recipe.profile if normalized_recipe is not None and normalized_recipe.profile else profile
+    normalized_title = _normalize_task_title(normalized_title)
     resolved_persona = resolve_agent_behavior_persona(
         requested_persona=persona,
         recipe_family=normalized_recipe.family if normalized_recipe is not None else explicit_recipe_family,
@@ -458,7 +474,7 @@ async def update_task_record(
     recipe_inputs_changed = False
 
     if title is not UNSET:
-        task.title = str(title)
+        task.title = _normalize_task_title(str(title))
         title_changed = True
         plan_inputs_changed = True
     if instruction is not UNSET:
@@ -563,7 +579,7 @@ async def update_task_record(
                 )
             if normalized_recipe is not None:
                 if not title_changed:
-                    task.title = normalized_recipe.title
+                    task.title = _normalize_task_title(normalized_recipe.title)
                 task.instruction = normalized_recipe.instruction
                 requested_profile_value = normalized_recipe.profile if normalized_recipe.profile else requested_profile_value
             inferred = infer_configured_executor(

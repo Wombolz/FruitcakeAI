@@ -27,6 +27,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.definition_loader import get_agent_definition
 from app.auth.dependencies import require_admin
 from app.auth.jwt import hash_password
 from app.autonomy.push import get_apns_pusher
@@ -583,11 +584,25 @@ def _duration_seconds(run: TaskRun) -> Optional[float]:
 
 
 def _serialize_run_metadata(run: TaskRun) -> Dict[str, Any]:
+    agent_role = getattr(run, "agent_role", None)
+    definition = get_agent_definition(agent_role) if agent_role else None
     return {
         "run_kind": getattr(run, "run_kind", "task") or "task",
-        "agent_role": getattr(run, "agent_role", None),
+        "agent_role": agent_role,
         "trigger_source": getattr(run, "trigger_source", None),
         "source_context": getattr(run, "source_context", None),
+        "resolved_agent": (
+            {
+                "id": definition.agent_type,
+                "display_name": definition.display_name,
+                "execution_mode": definition.execution_mode,
+                "background": definition.background,
+                "memory_scope": definition.memory_scope,
+                "persona_compatibility": definition.persona_compatibility,
+            }
+            if definition is not None
+            else None
+        ),
     }
 
 

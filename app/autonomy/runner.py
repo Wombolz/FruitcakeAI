@@ -21,6 +21,7 @@ import re
 import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import structlog
@@ -45,9 +46,51 @@ log = structlog.get_logger(__name__)
 # Exponential retry delays (seconds) for transient errors
 RETRY_DELAYS = [30, 60, 300, 900, 3600]
 REPEATED_TOOL_ERROR_THRESHOLD = 2
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_MAX_REQUIRED_CONTEXT_FILES = 4
+_MAX_REQUIRED_CONTEXT_FILE_CHARS = 5000
 
 # Limit concurrent task-mode agent loops
 _semaphore = asyncio.Semaphore(2)
+
+
+def _load_required_context_text(sources: list[str] | tuple[str, ...]) -> tuple[str, list[str]]:
+    loaded_paths: list[str] = []
+    blocks: list[str] = []
+    for raw in list(sources)[:_MAX_REQUIRED_CONTEXT_FILES]:
+        rel = str(raw or "").strip()
+        if not rel:
+            continue
+        candidate = Path(rel).expanduser()
+        if candidate.is_absolute():
+            path = candidate.resolve()
+            display_path = str(path)
+        else:
+            path = (_REPO_ROOT / rel).resolve()
+            try:
+                path.relative_to(_REPO_ROOT)
+            except ValueError:
+                continue
+            display_path = rel
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        snippet = text[:_MAX_REQUIRED_CONTEXT_FILE_CHARS].strip()
+        loaded_paths.append(display_path)
+        blocks.append(f"[Source: {display_path}]\n{snippet}")
+    if not blocks:
+        return "", loaded_paths
+    preloaded = (
+        "Preloaded required context sources. Treat these files as already available context before falling back to search.\n"
+        "Do not spend turns searching for or reopening these same files unless you specifically need content beyond the excerpt provided below.\n\n"
+        + "\n\n---\n\n".join(blocks)
+    )
+    return preloaded, loaded_paths
 
 
 class TaskRunner:
@@ -180,6 +223,15 @@ class TaskRunner:
                     log.warning("task.not_found", task_id=task_id)
                     await db.rollback()
                     return
+                recipe = task.task_recipe if isinstance(task.task_recipe, dict) else {}
+                recipe_family = str(recipe.get("family") or "").strip().lower()
+                recipe_params = recipe.get("params") if isinstance(recipe.get("params"), dict) else {}
+                resolved_agent_role = None
+                resolved_run_kind = "task"
+                if recipe_family == "agent":
+                    resolved_run_kind = "agent"
+                    role = str(recipe_params.get("agent_role") or "").strip()
+                    resolved_agent_role = role or None
                 active_run_rows = await db.execute(
                     select(TaskRun)
                     .where(
@@ -194,6 +246,9 @@ class TaskRunner:
                         active_run.status = "running"
                         active_run.finished_at = None
                         active_run.error = None
+                        if resolved_run_kind == "agent":
+                            active_run.run_kind = "agent"
+                            active_run.agent_role = resolved_agent_role
                         task_run_id = active_run.id
                     else:
                         task.status = "running"
@@ -208,7 +263,12 @@ class TaskRunner:
                 task_title = task.title
                 task_deliver = task.deliver
                 if task_run_id is None:
-                    run = TaskRun(task_id=task.id, status="running")
+                    run = TaskRun(
+                        task_id=task.id,
+                        status="running",
+                        run_kind=resolved_run_kind,
+                        agent_role=resolved_agent_role,
+                    )
                     db.add(run)
                     await db.flush()
                     task_run_id = run.id
@@ -347,6 +407,7 @@ class TaskRunner:
 
         # Load task + user; extract values before session closes to avoid DetachedInstanceError
         persona_name: Optional[str] = None
+        agent_role: Optional[str] = None
         session_id: Optional[int] = None
         task_user_id: Optional[int] = None
         task_instruction: Optional[str] = None
@@ -356,6 +417,8 @@ class TaskRunner:
         pre_approved = False
         model_profile: TaskModelProfile | None = None
         task_profile = None
+        preloaded_required_context = ""
+        loaded_required_context_sources: list[str] = []
 
         async with AsyncSessionLocal() as db:
             task = await db.get(Task, task_id)
@@ -379,6 +442,17 @@ class TaskRunner:
             task_title = task.title
             task_requires_approval = task.requires_approval
             has_plan = bool(task.has_plan)
+            recipe = task.task_recipe if isinstance(task.task_recipe, dict) else {}
+            if str(recipe.get("family") or "").strip().lower() == "agent":
+                params = recipe.get("params") if isinstance(recipe.get("params"), dict) else {}
+                agent_role = str(params.get("agent_role") or "").strip() or None
+                task_context_paths = [
+                    str(item).strip()
+                    for item in (params.get("context_paths") or [])
+                    if str(item).strip()
+                ]
+            else:
+                task_context_paths = []
             # Lazy backfill: persist inferred/defaulted persona for legacy tasks.
             if not task.persona:
                 task.persona = persona_name
@@ -431,6 +505,7 @@ class TaskRunner:
 
         # Build UserContext (re-fetch user while session open so from_user can read attributes)
         from app.agent.context import UserContext
+        from app.agent.definition_loader import get_agent_definition
         from app.skills.service import hydrate_user_context
 
         async with AsyncSessionLocal() as db:
@@ -444,6 +519,26 @@ class TaskRunner:
                 user_context,
                 query=(task_instruction or task_title or ""),
             )
+        if agent_role:
+            definition = get_agent_definition(agent_role)
+            combined_context_sources: list[str] = []
+            for item in task_context_paths:
+                if item not in combined_context_sources:
+                    combined_context_sources.append(item)
+            if definition:
+                for item in definition.required_context_sources:
+                    if item not in combined_context_sources:
+                        combined_context_sources.append(item)
+            if definition and definition.behavior_instructions:
+                merged = list(user_context.behavior_instructions)
+                for instruction in definition.behavior_instructions:
+                    if instruction not in merged:
+                        merged.append(instruction)
+                user_context.behavior_instructions = merged
+            if combined_context_sources:
+                preloaded_required_context, loaded_required_context_sources = _load_required_context_text(
+                    combined_context_sources
+                )
         user_context.session_id = session_id
         user_context.task_id = task_id
 
@@ -466,6 +561,8 @@ class TaskRunner:
                         model_profile=model_profile,
                         task_run_id=task_run_id,
                         task_profile=task_profile,
+                        preloaded_required_context=preloaded_required_context,
+                        loaded_required_context_sources=loaded_required_context_sources,
                     )
 
         # Back-compat mode: single instruction task behavior.
@@ -479,6 +576,8 @@ class TaskRunner:
         parts: list[str] = []
         if memories:
             parts.append(svc.format_for_prompt(memories))
+        if preloaded_required_context:
+            parts.append(preloaded_required_context)
         parts.append(f"[Task: {task_title}]")
         parts.append(task_instruction or "")
         parts.append(f"\nCurrent time: {now_str}")
@@ -502,6 +601,7 @@ class TaskRunner:
             )
             run_debug = {
                 "profile": getattr(task_profile, "name", "default"),
+                "required_context_sources": loaded_required_context_sources,
                 "active_skills": list(user_context.active_skill_slugs or []),
                 "skill_selection_mode": user_context.skill_selection_mode or "",
                 "skill_injection_events": [
@@ -538,6 +638,8 @@ class TaskRunner:
         model_profile: TaskModelProfile,
         task_run_id: Optional[int] = None,
         task_profile=None,
+        preloaded_required_context: str = "",
+        loaded_required_context_sources: list[str] | None = None,
     ) -> tuple[str, dict[str, object]]:
         """Execute task steps sequentially from current_step_index."""
         from sqlalchemy import select
@@ -559,6 +661,7 @@ class TaskRunner:
             "active_skills": list(step_user_context.active_skill_slugs or []),
             "skill_selection_mode": step_user_context.skill_selection_mode or "",
             "skill_injection_events": [],
+            "required_context_sources": list(loaded_required_context_sources or []),
         }
 
         if task_profile and task_run_id:
@@ -706,6 +809,8 @@ class TaskRunner:
                 run_context["preserved_runtime_state"] = preserved_runtime_state
                 run_debug["preserved_runtime_state"] = preserved_runtime_state
             prompt_parts: list[str] = [f"[Task: {task_title}]", task_instruction]
+            if preloaded_required_context:
+                prompt_parts.insert(0, preloaded_required_context)
             prompt_parts.append(f"Current Step ({step.step_index}): {step.title}")
             prompt_parts.append(step.instruction)
             if task_profile:
