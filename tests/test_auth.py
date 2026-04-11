@@ -550,7 +550,9 @@ async def test_agents_endpoint_lists_built_in_agent_definitions(client):
     monitor_presets = {item["id"]: item for item in categories["monitor"]["presets"]}
     assert "roadmap_verifier" in verify_presets
     assert "runtime_inspector" in verify_presets
+    assert "recent_run_analyzer" in verify_presets
     assert "document_sync_manager" in monitor_presets
+    assert "repo_map_manager" in monitor_presets
     assert "general_agent" not in verify_presets
     assert verify_presets["roadmap_verifier"]["execution_mode"] == "task"
     assert monitor_presets["document_sync_manager"]["background"] is True

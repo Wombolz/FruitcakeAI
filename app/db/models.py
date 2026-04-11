@@ -70,6 +70,7 @@ class User(Base):
     chat_sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
     audit_logs = relationship("AuditLog", back_populates="user", cascade="all, delete-orphan")
     tasks = relationship("Task", back_populates="user", cascade="all, delete-orphan")
+    managed_agent_presets = relationship("ManagedAgentPreset", back_populates="user", cascade="all, delete-orphan")
     device_tokens = relationship("DeviceToken", back_populates="user", cascade="all, delete-orphan")
     memories = relationship("Memory", back_populates="user", cascade="all, delete-orphan")
     memory_proposals = relationship("MemoryProposal", back_populates="user", foreign_keys="MemoryProposal.user_id", cascade="all, delete-orphan")
@@ -671,6 +672,11 @@ class Task(Base):
         cascade="all, delete-orphan",
         order_by="TaskAPIState.updated_at.desc()",
     )
+    managed_agent_preset_links = relationship(
+        "ManagedAgentPreset",
+        back_populates="linked_task",
+        foreign_keys="ManagedAgentPreset.linked_task_id",
+    )
 
     @property
     def executor_config(self) -> dict:
@@ -690,6 +696,50 @@ class Task(Base):
 
     def __repr__(self):
         return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"
+
+
+class ManagedAgentPreset(Base):
+    __tablename__ = "managed_agent_presets"
+    __table_args__ = (
+        UniqueConstraint("user_id", "preset_id", name="uq_managed_agent_presets_user_preset"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    preset_id = Column(String(100), nullable=False, index=True)
+    enabled = Column(Boolean, default=True, nullable=False)
+    auto_maintain_task = Column(Boolean, default=True, nullable=False)
+    schedule = Column(String(100), nullable=True)
+    active_hours_start = Column(String(5), nullable=True)
+    active_hours_end = Column(String(5), nullable=True)
+    active_hours_tz = Column(String(50), nullable=True)
+    context_paths_json = Column(Text, default="[]", nullable=False)
+    params_json = Column(Text, default="{}", nullable=False)
+    linked_task_id = Column(Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User", back_populates="managed_agent_presets")
+    linked_task = relationship("Task", back_populates="managed_agent_preset_links", foreign_keys=[linked_task_id])
+
+    @property
+    def context_paths(self) -> list[str]:
+        return json.loads(self.context_paths_json or "[]")
+
+    @context_paths.setter
+    def context_paths(self, value: list[str]):
+        self.context_paths_json = json.dumps(value or [])
+
+    @property
+    def params(self) -> dict:
+        return json.loads(self.params_json or "{}")
+
+    @params.setter
+    def params(self, value: dict):
+        self.params_json = json.dumps(value or {})
+
+    def __repr__(self):
+        return f"<ManagedAgentPreset(user_id={self.user_id}, preset_id='{self.preset_id}', enabled={self.enabled})>"
 
 
 class DeviceToken(Base):

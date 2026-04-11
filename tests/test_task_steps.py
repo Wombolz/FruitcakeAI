@@ -2369,6 +2369,9 @@ async def test_runner_stamps_agent_run_metadata_and_task_audit_resolves_agent(cl
     assert payload["resolved_agent"]["id"] == "roadmap_verifier"
     assert payload["resolved_agent"]["display_name"] == "Roadmap Verifier"
     assert payload["resolved_agent"]["category"] == "verify"
+    assert payload["latest_run"]["run_kind"] == "agent"
+    assert payload["latest_run"]["agent_role"] == "roadmap_verifier"
+    assert payload["latest_run"]["status"] == "completed"
 
 
 @pytest.mark.asyncio

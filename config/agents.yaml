@@ -100,6 +100,25 @@ presets:
       - issue observed or not observed
       - residual uncertainty
 
+  recent_run_analyzer:
+    category: verify
+    display_name: Recent Run Analyzer
+    when_to_use: Review recent non-self task runs, summarize failures or suspicious states, and keep the distinction between observation and inference sharp.
+    persona_compatibility: family_assistant
+    required_context_sources:
+      - app/api/tasks.py
+      - app/api/admin.py
+      - Docs/_internal/FruitcakeAi Roadmap.md
+    behavior_instructions:
+      - Inspect recent non-self runs first and summarize the most actionable failures, cancellations, missing outputs, or suspicious states.
+      - Prefer compact run-health reporting over one-run deep dives unless the instruction explicitly asks for a specific run.
+      - Emit a short all-clear summary only when the recent runs are healthy and the instruction allows a no-findings outcome.
+    output_contract:
+      - recent runs checked
+      - findings
+      - evidence
+      - residual uncertainty
+
   document_sync_manager:
     category: monitor
     display_name: Document Sync Manager
@@ -119,3 +138,22 @@ presets:
       - stale
       - failed
       - next needed action if blocked
+
+  repo_map_manager:
+    category: monitor
+    display_name: Repo Map Manager
+    when_to_use: Maintain a current repo map and workspace orientation artifact so specialist agents can start with grounded context instead of searching blindly.
+    persona_compatibility: family_assistant
+    required_context_sources:
+      - Docs/_internal/agent_context_preload_and_repo_map_plan.md
+      - Docs/_internal/fruitcake_agent_taxonomy_and_candidate_categories_plan.md
+      - Docs/_internal/FruitcakeAi Roadmap.md
+    behavior_instructions:
+      - Refresh the workspace orientation view after meaningful document or structure changes instead of treating the repo map as static.
+      - Focus on the most useful entrypoints, internal docs, and notable roots rather than dumping the full tree.
+      - Report what changed and where agents should start, not a broad architecture essay.
+    output_contract:
+      - roots checked
+      - artifacts updated
+      - notable changes
+      - next blocker if any

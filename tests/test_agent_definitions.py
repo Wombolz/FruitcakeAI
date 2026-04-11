@@ -16,6 +16,8 @@ def test_agent_registry_loads_expected_categories_and_presets():
     assert "roadmap_verifier" in presets
     assert "runtime_inspector" in presets
     assert "document_sync_manager" in presets
+    assert "repo_map_manager" in presets
+    assert "recent_run_analyzer" in presets
 
 
 def test_agent_preset_inherits_category_behavior():

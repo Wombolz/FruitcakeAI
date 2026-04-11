@@ -376,6 +376,84 @@ async def test_create_task_rejects_overlong_title_with_clear_validation_error(cl
 
 
 @pytest.mark.asyncio
+async def test_managed_agent_presets_ensure_defaults_creates_backing_tasks(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "managedpresetuser",
+            "email": "managedpreset@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "managedpresetuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post("/tasks/managed-agent-presets/ensure-defaults", headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    by_id = {item["preset_id"]: item for item in data}
+    assert set(by_id.keys()) == {"document_sync_manager", "repo_map_manager", "recent_run_analyzer"}
+    assert by_id["document_sync_manager"]["linked_task"]["title"] == "Document Sync Manager"
+    assert by_id["repo_map_manager"]["linked_task"]["schedule"] == "every:1d"
+    assert by_id["recent_run_analyzer"]["params"]["max_runs"] == 8
+    assert by_id["recent_run_analyzer"]["category"] == "verify"
+
+
+@pytest.mark.asyncio
+async def test_managed_agent_preset_update_disables_backing_task_and_updates_params(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "managedpresetedituser",
+            "email": "managedpresetedit@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "managedpresetedituser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post("/tasks/managed-agent-presets/ensure-defaults", headers=headers)
+    assert created.status_code == 200
+
+    patched = await client.patch(
+        "/tasks/managed-agent-presets/recent_run_analyzer",
+        json={
+            "enabled": False,
+            "schedule": "every:12h",
+            "params": {
+                "lookback_hours": 48,
+                "max_runs": 12,
+                "problematic_only": False,
+                "emit_all_clear": True,
+            },
+        },
+        headers=headers,
+    )
+    assert patched.status_code == 200
+    payload = patched.json()
+    assert payload["enabled"] is False
+    assert payload["schedule"] == "every:12h"
+    assert payload["params"]["lookback_hours"] == 48
+    assert payload["linked_task"]["status"] == "cancelled"
+
+    task_id = payload["linked_task"]["id"]
+    task_resp = await client.get(f"/tasks/{task_id}", headers=headers)
+    assert task_resp.status_code == 200
+    task_payload = task_resp.json()
+    assert task_payload["task_recipe"]["params"]["max_runs"] == 12
+    assert task_payload["task_recipe"]["params"]["problematic_only"] is False
+    assert task_payload["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_create_task_respects_explicit_generic_family_from_editor(client):
     await client.post(
         "/auth/register",

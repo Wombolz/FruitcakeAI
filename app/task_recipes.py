@@ -439,7 +439,12 @@ def _build_agent_recipe(
         return None
     agent_role = _string_param(params, "agent_role") or "general_agent"
     source_context_hint = _string_param(params, "source_context_hint")
-    normalized_params: dict[str, Any] = {"agent_role": agent_role}
+    normalized_params: dict[str, Any] = {
+        key: _json_safe_param_value(value)
+        for key, value in params.items()
+        if _json_safe_param_value(value) is not None
+    }
+    normalized_params["agent_role"] = agent_role
     context_paths = _string_list_param(params, "context_paths")
     if source_context_hint:
         normalized_params["source_context_hint"] = source_context_hint
@@ -455,6 +460,28 @@ def _build_agent_recipe(
         params=normalized_params,
         assumptions=[],
     )
+
+
+def _json_safe_param_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            normalized = _json_safe_param_value(item)
+            if normalized is not None:
+                out.append(normalized)
+        return out
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = _json_safe_param_value(item)
+            if normalized is not None:
+                out[str(key)] = normalized
+        return out
+    return str(value)
 
 
 def _build_iss_recipe(

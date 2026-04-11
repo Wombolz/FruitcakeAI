@@ -27,8 +27,16 @@ from app.agent.definition_loader import FruitcakeAgentPreset, get_agent_preset
 from app.autonomy.planner import create_task_plan_for_user
 from app.auth.dependencies import get_current_user
 from app.config import settings
-from app.db.models import AuditLog, Task, TaskRun, TaskRunArtifact, TaskStep, User
+from app.db.models import AuditLog, ManagedAgentPreset, Task, TaskRun, TaskRunArtifact, TaskStep, User
 from app.db.session import get_db
+from app.managed_agent_presets import (
+    ensure_default_managed_presets,
+    get_managed_preset_row,
+    get_managed_preset_spec,
+    list_managed_preset_rows,
+    reconcile_managed_preset,
+    update_managed_preset_row,
+)
 from app.memory.service import get_memory_service
 from app.mcp.servers.filesystem import resolve_workspace_path_for_user, write_workspace_text
 from app.task_service import TaskValidationError, UNSET, create_task_record, update_task_record
@@ -73,6 +81,60 @@ class TaskPatch(BaseModel):
     recipe_params: Optional[Dict[str, Any]] = None
     # Approval flow: set approved=True/False to resume or cancel a waiting_approval task
     approved: Optional[bool] = None
+
+
+class ManagedAgentPresetPatch(BaseModel):
+    enabled: Optional[bool] = None
+    auto_maintain_task: Optional[bool] = None
+    schedule: Optional[str] = None
+    active_hours_start: Optional[str] = None
+    active_hours_end: Optional[str] = None
+    active_hours_tz: Optional[str] = None
+    context_paths: Optional[List[str]] = None
+    params: Optional[Dict[str, Any]] = None
+
+
+class ManagedAgentPresetReconcileRequest(BaseModel):
+    recreate_missing: bool = True
+
+
+class ManagedAgentPresetTaskSummary(BaseModel):
+    id: int
+    title: str
+    status: str
+    schedule: Optional[str] = None
+    last_run_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = None
+
+
+class ManagedAgentPresetLatestRunSummary(BaseModel):
+    id: int
+    status: str
+    run_kind: str
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    summary: Optional[str] = None
+    error: Optional[str] = None
+
+
+class ManagedAgentPresetOut(BaseModel):
+    preset_id: str
+    display_name: str
+    category: str
+    category_display_name: str
+    when_to_use: str
+    execution_mode: str
+    background: bool
+    enabled: bool
+    auto_maintain_task: bool
+    schedule: Optional[str] = None
+    active_hours_start: Optional[str] = None
+    active_hours_end: Optional[str] = None
+    active_hours_tz: Optional[str] = None
+    context_paths: List[str]
+    params: Dict[str, Any]
+    linked_task: Optional[ManagedAgentPresetTaskSummary] = None
+    latest_run: Optional[ManagedAgentPresetLatestRunSummary] = None
 
 
 class TaskOut(BaseModel):
@@ -190,6 +252,71 @@ async def list_tasks(
         )
         for task in tasks
     ]
+
+
+@router.post("/tasks/managed-agent-presets/ensure-defaults", response_model=List[ManagedAgentPresetOut])
+async def ensure_managed_agent_presets_defaults(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    rows = await ensure_default_managed_presets(db, user=current_user)
+    return await _serialize_managed_agent_presets(db, rows)
+
+
+@router.get("/tasks/managed-agent-presets", response_model=List[ManagedAgentPresetOut])
+async def list_managed_agent_presets(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    rows = await list_managed_preset_rows(db, user_id=int(current_user.id))
+    return await _serialize_managed_agent_presets(db, rows)
+
+
+@router.patch("/tasks/managed-agent-presets/{preset_id}", response_model=ManagedAgentPresetOut)
+async def update_managed_agent_preset(
+    preset_id: str,
+    body: ManagedAgentPresetPatch,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    managed_preset = await get_managed_preset_row(db, user_id=int(current_user.id), preset_id=preset_id)
+    if managed_preset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Managed agent preset not found")
+    await update_managed_preset_row(
+        db,
+        managed_preset=managed_preset,
+        user=current_user,
+        enabled=body.enabled,
+        auto_maintain_task=body.auto_maintain_task,
+        schedule=body.schedule,
+        active_hours_start=body.active_hours_start,
+        active_hours_end=body.active_hours_end,
+        active_hours_tz=body.active_hours_tz,
+        context_paths=body.context_paths,
+        params=body.params,
+    )
+    payload = await _serialize_managed_agent_presets(db, [managed_preset])
+    return payload[0]
+
+
+@router.post("/tasks/managed-agent-presets/{preset_id}/reconcile", response_model=ManagedAgentPresetOut)
+async def reconcile_managed_agent_preset_endpoint(
+    preset_id: str,
+    body: ManagedAgentPresetReconcileRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    managed_preset = await get_managed_preset_row(db, user_id=int(current_user.id), preset_id=preset_id)
+    if managed_preset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Managed agent preset not found")
+    await reconcile_managed_preset(
+        db,
+        managed_preset=managed_preset,
+        user=current_user,
+        recreate_missing=body.recreate_missing,
+    )
+    payload = await _serialize_managed_agent_presets(db, [managed_preset])
+    return payload[0]
 
 
 @router.get("/tasks/{task_id}", response_model=TaskOut)
@@ -420,11 +547,26 @@ class TaskAuditEntry(BaseModel):
     result_summary: str
     created_at: datetime
 
+class TaskAuditRunSummary(BaseModel):
+    id: int
+    status: str
+    summary: Optional[str] = None
+    error: Optional[str] = None
+    run_kind: str
+    agent_role: Optional[str] = None
+    trigger_source: Optional[str] = None
+    source_context: Optional[Dict[str, Any] | str] = None
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    artifact_count: int = 0
+    artifact_types: List[str] = []
+
 class TaskAuditOut(BaseModel):
     task_id: int
     title: str
     result: Optional[str]
     resolved_agent: Optional[Dict[str, Any]] = None
+    latest_run: Optional[TaskAuditRunSummary] = None
     tool_calls: List[TaskAuditEntry]
 
 
@@ -568,6 +710,7 @@ async def get_task_audit(
     """Return the task's result and all tool calls from its last execution session."""
     task = await _get_owned_task(task_id, current_user.id, db)
     tool_calls: List[TaskAuditEntry] = []
+    latest_run: Optional[TaskAuditRunSummary] = None
     if task.last_session_id:
         rows = await db.execute(
             select(AuditLog)
@@ -583,11 +726,41 @@ async def get_task_audit(
             )
             for r in rows.scalars().all()
         ]
+    run = (
+        await db.execute(
+            select(TaskRun)
+            .where(TaskRun.task_id == task.id)
+            .order_by(desc(TaskRun.started_at), desc(TaskRun.id))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if run is not None:
+        artifact_rows = await db.execute(
+            select(TaskRunArtifact.artifact_type)
+            .where(TaskRunArtifact.task_run_id == run.id)
+            .order_by(desc(TaskRunArtifact.created_at), desc(TaskRunArtifact.id))
+        )
+        artifact_types = [str(item) for item in artifact_rows.scalars().all() if str(item)]
+        latest_run = TaskAuditRunSummary(
+            id=run.id,
+            status=run.status,
+            summary=run.summary,
+            error=run.error,
+            run_kind=(run.run_kind or "task"),
+            agent_role=run.agent_role,
+            trigger_source=run.trigger_source,
+            source_context=run.source_context,
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            artifact_count=len(artifact_types),
+            artifact_types=artifact_types,
+        )
     return TaskAuditOut(
         task_id=task.id,
         title=task.title,
         result=task.result,
         resolved_agent=_resolved_agent_summary_for_task(task),
+        latest_run=latest_run,
         tool_calls=tool_calls,
     )
 
@@ -889,6 +1062,76 @@ def _resolved_agent_summary_for_task(task: Task) -> Optional[Dict[str, Any]]:
     if not agent_role:
         return None
     return _resolved_agent_summary(get_agent_preset(agent_role))
+
+
+async def _serialize_managed_agent_presets(
+    db: AsyncSession,
+    rows: List[ManagedAgentPreset],
+) -> List[ManagedAgentPresetOut]:
+    out: List[ManagedAgentPresetOut] = []
+    for row in rows:
+        preset = get_agent_preset(row.preset_id)
+        spec = get_managed_preset_spec(row.preset_id)
+        if preset is None or spec is None:
+            continue
+        linked_task: Optional[Task] = None
+        if row.linked_task_id is not None:
+            linked_task = (
+                await db.execute(select(Task).where(Task.id == int(row.linked_task_id)))
+            ).scalar_one_or_none()
+            if linked_task is None:
+                row.linked_task_id = None
+        latest_run: Optional[ManagedAgentPresetLatestRunSummary] = None
+        linked_task_summary: Optional[ManagedAgentPresetTaskSummary] = None
+        if linked_task is not None:
+            linked_task_summary = ManagedAgentPresetTaskSummary(
+                id=int(linked_task.id),
+                title=linked_task.title,
+                status=linked_task.status,
+                schedule=linked_task.schedule,
+                last_run_at=linked_task.last_run_at,
+                next_run_at=linked_task.next_run_at,
+            )
+            run = (
+                await db.execute(
+                    select(TaskRun)
+                    .where(TaskRun.task_id == linked_task.id)
+                    .order_by(desc(TaskRun.started_at), desc(TaskRun.id))
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if run is not None:
+                latest_run = ManagedAgentPresetLatestRunSummary(
+                    id=int(run.id),
+                    status=run.status,
+                    run_kind=run.run_kind or "task",
+                    started_at=run.started_at,
+                    finished_at=run.finished_at,
+                    summary=run.summary,
+                    error=run.error,
+                )
+        out.append(
+            ManagedAgentPresetOut(
+                preset_id=preset.preset_id,
+                display_name=preset.display_name,
+                category=preset.category_id,
+                category_display_name=preset.category_display_name,
+                when_to_use=preset.when_to_use,
+                execution_mode=preset.execution_mode,
+                background=preset.background,
+                enabled=row.enabled,
+                auto_maintain_task=row.auto_maintain_task,
+                schedule=row.schedule,
+                active_hours_start=row.active_hours_start,
+                active_hours_end=row.active_hours_end,
+                active_hours_tz=row.active_hours_tz,
+                context_paths=row.context_paths,
+                params=row.params if isinstance(row.params, dict) else {},
+                linked_task=linked_task_summary,
+                latest_run=latest_run,
+            )
+        )
+    return out
 
 
 async def _load_current_steps(db: AsyncSession, tasks: List[Task]) -> Dict[tuple[int, int], TaskStep]:
