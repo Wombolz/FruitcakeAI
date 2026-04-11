@@ -1,10 +1,67 @@
-agents:
-  roadmap_verifier:
-    display_name: Roadmap Verifier
-    when_to_use: Compare roadmap claims against code and coordination notes and classify mismatches with direct evidence.
+categories:
+  explore:
+    display_name: Explore
+    when_to_use: Read-only discovery, search, and mapping of code, docs, and current system state.
     execution_mode: task
     background: false
     memory_scope: user
+    behavior_instructions:
+      - Prefer direct inspection of files, payloads, and current system state before broader synthesis.
+      - Stay read-only unless a higher-level runtime explicitly gives you a mutating role.
+      - Report findings clearly and avoid inventing remediation plans unless explicitly asked.
+
+  verify:
+    display_name: Verify
+    when_to_use: Evidence-first validation, runtime inspection, and trust or regression checking.
+    execution_mode: task
+    background: false
+    memory_scope: user
+    behavior_instructions:
+      - Prefer direct evidence over assumptions or broad product language.
+      - Clearly separate direct observation from inference.
+      - Do not make design conclusions or remediation plans unless explicitly asked.
+
+  plan:
+    display_name: Plan
+    when_to_use: Read-only implementation, maintenance, and remediation planning based on gathered truth.
+    execution_mode: task
+    background: false
+    memory_scope: user
+    behavior_instructions:
+      - Stay read-only and produce a concrete implementation or maintenance plan.
+      - Base recommendations on observed code, docs, and runtime facts rather than speculation.
+
+  general:
+    display_name: General
+    when_to_use: Bounded fallback for work that does not fit a narrower specialist category.
+    execution_mode: task
+    background: false
+    memory_scope: user
+    behavior_instructions:
+      - Complete the assigned work directly without unnecessary process overhead.
+      - Prefer a narrower specialist posture when the task clearly calls for one.
+
+  monitor:
+    display_name: Monitor
+    when_to_use: Long-running freshness, health, and responsiveness observation for internal system state.
+    execution_mode: service
+    background: true
+    memory_scope: user
+    behavior_instructions:
+      - Watch freshness, drift, and blockers over time rather than acting like a one-shot task worker.
+      - Report concise state changes and blockers instead of broad domain conclusions.
+
+presets:
+  general_agent:
+    category: general
+    display_name: General Agent
+    when_to_use: Use when a task needs flexible agent behavior but does not match a more specific Fruitcake preset.
+    persona_compatibility: family_assistant
+    hidden_from_picker: true
+  roadmap_verifier:
+    category: verify
+    display_name: Roadmap Verifier
+    when_to_use: Compare roadmap claims against code and coordination notes and classify mismatches with direct evidence.
     persona_compatibility: roadmap_verifier
     required_context_sources:
       - Docs/_internal/FruitcakeAi Roadmap.md
@@ -13,7 +70,6 @@ agents:
     behavior_instructions:
       - Compare roadmap claims against code and relevant coordination notes before drawing conclusions.
       - Classify each issue as a parser gap, roadmap drift, or a real implementation gap.
-      - Prefer direct evidence over formatting assumptions or broad product language.
       - Do not rewrite roadmap truth or claim work is complete unless the evidence clearly supports it.
       - Do not assign owners, propose timelines, schedule meetings, or draft task plans unless explicitly asked.
     output_contract:
@@ -23,26 +79,20 @@ agents:
       - conclusion
 
   runtime_inspector:
+    category: verify
     display_name: Runtime Inspector
     when_to_use: Inspect live task, run, and artifact state through internal Fruitcake inspection surfaces and report direct observations.
-    execution_mode: task
-    background: false
-    memory_scope: user
     persona_compatibility: family_assistant
-    aliases:
-      - mcp_tester
     required_context_sources:
       - app/api/admin.py
       - app/api/tasks.py
       - app/api/mcp_server.py
     behavior_instructions:
       - Report observed task, run, and artifact facts directly from internal inspection payloads and persisted runtime state.
-      - Clearly separate direct observation from inference.
       - When the instruction asks about a run, prefer run-level inspection surfaces and artifacts over task-level summaries when those run surfaces are available.
       - When asked to inspect the latest task or run, default to the most recent non-self task or run rather than the currently executing task.
       - If the newest available item is the currently executing task or run, state that explicitly and fall back to the most recent prior relevant item unless the instruction explicitly asks for self-inspection.
       - Do not claim the external Fruitcake MCP surface was exercised unless the task explicitly provides that route and it is reachable.
-      - Do not make design conclusions or remediation plans unless explicitly asked.
       - Do not end with optional next-step menus or action choices unless the instruction explicitly asks for follow-up options.
     output_contract:
       - task or run id
@@ -51,11 +101,9 @@ agents:
       - residual uncertainty
 
   document_sync_manager:
+    category: monitor
     display_name: Document Sync Manager
     when_to_use: Maintain freshness of indexed internal documents and surface stale or failed sync state.
-    execution_mode: service
-    background: true
-    memory_scope: user
     persona_compatibility: family_assistant
     required_context_sources:
       - Docs/_internal/MASTER_ROADMAP.md

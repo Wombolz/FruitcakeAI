@@ -543,12 +543,17 @@ async def test_agents_endpoint_lists_built_in_agent_definitions(client):
     resp = await client.get("/chat/agents")
     assert resp.status_code == 200
     data = resp.json()
-    assert "roadmap_verifier" in data
-    assert "runtime_inspector" in data
-    assert "mcp_tester" not in data
-    assert "document_sync_manager" in data
-    assert data["roadmap_verifier"]["execution_mode"] == "task"
-    assert data["document_sync_manager"]["background"] is True
+    categories = {item["id"]: item for item in data["categories"]}
+    assert "verify" in categories
+    assert "monitor" in categories
+    verify_presets = {item["id"]: item for item in categories["verify"]["presets"]}
+    monitor_presets = {item["id"]: item for item in categories["monitor"]["presets"]}
+    assert "roadmap_verifier" in verify_presets
+    assert "runtime_inspector" in verify_presets
+    assert "document_sync_manager" in monitor_presets
+    assert "general_agent" not in verify_presets
+    assert verify_presets["roadmap_verifier"]["execution_mode"] == "task"
+    assert monitor_presets["document_sync_manager"]["background"] is True
 
 
 @pytest.mark.asyncio

@@ -27,7 +27,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.definition_loader import get_agent_definition
+from app.agent.definition_loader import get_agent_preset
 from app.auth.dependencies import require_admin
 from app.auth.jwt import hash_password
 from app.autonomy.push import get_apns_pusher
@@ -585,7 +585,7 @@ def _duration_seconds(run: TaskRun) -> Optional[float]:
 
 def _serialize_run_metadata(run: TaskRun) -> Dict[str, Any]:
     agent_role = getattr(run, "agent_role", None)
-    definition = get_agent_definition(agent_role) if agent_role else None
+    preset = get_agent_preset(agent_role) if agent_role else None
     return {
         "run_kind": getattr(run, "run_kind", "task") or "task",
         "agent_role": agent_role,
@@ -593,14 +593,16 @@ def _serialize_run_metadata(run: TaskRun) -> Dict[str, Any]:
         "source_context": getattr(run, "source_context", None),
         "resolved_agent": (
             {
-                "id": definition.agent_type,
-                "display_name": definition.display_name,
-                "execution_mode": definition.execution_mode,
-                "background": definition.background,
-                "memory_scope": definition.memory_scope,
-                "persona_compatibility": definition.persona_compatibility,
+                "id": preset.preset_id,
+                "display_name": preset.display_name,
+                "category": preset.category_id,
+                "category_display_name": preset.category_display_name,
+                "execution_mode": preset.execution_mode,
+                "background": preset.background,
+                "memory_scope": preset.memory_scope,
+                "persona_compatibility": preset.persona_compatibility,
             }
-            if definition is not None
+            if preset is not None
             else None
         ),
     }

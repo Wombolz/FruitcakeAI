@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import json
 import re
 
-from app.agent.definition_loader import FruitcakeAgentDefinition, get_agent_definition
+from app.agent.definition_loader import FruitcakeAgentPreset, get_agent_preset
 from app.autonomy.planner import create_task_plan_for_user
 from app.auth.dependencies import get_current_user
 from app.config import settings
@@ -863,17 +863,19 @@ def _to_task_out(
     )
 
 
-def _resolved_agent_summary(definition: FruitcakeAgentDefinition | None) -> Optional[Dict[str, Any]]:
-    if definition is None:
+def _resolved_agent_summary(preset: FruitcakeAgentPreset | None) -> Optional[Dict[str, Any]]:
+    if preset is None:
         return None
     return {
-        "id": definition.agent_type,
-        "display_name": definition.display_name,
-        "execution_mode": definition.execution_mode,
-        "background": definition.background,
-        "memory_scope": definition.memory_scope,
-        "persona_compatibility": definition.persona_compatibility,
-        "when_to_use": definition.when_to_use,
+        "id": preset.preset_id,
+        "display_name": preset.display_name,
+        "category": preset.category_id,
+        "category_display_name": preset.category_display_name,
+        "execution_mode": preset.execution_mode,
+        "background": preset.background,
+        "memory_scope": preset.memory_scope,
+        "persona_compatibility": preset.persona_compatibility,
+        "when_to_use": preset.when_to_use,
     }
 
 
@@ -886,7 +888,7 @@ def _resolved_agent_summary_for_task(task: Task) -> Optional[Dict[str, Any]]:
     agent_role = str(params.get("agent_role") or "").strip()
     if not agent_role:
         return None
-    return _resolved_agent_summary(get_agent_definition(agent_role))
+    return _resolved_agent_summary(get_agent_preset(agent_role))
 
 
 async def _load_current_steps(db: AsyncSession, tasks: List[Task]) -> Dict[tuple[int, int], TaskStep]:

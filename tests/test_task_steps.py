@@ -2368,6 +2368,7 @@ async def test_runner_stamps_agent_run_metadata_and_task_audit_resolves_agent(cl
     payload = audit.json()
     assert payload["resolved_agent"]["id"] == "roadmap_verifier"
     assert payload["resolved_agent"]["display_name"] == "Roadmap Verifier"
+    assert payload["resolved_agent"]["category"] == "verify"
 
 
 @pytest.mark.asyncio

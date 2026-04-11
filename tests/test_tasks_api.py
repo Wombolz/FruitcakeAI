@@ -300,6 +300,7 @@ async def test_create_task_accepts_explicit_agent_recipe_family_from_editor(clie
     assert payload["persona"] == "roadmap_verifier"
     assert payload["resolved_agent"]["id"] == "roadmap_verifier"
     assert payload["resolved_agent"]["display_name"] == "Roadmap Verifier"
+    assert payload["resolved_agent"]["category"] == "verify"
     assert payload["resolved_agent"]["execution_mode"] == "task"
     assert payload["instruction"].startswith("Review pending roadmap phases")
 

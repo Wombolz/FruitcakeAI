@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from app.agent.context import UserContext
-from app.agent.definition_loader import get_agent_definition
+from app.agent.definition_loader import get_agent_preset
 from app.auth.dependencies import get_current_user
 from app.db.models import User
 
@@ -377,7 +377,7 @@ def _serialize_run(run: Any, task: Any) -> Dict[str, Any]:
             finished = finished.astimezone(timezone.utc).replace(tzinfo=None)
         duration_seconds = round((finished - started).total_seconds(), 3)
     agent_role = getattr(run, "agent_role", None)
-    definition = get_agent_definition(agent_role) if agent_role else None
+    preset = get_agent_preset(agent_role) if agent_role else None
     return {
         "run_id": run.id,
         "task_id": task.id,
@@ -392,14 +392,16 @@ def _serialize_run(run: Any, task: Any) -> Dict[str, Any]:
         "source_context": getattr(run, "source_context", None),
         "resolved_agent": (
             {
-                "id": definition.agent_type,
-                "display_name": definition.display_name,
-                "execution_mode": definition.execution_mode,
-                "background": definition.background,
-                "memory_scope": definition.memory_scope,
-                "persona_compatibility": definition.persona_compatibility,
+                "id": preset.preset_id,
+                "display_name": preset.display_name,
+                "category": preset.category_id,
+                "category_display_name": preset.category_display_name,
+                "execution_mode": preset.execution_mode,
+                "background": preset.background,
+                "memory_scope": preset.memory_scope,
+                "persona_compatibility": preset.persona_compatibility,
             }
-            if definition is not None
+            if preset is not None
             else None
         ),
         "summary": run.summary,

@@ -505,7 +505,7 @@ class TaskRunner:
 
         # Build UserContext (re-fetch user while session open so from_user can read attributes)
         from app.agent.context import UserContext
-        from app.agent.definition_loader import get_agent_definition
+        from app.agent.definition_loader import get_agent_preset
         from app.skills.service import hydrate_user_context
 
         async with AsyncSessionLocal() as db:
@@ -520,18 +520,18 @@ class TaskRunner:
                 query=(task_instruction or task_title or ""),
             )
         if agent_role:
-            definition = get_agent_definition(agent_role)
+            preset = get_agent_preset(agent_role)
             combined_context_sources: list[str] = []
             for item in task_context_paths:
                 if item not in combined_context_sources:
                     combined_context_sources.append(item)
-            if definition:
-                for item in definition.required_context_sources:
+            if preset:
+                for item in preset.required_context_sources:
                     if item not in combined_context_sources:
                         combined_context_sources.append(item)
-            if definition and definition.behavior_instructions:
+            if preset and preset.behavior_instructions:
                 merged = list(user_context.behavior_instructions)
-                for instruction in definition.behavior_instructions:
+                for instruction in preset.behavior_instructions:
                     if instruction not in merged:
                         merged.append(instruction)
                 user_context.behavior_instructions = merged

@@ -8,7 +8,7 @@ from typing import Any, Optional
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.definition_loader import get_agent_definition
+from app.agent.definition_loader import get_agent_preset
 from app.agent.persona_loader import list_personas, persona_exists
 from app.agent.persona_router import infer_persona_for_task
 from app.autonomy.configured_executor import infer_configured_executor
@@ -109,9 +109,9 @@ def resolve_agent_behavior_persona(
     agent_role = str(params.get("agent_role") or "").strip()
     if not agent_role:
         return None
-    definition = get_agent_definition(agent_role)
-    if definition and definition.persona_compatibility and persona_exists(definition.persona_compatibility):
-        return definition.persona_compatibility
+    preset = get_agent_preset(agent_role)
+    if preset and preset.persona_compatibility and persona_exists(preset.persona_compatibility):
+        return preset.persona_compatibility
     return agent_role if persona_exists(agent_role) else None
 
 

@@ -158,24 +158,43 @@ async def list_personas() -> Dict[str, Any]:
 
 @router.get("/agents")
 async def list_agents() -> Dict[str, Any]:
-    """Return all available Fruitcake agent definitions."""
-    from app.agent.definition_loader import list_agent_definitions as _list_agents
+    """Return all available Fruitcake agent presets grouped by category."""
+    from app.agent.definition_loader import list_agent_categories, list_agent_presets
 
-    agents = _list_agents()
-    return {
-        name: {
-            "display_name": definition.display_name,
-            "when_to_use": definition.when_to_use,
-            "execution_mode": definition.execution_mode,
-            "background": definition.background,
-            "memory_scope": definition.memory_scope,
-            "persona_compatibility": definition.persona_compatibility or "",
-            "required_context_sources": list(definition.required_context_sources),
-            "output_contract": list(definition.output_contract),
-        }
-        for name, definition in agents.items()
-        if not definition.hidden_from_picker
-    }
+    categories = list_agent_categories()
+    presets = list_agent_presets()
+
+    grouped: list[dict[str, Any]] = []
+    for category_id, category in categories.items():
+        category_presets = [
+            {
+                "id": preset.preset_id,
+                "display_name": preset.display_name,
+                "category": preset.category_id,
+                "category_display_name": preset.category_display_name,
+                "when_to_use": preset.when_to_use,
+                "execution_mode": preset.execution_mode,
+                "background": preset.background,
+                "memory_scope": preset.memory_scope,
+                "persona_compatibility": preset.persona_compatibility or "",
+                "required_context_sources": list(preset.required_context_sources),
+                "output_contract": list(preset.output_contract),
+            }
+            for preset in presets.values()
+            if preset.category_id == category_id and not preset.hidden_from_picker
+        ]
+        if not category_presets:
+            continue
+        grouped.append(
+            {
+                "id": category.category_id,
+                "display_name": category.display_name,
+                "when_to_use": category.when_to_use,
+                "presets": category_presets,
+            }
+        )
+
+    return {"categories": grouped}
 
 
 # ── GET /chat/tools ───────────────────────────────────────────────────────────
