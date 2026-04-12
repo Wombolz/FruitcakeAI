@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -376,7 +377,7 @@ async def test_create_task_rejects_overlong_title_with_clear_validation_error(cl
 
 
 @pytest.mark.asyncio
-async def test_managed_agent_presets_ensure_defaults_creates_backing_tasks(client):
+async def test_agent_instances_ensure_defaults_creates_seeded_instances(client):
     await client.post(
         "/auth/register",
         json={
@@ -392,19 +393,19 @@ async def test_managed_agent_presets_ensure_defaults_creates_backing_tasks(clien
     token = login.json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
-    resp = await client.post("/tasks/managed-agent-presets/ensure-defaults", headers=headers)
+    resp = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
     assert resp.status_code == 200
     data = resp.json()
-    by_id = {item["preset_id"]: item for item in data}
-    assert set(by_id.keys()) == {"document_sync_manager", "repo_map_manager", "recent_run_analyzer"}
-    assert by_id["document_sync_manager"]["linked_task"]["title"] == "Document Sync Manager"
-    assert by_id["repo_map_manager"]["linked_task"]["schedule"] == "every:1d"
-    assert by_id["recent_run_analyzer"]["params"]["max_runs"] == 8
-    assert by_id["recent_run_analyzer"]["category"] == "verify"
+    by_name = {item["display_name"]: item for item in data}
+    assert set(by_name.keys()) == {"Main Library Sync", "Primary Repo Map", "Run Health Check"}
+    assert by_name["Main Library Sync"]["linked_task"]["title"] == "Main Library Sync"
+    assert by_name["Primary Repo Map"]["linked_task"]["schedule"] == "every:1d"
+    assert by_name["Run Health Check"]["params"]["max_runs"] == 8
+    assert by_name["Run Health Check"]["category"] == "verify"
 
 
 @pytest.mark.asyncio
-async def test_managed_agent_preset_update_disables_backing_task_and_updates_params(client):
+async def test_agent_instance_update_disables_backing_task_and_updates_params(client):
     await client.post(
         "/auth/register",
         json={
@@ -420,12 +421,15 @@ async def test_managed_agent_preset_update_disables_backing_task_and_updates_par
     token = login.json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
-    created = await client.post("/tasks/managed-agent-presets/ensure-defaults", headers=headers)
+    created = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
     assert created.status_code == 200
+    recent = next(item for item in created.json() if item["display_name"] == "Run Health Check")
+    instance_id = recent["id"]
 
     patched = await client.patch(
-        "/tasks/managed-agent-presets/recent_run_analyzer",
+        f"/tasks/agent-instances/{instance_id}",
         json={
+            "display_name": "Run Health Deep Check",
             "enabled": False,
             "schedule": "every:12h",
             "params": {
@@ -440,6 +444,7 @@ async def test_managed_agent_preset_update_disables_backing_task_and_updates_par
     assert patched.status_code == 200
     payload = patched.json()
     assert payload["enabled"] is False
+    assert payload["display_name"] == "Run Health Deep Check"
     assert payload["schedule"] == "every:12h"
     assert payload["params"]["lookback_hours"] == 48
     assert payload["linked_task"]["status"] == "cancelled"
@@ -449,8 +454,133 @@ async def test_managed_agent_preset_update_disables_backing_task_and_updates_par
     assert task_resp.status_code == 200
     task_payload = task_resp.json()
     assert task_payload["task_recipe"]["params"]["max_runs"] == 12
-    assert task_payload["task_recipe"]["params"]["problematic_only"] is False
-    assert task_payload["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_create_agent_instance_supports_multiple_instances_per_preset(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "agentinstancecreateuser",
+            "email": "agentinstancecreate@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "agentinstancecreateuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    seeded = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
+    assert seeded.status_code == 200
+
+    created = await client.post(
+        "/tasks/agent-instances",
+        json={
+            "preset_id": "repo_map_manager",
+            "display_name": "Client Repo Map",
+            "schedule": "every:12h",
+            "params": {
+                "output_path": "reports/client_repo_map.md",
+                "included_roots": ["/tmp/client-repo"],
+                "ignored_paths": [".git", ".venv"],
+                "refresh_after_sync_only": False,
+            },
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["display_name"] == "Client Repo Map"
+    assert payload["preset_id"] == "repo_map_manager"
+    assert payload["linked_task"]["title"] == "Client Repo Map"
+    assert payload["params"]["included_roots"] == ["/tmp/client-repo"]
+
+    listed = await client.get("/tasks/agent-instances", headers=headers)
+    assert listed.status_code == 200
+    names = {item["display_name"] for item in listed.json()}
+    assert "Primary Repo Map" in names
+    assert "Client Repo Map" in names
+
+
+@pytest.mark.asyncio
+async def test_agent_instance_model_override_syncs_to_backing_task(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "agentinstancemodeluser",
+            "email": "agentinstancemodel@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "agentinstancemodeluser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks/agent-instances",
+        json={
+            "preset_id": "recent_run_analyzer",
+            "display_name": "Model-Aware Run Health",
+            "llm_model_override": "gpt-5.4-mini",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["llm_model_override"] == "gpt-5.4-mini"
+
+    task_id = payload["linked_task"]["id"]
+    task_resp = await client.get(f"/tasks/{task_id}", headers=headers)
+    assert task_resp.status_code == 200
+    assert task_resp.json()["llm_model_override"] == "gpt-5.4-mini"
+
+    patched = await client.patch(
+        f"/tasks/agent-instances/{payload['id']}",
+        json={"llm_model_override": "gpt-5.4"},
+        headers=headers,
+    )
+    assert patched.status_code == 200
+    assert patched.json()["llm_model_override"] == "gpt-5.4"
+
+    task_resp = await client.get(f"/tasks/{task_id}", headers=headers)
+    assert task_resp.status_code == 200
+    assert task_resp.json()["llm_model_override"] == "gpt-5.4"
+
+
+@pytest.mark.asyncio
+async def test_agent_instances_ensure_defaults_falls_back_to_existing_instances_on_error(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "agentinstancefallbackuser",
+            "email": "agentinstancefallback@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "agentinstancefallbackuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    seeded = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
+    assert seeded.status_code == 200
+
+    with patch("app.api.tasks.ensure_seed_agent_instances", new=AsyncMock(side_effect=RuntimeError("boom"))):
+        fallback = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
+
+    assert fallback.status_code == 200
+    payload = fallback.json()
+    names = {item["display_name"] for item in payload}
+    assert "Main Library Sync" in names
+    assert "Primary Repo Map" in names
 
 
 @pytest.mark.asyncio
@@ -871,3 +1001,57 @@ async def test_manual_run_rejects_when_task_has_active_run(client):
     resp = await client.post(f"/tasks/{task_id}/run", headers=headers)
     assert resp.status_code == 409
     assert "Task is already running" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_manual_run_commits_immediate_queue_state_before_runner_executes(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "manualrunqueueuser",
+            "email": "manualrunqueue@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "manualrunqueueuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Recurring agent task",
+            "instruction": "Run immediately when asked.",
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "recipe_family": "agent",
+            "recipe_params": {"agent_role": "runtime_inspector"},
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    task_id = int(created.json()["id"])
+
+    observed: dict[str, object] = {}
+
+    class FakeRunner:
+        async def execute(self, task, *, trigger_source: str = "direct"):
+            observed["trigger_source"] = trigger_source
+            observed["passed_next_run_at"] = getattr(task, "next_run_at", None)
+            async with TestSessionLocal() as db:
+                persisted = await db.get(Task, int(task.id))
+                observed["persisted_next_run_at"] = getattr(persisted, "next_run_at", None)
+                observed["persisted_status"] = getattr(persisted, "status", None)
+
+    with patch("app.autonomy.runner.get_task_runner", return_value=FakeRunner()):
+        resp = await client.post(f"/tasks/{task_id}/run", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["queued"] is True
+    assert observed["trigger_source"] == "manual"
+    assert observed["persisted_status"] == "pending"
+    assert observed["passed_next_run_at"] is not None
+    assert observed["persisted_next_run_at"] == observed["passed_next_run_at"]

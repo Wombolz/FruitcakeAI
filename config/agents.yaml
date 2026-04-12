@@ -105,10 +105,6 @@ presets:
     display_name: Recent Run Analyzer
     when_to_use: Review recent non-self task runs, summarize failures or suspicious states, and keep the distinction between observation and inference sharp.
     persona_compatibility: family_assistant
-    required_context_sources:
-      - app/api/tasks.py
-      - app/api/admin.py
-      - Docs/_internal/FruitcakeAi Roadmap.md
     behavior_instructions:
       - Inspect recent non-self runs first and summarize the most actionable failures, cancellations, missing outputs, or suspicious states.
       - Prefer compact run-health reporting over one-run deep dives unless the instruction explicitly asks for a specific run.
@@ -124,10 +120,6 @@ presets:
     display_name: Document Sync Manager
     when_to_use: Maintain freshness of indexed internal documents and surface stale or failed sync state.
     persona_compatibility: family_assistant
-    required_context_sources:
-      - Docs/_internal/MASTER_ROADMAP.md
-      - Docs/_internal/PLANNING_CONTEXT.md
-      - Docs/_internal/agent_context_preload_and_repo_map_plan.md
     behavior_instructions:
       - Detect changed, stale, or failed document sync state before attempting broader document reasoning tasks.
       - Trigger or queue re-sync and re-ingest work rather than rewriting documents.
@@ -144,10 +136,6 @@ presets:
     display_name: Repo Map Manager
     when_to_use: Maintain a current repo map and workspace orientation artifact so specialist agents can start with grounded context instead of searching blindly.
     persona_compatibility: family_assistant
-    required_context_sources:
-      - Docs/_internal/agent_context_preload_and_repo_map_plan.md
-      - Docs/_internal/fruitcake_agent_taxonomy_and_candidate_categories_plan.md
-      - Docs/_internal/FruitcakeAi Roadmap.md
     behavior_instructions:
       - Refresh the workspace orientation view after meaningful document or structure changes instead of treating the repo map as static.
       - Focus on the most useful entrypoints, internal docs, and notable roots rather than dumping the full tree.

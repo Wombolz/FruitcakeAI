@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -30,12 +31,12 @@ from app.config import settings
 from app.db.models import AuditLog, ManagedAgentPreset, Task, TaskRun, TaskRunArtifact, TaskStep, User
 from app.db.session import get_db
 from app.managed_agent_presets import (
-    ensure_default_managed_presets,
-    get_managed_preset_row,
-    get_managed_preset_spec,
-    list_managed_preset_rows,
-    reconcile_managed_preset,
-    update_managed_preset_row,
+    create_agent_instance,
+    ensure_seed_agent_instances,
+    get_agent_instance,
+    list_agent_instances,
+    reconcile_agent_instance,
+    update_agent_instance,
 )
 from app.memory.service import get_memory_service
 from app.mcp.servers.filesystem import resolve_workspace_path_for_user, write_workspace_text
@@ -43,6 +44,7 @@ from app.task_service import TaskValidationError, UNSET, create_task_record, upd
 from app.time_utils import format_localized_datetime, resolve_effective_timezone
 
 router = APIRouter()
+log = logging.getLogger(__name__)
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -83,22 +85,38 @@ class TaskPatch(BaseModel):
     approved: Optional[bool] = None
 
 
-class ManagedAgentPresetPatch(BaseModel):
+class AgentInstanceCreate(BaseModel):
+    preset_id: str
+    display_name: str
+    enabled: bool = True
+    auto_maintain_task: bool = True
+    schedule: Optional[str] = None
+    active_hours_start: Optional[str] = None
+    active_hours_end: Optional[str] = None
+    active_hours_tz: Optional[str] = None
+    llm_model_override: Optional[str] = None
+    context_paths: Optional[List[str]] = None
+    params: Optional[Dict[str, Any]] = None
+
+
+class AgentInstancePatch(BaseModel):
+    display_name: Optional[str] = None
     enabled: Optional[bool] = None
     auto_maintain_task: Optional[bool] = None
     schedule: Optional[str] = None
     active_hours_start: Optional[str] = None
     active_hours_end: Optional[str] = None
     active_hours_tz: Optional[str] = None
+    llm_model_override: Optional[str] = None
     context_paths: Optional[List[str]] = None
     params: Optional[Dict[str, Any]] = None
 
 
-class ManagedAgentPresetReconcileRequest(BaseModel):
+class AgentInstanceReconcileRequest(BaseModel):
     recreate_missing: bool = True
 
 
-class ManagedAgentPresetTaskSummary(BaseModel):
+class AgentInstanceTaskSummary(BaseModel):
     id: int
     title: str
     status: str
@@ -107,7 +125,7 @@ class ManagedAgentPresetTaskSummary(BaseModel):
     next_run_at: Optional[datetime] = None
 
 
-class ManagedAgentPresetLatestRunSummary(BaseModel):
+class AgentInstanceLatestRunSummary(BaseModel):
     id: int
     status: str
     run_kind: str
@@ -117,7 +135,8 @@ class ManagedAgentPresetLatestRunSummary(BaseModel):
     error: Optional[str] = None
 
 
-class ManagedAgentPresetOut(BaseModel):
+class AgentInstanceOut(BaseModel):
+    id: int
     preset_id: str
     display_name: str
     category: str
@@ -131,10 +150,11 @@ class ManagedAgentPresetOut(BaseModel):
     active_hours_start: Optional[str] = None
     active_hours_end: Optional[str] = None
     active_hours_tz: Optional[str] = None
+    llm_model_override: Optional[str] = None
     context_paths: List[str]
     params: Dict[str, Any]
-    linked_task: Optional[ManagedAgentPresetTaskSummary] = None
-    latest_run: Optional[ManagedAgentPresetLatestRunSummary] = None
+    linked_task: Optional[AgentInstanceTaskSummary] = None
+    latest_run: Optional[AgentInstanceLatestRunSummary] = None
 
 
 class TaskOut(BaseModel):
@@ -254,68 +274,105 @@ async def list_tasks(
     ]
 
 
-@router.post("/tasks/managed-agent-presets/ensure-defaults", response_model=List[ManagedAgentPresetOut])
-async def ensure_managed_agent_presets_defaults(
+@router.post("/tasks/agent-instances/ensure-defaults", response_model=List[AgentInstanceOut])
+async def ensure_agent_instances_defaults(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    rows = await ensure_default_managed_presets(db, user=current_user)
-    return await _serialize_managed_agent_presets(db, rows)
+    try:
+        rows = await ensure_seed_agent_instances(db, user=current_user)
+    except Exception:
+        log.exception("Failed to ensure default agent instances for user_id=%s", current_user.id)
+        rows = await list_agent_instances(db, user_id=int(current_user.id))
+    return await _serialize_agent_instances(db, rows)
 
 
-@router.get("/tasks/managed-agent-presets", response_model=List[ManagedAgentPresetOut])
-async def list_managed_agent_presets(
+@router.get("/tasks/agent-instances", response_model=List[AgentInstanceOut])
+async def list_agent_instances_endpoint(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    rows = await list_managed_preset_rows(db, user_id=int(current_user.id))
-    return await _serialize_managed_agent_presets(db, rows)
+    rows = await list_agent_instances(db, user_id=int(current_user.id))
+    return await _serialize_agent_instances(db, rows)
 
 
-@router.patch("/tasks/managed-agent-presets/{preset_id}", response_model=ManagedAgentPresetOut)
-async def update_managed_agent_preset(
-    preset_id: str,
-    body: ManagedAgentPresetPatch,
+@router.post("/tasks/agent-instances", response_model=AgentInstanceOut, status_code=status.HTTP_201_CREATED)
+async def create_agent_instance_endpoint(
+    body: AgentInstanceCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    managed_preset = await get_managed_preset_row(db, user_id=int(current_user.id), preset_id=preset_id)
-    if managed_preset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Managed agent preset not found")
-    await update_managed_preset_row(
-        db,
-        managed_preset=managed_preset,
-        user=current_user,
-        enabled=body.enabled,
-        auto_maintain_task=body.auto_maintain_task,
-        schedule=body.schedule,
-        active_hours_start=body.active_hours_start,
-        active_hours_end=body.active_hours_end,
-        active_hours_tz=body.active_hours_tz,
-        context_paths=body.context_paths,
-        params=body.params,
-    )
-    payload = await _serialize_managed_agent_presets(db, [managed_preset])
+    try:
+        agent_instance = await create_agent_instance(
+            db,
+            user=current_user,
+            preset_id=body.preset_id,
+            display_name=body.display_name,
+            enabled=body.enabled,
+            auto_maintain_task=body.auto_maintain_task,
+            schedule=body.schedule,
+            active_hours_start=body.active_hours_start,
+            active_hours_end=body.active_hours_end,
+            active_hours_tz=body.active_hours_tz,
+            llm_model_override=body.llm_model_override,
+            context_paths=body.context_paths,
+            params=body.params,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    payload = await _serialize_agent_instances(db, [agent_instance])
     return payload[0]
 
 
-@router.post("/tasks/managed-agent-presets/{preset_id}/reconcile", response_model=ManagedAgentPresetOut)
-async def reconcile_managed_agent_preset_endpoint(
-    preset_id: str,
-    body: ManagedAgentPresetReconcileRequest,
+@router.patch("/tasks/agent-instances/{instance_id}", response_model=AgentInstanceOut)
+async def update_agent_instance_endpoint(
+    instance_id: int,
+    body: AgentInstancePatch,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    managed_preset = await get_managed_preset_row(db, user_id=int(current_user.id), preset_id=preset_id)
-    if managed_preset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Managed agent preset not found")
-    await reconcile_managed_preset(
+    agent_instance = await get_agent_instance(db, user_id=int(current_user.id), instance_id=instance_id)
+    if agent_instance is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent instance not found")
+    try:
+        await update_agent_instance(
+            db,
+            agent_instance=agent_instance,
+            user=current_user,
+            display_name=body.display_name,
+            enabled=body.enabled,
+            auto_maintain_task=body.auto_maintain_task,
+            schedule=body.schedule,
+            active_hours_start=body.active_hours_start,
+            active_hours_end=body.active_hours_end,
+            active_hours_tz=body.active_hours_tz,
+            llm_model_override=body.llm_model_override,
+            context_paths=body.context_paths,
+            params=body.params,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    payload = await _serialize_agent_instances(db, [agent_instance])
+    return payload[0]
+
+
+@router.post("/tasks/agent-instances/{instance_id}/reconcile", response_model=AgentInstanceOut)
+async def reconcile_agent_instance_endpoint(
+    instance_id: int,
+    body: AgentInstanceReconcileRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    agent_instance = await get_agent_instance(db, user_id=int(current_user.id), instance_id=instance_id)
+    if agent_instance is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent instance not found")
+    await reconcile_agent_instance(
         db,
-        managed_preset=managed_preset,
+        agent_instance=agent_instance,
         user=current_user,
         recreate_missing=body.recreate_missing,
     )
-    payload = await _serialize_managed_agent_presets(db, [managed_preset])
+    payload = await _serialize_agent_instances(db, [agent_instance])
     return payload[0]
 
 
@@ -491,11 +548,13 @@ async def manual_run(
 
     task.next_run_at = datetime.now(timezone.utc)
     task.status = "pending"
+    await db.commit()
+    await db.refresh(task)
 
     try:
         from app.autonomy.runner import get_task_runner
         runner = get_task_runner()
-        background_tasks.add_task(runner.execute, task)
+        background_tasks.add_task(runner.execute, task, trigger_source="manual")
     except ImportError:
         pass  # Runner not yet wired (Sprint 4.2) — next scheduler tick will pick it up
 
@@ -1064,15 +1123,14 @@ def _resolved_agent_summary_for_task(task: Task) -> Optional[Dict[str, Any]]:
     return _resolved_agent_summary(get_agent_preset(agent_role))
 
 
-async def _serialize_managed_agent_presets(
+async def _serialize_agent_instances(
     db: AsyncSession,
     rows: List[ManagedAgentPreset],
-) -> List[ManagedAgentPresetOut]:
-    out: List[ManagedAgentPresetOut] = []
+) -> List[AgentInstanceOut]:
+    out: List[AgentInstanceOut] = []
     for row in rows:
         preset = get_agent_preset(row.preset_id)
-        spec = get_managed_preset_spec(row.preset_id)
-        if preset is None or spec is None:
+        if preset is None:
             continue
         linked_task: Optional[Task] = None
         if row.linked_task_id is not None:
@@ -1081,10 +1139,10 @@ async def _serialize_managed_agent_presets(
             ).scalar_one_or_none()
             if linked_task is None:
                 row.linked_task_id = None
-        latest_run: Optional[ManagedAgentPresetLatestRunSummary] = None
-        linked_task_summary: Optional[ManagedAgentPresetTaskSummary] = None
+        latest_run: Optional[AgentInstanceLatestRunSummary] = None
+        linked_task_summary: Optional[AgentInstanceTaskSummary] = None
         if linked_task is not None:
-            linked_task_summary = ManagedAgentPresetTaskSummary(
+            linked_task_summary = AgentInstanceTaskSummary(
                 id=int(linked_task.id),
                 title=linked_task.title,
                 status=linked_task.status,
@@ -1101,7 +1159,7 @@ async def _serialize_managed_agent_presets(
                 )
             ).scalar_one_or_none()
             if run is not None:
-                latest_run = ManagedAgentPresetLatestRunSummary(
+                latest_run = AgentInstanceLatestRunSummary(
                     id=int(run.id),
                     status=run.status,
                     run_kind=run.run_kind or "task",
@@ -1111,9 +1169,10 @@ async def _serialize_managed_agent_presets(
                     error=run.error,
                 )
         out.append(
-            ManagedAgentPresetOut(
+            AgentInstanceOut(
+                id=int(row.id),
                 preset_id=preset.preset_id,
-                display_name=preset.display_name,
+                display_name=row.display_name,
                 category=preset.category_id,
                 category_display_name=preset.category_display_name,
                 when_to_use=preset.when_to_use,
@@ -1125,6 +1184,7 @@ async def _serialize_managed_agent_presets(
                 active_hours_start=row.active_hours_start,
                 active_hours_end=row.active_hours_end,
                 active_hours_tz=row.active_hours_tz,
+                llm_model_override=row.llm_model_override,
                 context_paths=row.context_paths,
                 params=row.params if isinstance(row.params, dict) else {},
                 linked_task=linked_task_summary,

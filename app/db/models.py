@@ -701,18 +701,20 @@ class Task(Base):
 class ManagedAgentPreset(Base):
     __tablename__ = "managed_agent_presets"
     __table_args__ = (
-        UniqueConstraint("user_id", "preset_id", name="uq_managed_agent_presets_user_preset"),
+        UniqueConstraint("user_id", "display_name", name="uq_managed_agent_presets_user_display_name"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     preset_id = Column(String(100), nullable=False, index=True)
+    display_name = Column(String(255), nullable=False)
     enabled = Column(Boolean, default=True, nullable=False)
     auto_maintain_task = Column(Boolean, default=True, nullable=False)
     schedule = Column(String(100), nullable=True)
     active_hours_start = Column(String(5), nullable=True)
     active_hours_end = Column(String(5), nullable=True)
     active_hours_tz = Column(String(50), nullable=True)
+    llm_model_override = Column(String(200), nullable=True)
     context_paths_json = Column(Text, default="[]", nullable=False)
     params_json = Column(Text, default="{}", nullable=False)
     linked_task_id = Column(Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -739,7 +741,10 @@ class ManagedAgentPreset(Base):
         self.params_json = json.dumps(value or {})
 
     def __repr__(self):
-        return f"<ManagedAgentPreset(user_id={self.user_id}, preset_id='{self.preset_id}', enabled={self.enabled})>"
+        return (
+            f"<ManagedAgentPreset(user_id={self.user_id}, preset_id='{self.preset_id}', "
+            f"display_name='{self.display_name}', enabled={self.enabled})>"
+        )
 
 
 class DeviceToken(Base):
