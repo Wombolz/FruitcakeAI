@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.definition_loader import get_agent_preset
@@ -151,6 +151,13 @@ async def ensure_seed_agent_instances(
                     row.context_paths = list(spec.context_paths)
                 if not isinstance(row.params, dict) or not row.params:
                     row.params = dict(spec.params or {})
+        else:
+            await _cleanup_legacy_duplicates(
+                db,
+                user_id=int(user.id),
+                preset_id=spec.preset_id,
+                keep_instance_id=int(row.id),
+            )
         if row is None:
             row = ManagedAgentPreset(
                 user_id=int(user.id),
@@ -179,6 +186,31 @@ async def ensure_seed_agent_instances(
             continue
         ensured.append(row)
     return ensured
+
+
+async def _cleanup_legacy_duplicates(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    preset_id: str,
+    keep_instance_id: int,
+) -> None:
+    rows = await db.execute(
+        select(ManagedAgentPreset).where(
+            ManagedAgentPreset.user_id == user_id,
+            ManagedAgentPreset.preset_id == preset_id,
+        )
+    )
+    duplicates = [
+        row
+        for row in rows.scalars().all()
+        if int(row.id) != keep_instance_id and row.display_name in {None, "", preset_id}
+    ]
+    for duplicate in duplicates:
+        linked_task_id = getattr(duplicate, "linked_task_id", None)
+        if linked_task_id is not None:
+            await db.execute(delete(Task).where(Task.id == int(linked_task_id)))
+        await db.delete(duplicate)
 
 
 async def create_agent_instance(

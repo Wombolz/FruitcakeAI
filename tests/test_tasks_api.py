@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from sqlalchemy import select
 
-from app.db.models import Task, TaskRun, User
+from app.db.models import ManagedAgentPreset, Task, TaskRun, User
 from app.task_service import compute_next_run_at
 from tests.conftest import TestSessionLocal
 
@@ -405,6 +405,76 @@ async def test_agent_instances_ensure_defaults_creates_seeded_instances(client):
 
 
 @pytest.mark.asyncio
+async def test_agent_instances_ensure_defaults_cleans_up_legacy_duplicate_seed_rows(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "managedpresetlegacyuser",
+            "email": "managedpresetlegacy@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "managedpresetlegacyuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    seeded = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
+    assert seeded.status_code == 200
+    primary_repo_map = next(item for item in seeded.json() if item["display_name"] == "Primary Repo Map")
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "managedpresetlegacyuser"))
+        ).scalar_one()
+        legacy_task = Task(
+            user_id=user.id,
+            title="repo_map_manager",
+            instruction="Legacy repo map",
+            task_type="recurring",
+            schedule="every:1d",
+            status="pending",
+            deliver=False,
+            requires_approval=False,
+        )
+        db.add(legacy_task)
+        await db.flush()
+        db.add(
+            ManagedAgentPreset(
+                user_id=user.id,
+                preset_id="repo_map_manager",
+                display_name="repo_map_manager",
+                enabled=True,
+                auto_maintain_task=True,
+                schedule="every:1d",
+                active_hours_tz="UTC",
+                context_paths_json="[]",
+                params_json="{}",
+                linked_task_id=legacy_task.id,
+            )
+        )
+        await db.commit()
+
+    refreshed = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
+    assert refreshed.status_code == 200
+    payload = refreshed.json()
+    repo_map_rows = [item for item in payload if item["preset_id"] == "repo_map_manager"]
+    assert len(repo_map_rows) == 1
+    assert repo_map_rows[0]["display_name"] == "Primary Repo Map"
+    assert repo_map_rows[0]["id"] == primary_repo_map["id"]
+
+    async with TestSessionLocal() as db:
+        duplicate_rows = (
+            await db.execute(
+                select(Task).where(Task.title == "repo_map_manager")
+            )
+        ).scalars().all()
+        assert duplicate_rows == []
+
+
+@pytest.mark.asyncio
 async def test_agent_instance_update_disables_backing_task_and_updates_params(client):
     await client.post(
         "/auth/register",
@@ -448,12 +518,15 @@ async def test_agent_instance_update_disables_backing_task_and_updates_params(cl
     assert payload["schedule"] == "every:12h"
     assert payload["params"]["lookback_hours"] == 48
     assert payload["linked_task"]["status"] == "cancelled"
+    assert payload["linked_task"]["next_run_at"] is None
 
     task_id = payload["linked_task"]["id"]
     task_resp = await client.get(f"/tasks/{task_id}", headers=headers)
     assert task_resp.status_code == 200
     task_payload = task_resp.json()
     assert task_payload["task_recipe"]["params"]["max_runs"] == 12
+    assert task_payload["status"] == "cancelled"
+    assert task_payload["next_run_at"] is None
 
 
 @pytest.mark.asyncio
