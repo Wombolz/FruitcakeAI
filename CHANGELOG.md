@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.13
+
+- Introduced the first category-and-preset agent registry, with grouped agent selection in task creation and resolved preset/category metadata in task and run inspection.
+- Added managed agent instances in `Settings > Agents`, including seeded recurring agents for library sync, repo-map maintenance, and recent-run analysis.
+- Improved agent management with model override support, context-file selection, repo-root selection for repo-map instances, and live status refresh while the Agents screen is open.
+- Expanded agent-run visibility through latest-run summaries in task detail and stronger linked task/latest run surfaces for background agents.
+- Stabilized the first-agent branch by fixing manual-run dispatch persistence, cleaning up hidden legacy managed-agent duplicates, and tightening disable/queue behavior so stale recurring agent work does not silently continue.
+
 ## v0.7.12
 
 - Introduced the new `briefing` family runtime as the shared path for morning and evening briefings while preserving compatibility with older briefing tasks.
