@@ -398,13 +398,11 @@ class ConfiguredDailyResearchBriefingExecution(TaskExecutionProfile):
         out: List[Dict[str, Any]] = []
         dataset = run_debug.get("dataset")
         grounding = run_debug.get("grounding_report")
-        diagnostics = {
+        diagnostics = self._build_run_diagnostics(run_debug=run_debug, extra={
             "executor_config": run_debug.get("executor_config", {}),
             "runtime_contract": run_debug.get("runtime_contract", {}),
-            "dataset_stats": run_debug.get("dataset_stats", {}),
-            "refresh_stats": run_debug.get("refresh_stats", {}),
             "append_result": run_debug.get("append_result", {}),
-        }
+        })
         if isinstance(dataset, dict):
             out.append({"artifact_type": "prepared_dataset", "content_json": dataset})
         if isinstance(run_debug.get("runtime_contract"), dict):

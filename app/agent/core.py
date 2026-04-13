@@ -6,6 +6,7 @@ it decides when to call tools and how to synthesize results.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import contextvars
@@ -25,6 +26,10 @@ _task_handoff_payload: contextvars.ContextVar[dict[str, Any] | None] = contextva
     "task_handoff_payload",
     default=None,
 )
+_agent_loop_diagnostics: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+    "agent_loop_diagnostics",
+    default={},
+)
 
 # Silence LiteLLM's verbose request logging in production
 litellm.suppress_debug_info = True
@@ -37,6 +42,7 @@ TURN_LIMITS: Dict[str, int] = {
 }
 
 REPEATED_FAILED_SEARCH_TURN_THRESHOLD = 5
+ESTIMATED_CHARS_PER_TOKEN = 4
 FAILED_SEARCH_PREFIXES = (
     "no results found for:",
     "tool web_search failed:",
@@ -55,6 +61,24 @@ UNSUPPORTED_ALPHA_VANTAGE_HINT = (
 )
 
 
+def reset_agent_loop_diagnostics() -> contextvars.Token:
+    return _agent_loop_diagnostics.set({})
+
+
+def get_agent_loop_diagnostics() -> dict[str, Any]:
+    value = _agent_loop_diagnostics.get() or {}
+    copied = dict(value)
+    if isinstance(value.get("budget_events"), list):
+        copied["budget_events"] = [dict(item) if isinstance(item, dict) else item for item in value["budget_events"]]
+    if isinstance(value.get("loop_events"), list):
+        copied["loop_events"] = [dict(item) if isinstance(item, dict) else item for item in value["loop_events"]]
+    return copied
+
+
+def restore_agent_loop_diagnostics(token: contextvars.Token) -> None:
+    _agent_loop_diagnostics.reset(token)
+
+
 def _build_messages(
     history: List[Dict[str, Any]],
     user_context: UserContext,
@@ -65,6 +89,61 @@ def _build_messages(
     if followup_hint:
         messages.append({"role": "system", "content": followup_hint})
     return messages + history
+
+
+async def _acompletion_with_budget(
+    *,
+    history: List[Dict[str, Any]],
+    user_context: UserContext,
+    model: str,
+    mode: str,
+    stage: str | None,
+    stream: bool = False,
+    tools: List[Dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    extra_kwargs: Dict[str, Any] | None = None,
+    stream_kwargs: Dict[str, Any] | None = None,
+) -> Any:
+    extra_kwargs = dict(extra_kwargs or {})
+    stream_kwargs = dict(stream_kwargs or {})
+
+    projected_history, report = _project_history_for_model(history, aggressive=False)
+    _record_budget_event(report, stage=stage, mode=mode, model=model)
+
+    try:
+        return await litellm.acompletion(
+            model=model,
+            messages=_build_messages(projected_history, user_context),
+            stream=stream,
+            tools=tools or None,
+            tool_choice=tool_choice if tools else None,
+            **extra_kwargs,
+            **stream_kwargs,
+        )
+    except Exception as exc:
+        if not settings.agent_overflow_retry_enabled or not _is_context_window_error(exc):
+            raise
+        aggressive_history, aggressive_report = _project_history_for_model(history, aggressive=True)
+        _record_budget_event(aggressive_report, stage=stage, mode=mode, model=model)
+        try:
+            response = await litellm.acompletion(
+                model=model,
+                messages=_build_messages(aggressive_history, user_context),
+                stream=stream,
+                tools=tools or None,
+                tool_choice=tool_choice if tools else None,
+                **extra_kwargs,
+                **stream_kwargs,
+            )
+        except Exception as retry_exc:
+            if _is_context_window_error(retry_exc):
+                _record_overflow_retry(stage=stage, mode=mode, model=model, succeeded=False)
+                raise RuntimeError(
+                    "Context budget exceeded after compaction retry. Reduce prompt history or task scope."
+                ) from retry_exc
+            raise
+        _record_overflow_retry(stage=stage, mode=mode, model=model, succeeded=True)
+        return response
 
 
 def _normalize_tool_calls(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -112,7 +191,242 @@ def _tool_call_name(call: Any) -> str:
 
 def _content_fingerprint(value: str, *, length: int = 12) -> str:
     normalized = " ".join(str(value or "").split())
-    return str(abs(hash(normalized)))[:length]
+    if not normalized:
+        return "0" * max(1, length)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[: max(1, length)]
+
+
+def _estimate_tokens(text: str) -> int:
+    chars = len(str(text or ""))
+    return max(1, chars // ESTIMATED_CHARS_PER_TOKEN) if chars else 0
+
+
+def _estimate_message_tokens(message: Dict[str, Any]) -> int:
+    total = _estimate_tokens(str(message.get("content") or ""))
+    tool_calls = message.get("tool_calls") or []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        total += _estimate_tokens(str(function.get("name") or ""))
+        total += _estimate_tokens(str(function.get("arguments") or ""))
+    return total
+
+
+def _estimate_history_tokens(history: List[Dict[str, Any]]) -> int:
+    return sum(_estimate_message_tokens(message) for message in history)
+
+
+def _compact_text(value: str, *, max_chars: int) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _tool_name_lookup(history: List[Dict[str, Any]]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for message in history:
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("id") or "").strip()
+            function = call.get("function") or {}
+            tool_name = str(function.get("name") or "").strip()
+            if call_id and tool_name:
+                lookup[call_id] = tool_name
+    return lookup
+
+
+def _compact_tool_message(
+    message: Dict[str, Any],
+    *,
+    tool_name_lookup: dict[str, str],
+    max_chars: int,
+) -> Dict[str, Any]:
+    content = str(message.get("content") or "")
+    compact_summary = _compact_text(content, max_chars=max_chars)
+    tool_call_id = str(message.get("tool_call_id") or "").strip()
+    tool_name = tool_name_lookup.get(tool_call_id) or "unknown_tool"
+    compacted = (
+        "Compacted tool result.\n"
+        f"Tool: {tool_name}\n"
+        f"Tool call id: {tool_call_id or 'unknown'}\n"
+        f"Fingerprint: {_content_fingerprint(content)}\n"
+        f"Original chars: {len(content)}\n"
+        f"Summary: {compact_summary}"
+    )
+    return {**message, "content": compacted}
+
+
+def _compact_message_summary(
+    message: Dict[str, Any],
+    *,
+    tool_name_lookup: dict[str, str],
+) -> str:
+    role = str(message.get("role") or "").strip() or "unknown"
+    if role == "tool":
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        tool_name = tool_name_lookup.get(tool_call_id) or "unknown_tool"
+        content = _compact_text(str(message.get("content") or ""), max_chars=140)
+        return f"Tool {tool_name}: {content}"
+    if message.get("tool_calls"):
+        names = []
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            names.append(str(function.get("name") or "unknown_tool"))
+        return f"Assistant requested tools: {', '.join(names[:5])}"
+    content = _compact_text(str(message.get("content") or ""), max_chars=160)
+    return f"{role.capitalize()}: {content}"
+
+
+def _build_compaction_boundary_message(
+    prefix: List[Dict[str, Any]],
+    *,
+    tool_name_lookup: dict[str, str],
+) -> Dict[str, Any]:
+    lines = [
+        "Earlier conversation was compacted to stay within the context budget.",
+        "Preserve these compacted facts unless later context contradicts them:",
+    ]
+    summaries: list[str] = []
+    for message in prefix:
+        summary = _compact_message_summary(message, tool_name_lookup=tool_name_lookup)
+        if summary:
+            summaries.append(f"- {summary}")
+        if len(summaries) >= 10:
+            break
+    if not summaries:
+        summaries.append("- Earlier tool and assistant turns were compacted.")
+    lines.extend(summaries)
+    return {"role": "system", "content": "\n".join(lines)}
+
+
+def _project_history_for_model(
+    history: List[Dict[str, Any]],
+    *,
+    aggressive: bool = False,
+) -> tuple[List[Dict[str, Any]], dict[str, Any]]:
+    projected = list(history)
+    report: dict[str, Any] = {
+        "aggressive": aggressive,
+        "estimated_tokens_before": _estimate_history_tokens(history),
+        "estimated_tokens_after": 0,
+        "tool_results_compacted": 0,
+        "compaction_boundary_applied": False,
+        "boundary_messages_collapsed": 0,
+    }
+    tool_lookup = _tool_name_lookup(history)
+    tool_indices = [index for index, message in enumerate(projected) if str(message.get("role") or "") == "tool"]
+    keep_recent_tools = max(0, int(settings.agent_tool_recent_keep))
+    recent_tool_indices = set(tool_indices[-keep_recent_tools:]) if keep_recent_tools else set()
+    for index in tool_indices:
+        message = projected[index]
+        content = str(message.get("content") or "")
+        if not content:
+            continue
+        should_compact = aggressive or len(content) > int(settings.agent_tool_result_max_chars)
+        if not should_compact and index not in recent_tool_indices:
+            should_compact = len(content) > max(400, int(settings.agent_tool_result_max_chars) // 2)
+        if not should_compact:
+            continue
+        projected[index] = _compact_tool_message(
+            message,
+            tool_name_lookup=tool_lookup,
+            max_chars=int(settings.agent_tool_result_max_chars),
+        )
+        report["tool_results_compacted"] += 1
+
+    estimated_after = _estimate_history_tokens(projected)
+    keep_recent_messages = max(1, int(settings.agent_recent_messages_keep))
+    if projected and (aggressive or estimated_after > int(settings.agent_history_soft_token_limit)):
+        prefix = projected[:-keep_recent_messages]
+        suffix = projected[-keep_recent_messages:]
+        if prefix:
+            projected = [_build_compaction_boundary_message(prefix, tool_name_lookup=tool_lookup)] + suffix
+            report["compaction_boundary_applied"] = True
+            report["boundary_messages_collapsed"] = len(prefix)
+            estimated_after = _estimate_history_tokens(projected)
+
+    report["estimated_tokens_after"] = estimated_after
+    return projected, report
+
+
+def _record_budget_event(report: dict[str, Any], *, stage: str | None, mode: str, model: str) -> None:
+    if not report:
+        return
+    current = dict(_agent_loop_diagnostics.get() or {})
+    events = list(current.get("budget_events") or [])
+    event = {
+        "stage": stage or "",
+        "mode": mode,
+        "model": model,
+        **report,
+    }
+    events.append(event)
+    current["budget_events"] = events[-20:]
+    current["tool_results_compacted"] = int(current.get("tool_results_compacted") or 0) + int(report.get("tool_results_compacted") or 0)
+    current["compaction_boundaries"] = int(current.get("compaction_boundaries") or 0) + (
+        1 if report.get("compaction_boundary_applied") else 0
+    )
+    current["max_estimated_tokens_before"] = max(
+        int(current.get("max_estimated_tokens_before") or 0),
+        int(report.get("estimated_tokens_before") or 0),
+    )
+    current["max_estimated_tokens_after"] = max(
+        int(current.get("max_estimated_tokens_after") or 0),
+        int(report.get("estimated_tokens_after") or 0),
+    )
+    _agent_loop_diagnostics.set(current)
+
+
+def _record_overflow_retry(*, stage: str | None, mode: str, model: str, succeeded: bool) -> None:
+    current = dict(_agent_loop_diagnostics.get() or {})
+    current["overflow_retries"] = int(current.get("overflow_retries") or 0) + 1
+    current["overflow_retry_succeeded"] = bool(current.get("overflow_retry_succeeded") or succeeded)
+    events = list(current.get("budget_events") or [])
+    events.append(
+        {
+            "stage": stage or "",
+            "mode": mode,
+            "model": model,
+            "overflow_retry": True,
+            "overflow_retry_succeeded": succeeded,
+        }
+    )
+    current["budget_events"] = events[-20:]
+    _agent_loop_diagnostics.set(current)
+
+
+def _record_loop_event(*, event_type: str, stage: str | None, mode: str, model: str, details: dict[str, Any]) -> None:
+    current = dict(_agent_loop_diagnostics.get() or {})
+    events = list(current.get("loop_events") or [])
+    events.append(
+        {
+            "type": event_type,
+            "stage": stage or "",
+            "mode": mode,
+            "model": model,
+            **details,
+        }
+    )
+    current["loop_events"] = events[-20:]
+    _agent_loop_diagnostics.set(current)
+
+
+def _is_context_window_error(exc: Exception) -> bool:
+    lowered = str(exc or "").lower()
+    markers = (
+        "contextwindowexceedederror",
+        "input tokens exceed",
+        "maximum context length",
+        "prompt is too long",
+        "messages resulted in",
+        "context length exceeded",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _turn_state_summary(history: List[Dict[str, Any]], *, limit: int = 6) -> Dict[str, Any]:
@@ -275,6 +589,28 @@ def _repeated_failed_search_message(history: List[Dict[str, Any]]) -> str:
     return (
         "I couldn't reliably find enough matching results for that lookup after several search attempts. "
         "Try narrowing the request or giving me one item at a time."
+    )
+
+
+def _repeated_tool_signature_message(
+    *,
+    tool_calls: List[Any],
+    repeated_count: int,
+    history: List[Dict[str, Any]],
+) -> str:
+    tool_names = [name for name in (_tool_call_name(call) for call in tool_calls) if name]
+    tool_label = ", ".join(tool_names[:4]) or "the same tools"
+    snippets = _recent_tool_snippets(history)
+    if snippets:
+        return (
+            "I stopped after repeating the same tool cycle without enough progress. "
+            f"Repeated tools: {tool_label}. "
+            f"Recent results were: {' | '.join(snippets)}. "
+            "Try narrowing the scope or giving me a more specific target."
+        )
+    return (
+        "I stopped after repeating the same tool cycle without enough progress. "
+        f"Repeated tools: {tool_label}. Try narrowing the scope or giving me a more specific target."
     )
 
 
@@ -536,12 +872,15 @@ async def _stream_final_response(
         stream_kwargs: Dict[str, Any] = {}
         if stream_usage_enabled():
             stream_kwargs["stream_options"] = {"include_usage": True}
-        response = await litellm.acompletion(
+        response = await _acompletion_with_budget(
+            history=history,
+            user_context=user_context,
             model=selected_model,
-            messages=_build_messages(history, user_context),
+            mode="chat",
+            stage=stage,
             stream=True,
-            **extra,
-            **stream_kwargs,
+            extra_kwargs=extra,
+            stream_kwargs=stream_kwargs,
         )
     except Exception as e:
         log.error(
@@ -634,12 +973,15 @@ async def run_agent(
             history=history,
         )
         try:
-            response = await litellm.acompletion(
+            response = await _acompletion_with_budget(
+                history=history,
+                user_context=user_context,
                 model=selected_model,
-                messages=_build_messages(history, user_context),
-                tools=tools or None,
-                tool_choice="auto" if tools else None,
-                **extra,
+                mode=mode,
+                stage=stage,
+                tools=tools,
+                tool_choice="auto",
+                extra_kwargs=extra,
             )
         except Exception as e:
             log.error("LLM call failed", error=str(e), model=selected_model, mode=mode, stage=stage)
@@ -684,6 +1026,13 @@ async def run_agent(
             if _is_failed_search_turn(message.tool_calls, tool_results):
                 consecutive_failed_search_turns += 1
                 if consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
+                    _record_loop_event(
+                        event_type="failed_search_loop",
+                        stage=stage,
+                        mode=mode,
+                        model=selected_model,
+                        details={"turn": turn_number, "threshold": REPEATED_FAILED_SEARCH_TURN_THRESHOLD},
+                    )
                     log.info(
                         "Stopping repeated failed search loop",
                         turn=turn_number,
@@ -694,6 +1043,23 @@ async def run_agent(
                     return _repeated_failed_search_message(history)
             else:
                 consecutive_failed_search_turns = 0
+            if repeated_tool_signature_count >= int(settings.agent_repeated_tool_signature_threshold):
+                _record_loop_event(
+                    event_type="repeated_tool_signature",
+                    stage=stage,
+                    mode=mode,
+                    model=selected_model,
+                    details={
+                        "turn": turn_number,
+                        "repeated_count": repeated_tool_signature_count,
+                        "tool_signature": current_tool_signature,
+                    },
+                )
+                return _repeated_tool_signature_message(
+                    tool_calls=message.tool_calls,
+                    repeated_count=repeated_tool_signature_count,
+                    history=history,
+                )
             log.info(
                 "Tool calls executed",
                 turn=turn + 1,
@@ -758,13 +1124,16 @@ async def stream_agent(
         )
         # Probe turn non-streaming so intermediate tool turns stay internal.
         try:
-            response = await litellm.acompletion(
+            response = await _acompletion_with_budget(
+                history=history,
+                user_context=user_context,
                 model=selected_model,
-                messages=_build_messages(history, user_context),
-                tools=tools or None,
-                tool_choice="auto" if tools else None,
+                mode=mode,
+                stage=stage,
                 stream=False,
-                **extra,
+                tools=tools,
+                tool_choice="auto",
+                extra_kwargs=extra,
             )
         except Exception as e:
             log.error(
@@ -815,10 +1184,35 @@ async def stream_agent(
             if _is_failed_search_turn(message.tool_calls, tool_results):
                 consecutive_failed_search_turns += 1
                 if consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
+                    _record_loop_event(
+                        event_type="failed_search_loop",
+                        stage=stage,
+                        mode=mode,
+                        model=selected_model,
+                        details={"turn": turn_number, "threshold": REPEATED_FAILED_SEARCH_TURN_THRESHOLD},
+                    )
                     yield _repeated_failed_search_message(history)
                     return
             else:
                 consecutive_failed_search_turns = 0
+            if repeated_tool_signature_count >= int(settings.agent_repeated_tool_signature_threshold):
+                _record_loop_event(
+                    event_type="repeated_tool_signature",
+                    stage=stage,
+                    mode=mode,
+                    model=selected_model,
+                    details={
+                        "turn": turn_number,
+                        "repeated_count": repeated_tool_signature_count,
+                        "tool_signature": current_tool_signature,
+                    },
+                )
+                yield _repeated_tool_signature_message(
+                    tool_calls=message.tool_calls,
+                    repeated_count=repeated_tool_signature_count,
+                    history=history,
+                )
+                return
             log.info(
                 "Tool calls executed (streaming turn)",
                 turn=turn + 1,

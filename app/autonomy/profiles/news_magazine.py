@@ -258,14 +258,7 @@ class NewsMagazineExecutionProfile(TaskExecutionProfile):
         out = []
         dataset = run_debug.get("dataset")
         grounding = run_debug.get("grounding_report")
-        diagnostics = {
-            "dataset_stats": run_debug.get("dataset_stats", {}),
-            "refresh_stats": run_debug.get("refresh_stats", {}),
-            "suppression_events": run_debug.get("tool_failure_suppressions", []),
-            "active_skills": run_debug.get("active_skills", []),
-            "skill_selection_mode": run_debug.get("skill_selection_mode", ""),
-            "skill_injection_events": run_debug.get("skill_injection_events", []),
-        }
+        diagnostics = self._build_run_diagnostics(run_debug=run_debug)
         if isinstance(dataset, dict):
             out.append({"artifact_type": "prepared_dataset", "content_json": dataset})
         if final_markdown:

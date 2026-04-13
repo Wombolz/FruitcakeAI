@@ -438,12 +438,10 @@ class TopicWatcherExecutionProfile(TaskExecutionProfile):
         out: List[Dict[str, Any]] = []
         dataset = run_debug.get("dataset")
         grounding = run_debug.get("grounding_report")
-        diagnostics = {
+        diagnostics = self._build_run_diagnostics(run_debug=run_debug, extra={
             "watcher_config": run_debug.get("watcher_config", {}),
             "config_warnings": run_debug.get("config_warnings", []),
-            "dataset_stats": run_debug.get("dataset_stats", {}),
-            "refresh_stats": run_debug.get("refresh_stats", {}),
-        }
+        })
         if isinstance(dataset, dict):
             out.append({"artifact_type": "prepared_dataset", "content_json": dataset})
         if final_markdown:

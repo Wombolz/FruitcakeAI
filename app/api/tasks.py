@@ -217,6 +217,68 @@ class MemoryCandidateApprovalOut(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _decode_json_like(raw: Any) -> Any:
+    if raw is None or isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+    return None
+
+
+def _normalize_agent_context_budgeting(entries: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(entries, list) or not entries:
+        return None
+
+    normalized_entries: list[Dict[str, Any]] = []
+    totals = {
+        "tool_results_compacted": 0,
+        "compaction_boundaries": 0,
+        "overflow_retries": 0,
+        "loop_events": 0,
+    }
+    max_before = 0
+    max_after = 0
+    overflow_retry_succeeded = False
+
+    for raw in entries:
+        if not isinstance(raw, dict):
+            continue
+        item = {
+            "stage": str(raw.get("stage") or ""),
+            "model": str(raw.get("model") or ""),
+            "tool_results_compacted": int(raw.get("tool_results_compacted") or 0),
+            "compaction_boundaries": int(raw.get("compaction_boundaries") or 0),
+            "overflow_retries": int(raw.get("overflow_retries") or 0),
+            "overflow_retry_succeeded": bool(raw.get("overflow_retry_succeeded") or False),
+            "loop_events_count": int(raw.get("loop_events_count") or 0),
+            "max_estimated_tokens_before": int(raw.get("max_estimated_tokens_before") or 0),
+            "max_estimated_tokens_after": int(raw.get("max_estimated_tokens_after") or 0),
+            "budget_events": list(raw.get("budget_events") or []),
+            "loop_events": list(raw.get("loop_events") or []),
+        }
+        totals["tool_results_compacted"] += item["tool_results_compacted"]
+        totals["compaction_boundaries"] += item["compaction_boundaries"]
+        totals["overflow_retries"] += item["overflow_retries"]
+        totals["loop_events"] += item["loop_events_count"]
+        max_before = max(max_before, item["max_estimated_tokens_before"])
+        max_after = max(max_after, item["max_estimated_tokens_after"])
+        overflow_retry_succeeded = overflow_retry_succeeded or item["overflow_retry_succeeded"]
+        normalized_entries.append(item)
+
+    if not normalized_entries:
+        return None
+
+    return {
+        "entries": normalized_entries,
+        "totals": totals,
+        "max_estimated_tokens_before": max_before,
+        "max_estimated_tokens_after": max_after,
+        "overflow_retry_succeeded": overflow_retry_succeeded,
+    }
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.post("/tasks", response_model=TaskOut, status_code=status.HTTP_201_CREATED)
@@ -619,6 +681,7 @@ class TaskAuditRunSummary(BaseModel):
     finished_at: Optional[datetime] = None
     artifact_count: int = 0
     artifact_types: List[str] = []
+    agent_context_budgeting: Optional[Dict[str, Any]] = None
 
 class TaskAuditOut(BaseModel):
     task_id: int
@@ -795,11 +858,22 @@ async def get_task_audit(
     ).scalar_one_or_none()
     if run is not None:
         artifact_rows = await db.execute(
-            select(TaskRunArtifact.artifact_type)
+            select(TaskRunArtifact.artifact_type, TaskRunArtifact.content_json)
             .where(TaskRunArtifact.task_run_id == run.id)
             .order_by(desc(TaskRunArtifact.created_at), desc(TaskRunArtifact.id))
         )
-        artifact_types = [str(item) for item in artifact_rows.scalars().all() if str(item)]
+        artifact_types: list[str] = []
+        agent_context_budgeting: Optional[Dict[str, Any]] = None
+        for artifact_type, content_json in artifact_rows.all():
+            artifact_name = str(artifact_type or "").strip()
+            if artifact_name:
+                artifact_types.append(artifact_name)
+            if artifact_name == "run_diagnostics" and agent_context_budgeting is None:
+                decoded = _decode_json_like(content_json)
+                if isinstance(decoded, dict):
+                    agent_context_budgeting = _normalize_agent_context_budgeting(
+                        decoded.get("agent_context_budgeting")
+                    )
         latest_run = TaskAuditRunSummary(
             id=run.id,
             status=run.status,
@@ -813,6 +887,7 @@ async def get_task_audit(
             finished_at=run.finished_at,
             artifact_count=len(artifact_types),
             artifact_types=artifact_types,
+            agent_context_budgeting=agent_context_budgeting,
         )
     return TaskAuditOut(
         task_id=task.id,

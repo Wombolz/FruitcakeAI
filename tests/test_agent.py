@@ -15,13 +15,22 @@ tool-registry level using mock UserContext objects.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, patch
 from sqlalchemy import select
 
 from app.agent.context import UserContext
+from app.agent.core import (
+    _content_fingerprint,
+    get_agent_loop_diagnostics,
+    reset_agent_loop_diagnostics,
+    restore_agent_loop_diagnostics,
+    run_agent,
+)
 from app.agent.tools import TOOL_SCHEMAS, _parse_iso_datetime, get_tools_for_user
+from app.config import settings
 from tests.conftest import TestSessionLocal
 
 
@@ -35,6 +44,220 @@ def _make_context(persona: str = "family_assistant", blocked: list[str] | None =
         persona=persona,
         blocked_tools=blocked or [],
     )
+
+
+class _FakeMessage:
+    def __init__(self, *, content: str | None = None, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls
+
+    def model_dump(self, exclude_none: bool = True):
+        payload = {}
+        if self.content is not None or not exclude_none:
+            payload["content"] = self.content
+        if self.tool_calls is not None or not exclude_none:
+            payload["tool_calls"] = self.tool_calls
+        return payload
+
+
+class _FakeResponse:
+    def __init__(self, message: _FakeMessage):
+        self.choices = [SimpleNamespace(message=message, finish_reason="stop")]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_compacts_oversized_tool_history_before_next_call(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_tool_result_max_chars", 120)
+    monkeypatch.setattr(settings, "agent_tool_recent_keep", 0)
+    monkeypatch.setattr(settings, "agent_history_soft_token_limit", 5000)
+
+    seen_messages = []
+    calls = {"count": 0}
+
+    async def _fake_acompletion(*, model, messages, **kwargs):
+        seen_messages.append(messages)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            tool_calls = [{"id": "call_1", "function": {"name": "list_directory", "arguments": "{}"}}]
+            return _FakeResponse(_FakeMessage(tool_calls=tool_calls))
+        return _FakeResponse(_FakeMessage(content="done"))
+
+    large_tool_result = [{"role": "tool", "tool_call_id": "call_1", "content": "X" * 2000}]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch("app.agent.core.get_tools_for_user", return_value=[{"type": "function", "function": {"name": "list_directory"}}]):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(return_value=large_tool_result)):
+                with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=_fake_acompletion)):
+                    result = await run_agent([{"role": "user", "content": "Map the repo."}], ctx, mode="task")
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert result == "done"
+    second_call_messages = seen_messages[1]
+    assert any(
+        str(message.get("role")) == "tool" and "Compacted tool result." in str(message.get("content"))
+        for message in second_call_messages
+    )
+    assert diagnostics["tool_results_compacted"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_run_agent_retries_once_after_context_window_error(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_overflow_retry_enabled", True)
+    monkeypatch.setattr(settings, "agent_history_soft_token_limit", 10)
+    monkeypatch.setattr(settings, "agent_recent_messages_keep", 1)
+
+    calls = {"count": 0}
+
+    async def _fake_acompletion(*, model, messages, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError(
+                "ContextWindowExceededError: Input tokens exceed the configured limit of 272000 tokens."
+            )
+        assert any(str(message.get("role")) == "system" and "Earlier conversation was compacted" in str(message.get("content")) for message in messages)
+        return _FakeResponse(_FakeMessage(content="recovered"))
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch("app.agent.core.get_tools_for_user", return_value=[]):
+            with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=_fake_acompletion)):
+                result = await run_agent(
+                    [{"role": "user", "content": "A" * 2000}, {"role": "assistant", "content": "B" * 2000}],
+                    ctx,
+                    mode="task",
+                )
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert result == "recovered"
+    assert diagnostics["overflow_retries"] == 1
+    assert diagnostics["overflow_retry_succeeded"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_agent_stops_repeated_identical_tool_cycles(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 1)
+
+    async def _fake_acompletion(*, model, messages, **kwargs):
+        tool_calls = [{"id": "call_repeat", "function": {"name": "find_files", "arguments": "{}"}}]
+        return _FakeResponse(_FakeMessage(tool_calls=tool_calls))
+
+    tool_result = [{"role": "tool", "tool_call_id": "call_repeat", "content": "same result"}]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch("app.agent.core.get_tools_for_user", return_value=[{"type": "function", "function": {"name": "find_files"}}]):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(return_value=tool_result)):
+                with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=_fake_acompletion)):
+                    result = await run_agent([{"role": "user", "content": "Keep searching."}], ctx, mode="task")
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert "repeating the same tool cycle" in result.lower()
+    loop_events = diagnostics.get("loop_events") or []
+    assert any(event.get("type") == "repeated_tool_signature" for event in loop_events if isinstance(event, dict))
+
+
+@pytest.mark.asyncio
+async def test_run_agent_repo_map_style_exploration_compacts_multi_turn_history(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_tool_result_max_chars", 120)
+    monkeypatch.setattr(settings, "agent_tool_recent_keep", 1)
+    monkeypatch.setattr(settings, "agent_recent_messages_keep", 2)
+    monkeypatch.setattr(settings, "agent_history_soft_token_limit", 80)
+
+    seen_messages = []
+    calls = {"count": 0}
+
+    async def _fake_acompletion(*, model, messages, **kwargs):
+        seen_messages.append(messages)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return _FakeResponse(
+                _FakeMessage(
+                    tool_calls=[
+                        {
+                            "id": "call_dirs",
+                            "function": {"name": "list_directory", "arguments": "{\"path\":\"app\"}"},
+                        }
+                    ]
+                )
+            )
+        if calls["count"] == 2:
+            return _FakeResponse(
+                _FakeMessage(
+                    tool_calls=[
+                        {
+                            "id": "call_file",
+                            "function": {"name": "read_file", "arguments": "{\"path\":\"app/api/tasks.py\"}"},
+                        }
+                    ]
+                )
+            )
+        return _FakeResponse(_FakeMessage(content="repo map ready"))
+
+    tool_results = [
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "call_dirs",
+                "content": "app/\n" + "\n".join(f"file_{idx}.py" for idx in range(400)),
+            }
+        ],
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "call_file",
+                "content": "def handler():\n" + ("    important_line = 'x'\n" * 400),
+            }
+        ],
+    ]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"type": "function", "function": {"name": "list_directory"}},
+                {"type": "function", "function": {"name": "read_file"}},
+            ],
+        ):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(side_effect=tool_results)):
+                with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=_fake_acompletion)):
+                    result = await run_agent([{"role": "user", "content": "Build a repo map for the app package."}], ctx, mode="task")
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert result == "repo map ready"
+    third_call_messages = seen_messages[2]
+    assert any(
+        str(message.get("role")) == "system" and "Earlier conversation was compacted" in str(message.get("content"))
+        for message in third_call_messages
+    )
+    assert any(
+        str(message.get("role")) == "tool" and "Compacted tool result." in str(message.get("content"))
+        for message in third_call_messages
+    )
+    assert diagnostics["tool_results_compacted"] >= 2
+    assert diagnostics["compaction_boundaries"] >= 1
+
+
+def test_content_fingerprint_is_deterministic_sha_based():
+    value = "  Repo   map  content  "
+    first = _content_fingerprint(value)
+    second = _content_fingerprint(value)
+
+    assert first == second
+    assert first == "dd590d588580"
 
 
 # ── Schema format tests ────────────────────────────────────────────────────────

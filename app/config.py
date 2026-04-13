@@ -58,6 +58,16 @@ class Settings(BaseSettings):
     task_force_large_for_final_synthesis: bool = True
     task_plan_default_steps: int = 8
     task_plan_max_steps: int = 20
+    agent_history_soft_token_limit: int = 48000
+    agent_recent_messages_keep: int = 12
+    agent_tool_result_max_chars: int = 1600
+    agent_tool_recent_keep: int = 4
+    agent_overflow_retry_enabled: bool = True
+    agent_repeated_tool_signature_threshold: int = 3
+    task_prompt_max_prior_summaries: int = 10
+    task_final_synthesis_max_prior_outputs: int = 2
+    task_final_synthesis_max_prior_output_tokens: int = 300
+    task_final_synthesis_max_prior_output_chars: int = 1200
     # Scheduler guardrails (laptop sleep / transient local LLM outages)
     scheduler_llm_health_gate_enabled: bool = True
     scheduler_unhealthy_cooldown_seconds: int = 300

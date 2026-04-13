@@ -49,6 +49,7 @@ REPEATED_TOOL_ERROR_THRESHOLD = 2
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MAX_REQUIRED_CONTEXT_FILES = 4
 _MAX_REQUIRED_CONTEXT_FILE_CHARS = 5000
+_ESTIMATED_CHARS_PER_TOKEN = 4
 
 # Limit concurrent task-mode agent loops
 _semaphore = asyncio.Semaphore(2)
@@ -91,6 +92,23 @@ def _load_required_context_text(sources: list[str] | tuple[str, ...]) -> tuple[s
         + "\n\n---\n\n".join(blocks)
     )
     return preloaded, loaded_paths
+
+
+def _estimate_text_tokens(text: str) -> int:
+    chars = len(str(text or ""))
+    return max(1, chars // _ESTIMATED_CHARS_PER_TOKEN) if chars else 0
+
+
+def _truncate_text_to_estimated_tokens(text: str, *, max_tokens: int) -> str:
+    value = str(text or "")
+    budget = max(1, int(max_tokens))
+    if _estimate_text_tokens(value) <= budget:
+        return value
+    max_chars = max(1, budget * _ESTIMATED_CHARS_PER_TOKEN)
+    truncated = value[:max_chars]
+    while truncated and _estimate_text_tokens(truncated) > budget:
+        truncated = truncated[:-1]
+    return truncated.rstrip() + "…"
 
 
 class TaskRunner:
@@ -591,14 +609,25 @@ class TaskRunner:
             task_run_id=task_run_id,
             source="task_runner",
         )
+        from app.agent.core import (
+            get_agent_loop_diagnostics,
+            reset_agent_loop_diagnostics,
+            restore_agent_loop_diagnostics,
+        )
+        diagnostics_token = reset_agent_loop_diagnostics()
+        agent_loop_diagnostics: dict[str, object] = {}
         try:
-            result = await run_agent(
-                [{"role": "user", "content": "\n\n".join(parts)}],
-                user_context,
-                mode="task",
-                model_override=model_profile.final_synthesis_model if model_profile else None,
-                stage="task_single_stage",
-            )
+            try:
+                result = await run_agent(
+                    [{"role": "user", "content": "\n\n".join(parts)}],
+                    user_context,
+                    mode="task",
+                    model_override=model_profile.final_synthesis_model if model_profile else None,
+                    stage="task_single_stage",
+                )
+            finally:
+                agent_loop_diagnostics = get_agent_loop_diagnostics()
+                restore_agent_loop_diagnostics(diagnostics_token)
             run_debug = {
                 "profile": getattr(task_profile, "name", "default"),
                 "required_context_sources": loaded_required_context_sources,
@@ -613,6 +642,12 @@ class TaskRunner:
                     }
                 ],
             }
+            _append_agent_context_budgeting(
+                run_debug,
+                stage="task_single_stage",
+                model=model_profile.final_synthesis_model if model_profile else settings.llm_model,
+                diagnostics=agent_loop_diagnostics,
+            )
             if recalled_memory_ids:
                 await svc.mark_accessed(sorted(recalled_memory_ids), mode="task_materialized")
             return result, run_debug
@@ -768,6 +803,8 @@ class TaskRunner:
             # Summaries from previous succeeded steps keep context compact.
             prior_summaries: list[str] = []
             prior_full_outputs: list[str] = []
+            omitted_prior_outputs = 0
+            truncated_prior_outputs = 0
             async with AsyncSessionLocal() as db:
                 prev_rows = await db.execute(
                     select(TaskStep)
@@ -779,11 +816,27 @@ class TaskRunner:
                     .order_by(TaskStep.step_index)
                 )
                 prev_steps = prev_rows.scalars().all()
-                for prev in prev_steps:
+                max_prior_summaries = max(1, int(settings.task_prompt_max_prior_summaries))
+                summary_steps = prev_steps[-max_prior_summaries:]
+                for prev in summary_steps:
                     prior_summaries.append(f"Step {prev.step_index}: {prev.output_summary}")
+                max_prior_full_outputs = max(1, int(settings.task_final_synthesis_max_prior_outputs))
+                output_steps = [prev for prev in prev_steps if prev.result][-max_prior_full_outputs:]
+                omitted_prior_outputs = max(0, len([prev for prev in prev_steps if prev.result]) - len(output_steps))
+                max_prior_output_tokens = max(50, int(settings.task_final_synthesis_max_prior_output_tokens))
+                max_prior_output_chars = max(200, int(settings.task_final_synthesis_max_prior_output_chars))
+                for prev in output_steps:
                     if prev.result:
+                        truncated_output = _truncate_text_to_estimated_tokens(
+                            prev.result,
+                            max_tokens=max_prior_output_tokens,
+                        )
+                        if len(truncated_output) > max_prior_output_chars:
+                            truncated_output = truncated_output[: max_prior_output_chars - 1].rstrip() + "…"
+                        if truncated_output != prev.result:
+                            truncated_prior_outputs += 1
                         prior_full_outputs.append(
-                            f"Step {prev.step_index} full output:\n{prev.result[:2200]}"
+                            f"Step {prev.step_index} full output:\n{truncated_output}"
                         )
 
             is_final_step = self._is_final_synthesis_step(step, steps)
@@ -829,6 +882,14 @@ class TaskRunner:
                     "Previous step outputs (use exact details for final synthesis):\n"
                     + "\n\n".join(prior_full_outputs)
                 )
+                if omitted_prior_outputs:
+                    prompt_parts.append(
+                        f"Older prior full outputs omitted for context budget: {omitted_prior_outputs}."
+                    )
+                if truncated_prior_outputs:
+                    prompt_parts.append(
+                        f"Included prior full outputs were truncated to an estimated token budget: {truncated_prior_outputs}."
+                    )
                 prompt_parts.append(
                     "If you include links in the final output, copy exact URLs from prior step outputs. "
                     "Do not invent, rewrite, or simplify URLs."
@@ -859,6 +920,7 @@ class TaskRunner:
                     count_final_large_metric=is_final_step,
                     repeated_error_counts=repeated_error_counts,
                     suppression_events=suppression_events,
+                    run_debug=run_debug,
                 )
                 tool_records = get_tool_execution_records()
             except ApprovalRequired as exc:
@@ -989,8 +1051,14 @@ class TaskRunner:
         count_final_large_metric: bool,
         repeated_error_counts: dict[str, int],
         suppression_events: list[dict[str, str | int]],
+        run_debug: dict[str, object],
     ) -> str:
-        from app.agent.core import run_agent
+        from app.agent.core import (
+            get_agent_loop_diagnostics,
+            reset_agent_loop_diagnostics,
+            restore_agent_loop_diagnostics,
+            run_agent,
+        )
 
         attempts = 0
         max_attempts = max(0, fallback_attempts)
@@ -1008,6 +1076,7 @@ class TaskRunner:
                 used_fallback = True
 
             try:
+                agent_loop_diagnostics: dict[str, object] = {}
                 usage_token = bind_llm_usage_context(
                     user_id=user_context.user_id,
                     session_id=getattr(user_context, "session_id", None),
@@ -1015,16 +1084,27 @@ class TaskRunner:
                     task_run_id=task_run_id,
                     source="task_runner",
                 )
+                diagnostics_token = reset_agent_loop_diagnostics()
                 try:
-                    result = await run_agent(
-                        [{"role": "user", "content": prompt}],
-                        user_context,
-                        mode="task",
-                        model_override=model,
-                        stage=stage,
-                    )
+                    try:
+                        result = await run_agent(
+                            [{"role": "user", "content": prompt}],
+                            user_context,
+                            mode="task",
+                            model_override=model,
+                            stage=stage,
+                        )
+                    finally:
+                        agent_loop_diagnostics = get_agent_loop_diagnostics()
+                        restore_agent_loop_diagnostics(diagnostics_token)
                 finally:
                     reset_llm_usage_context(usage_token)
+                _append_agent_context_budgeting(
+                    run_debug,
+                    stage=stage,
+                    model=model,
+                    diagnostics=agent_loop_diagnostics,
+                )
                 if not (result or "").strip():
                     raise ValueError("Empty model output")
                 if used_fallback:
@@ -1033,6 +1113,12 @@ class TaskRunner:
             except ApprovalRequired:
                 raise
             except Exception as exc:
+                _append_agent_context_budgeting(
+                    run_debug,
+                    stage=stage,
+                    model=model,
+                    diagnostics=agent_loop_diagnostics,
+                )
                 signature = _build_tool_error_signature(exc, stage=stage, model=model)
                 if signature:
                     count = repeated_error_counts.get(signature, 0) + 1
@@ -1358,9 +1444,64 @@ def _format_run_diagnostics(run_debug: dict[str, object]) -> str:
             f"placeholders={grounding.get('placeholder_hits', 0)}, "
             f"fatal={grounding.get('fatal', False)}"
         )
+    context_budgeting = run_debug.get("agent_context_budgeting") or []
+    if isinstance(context_budgeting, list) and context_budgeting:
+        tool_results_compacted = 0
+        compaction_boundaries = 0
+        overflow_retries = 0
+        loop_events = 0
+        max_before = 0
+        max_after = 0
+        for item in context_budgeting:
+            if not isinstance(item, dict):
+                continue
+            tool_results_compacted += int(item.get("tool_results_compacted") or 0)
+            compaction_boundaries += int(item.get("compaction_boundaries") or 0)
+            overflow_retries += int(item.get("overflow_retries") or 0)
+            loop_events += int(item.get("loop_events_count") or 0)
+            max_before = max(max_before, int(item.get("max_estimated_tokens_before") or 0))
+            max_after = max(max_after, int(item.get("max_estimated_tokens_after") or 0))
+        lines.append(
+            "- Context budgeting: "
+            f"tool_results_compacted={tool_results_compacted}, "
+            f"compaction_boundaries={compaction_boundaries}, "
+            f"overflow_retries={overflow_retries}, "
+            f"loop_events={loop_events}, "
+            f"max_estimated_tokens_before={max_before}, "
+            f"max_estimated_tokens_after={max_after}"
+        )
     if len(lines) == 1:
         return ""
     return "\n".join(lines)
+
+
+def _append_agent_context_budgeting(
+    run_debug: dict[str, object],
+    *,
+    stage: str,
+    model: str,
+    diagnostics: dict[str, object],
+) -> None:
+    if not diagnostics:
+        return
+    items = run_debug.setdefault("agent_context_budgeting", [])
+    if not isinstance(items, list):
+        items = []
+        run_debug["agent_context_budgeting"] = items
+    item = {
+        "stage": stage,
+        "model": model,
+        "tool_results_compacted": int(diagnostics.get("tool_results_compacted") or 0),
+        "compaction_boundaries": int(diagnostics.get("compaction_boundaries") or 0),
+        "overflow_retries": int(diagnostics.get("overflow_retries") or 0),
+        "overflow_retry_succeeded": bool(diagnostics.get("overflow_retry_succeeded") or False),
+        "loop_events_count": len(diagnostics.get("loop_events") or []),
+        "max_estimated_tokens_before": int(diagnostics.get("max_estimated_tokens_before") or 0),
+        "max_estimated_tokens_after": int(diagnostics.get("max_estimated_tokens_after") or 0),
+        "budget_events": diagnostics.get("budget_events") or [],
+        "loop_events": diagnostics.get("loop_events") or [],
+    }
+    items.append(item)
 
 
 async def _persist_run_artifacts(

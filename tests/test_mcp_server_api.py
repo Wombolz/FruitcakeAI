@@ -690,6 +690,32 @@ async def test_mcp_inspect_task_run_returns_latest_summary_and_structured_conten
                     artifact_type="validation_report",
                     content_json=json.dumps({"fatal": False, "declared_tool_called": True}),
                 ),
+                TaskRunArtifact(
+                    task_run_id=run.id,
+                    artifact_type="run_diagnostics",
+                    content_json=json.dumps(
+                        {
+                            "active_skills": ["repo-map"],
+                            "dataset_stats": {"selected_count": 3},
+                            "refresh_stats": {"sources_refreshed": 1},
+                            "agent_context_budgeting": [
+                                {
+                                    "stage": "task_execution_step",
+                                    "model": "ollama_chat/qwen2.5:14b",
+                                    "tool_results_compacted": 4,
+                                    "compaction_boundaries": 1,
+                                    "overflow_retries": 1,
+                                    "overflow_retry_succeeded": True,
+                                    "loop_events_count": 1,
+                                    "max_estimated_tokens_before": 64000,
+                                    "max_estimated_tokens_after": 12000,
+                                    "budget_events": [{"kind": "history_projection"}],
+                                    "loop_events": [{"type": "repeated_tool_signature"}],
+                                }
+                            ],
+                        }
+                    ),
+                ),
             ]
         )
         await db.commit()
@@ -715,8 +741,10 @@ async def test_mcp_inspect_task_run_returns_latest_summary_and_structured_conten
     assert payload["found"] is True
     assert payload["task"]["id"] == task_id
     assert payload["quality_signals"]["has_artifacts"] is True
-    assert payload["artifacts"]["types"] == ["validation_report", "final_output"]
+    assert payload["artifacts"]["types"] == ["run_diagnostics", "validation_report", "final_output"]
     assert payload["diagnostics"]["grounding_fatal"] is False
+    assert payload["diagnostics"]["agent_context_budgeting"]["totals"]["tool_results_compacted"] == 4
+    assert payload["diagnostics"]["agent_context_budgeting"]["totals"]["loop_events"] == 1
     assert json.loads(result["content"][0]["text"])["task"]["id"] == task_id
 
 

@@ -559,6 +559,52 @@ def _normalized_diagnostics(artifacts: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(edition_export, dict):
         edition_export = {}
 
+    raw_budgeting = run_diagnostics.get("agent_context_budgeting") if isinstance(run_diagnostics, dict) else None
+    normalized_budgeting: Dict[str, Any] | None = None
+    if isinstance(raw_budgeting, list) and raw_budgeting:
+        entries: list[Dict[str, Any]] = []
+        totals = {
+            "tool_results_compacted": 0,
+            "compaction_boundaries": 0,
+            "overflow_retries": 0,
+            "loop_events": 0,
+        }
+        max_before = 0
+        max_after = 0
+        overflow_retry_succeeded = False
+        for raw in raw_budgeting:
+            if not isinstance(raw, dict):
+                continue
+            item = {
+                "stage": str(raw.get("stage") or ""),
+                "model": str(raw.get("model") or ""),
+                "tool_results_compacted": int(raw.get("tool_results_compacted") or 0),
+                "compaction_boundaries": int(raw.get("compaction_boundaries") or 0),
+                "overflow_retries": int(raw.get("overflow_retries") or 0),
+                "overflow_retry_succeeded": bool(raw.get("overflow_retry_succeeded") or False),
+                "loop_events_count": int(raw.get("loop_events_count") or 0),
+                "max_estimated_tokens_before": int(raw.get("max_estimated_tokens_before") or 0),
+                "max_estimated_tokens_after": int(raw.get("max_estimated_tokens_after") or 0),
+                "budget_events": list(raw.get("budget_events") or []),
+                "loop_events": list(raw.get("loop_events") or []),
+            }
+            totals["tool_results_compacted"] += item["tool_results_compacted"]
+            totals["compaction_boundaries"] += item["compaction_boundaries"]
+            totals["overflow_retries"] += item["overflow_retries"]
+            totals["loop_events"] += item["loop_events_count"]
+            max_before = max(max_before, item["max_estimated_tokens_before"])
+            max_after = max(max_after, item["max_estimated_tokens_after"])
+            overflow_retry_succeeded = overflow_retry_succeeded or item["overflow_retry_succeeded"]
+            entries.append(item)
+        if entries:
+            normalized_budgeting = {
+                "entries": entries,
+                "totals": totals,
+                "max_estimated_tokens_before": max_before,
+                "max_estimated_tokens_after": max_after,
+                "overflow_retry_succeeded": overflow_retry_succeeded,
+            }
+
     return {
         "active_skills": run_diagnostics.get("active_skills", []),
         "skill_selection_mode": run_diagnostics.get("skill_selection_mode", ""),
@@ -566,6 +612,7 @@ def _normalized_diagnostics(artifacts: List[Dict[str, Any]]) -> Dict[str, Any]:
         "dataset_stats": run_diagnostics.get("dataset_stats", {}),
         "refresh_stats": run_diagnostics.get("refresh_stats", {}),
         "tool_failure_suppressions": run_diagnostics.get("suppression_events", []),
+        "agent_context_budgeting": normalized_budgeting,
         "validation_report": validation_report,
         "edition_export": edition_export,
     }

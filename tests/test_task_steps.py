@@ -16,7 +16,7 @@ from app.config import settings
 from app.autonomy.planner import _normalize_steps
 from app.db.models import AuditLog, ChatSession, LLMUsageEvent, Memory, MemoryProposal, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
 from app.autonomy.profiles.news_magazine import _ground_output
-from app.autonomy.runner import _format_result_for_inbox, _persist_run_artifacts
+from app.autonomy.runner import _format_result_for_inbox, _persist_run_artifacts, _truncate_text_to_estimated_tokens
 from tests.conftest import TestSessionLocal
 
 
@@ -184,6 +184,15 @@ def test_normalize_steps_drops_redundant_task_setup_steps():
     )
 
     assert [row["title"] for row in rows] == ["Collect Data"]
+
+
+def test_truncate_text_to_estimated_tokens_uses_token_budget():
+    text = "A" * 2000
+
+    truncated = _truncate_text_to_estimated_tokens(text, max_tokens=100)
+
+    assert truncated.endswith("…")
+    assert len(truncated) <= 401
 
 
 @pytest.mark.asyncio
@@ -1080,7 +1089,7 @@ async def test_admin_task_run_inspect_returns_ordered_payloads_and_diagnostics(c
                 TaskRunArtifact(
                     task_run_id=run.id,
                     artifact_type="run_diagnostics",
-                    content_json='{"active_skills":["rss-grounded-briefing"],"skill_selection_mode":"embedding","skill_injection_events":[{"stage":"step_1"}],"dataset_stats":{"selected_count":12},"refresh_stats":{"sources_refreshed":9},"suppression_events":[]}',
+                    content_json='{"active_skills":["rss-grounded-briefing"],"skill_selection_mode":"embedding","skill_injection_events":[{"stage":"step_1"}],"dataset_stats":{"selected_count":12},"refresh_stats":{"sources_refreshed":9},"suppression_events":[],"agent_context_budgeting":[{"stage":"task_execution_step","model":"ollama_chat/qwen2.5:14b","tool_results_compacted":2,"compaction_boundaries":1,"overflow_retries":1,"overflow_retry_succeeded":true,"loop_events_count":0,"max_estimated_tokens_before":42000,"max_estimated_tokens_after":12000,"budget_events":[],"loop_events":[]}]}',
                 ),
             ]
         )
@@ -1110,6 +1119,8 @@ async def test_admin_task_run_inspect_returns_ordered_payloads_and_diagnostics(c
     ]
     assert payload["diagnostics"]["active_skills"] == ["rss-grounded-briefing"]
     assert payload["diagnostics"]["validation_report"]["publish_mode"] == "full"
+    assert payload["diagnostics"]["agent_context_budgeting"]["totals"]["tool_results_compacted"] == 2
+    assert payload["diagnostics"]["agent_context_budgeting"]["totals"]["overflow_retries"] == 1
     assert payload["execution"]["edition_export"]["pdf_relative_path"].endswith("edition.pdf")
 
 
@@ -2372,6 +2383,82 @@ async def test_runner_stamps_agent_run_metadata_and_task_audit_resolves_agent(cl
     assert payload["latest_run"]["run_kind"] == "agent"
     assert payload["latest_run"]["agent_role"] == "roadmap_verifier"
     assert payload["latest_run"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_runner_records_agent_context_budgeting_in_run_summary(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "agentbudgetsummary")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Budgeted Agent Run",
+            "instruction": "Inspect recent runs and summarize them.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {"agent_role": "runtime_inspector"},
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    fake_diagnostics = {
+        "tool_results_compacted": 3,
+        "compaction_boundaries": 1,
+        "overflow_retries": 1,
+        "overflow_retry_succeeded": True,
+        "loop_events": [{"type": "repeated_tool_signature"}],
+        "max_estimated_tokens_before": 64000,
+        "max_estimated_tokens_after": 12000,
+        "budget_events": [{"stage": "task_execution_step"}],
+    }
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(return_value="VERIFIED")):
+        with patch("app.agent.core.reset_agent_loop_diagnostics", return_value=object()):
+            with patch("app.agent.core.get_agent_loop_diagnostics", return_value=fake_diagnostics):
+                with patch("app.agent.core.restore_agent_loop_diagnostics", return_value=None):
+                    with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+                        await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    audit = await client.get(f"/tasks/{task_id}/audit", headers=headers)
+    assert audit.status_code == 200
+    payload = audit.json()
+    summary = payload["latest_run"]["summary"] or ""
+    assert "Context budgeting:" in summary
+    assert "tool_results_compacted=3" in summary
+    assert "overflow_retries=1" in summary
+    assert "loop_events=1" in summary
+    budgeting = payload["latest_run"]["agent_context_budgeting"]
+    assert budgeting["totals"]["tool_results_compacted"] == 3
+    assert budgeting["totals"]["overflow_retries"] == 1
+    assert budgeting["totals"]["loop_events"] == 1
+
+    async with TestSessionLocal() as db:
+        run = (
+            await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.id.desc())
+            )
+        ).scalars().first()
+        assert run is not None
+        artifact = (
+            await db.execute(
+                select(TaskRunArtifact)
+                .where(
+                    TaskRunArtifact.task_run_id == run.id,
+                    TaskRunArtifact.artifact_type == "run_diagnostics",
+                )
+                .order_by(TaskRunArtifact.id.desc())
+            )
+        ).scalars().first()
+        assert artifact is not None
+        artifact_payload = json.loads(artifact.content_json or "{}")
+        assert artifact_payload["agent_context_budgeting"][0]["tool_results_compacted"] == 3
+        assert artifact_payload["agent_context_budgeting"][0]["overflow_retries"] == 1
 
 
 @pytest.mark.asyncio

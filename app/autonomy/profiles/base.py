@@ -10,6 +10,25 @@ DefaultPlannerFn = Callable[..., Awaitable[List[Dict[str, Any]]]]
 class TaskExecutionProfile(ABC):
     name = "default"
 
+    def _build_run_diagnostics(
+        self,
+        *,
+        run_debug: Dict[str, Any],
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        diagnostics: Dict[str, Any] = {
+            "dataset_stats": run_debug.get("dataset_stats", {}),
+            "refresh_stats": run_debug.get("refresh_stats", {}),
+            "suppression_events": run_debug.get("tool_failure_suppressions", []),
+            "active_skills": run_debug.get("active_skills", []),
+            "skill_selection_mode": run_debug.get("skill_selection_mode", ""),
+            "skill_injection_events": run_debug.get("skill_injection_events", []),
+            "agent_context_budgeting": run_debug.get("agent_context_budgeting", []),
+        }
+        if isinstance(extra, dict):
+            diagnostics.update(extra)
+        return diagnostics
+
     async def plan_steps(
         self,
         *,
@@ -78,14 +97,7 @@ class TaskExecutionProfile(ABC):
         final_markdown: str,
         run_debug: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        diagnostics = {
-            "dataset_stats": run_debug.get("dataset_stats", {}),
-            "refresh_stats": run_debug.get("refresh_stats", {}),
-            "suppression_events": run_debug.get("tool_failure_suppressions", []),
-            "active_skills": run_debug.get("active_skills", []),
-            "skill_selection_mode": run_debug.get("skill_selection_mode", ""),
-            "skill_injection_events": run_debug.get("skill_injection_events", []),
-        }
+        diagnostics = self._build_run_diagnostics(run_debug=run_debug)
         out: List[Dict[str, Any]] = []
         if final_markdown:
             out.append({"artifact_type": "final_output", "content_text": final_markdown})

@@ -206,7 +206,7 @@ class MaintenanceExecutionProfile(TaskExecutionProfile):
         final_markdown: str,
         run_debug: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        diagnostics = {
+        diagnostics = self._build_run_diagnostics(run_debug=run_debug, extra={
             "declared_tool": ((run_debug.get("grounding_report") or {}).get("declared_tool")),
             "declared_args": ((run_debug.get("grounding_report") or {}).get("declared_args") or {}),
             "declared_tool_called": bool(
@@ -218,13 +218,7 @@ class MaintenanceExecutionProfile(TaskExecutionProfile):
             "exact_output_match": bool(
                 (run_debug.get("grounding_report") or {}).get("exact_output_match")
             ),
-            "dataset_stats": run_debug.get("dataset_stats", {}),
-            "refresh_stats": run_debug.get("refresh_stats", {}),
-            "suppression_events": run_debug.get("tool_failure_suppressions", []),
-            "active_skills": run_debug.get("active_skills", []),
-            "skill_selection_mode": run_debug.get("skill_selection_mode", ""),
-            "skill_injection_events": run_debug.get("skill_injection_events", []),
-        }
+        })
         out: List[Dict[str, Any]] = []
         if final_markdown:
             out.append({"artifact_type": "final_output", "content_text": final_markdown})

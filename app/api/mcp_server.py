@@ -466,6 +466,51 @@ def _summarize_run_diagnostics_payload(payload: Any) -> Dict[str, Any]:
         return {"kind": "run_diagnostics"}
     dataset_stats = decoded.get("dataset_stats") or {}
     refresh_stats = decoded.get("refresh_stats") or {}
+    raw_budgeting = decoded.get("agent_context_budgeting")
+    normalized_budgeting = None
+    if isinstance(raw_budgeting, list) and raw_budgeting:
+        entries: list[dict[str, Any]] = []
+        totals = {
+            "tool_results_compacted": 0,
+            "compaction_boundaries": 0,
+            "overflow_retries": 0,
+            "loop_events": 0,
+        }
+        max_before = 0
+        max_after = 0
+        overflow_retry_succeeded = False
+        for raw in raw_budgeting:
+            if not isinstance(raw, dict):
+                continue
+            item = {
+                "stage": str(raw.get("stage") or ""),
+                "model": str(raw.get("model") or ""),
+                "tool_results_compacted": int(raw.get("tool_results_compacted") or 0),
+                "compaction_boundaries": int(raw.get("compaction_boundaries") or 0),
+                "overflow_retries": int(raw.get("overflow_retries") or 0),
+                "overflow_retry_succeeded": bool(raw.get("overflow_retry_succeeded") or False),
+                "loop_events_count": int(raw.get("loop_events_count") or 0),
+                "max_estimated_tokens_before": int(raw.get("max_estimated_tokens_before") or 0),
+                "max_estimated_tokens_after": int(raw.get("max_estimated_tokens_after") or 0),
+                "budget_events": list(raw.get("budget_events") or []),
+                "loop_events": list(raw.get("loop_events") or []),
+            }
+            totals["tool_results_compacted"] += item["tool_results_compacted"]
+            totals["compaction_boundaries"] += item["compaction_boundaries"]
+            totals["overflow_retries"] += item["overflow_retries"]
+            totals["loop_events"] += item["loop_events_count"]
+            max_before = max(max_before, item["max_estimated_tokens_before"])
+            max_after = max(max_after, item["max_estimated_tokens_after"])
+            overflow_retry_succeeded = overflow_retry_succeeded or item["overflow_retry_succeeded"]
+            entries.append(item)
+        if entries:
+            normalized_budgeting = {
+                "entries": entries,
+                "totals": totals,
+                "max_estimated_tokens_before": max_before,
+                "max_estimated_tokens_after": max_after,
+                "overflow_retry_succeeded": overflow_retry_succeeded,
+            }
     return {
         "kind": "run_diagnostics",
         "active_skills": decoded.get("active_skills") or [],
@@ -473,6 +518,7 @@ def _summarize_run_diagnostics_payload(payload: Any) -> Dict[str, Any]:
         "dataset_stats": dataset_stats if isinstance(dataset_stats, dict) else {},
         "refresh_stats": refresh_stats if isinstance(refresh_stats, dict) else {},
         "suppression_events": decoded.get("suppression_events") or [],
+        "agent_context_budgeting": normalized_budgeting,
         "unexpected_tool_calls": decoded.get("unexpected_tool_calls") or [],
     }
 
@@ -730,6 +776,9 @@ def _diagnostics_summary(artifacts: list[Dict[str, Any]]) -> Dict[str, Any]:
     run_diagnostics = artifact_by_type.get("run_diagnostics", {}).get("summary", {})
     dataset_stats = run_diagnostics.get("dataset_stats") if isinstance(run_diagnostics, dict) else {}
     refresh_stats = run_diagnostics.get("refresh_stats") if isinstance(run_diagnostics, dict) else {}
+    agent_context_budgeting = (
+        run_diagnostics.get("agent_context_budgeting") if isinstance(run_diagnostics, dict) else None
+    )
     return {
         "validation_report": validation if isinstance(validation, dict) else {},
         "run_diagnostics": run_diagnostics if isinstance(run_diagnostics, dict) else {},
@@ -737,6 +786,7 @@ def _diagnostics_summary(artifacts: list[Dict[str, Any]]) -> Dict[str, Any]:
         "active_skills": list((run_diagnostics or {}).get("active_skills") or []) if isinstance(run_diagnostics, dict) else [],
         "dataset_stats": dataset_stats if isinstance(dataset_stats, dict) else {},
         "refresh_stats": refresh_stats if isinstance(refresh_stats, dict) else {},
+        "agent_context_budgeting": agent_context_budgeting if isinstance(agent_context_budgeting, dict) else None,
     }
 
 
