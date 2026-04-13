@@ -67,6 +67,8 @@ from app.agent.tools import (
 log = structlog.get_logger(__name__)
 
 router = APIRouter()
+_CHAT_ESTIMATED_CHARS_PER_TOKEN = 4
+_CHAT_COMPACTION_MARKER_KIND = "history_compaction"
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -293,12 +295,18 @@ async def get_session(
         .order_by(ChatMessage.created_at, ChatMessage.id)
     )
     messages = result.scalars().all()
+    compaction_events = [
+        event
+        for event in (_serialize_chat_compaction_event(message) for message in messages)
+        if event is not None
+    ]
 
     return {
         "id": session.id,
         "title": session.title,
         "persona": session.persona,
         "llm_model": session.llm_model,
+        "compaction_events": compaction_events,
         "messages": [
             {
                 "id": m.id,
@@ -307,6 +315,7 @@ async def get_session(
                 "created_at": m.created_at,
             }
             for m in messages
+            if not _chat_compaction_metadata(m)
         ],
     }
 
@@ -1611,6 +1620,167 @@ async def _get_session_or_404(
     return session
 
 
+def _estimate_chat_message_tokens(message: Dict[str, Any]) -> int:
+    total = max(1, len(str(message.get("content") or "")) // _CHAT_ESTIMATED_CHARS_PER_TOKEN) if message.get("content") else 0
+    tool_calls = message.get("tool_calls") or []
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            total += max(1, len(str(function.get("name") or "")) // _CHAT_ESTIMATED_CHARS_PER_TOKEN) if function.get("name") else 0
+            total += max(1, len(str(function.get("arguments") or "")) // _CHAT_ESTIMATED_CHARS_PER_TOKEN) if function.get("arguments") else 0
+    return total
+
+
+def _decode_chat_json(raw: Any) -> Any:
+    if raw is None or isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+    return None
+
+
+def _estimate_chat_history_tokens(history: List[Dict[str, Any]]) -> int:
+    return sum(_estimate_chat_message_tokens(message) for message in history)
+
+
+def _compact_chat_message_summary(message: Dict[str, Any]) -> str:
+    role = str(message.get("role") or "").strip() or "unknown"
+    content = " ".join(str(message.get("content") or "").split()).strip()
+    if len(content) > 160:
+        content = content[:159].rstrip() + "…"
+    if role == "assistant" and message.get("tool_calls"):
+        tool_names = []
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            name = str(function.get("name") or "").strip()
+            if name:
+                tool_names.append(name)
+        if tool_names:
+            return f"Assistant requested tools: {', '.join(tool_names[:5])}"
+    return f"{role.capitalize()}: {content}" if content else f"{role.capitalize()}:"
+
+
+def _build_chat_compaction_boundary(prefix: List[Dict[str, Any]]) -> Dict[str, Any]:
+    lines = [
+        "Earlier chat history was compacted to keep the live context focused.",
+        "Use this as a compact recap unless newer turns contradict it:",
+    ]
+    summaries: list[str] = []
+    for message in prefix:
+        summary = _compact_chat_message_summary(message)
+        if summary:
+            summaries.append(f"- {summary}")
+        if len(summaries) >= 12:
+            break
+    if not summaries:
+        summaries.append("- Earlier user and assistant turns were compacted.")
+    lines.extend(summaries)
+    return {"role": "system", "content": "\n".join(lines)}
+
+
+def _chat_compaction_metadata(message: ChatMessage) -> Dict[str, Any] | None:
+    if str(getattr(message, "role", "") or "") != "system":
+        return None
+    payload = _decode_chat_json(getattr(message, "tool_results", None))
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("kind") or "") != _CHAT_COMPACTION_MARKER_KIND:
+        return None
+    return payload
+
+
+def _serialize_chat_compaction_event(message: ChatMessage) -> Dict[str, Any] | None:
+    payload = _chat_compaction_metadata(message)
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "id": int(message.id),
+        "kind": _CHAT_COMPACTION_MARKER_KIND,
+        "content": message.content,
+        "created_at": message.created_at,
+        "compacted_until_message_id": payload.get("compacted_until_message_id"),
+        "compacted_message_count": payload.get("compacted_message_count"),
+        "estimated_tokens_before": payload.get("estimated_tokens_before"),
+        "estimated_tokens_after": payload.get("estimated_tokens_after"),
+        "recent_messages_kept": payload.get("recent_messages_kept"),
+    }
+
+
+async def _persist_chat_compaction_marker(
+    session_id: int,
+    *,
+    prefix_messages: List[ChatMessage],
+    recent_messages_kept: int,
+    estimated_tokens_before: int,
+    estimated_tokens_after: int,
+    db: AsyncSession,
+) -> ChatMessage | None:
+    if not prefix_messages:
+        return None
+
+    boundary = _build_chat_compaction_boundary(
+        [{"role": str(message.role), "content": str(message.content)} for message in prefix_messages]
+    )
+    compacted_until_message_id = int(prefix_messages[-1].id)
+    metadata = {
+        "kind": _CHAT_COMPACTION_MARKER_KIND,
+        "compacted_until_message_id": compacted_until_message_id,
+        "compacted_message_count": len(prefix_messages),
+        "estimated_tokens_before": estimated_tokens_before,
+        "estimated_tokens_after": estimated_tokens_after,
+        "recent_messages_kept": recent_messages_kept,
+    }
+
+    result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session_id, ChatMessage.role == "system")
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+    )
+    system_rows = list(result.scalars().all())
+    compaction_rows = [row for row in system_rows if _chat_compaction_metadata(row)]
+    marker = compaction_rows[0] if compaction_rows else None
+    stale_rows = compaction_rows[1:] if len(compaction_rows) > 1 else []
+
+    if marker is None:
+        marker = ChatMessage(
+            session_id=session_id,
+            role="system",
+            content=boundary["content"],
+            tool_results=json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+        )
+        db.add(marker)
+    else:
+        marker.content = boundary["content"]
+        marker.tool_results = json.dumps(metadata, ensure_ascii=True, sort_keys=True)
+    for stale in stale_rows:
+        await db.delete(stale)
+    await db.flush()
+    return marker
+
+
+def _project_chat_history(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not history:
+        return []
+
+    estimated_tokens = _estimate_chat_history_tokens(history)
+    if estimated_tokens <= int(settings.chat_history_soft_token_limit):
+        return history
+
+    keep_recent = max(1, int(settings.chat_recent_messages_keep))
+    prefix = history[:-keep_recent]
+    suffix = history[-keep_recent:]
+    if not prefix:
+        return history
+    return [_build_chat_compaction_boundary(prefix)] + suffix
+
+
 async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any]]:
     """Load conversation history as a list of {role, content} dicts."""
     result = await db.execute(
@@ -1618,8 +1788,48 @@ async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any
         .where(ChatMessage.session_id == session_id)
         .order_by(ChatMessage.created_at, ChatMessage.id)
     )
-    messages = result.scalars().all()
-    return [{"role": m.role, "content": m.content} for m in messages]
+    messages = list(result.scalars().all())
+    compaction_markers = [message for message in messages if _chat_compaction_metadata(message)]
+    latest_marker = compaction_markers[-1] if compaction_markers else None
+    compacted_until_id = 0
+    if latest_marker is not None:
+        marker_payload = _chat_compaction_metadata(latest_marker) or {}
+        compacted_until_id = int(marker_payload.get("compacted_until_message_id") or 0)
+
+    raw_messages = [
+        message
+        for message in messages
+        if not _chat_compaction_metadata(message) and int(message.id or 0) > compacted_until_id
+    ]
+    raw_history = [{"role": m.role, "content": m.content} for m in raw_messages]
+    estimated_tokens_before = _estimate_chat_history_tokens(raw_history)
+    if estimated_tokens_before <= int(settings.chat_history_soft_token_limit):
+        if latest_marker is not None:
+            return [{"role": "system", "content": latest_marker.content}] + raw_history
+        return raw_history
+
+    keep_recent = max(1, int(settings.chat_recent_messages_keep))
+    prefix_messages = raw_messages[:-keep_recent]
+    suffix_messages = raw_messages[-keep_recent:]
+    if not prefix_messages:
+        if latest_marker is not None:
+            return [{"role": "system", "content": latest_marker.content}] + raw_history
+        return raw_history
+
+    projected_suffix = [{"role": m.role, "content": m.content} for m in suffix_messages]
+    estimated_tokens_after = _estimate_chat_history_tokens(projected_suffix)
+    marker = await _persist_chat_compaction_marker(
+        session_id,
+        prefix_messages=prefix_messages,
+        recent_messages_kept=keep_recent,
+        estimated_tokens_before=estimated_tokens_before,
+        estimated_tokens_after=estimated_tokens_after,
+        db=db,
+    )
+    marker_content = marker.content if marker is not None else _build_chat_compaction_boundary(
+        [{"role": m.role, "content": m.content} for m in prefix_messages]
+    )["content"]
+    return [{"role": "system", "content": marker_content}] + projected_suffix
 
 
 def _apply_tool_overrides(
