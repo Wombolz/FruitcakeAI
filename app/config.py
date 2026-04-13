@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     agent_tool_recent_keep: int = 4
     agent_overflow_retry_enabled: bool = True
     agent_repeated_tool_signature_threshold: int = 3
+    agent_exploration_churn_window: int = 4
+    agent_exploration_churn_max_unique_signatures: int = 2
     task_prompt_max_prior_summaries: int = 10
     task_final_synthesis_max_prior_outputs: int = 2
     task_final_synthesis_max_prior_output_tokens: int = 300

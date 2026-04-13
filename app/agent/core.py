@@ -52,6 +52,13 @@ FAILED_DELETE_PREFIXES = (
     "failed to verify deletion for event",
     "deletion requires explicit confirmation.",
 )
+EXPLORATION_TOOL_NAMES = {
+    "list_directory",
+    "find_files",
+    "read_file",
+    "search_code",
+    "grep_files",
+}
 TASK_ID_RE = re.compile(r'"task_id"\s*:\s*(\d+)')
 UNSUPPORTED_ALPHA_VANTAGE_HINT = (
     "I can use Alpha Vantage for quote lookup, daily history, and bounded intraday history right now, "
@@ -614,6 +621,43 @@ def _repeated_tool_signature_message(
     )
 
 
+def _is_exploration_tool_turn(tool_calls: List[Any]) -> bool:
+    tool_names = [name for name in (_tool_call_name(call) for call in tool_calls) if name]
+    return bool(tool_names) and all(name in EXPLORATION_TOOL_NAMES for name in tool_names)
+
+
+def _exploration_churn_detected(signatures: List[str]) -> bool:
+    if not signatures:
+        return False
+    window = max(2, int(settings.agent_exploration_churn_window))
+    max_unique = max(1, int(settings.agent_exploration_churn_max_unique_signatures))
+    if len(signatures) < window:
+        return False
+    recent = signatures[-window:]
+    return len(set(recent)) <= max_unique
+
+
+def _exploration_churn_message(
+    *,
+    tool_calls: List[Any],
+    history: List[Dict[str, Any]],
+) -> str:
+    tool_names = [name for name in (_tool_call_name(call) for call in tool_calls) if name]
+    tool_label = ", ".join(tool_names[:4]) or "repo exploration tools"
+    snippets = _recent_tool_snippets(history)
+    if snippets:
+        return (
+            "I stopped because the repo exploration was cycling through the same small set of results without enough new signal. "
+            f"Recent exploration tools: {tool_label}. "
+            f"Recent results were: {' | '.join(snippets)}. "
+            "Try narrowing the roots, excluding more paths, or pointing me at a smaller target."
+        )
+    return (
+        "I stopped because the repo exploration was cycling through the same small set of results without enough new signal. "
+        f"Recent exploration tools: {tool_label}. Try narrowing the roots, excluding more paths, or pointing me at a smaller target."
+    )
+
+
 def _max_turns_message(history: List[Dict[str, Any]]) -> str:
     snippets = _recent_tool_snippets(history)
     if snippets:
@@ -960,6 +1004,8 @@ async def run_agent(
     consecutive_failed_search_turns = 0
     previous_tool_signature = ""
     repeated_tool_signature_count = 0
+    recent_exploration_signatures: List[str] = []
+    recent_exploration_signatures: List[str] = []
 
     for turn in range(max_turns):
         turn_number = turn + 1
@@ -1006,6 +1052,13 @@ async def run_agent(
             else:
                 repeated_tool_signature_count = 0
                 previous_tool_signature = current_tool_signature
+            if _is_exploration_tool_turn(message.tool_calls):
+                recent_exploration_signatures.append(current_tool_signature)
+                recent_exploration_signatures = recent_exploration_signatures[
+                    -max(2, int(settings.agent_exploration_churn_window)) :
+                ]
+            else:
+                recent_exploration_signatures = []
             _log_agent_tool_turn(
                 turn=turn_number,
                 mode=mode,
@@ -1058,6 +1111,23 @@ async def run_agent(
                 return _repeated_tool_signature_message(
                     tool_calls=message.tool_calls,
                     repeated_count=repeated_tool_signature_count,
+                    history=history,
+                )
+            if _exploration_churn_detected(recent_exploration_signatures):
+                _record_loop_event(
+                    event_type="exploration_churn",
+                    stage=stage,
+                    mode=mode,
+                    model=selected_model,
+                    details={
+                        "turn": turn_number,
+                        "recent_signatures": list(recent_exploration_signatures),
+                        "window": int(settings.agent_exploration_churn_window),
+                        "max_unique_signatures": int(settings.agent_exploration_churn_max_unique_signatures),
+                    },
+                )
+                return _exploration_churn_message(
+                    tool_calls=message.tool_calls,
                     history=history,
                 )
             log.info(
@@ -1162,6 +1232,13 @@ async def stream_agent(
             else:
                 repeated_tool_signature_count = 0
                 previous_tool_signature = current_tool_signature
+            if _is_exploration_tool_turn(message.tool_calls):
+                recent_exploration_signatures.append(current_tool_signature)
+                recent_exploration_signatures = recent_exploration_signatures[
+                    -max(2, int(settings.agent_exploration_churn_window)) :
+                ]
+            else:
+                recent_exploration_signatures = []
             _log_agent_tool_turn(
                 turn=turn_number,
                 mode=mode,
@@ -1210,6 +1287,24 @@ async def stream_agent(
                 yield _repeated_tool_signature_message(
                     tool_calls=message.tool_calls,
                     repeated_count=repeated_tool_signature_count,
+                    history=history,
+                )
+                return
+            if _exploration_churn_detected(recent_exploration_signatures):
+                _record_loop_event(
+                    event_type="exploration_churn",
+                    stage=stage,
+                    mode=mode,
+                    model=selected_model,
+                    details={
+                        "turn": turn_number,
+                        "recent_signatures": list(recent_exploration_signatures),
+                        "window": int(settings.agent_exploration_churn_window),
+                        "max_unique_signatures": int(settings.agent_exploration_churn_max_unique_signatures),
+                    },
+                )
+                yield _exploration_churn_message(
+                    tool_calls=message.tool_calls,
                     history=history,
                 )
                 return

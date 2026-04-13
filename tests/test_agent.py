@@ -251,6 +251,75 @@ async def test_run_agent_repo_map_style_exploration_compacts_multi_turn_history(
     assert diagnostics["compaction_boundaries"] >= 1
 
 
+@pytest.mark.asyncio
+async def test_run_agent_stops_exploration_churn_with_alternating_signatures(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_exploration_churn_window", 4)
+    monkeypatch.setattr(settings, "agent_exploration_churn_max_unique_signatures", 2)
+    monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 10)
+
+    responses = [
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {"id": "dirs_a", "function": {"name": "list_directory", "arguments": "{\"path\":\"app\"}"}}
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {"id": "file_b", "function": {"name": "read_file", "arguments": "{\"path\":\"app/api/tasks.py\"}"}}
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {"id": "dirs_a2", "function": {"name": "list_directory", "arguments": "{\"path\":\"app\"}"}}
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {"id": "file_b2", "function": {"name": "read_file", "arguments": "{\"path\":\"app/api/tasks.py\"}"}}
+                ]
+            )
+        ),
+    ]
+    tool_results = [
+        [{"role": "tool", "tool_call_id": "dirs_a", "content": "app/\napi\nagent\nconfig"}],
+        [{"role": "tool", "tool_call_id": "file_b", "content": "def handler():\n    return 'tasks'"}],
+        [{"role": "tool", "tool_call_id": "dirs_a2", "content": "app/\napi\nagent\nconfig"}],
+        [{"role": "tool", "tool_call_id": "file_b2", "content": "def handler():\n    return 'tasks'"}],
+    ]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"type": "function", "function": {"name": "list_directory"}},
+                {"type": "function", "function": {"name": "read_file"}},
+            ],
+        ):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(side_effect=tool_results)):
+                with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=responses)):
+                    result = await run_agent(
+                        [{"role": "user", "content": "Keep mapping the repo roots until you understand the structure."}],
+                        ctx,
+                        mode="task",
+                    )
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert "repo exploration was cycling" in result.lower()
+    loop_events = diagnostics.get("loop_events") or []
+    assert any(event.get("type") == "exploration_churn" for event in loop_events if isinstance(event, dict))
+
+
 def test_content_fingerprint_is_deterministic_sha_based():
     value = "  Repo   map  content  "
     first = _content_fingerprint(value)
