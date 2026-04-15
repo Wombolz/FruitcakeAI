@@ -8,7 +8,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.definition_loader import get_agent_preset
-from app.db.models import ManagedAgentPreset, Task, User
+from app.db.models import ManagedAgentPreset, Task, TaskStep, User
 from app.task_service import compute_next_run_at, create_task_record, update_task_record
 from app.time_utils import resolve_effective_timezone
 
@@ -385,7 +385,13 @@ async def _sync_linked_task(
         recipe_params=_build_recipe_params(agent_instance),
         user_timezone=user.active_hours_tz,
     )
+    await _clear_idle_agent_plan_state(db, linked_task=linked_task)
+
+    is_active_run = str(linked_task.status or "").strip().lower() in {"running", "waiting_approval"}
     if agent_instance.enabled and agent_instance.auto_maintain_task:
+        if is_active_run:
+            linked_task.error = None
+            return
         linked_task.status = "pending"
         linked_task.error = None
         linked_task.next_run_at = compute_next_run_at(
@@ -398,6 +404,21 @@ async def _sync_linked_task(
         linked_task.next_run_at = None
         linked_task.next_retry_at = None
         linked_task.error = "Agent instance disabled" if not agent_instance.enabled else "Agent instance auto-maintain disabled"
+
+
+async def _clear_idle_agent_plan_state(db: AsyncSession, *, linked_task: Task) -> None:
+    recipe = linked_task.task_recipe if isinstance(linked_task.task_recipe, dict) else {}
+    if str(recipe.get("family") or "").strip().lower() != "agent":
+        return
+    if str(linked_task.status or "").strip().lower() in {"running", "waiting_approval"}:
+        return
+    rows = await db.execute(select(TaskStep.id).where(TaskStep.task_id == int(linked_task.id)).limit(1))
+    has_steps = rows.scalar_one_or_none() is not None
+    if not linked_task.has_plan and linked_task.current_step_index is None and not has_steps:
+        return
+    await db.execute(delete(TaskStep).where(TaskStep.task_id == int(linked_task.id)))
+    linked_task.has_plan = False
+    linked_task.current_step_index = None
 
 
 async def _load_linked_task(db: AsyncSession, agent_instance: ManagedAgentPreset) -> Task | None:

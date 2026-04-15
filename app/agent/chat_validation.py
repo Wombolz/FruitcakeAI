@@ -20,6 +20,12 @@ RESEARCH_KEYWORDS = {
     "search",
     "compare",
 }
+TOOL_LEAKAGE_PATTERNS = (
+    r"\(to=functions\.[^)]+\)",
+    r"\bthe tool name must be provided correctly\b",
+    r"\bcalling timeline search\b",
+    r"\bcalling .*search\b",
+)
 
 URL_RE = re.compile(r"https?://[^\s)\]>\"']+", re.IGNORECASE)
 MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)", re.IGNORECASE)
@@ -125,6 +131,7 @@ TASK_UPDATE_SUCCESS_PATTERNS = (
 class ChatValidationResult:
     is_research_style: bool
     is_empty_result: bool
+    has_tool_call_leakage: bool
     valid_urls: list[str]
     invalid_urls: list[str]
     mutation_unconfirmed: bool
@@ -142,6 +149,7 @@ def validate_chat_response(
     prompt = (user_prompt or "").strip().lower()
     text = (response or "").strip()
     is_research_style = any(word in prompt for word in RESEARCH_KEYWORDS)
+    has_tool_call_leakage = _has_tool_call_leakage(text)
     mutation_unconfirmed = _is_calendar_mutation_prompt(prompt) and _claims_calendar_mutation_success(text) and not _calendar_mutation_confirmed(executed_tools or [])
     task_mutation_reason = None
     if _is_task_mutation_prompt(prompt) and _claims_task_mutation_success(text):
@@ -158,7 +166,10 @@ def validate_chat_response(
     retry_reason: str | None = None
 
     if is_research_style:
-        if mutation_unconfirmed:
+        if has_tool_call_leakage:
+            should_retry = True
+            retry_reason = "tool_call_leakage"
+        elif mutation_unconfirmed:
             should_retry = True
             retry_reason = "calendar_mutation_unconfirmed"
         elif task_mutation_unconfirmed:
@@ -174,7 +185,10 @@ def validate_chat_response(
             should_retry = True
             retry_reason = "empty_result"
     else:
-        if mutation_unconfirmed:
+        if has_tool_call_leakage:
+            should_retry = True
+            retry_reason = "tool_call_leakage"
+        elif mutation_unconfirmed:
             should_retry = True
             retry_reason = "calendar_mutation_unconfirmed"
         elif task_mutation_unconfirmed:
@@ -190,6 +204,7 @@ def validate_chat_response(
     return ChatValidationResult(
         is_research_style=is_research_style,
         is_empty_result=empty_result,
+        has_tool_call_leakage=has_tool_call_leakage,
         valid_urls=valid_urls,
         invalid_urls=invalid_urls,
         mutation_unconfirmed=mutation_unconfirmed,
@@ -201,6 +216,11 @@ def validate_chat_response(
 
 
 def build_chat_retry_instruction(reason: str | None) -> str:
+    if reason == "tool_call_leakage":
+        return (
+            "Your previous answer exposed internal tool-calling or research narration. "
+            "Re-answer for the user directly. Do not include tool-call syntax, function names, or internal search process notes."
+        )
     if reason == "empty_result":
         return (
             "Your previous answer was too brief/empty. Provide a complete answer now. "
@@ -237,6 +257,24 @@ def build_chat_retry_instruction(reason: str | None) -> str:
             "If you created a second task instead, say that clearly and verify the current task list."
         )
     return "Re-answer with a complete grounded response."
+
+
+def should_validate_chat_response(
+    *,
+    user_prompt: str,
+    effective_complex: bool,
+) -> bool:
+    if effective_complex:
+        return True
+    prompt = (user_prompt or "").strip().lower()
+    return any(word in prompt for word in RESEARCH_KEYWORDS)
+
+
+def _has_tool_call_leakage(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in TOOL_LEAKAGE_PATTERNS)
 
 
 def _extract_urls(text: str) -> list[str]:

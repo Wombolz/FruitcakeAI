@@ -10,11 +10,13 @@ from app.db.models import RSSItem, RSSSource
 from app.db.session import Base
 from app.mcp.servers.rss import _looks_like_placeholder_feed, _normalize_feed_url, call_tool, get_tools
 from app.mcp.services.rss_sources import (
+    parse_rss_query,
     _strip_html,
     add_source,
     equivalent_canonical_urls,
     get_recent_list_cursor,
     list_recent_items,
+    search_cached_items_timeline,
     search_cached_items,
     set_recent_list_cursor,
     upsert_feed_entries,
@@ -59,6 +61,7 @@ def test_rss_server_exposes_new_tool_schemas():
     assert "discover_rss_sources" in names
     assert "refresh_rss_cache" in names
     assert "search_my_feeds" in names
+    assert "search_my_feeds_timeline" in names
     assert "list_recent_feed_items" in names
 
 
@@ -84,6 +87,19 @@ def test_search_my_feeds_schema_requires_non_empty_query():
     query_schema = tool["inputSchema"]["properties"]["query"]
     assert "minLength" not in query_schema
     assert "most recent cached headlines" in tool["description"].lower()
+
+
+def test_parse_rss_query_drops_boolean_junk_and_preserves_phrase():
+    parsed = parse_rss_query('Iran OR Tehran OR "Islamic Republic" site:news latest')
+    assert parsed.terms == ["iran", "tehran"]
+    assert parsed.phrases == ["islamic republic"]
+    assert "latest" in parsed.time_hints
+
+
+def test_parse_rss_query_temporal_only_is_effectively_empty():
+    parsed = parse_rss_query("latest today recent")
+    assert parsed.is_effectively_empty is True
+    assert "today" in parsed.time_hints
 
 
 @pytest.mark.asyncio
@@ -203,6 +219,178 @@ async def test_search_cached_items_temporal_query_returns_latest_items():
 
     assert len(rows) >= 1
     assert rows[0]["title"] == "Breaking market move"
+
+
+@pytest.mark.asyncio
+async def test_search_cached_items_prefers_more_relevant_older_result():
+    async with TestSessionLocal() as db:
+        source = RSSSource(
+            user_id=None,
+            name="Example",
+            url="https://example.com/feed.xml",
+            url_canonical="https://example.com/feed.xml",
+            category="news",
+            active=True,
+            trust_level="seed",
+            update_interval_minutes=60,
+        )
+        db.add(source)
+        await db.flush()
+
+        db.add_all(
+            [
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="older-strong",
+                    title="Islamic Republic faces Tehran pressure",
+                    link="https://example.com/older-strong",
+                    summary="Iran officials say the Islamic Republic is under pressure in Tehran.",
+                    published_at=datetime.now(timezone.utc) - timedelta(days=2),
+                ),
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="newer-weak",
+                    title="Weekly market digest",
+                    link="https://example.com/newer-weak",
+                    summary="A regional roundup mentions Iran once in passing.",
+                    published_at=datetime.now(timezone.utc),
+                ),
+            ]
+        )
+        await db.commit()
+
+        rows = await search_cached_items(
+            db,
+            user_id=999,
+            query='Iran OR Tehran OR "Islamic Republic"',
+            max_results=5,
+            category="news",
+            days_back=7,
+        )
+
+    assert len(rows) >= 2
+    assert rows[0]["title"] == "Islamic Republic faces Tehran pressure"
+
+
+@pytest.mark.asyncio
+async def test_search_cached_items_phrase_match_beats_scattered_terms():
+    async with TestSessionLocal() as db:
+        source = RSSSource(
+            user_id=None,
+            name="Example",
+            url="https://example.com/feed.xml",
+            url_canonical="https://example.com/feed.xml",
+            category="news",
+            active=True,
+            trust_level="seed",
+            update_interval_minutes=60,
+        )
+        db.add(source)
+        await db.flush()
+
+        db.add_all(
+            [
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="phrase-hit",
+                    title="Islamic Republic responds to new sanctions",
+                    link="https://example.com/phrase-hit",
+                    summary="Officials respond to new sanctions.",
+                    published_at=datetime.now(timezone.utc) - timedelta(hours=8),
+                ),
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="scattered-hit",
+                    title="Republic debates security measure",
+                    link="https://example.com/scattered-hit",
+                    summary="Iran officials mention broader Islamic education reform.",
+                    published_at=datetime.now(timezone.utc),
+                ),
+            ]
+        )
+        await db.commit()
+
+        rows = await search_cached_items(
+            db,
+            user_id=999,
+            query='"Islamic Republic"',
+            max_results=5,
+            category="news",
+            days_back=7,
+        )
+
+    assert len(rows) >= 2
+    assert rows[0]["title"] == "Islamic Republic responds to new sanctions"
+
+
+@pytest.mark.asyncio
+async def test_search_cached_items_timeline_groups_by_day_and_dedupes():
+    async with TestSessionLocal() as db:
+        source = RSSSource(
+            user_id=None,
+            name="Example",
+            url="https://example.com/feed.xml",
+            url_canonical="https://example.com/feed.xml",
+            category="news",
+            active=True,
+            trust_level="seed",
+            update_interval_minutes=60,
+        )
+        db.add(source)
+        await db.flush()
+
+        db.add_all(
+            [
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="fri-1",
+                    title="Iran talks intensify Friday",
+                    link="https://example.com/fri-1",
+                    summary="Friday update on Iran talks.",
+                    published_at=datetime(2026, 4, 10, 14, 0, tzinfo=timezone.utc),
+                ),
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="fri-dup",
+                    title="Iran talks intensify Friday",
+                    link="https://example.com/fri-1",
+                    summary="Duplicate Friday update.",
+                    published_at=datetime(2026, 4, 10, 15, 0, tzinfo=timezone.utc),
+                ),
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="sat-1",
+                    title="Iran talks continue Saturday",
+                    link="https://example.com/sat-1",
+                    summary="Saturday update on Iran talks.",
+                    published_at=datetime(2026, 4, 11, 14, 0, tzinfo=timezone.utc),
+                ),
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="sun-1",
+                    title="Iran talks stall Sunday",
+                    link="https://example.com/sun-1",
+                    summary="Sunday update on Iran talks.",
+                    published_at=datetime(2026, 4, 12, 14, 0, tzinfo=timezone.utc),
+                ),
+            ]
+        )
+        await db.commit()
+
+        groups = await search_cached_items_timeline(
+            db,
+            user_id=999,
+            query="Iran talks",
+            start_at=datetime(2026, 4, 10, 0, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 4, 12, 23, 59, tzinfo=timezone.utc),
+            category="news",
+            max_total_results=10,
+            max_results_per_day=5,
+        )
+
+    assert [group["day"] for group in groups] == ["2026-04-10", "2026-04-11", "2026-04-12"]
+    assert len(groups[0]["items"]) == 1
+    assert groups[0]["items"][0]["url"] == "https://example.com/fri-1"
 
 
 @pytest.mark.asyncio
@@ -333,6 +521,62 @@ async def test_list_recent_feed_items_requires_value_for_explicit_days_mode():
             user_context={"user_id": 11},
         )
     assert "window.value must be a positive integer" in result
+
+
+@pytest.mark.asyncio
+async def test_search_my_feeds_timeline_tool_outputs_grouped_results():
+    async with TestSessionLocal() as db:
+        source = RSSSource(
+            user_id=1,
+            name="Example",
+            url="https://example.com/feed.xml",
+            url_canonical="https://example.com/feed.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(source)
+        await db.flush()
+        db.add_all(
+            [
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="timeline-fri",
+                    title="Iran diplomacy intensifies",
+                    link="https://example.com/fri",
+                    summary="Friday diplomacy update.",
+                    published_at=datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc),
+                ),
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="timeline-sat",
+                    title="Iran diplomacy enters second day",
+                    link="https://example.com/sat",
+                    summary="Saturday diplomacy update.",
+                    published_at=datetime(2026, 4, 11, 12, 0, tzinfo=timezone.utc),
+                ),
+            ]
+        )
+        await db.commit()
+
+    with patch("app.mcp.servers.rss.AsyncSessionLocal", new=TestSessionLocal):
+        result = await call_tool(
+            "search_my_feeds_timeline",
+            {
+                "query": "Iran diplomacy",
+                "start_date": "2026-04-10",
+                "end_date": "2026-04-11",
+                "max_results_per_day": 5,
+                "max_total_results": 10,
+            },
+            user_context={"user_id": 1},
+        )
+
+    assert "Timeline feed results for 'Iran diplomacy'" in result
+    assert "2026-04-10:" in result
+    assert "2026-04-11:" in result
+    assert "URL: https://example.com/fri" in result
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ Tools exposed to the agent:
   refresh_rss_cache             — Refresh active RSS cache and return stats only
   list_recent_feed_items        — List recent articles with configurable window/source filters
   search_my_feeds               — Search user active feed catalog
+  search_my_feeds_timeline      — Search user active feed catalog over a bounded timeline
 """
 
 from __future__ import annotations
@@ -203,7 +204,8 @@ _SEARCH_MY_FEEDS_SCHEMA: Dict[str, Any] = {
     "name": "search_my_feeds",
     "description": (
         "Search across active RSS sources in the user's curated catalog. "
-        "If query is omitted/empty, returns most recent cached headlines."
+        "If query is omitted/empty, returns most recent cached headlines. "
+        "Use search_my_feeds_timeline for questions about how a topic evolved over a time period."
     ),
     "inputSchema": {
         "type": "object",
@@ -217,6 +219,36 @@ _SEARCH_MY_FEEDS_SCHEMA: Dict[str, Any] = {
             "refresh": {"type": "boolean", "default": False},
             "days_back": {"type": "integer", "default": 7},
         },
+    },
+}
+
+_SEARCH_MY_FEEDS_TIMELINE_SCHEMA: Dict[str, Any] = {
+    "name": "search_my_feeds_timeline",
+    "description": (
+        "Search across active RSS sources for how a topic evolved over a bounded time window. "
+        "Use this for chronology questions such as what changed over the weekend or from Friday to Sunday."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Topic query to match across article titles and summaries.",
+            },
+            "start_date": {
+                "type": "string",
+                "description": "Inclusive ISO date or datetime for the beginning of the timeline window.",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Inclusive ISO date or datetime for the end of the timeline window.",
+            },
+            "max_results_per_day": {"type": "integer", "default": 6},
+            "max_total_results": {"type": "integer", "default": 18},
+            "category": {"type": "string"},
+            "refresh": {"type": "boolean", "default": False},
+        },
+        "required": ["query", "start_date", "end_date"],
     },
 }
 
@@ -293,6 +325,7 @@ def get_tools() -> List[Dict[str, Any]]:
         _REFRESH_RSS_CACHE_SCHEMA,
         _LIST_RECENT_FEED_ITEMS_SCHEMA,
         _SEARCH_MY_FEEDS_SCHEMA,
+        _SEARCH_MY_FEEDS_TIMELINE_SCHEMA,
     ]
 
 
@@ -325,6 +358,8 @@ async def call_tool(
         return await _list_recent_feed_items(arguments, user_context)
     if tool_name == "search_my_feeds":
         return await _search_my_feeds(arguments, user_context)
+    if tool_name == "search_my_feeds_timeline":
+        return await _search_my_feeds_timeline(arguments, user_context)
     return f"Unknown tool: {tool_name}"
 
 
@@ -725,6 +760,85 @@ async def _search_my_feeds(arguments: Dict[str, Any], user_context: Any) -> str:
         )
 
 
+async def _search_my_feeds_timeline(arguments: Dict[str, Any], user_context: Any) -> str:
+    user_id = _get_user_id(user_context)
+    if not user_id:
+        return "search_my_feeds_timeline requires an authenticated user context."
+
+    query = (arguments.get("query") or "").strip()
+    if not query:
+        return "search_my_feeds_timeline requires a non-empty query."
+
+    start_date = (arguments.get("start_date") or "").strip()
+    end_date = (arguments.get("end_date") or "").strip()
+    category = (arguments.get("category") or "").strip() or None
+    refresh = bool(arguments.get("refresh", False))
+    max_results_per_day = max(1, min(int(arguments.get("max_results_per_day", 6)), 12))
+    max_total_results = max(1, min(int(arguments.get("max_total_results", 18)), 50))
+
+    try:
+        start_at = rss_sources._parse_timeline_boundary(start_date, end_of_day=False)
+        end_at = rss_sources._parse_timeline_boundary(end_date, end_of_day=True)
+    except ValueError as exc:
+        return str(exc)
+    if end_at < start_at:
+        return "end_date must be the same as or later than start_date."
+
+    async with AsyncSessionLocal() as db:
+        grouped = await rss_sources.search_cached_items_timeline(
+            db,
+            user_id=user_id,
+            query=query,
+            start_at=start_at,
+            end_at=end_at,
+            category=category,
+            max_total_results=max_total_results,
+            max_results_per_day=max_results_per_day,
+        )
+        if grouped and not refresh:
+            return _format_timeline_results(
+                query,
+                grouped,
+                start_date=start_at.date().isoformat(),
+                end_date=end_at.date().isoformat(),
+                used_cache_only=True,
+            )
+
+        refreshed = await rss_sources.refresh_active_sources_cache(
+            db,
+            user_id=user_id,
+            category=category,
+            max_items_per_source=20,
+        )
+        await db.commit()
+
+        grouped = await rss_sources.search_cached_items_timeline(
+            db,
+            user_id=user_id,
+            query=query,
+            start_at=start_at,
+            end_at=end_at,
+            category=category,
+            max_total_results=max_total_results,
+            max_results_per_day=max_results_per_day,
+        )
+        if not grouped:
+            if refreshed["sources"] == 0:
+                return "No active RSS sources available. Add or approve sources first."
+            return (
+                f"No timeline results found for '{query}' between {start_at.date().isoformat()} "
+                f"and {end_at.date().isoformat()} after refreshing {refreshed['sources']} source(s)."
+            )
+        return _format_timeline_results(
+            query,
+            grouped,
+            start_date=start_at.date().isoformat(),
+            end_date=end_at.date().isoformat(),
+            used_cache_only=False,
+            refreshed_sources=refreshed["sources"],
+        )
+
+
 async def _refresh_rss_cache(arguments: Dict[str, Any], user_context: Any) -> str:
     user_id = _get_user_id(user_context)
     if not user_id:
@@ -941,6 +1055,38 @@ def _format_cached_results(
         summary = row.get("summary") or ""
         if summary:
             lines.append(f"    {summary}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _format_timeline_results(
+    query: str,
+    groups: List[Dict[str, Any]],
+    *,
+    start_date: str,
+    end_date: str,
+    used_cache_only: bool,
+    refreshed_sources: int = 0,
+) -> str:
+    mode = "cache-only" if used_cache_only else f"cache after refreshing {refreshed_sources} source(s)"
+    lines = [f"Timeline feed results for '{query}' from {start_date} to {end_date} ({mode}):", ""]
+    for group in groups:
+        day = str(group.get("day") or "unknown")
+        lines.append(f"{day}:")
+        for i, row in enumerate(group.get("items") or [], 1):
+            lines.append(f"  [{i}] {row.get('title') or '(no title)'}")
+            feed = row.get("feed") or ""
+            if feed:
+                lines.append(f"      Feed: {feed}")
+            published = row.get("published") or ""
+            if published:
+                lines.append(f"      Published: {published}")
+            url = row.get("url") or ""
+            if url:
+                lines.append(f"      URL: {url}")
+            summary = row.get("summary") or ""
+            if summary:
+                lines.append(f"      {summary}")
         lines.append("")
     return "\n".join(lines)
 

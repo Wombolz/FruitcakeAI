@@ -501,6 +501,11 @@ class SkillService:
 
         names = {tool["function"]["name"] for tool in TOOL_SCHEMAS}
         registry = get_mcp_registry()
+        if not registry._is_ready:
+            try:
+                await registry.startup()
+            except Exception:
+                log.warning("skills.mcp_registry_startup_failed", exc_info=True)
         if registry._is_ready:
             names.update(tool["function"]["name"] for tool in registry.get_tools_for_agent())
         return names

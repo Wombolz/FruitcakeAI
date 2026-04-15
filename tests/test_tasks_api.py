@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from sqlalchemy import select
 
-from app.db.models import ManagedAgentPreset, Task, TaskRun, User
+from app.db.models import ManagedAgentPreset, Task, TaskRun, TaskStep, User
 from app.task_service import compute_next_run_at
 from tests.conftest import TestSessionLocal
 
@@ -472,6 +472,98 @@ async def test_agent_instances_ensure_defaults_cleans_up_legacy_duplicate_seed_r
             )
         ).scalars().all()
         assert duplicate_rows == []
+
+
+@pytest.mark.asyncio
+async def test_agent_instances_ensure_defaults_clears_idle_stale_plan_for_agent_task(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "agentstaleplanuser",
+            "email": "agentstaleplan@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "agentstaleplanuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    seeded = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
+    assert seeded.status_code == 200
+    repo_map = next(item for item in seeded.json() if item["display_name"] == "Primary Repo Map")
+    task_id = repo_map["linked_task"]["id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.has_plan = True
+        task.current_step_index = 8
+        db.add(
+            TaskStep(
+                task_id=task_id,
+                step_index=1,
+                title="Open pull request",
+                instruction="Stale generic plan",
+                status="pending",
+            )
+        )
+        await db.commit()
+
+    refreshed = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
+    assert refreshed.status_code == 200
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.has_plan is False
+        assert task.current_step_index is None
+        rows = await db.execute(select(TaskStep).where(TaskStep.task_id == task_id))
+        assert rows.scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_agent_instances_ensure_defaults_does_not_clobber_running_agent_task_status(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "agentrunninguser",
+            "email": "agentrunning@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "agentrunninguser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    seeded = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
+    assert seeded.status_code == 200
+    repo_map = next(item for item in seeded.json() if item["display_name"] == "Primary Repo Map")
+    task_id = repo_map["linked_task"]["id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.status = "running"
+        task.error = "stale error"
+        task.next_run_at = None
+        await db.commit()
+
+    refreshed = await client.post("/tasks/agent-instances/ensure-defaults", headers=headers)
+    assert refreshed.status_code == 200
+    repo_map = next(item for item in refreshed.json() if item["display_name"] == "Primary Repo Map")
+    assert repo_map["linked_task"]["status"] == "running"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.error is None
 
 
 @pytest.mark.asyncio

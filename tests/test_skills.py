@@ -69,6 +69,41 @@ async def test_skill_preview_fetches_url_once(client):
 
 
 @pytest.mark.asyncio
+async def test_skill_preview_bootstraps_mcp_registry_for_tool_validation(client):
+    token = await _register_admin_token(client, "rssskilladmin")
+    headers = {"Authorization": f"Bearer {token}"}
+    markdown = _skill_markdown(
+        name="RSS News Research",
+        slug="rss-news-research",
+        tools=["search_my_feeds", "search_my_feeds_timeline", "list_recent_feed_items"],
+    )
+
+    class DummyRegistry:
+        def __init__(self):
+            self._is_ready = False
+
+        async def startup(self):
+            self._is_ready = True
+
+        def get_tools_for_agent(self):
+            return [
+                {"type": "function", "function": {"name": "search_my_feeds"}},
+                {"type": "function", "function": {"name": "search_my_feeds_timeline"}},
+                {"type": "function", "function": {"name": "list_recent_feed_items"}},
+            ]
+
+    with patch("app.mcp.registry.get_mcp_registry", return_value=DummyRegistry()):
+        resp = await client.post("/admin/skills/preview", headers=headers, json={"content": markdown})
+
+    assert resp.status_code == 200
+    assert resp.json()["allowed_tool_additions"] == [
+        "search_my_feeds",
+        "search_my_feeds_timeline",
+        "list_recent_feed_items",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_skill_install_and_list(client):
     token = await _register_admin_token(client, "installadmin")
     headers = {"Authorization": f"Bearer {token}"}

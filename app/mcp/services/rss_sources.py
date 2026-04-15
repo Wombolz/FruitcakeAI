@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -43,6 +44,36 @@ _QUERY_STOPWORDS = {
     "update",
     "updates",
 }
+_QUERY_OPERATOR_STOPWORDS = {
+    "or",
+    "and",
+    "not",
+    "site",
+    "from",
+}
+_QUERY_TIME_HINTS = {
+    "today",
+    "yesterday",
+    "tomorrow",
+    "weekend",
+    "week",
+    "daily",
+    "hourly",
+    "latest",
+    "recent",
+}
+_SEARCH_CANDIDATE_LIMIT = 250
+
+
+@dataclass(frozen=True)
+class ParsedRSSQuery:
+    terms: List[str]
+    phrases: List[str]
+    time_hints: List[str]
+
+    @property
+    def is_effectively_empty(self) -> bool:
+        return not self.terms and not self.phrases
 
 
 def canonicalize_url(raw: str) -> str:
@@ -377,6 +408,7 @@ async def search_cached_items(
     if not source_ids:
         return []
 
+    parsed_query = parse_rss_query(query)
     q = (
         select(RSSItem, RSSSource.name)
         .join(RSSSource, RSSSource.id == RSSItem.source_id)
@@ -386,28 +418,92 @@ async def search_cached_items(
         cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
         q = q.where(or_(RSSItem.published_at.is_(None), RSSItem.published_at >= cutoff))
 
-    terms = _meaningful_query_terms(query)
-    if terms:
+    if not parsed_query.is_effectively_empty:
         term_filters = []
-        for term in terms:
+        for term in _query_filter_terms(parsed_query):
             ilike = f"%{term}%"
+            term_filters.append(RSSItem.title.ilike(ilike))
+            term_filters.append(RSSItem.summary.ilike(ilike))
+        for phrase in parsed_query.phrases:
+            ilike = f"%{phrase}%"
             term_filters.append(RSSItem.title.ilike(ilike))
             term_filters.append(RSSItem.summary.ilike(ilike))
         q = q.where(or_(*term_filters))
 
-    q = q.order_by(RSSItem.published_at.desc().nullslast(), RSSItem.fetched_at.desc()).limit(max(1, min(max_results, 100)))
+    q = q.order_by(RSSItem.published_at.desc().nullslast(), RSSItem.fetched_at.desc()).limit(
+        _SEARCH_CANDIDATE_LIMIT if not parsed_query.is_effectively_empty else max(1, min(max_results, 100))
+    )
     rows = (await db.execute(q)).all()
-    return [
-        {
-            "title": item.title,
-            "url": item.link or "",
-            "summary": item.summary or "",
-            "published": item.published_at.isoformat() if item.published_at else "",
-            "feed": source_name,
-            "fetched_at": item.fetched_at.isoformat() if item.fetched_at else "",
-        }
-        for item, source_name in rows
-    ]
+    serialized = [_serialize_rss_row(item, source_name) for item, source_name in rows]
+    if parsed_query.is_effectively_empty:
+        return serialized[: max(1, min(max_results, 100))]
+    ranked = _rank_serialized_results(serialized, parsed_query=parsed_query)
+    return ranked[: max(1, min(max_results, 100))]
+
+
+async def search_cached_items_timeline(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    query: str,
+    start_at: datetime,
+    end_at: datetime,
+    category: Optional[str] = None,
+    max_total_results: int = 30,
+    max_results_per_day: int = 10,
+) -> List[Dict[str, Any]]:
+    sources = await resolve_active_sources(db, user_id=user_id, category=category)
+    source_ids = [s.id for s in sources]
+    if not source_ids:
+        return []
+
+    parsed_query = parse_rss_query(query)
+    q = (
+        select(RSSItem, RSSSource.name)
+        .join(RSSSource, RSSSource.id == RSSItem.source_id)
+        .where(RSSItem.source_id.in_(source_ids))
+    )
+    q = q.where(
+        or_(
+            and_(RSSItem.published_at.is_not(None), RSSItem.published_at >= start_at, RSSItem.published_at <= end_at),
+            and_(RSSItem.published_at.is_(None), RSSItem.fetched_at >= start_at, RSSItem.fetched_at <= end_at),
+        )
+    )
+    if not parsed_query.is_effectively_empty:
+        term_filters = []
+        for term in _query_filter_terms(parsed_query):
+            ilike = f"%{term}%"
+            term_filters.append(RSSItem.title.ilike(ilike))
+            term_filters.append(RSSItem.summary.ilike(ilike))
+        for phrase in parsed_query.phrases:
+            ilike = f"%{phrase}%"
+            term_filters.append(RSSItem.title.ilike(ilike))
+            term_filters.append(RSSItem.summary.ilike(ilike))
+        q = q.where(or_(*term_filters))
+
+    q = q.order_by(RSSItem.published_at.asc().nullslast(), RSSItem.fetched_at.asc()).limit(_SEARCH_CANDIDATE_LIMIT)
+    rows = (await db.execute(q)).all()
+    serialized = [_serialize_rss_row(item, source_name) for item, source_name in rows]
+    ranked = _rank_serialized_results(serialized, parsed_query=parsed_query)
+    deduped = _dedupe_timeline_rows(ranked)
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in deduped:
+        day_key = _timeline_day_key(row)
+        grouped.setdefault(day_key, [])
+        if len(grouped[day_key]) < max(1, min(max_results_per_day, 25)):
+            grouped[day_key].append(row)
+
+    ordered_days = sorted(grouped.keys())
+    out: List[Dict[str, Any]] = []
+    running_total = 0
+    for day_key in ordered_days:
+        rows_for_day = grouped[day_key]
+        out.append({"day": day_key, "items": rows_for_day})
+        running_total += len(rows_for_day)
+        if running_total >= max(1, min(max_total_results, 100)):
+            break
+    return out
 
 
 async def get_recent_list_cursor(
@@ -893,15 +989,204 @@ def _strip_html(text: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def _meaningful_query_terms(query: str) -> List[str]:
-    tokens = re.findall(r"[a-z0-9]{2,}", (query or "").lower())
-    terms = [t for t in tokens if t not in _QUERY_STOPWORDS]
-    # dedupe while preserving order
-    seen = set()
-    out: List[str] = []
-    for term in terms:
+def parse_rss_query(query: str) -> ParsedRSSQuery:
+    raw = str(query or "").strip()
+    phrases = _extract_query_phrases(raw)
+    raw_without_phrases = re.sub(r'"([^"]+)"', " ", raw)
+    tokens = re.findall(r"[a-z0-9]{2,}", raw_without_phrases.lower())
+
+    terms: List[str] = []
+    time_hints: List[str] = []
+    seen_terms: set[str] = set()
+    seen_time_hints: set[str] = set()
+
+    for token in tokens:
+        if token in _QUERY_OPERATOR_STOPWORDS:
+            continue
+        if token in _QUERY_TIME_HINTS:
+            if token not in seen_time_hints:
+                time_hints.append(token)
+                seen_time_hints.add(token)
+            continue
+        if token in _QUERY_STOPWORDS:
+            continue
+        if token in seen_terms:
+            continue
+        seen_terms.add(token)
+        terms.append(token)
+
+    seen_phrases: set[str] = set()
+    normalized_phrases: List[str] = []
+    for phrase in phrases:
+        if phrase in seen_phrases:
+            continue
+        seen_phrases.add(phrase)
+        normalized_phrases.append(phrase)
+
+    return ParsedRSSQuery(
+        terms=terms,
+        phrases=normalized_phrases,
+        time_hints=time_hints,
+    )
+
+
+def _extract_query_phrases(query: str) -> List[str]:
+    phrases: List[str] = []
+    for match in re.finditer(r'"([^"]+)"', query or ""):
+        phrase = re.sub(r"\s+", " ", match.group(1).strip().lower())
+        if not phrase:
+            continue
+        if all(token in _QUERY_OPERATOR_STOPWORDS or token in _QUERY_STOPWORDS for token in phrase.split()):
+            continue
+        phrases.append(phrase)
+    return phrases
+
+
+def _query_filter_terms(parsed_query: ParsedRSSQuery) -> List[str]:
+    terms: List[str] = []
+    seen: set[str] = set()
+    for term in parsed_query.terms:
         if term in seen:
             continue
         seen.add(term)
-        out.append(term)
+        terms.append(term)
+    for phrase in parsed_query.phrases:
+        for token in re.findall(r"[a-z0-9]{2,}", phrase):
+            if token in _QUERY_OPERATOR_STOPWORDS or token in _QUERY_STOPWORDS or token in seen:
+                continue
+            seen.add(token)
+            terms.append(token)
+    return terms
+
+
+def _serialize_rss_row(item: RSSItem, source_name: str) -> Dict[str, Any]:
+    return {
+        "title": item.title,
+        "url": item.link or "",
+        "summary": item.summary or "",
+        "published": item.published_at.isoformat() if item.published_at else "",
+        "feed": source_name,
+        "fetched_at": item.fetched_at.isoformat() if item.fetched_at else "",
+    }
+
+
+def _rank_serialized_results(
+    rows: List[Dict[str, Any]],
+    *,
+    parsed_query: ParsedRSSQuery,
+) -> List[Dict[str, Any]]:
+    scored: List[Dict[str, Any]] = []
+    for row in rows:
+        enriched = dict(row)
+        score = _rss_result_score(row, parsed_query=parsed_query)
+        enriched["_relevance_score"] = score
+        scored.append(enriched)
+    scored.sort(
+        key=lambda row: (
+            float(row.get("_relevance_score") or 0.0),
+            _sort_timestamp_value(row),
+        ),
+        reverse=True,
+    )
+    return scored
+
+
+def _rss_result_score(row: Dict[str, Any], *, parsed_query: ParsedRSSQuery) -> float:
+    title = str(row.get("title") or "").lower()
+    summary = str(row.get("summary") or "").lower()
+
+    score = 0.0
+    matched_terms = 0
+    title_term_hits = 0
+    summary_term_hits = 0
+
+    for phrase in parsed_query.phrases:
+        phrase_tokens = [token for token in phrase.split() if token]
+        if phrase and phrase in title:
+            score += 5.0
+            matched_terms += len(phrase_tokens) or 1
+            title_term_hits += len(phrase_tokens) or 1
+        elif phrase and phrase in summary:
+            score += 3.0
+            matched_terms += len(phrase_tokens) or 1
+            summary_term_hits += len(phrase_tokens) or 1
+
+    for term in parsed_query.terms:
+        in_title = term in title
+        in_summary = term in summary
+        if in_title:
+            score += 2.0
+            matched_terms += 1
+            title_term_hits += 1
+        if in_summary:
+            score += 1.0
+            if not in_title:
+                matched_terms += 1
+            summary_term_hits += 1
+
+    score += min(matched_terms, 8) * 0.35
+    if title_term_hits and summary_term_hits:
+        score += 0.75
+
+    return score
+
+
+def _sort_timestamp_value(row: Dict[str, Any]) -> float:
+    stamp = _row_timestamp(row)
+    if stamp is None:
+        return 0.0
+    return stamp.timestamp()
+
+
+def _row_timestamp(row: Dict[str, Any]) -> Optional[datetime]:
+    for key in ("published", "fetched_at"):
+        text = str(row.get(key) or "").strip()
+        if not text:
+            continue
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+    return None
+
+
+def _timeline_day_key(row: Dict[str, Any]) -> str:
+    stamp = _row_timestamp(row)
+    if stamp is None:
+        return "unknown"
+    return stamp.astimezone(timezone.utc).date().isoformat()
+
+
+def _dedupe_timeline_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        normalized_title = re.sub(r"\s+", " ", str(row.get("title") or "").strip().lower())
+        normalized_url = canonicalize_url(str(row.get("url") or ""))
+        key = normalized_url or normalized_title
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
     return out
+
+
+def _parse_timeline_boundary(value: str, *, end_of_day: bool) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Missing timeline boundary.")
+    try:
+        if len(text) == 10:
+            parsed_date = date.fromisoformat(text)
+            if end_of_day:
+                return datetime.combine(parsed_date, datetime.max.time()).replace(tzinfo=timezone.utc)
+            return datetime.combine(parsed_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception as exc:
+        raise ValueError(f"Invalid timeline boundary '{text}'.") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)

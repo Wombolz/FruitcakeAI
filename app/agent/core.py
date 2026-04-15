@@ -59,6 +59,10 @@ EXPLORATION_TOOL_NAMES = {
     "search_code",
     "grep_files",
 }
+RSS_SEARCH_TOOL_NAMES = {
+    "search_my_feeds",
+    "search_my_feeds_timeline",
+}
 TASK_ID_RE = re.compile(r'"task_id"\s*:\s*(\d+)')
 UNSUPPORTED_ALPHA_VANTAGE_HINT = (
     "I can use Alpha Vantage for quote lookup, daily history, and bounded intraday history right now, "
@@ -466,6 +470,49 @@ def _tool_call_signature(tool_calls: List[Any], tool_results: List[Dict[str, Any
     return combined or "no_tool_signature"
 
 
+def _tool_call_arguments(call: Any) -> Dict[str, Any]:
+    if isinstance(call, dict):
+        raw = ((call.get("function") or {}).get("arguments"))
+    else:
+        raw = getattr(getattr(call, "function", None), "arguments", None)
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(str(raw))
+    except Exception:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _semantic_tool_signature(tool_calls: List[Any]) -> str | None:
+    if len(tool_calls) != 1:
+        return None
+    tool_name = _tool_call_name(tool_calls[0])
+    if tool_name not in RSS_SEARCH_TOOL_NAMES:
+        return None
+    arguments = _tool_call_arguments(tool_calls[0])
+    ignored_keys = {
+        "refresh",
+        "max_results",
+        "max_total_results",
+        "max_results_per_day",
+    }
+    normalized = {
+        key: value
+        for key, value in arguments.items()
+        if key not in ignored_keys
+    }
+    if tool_name == "search_my_feeds":
+        normalized.pop("days_back", None)
+    try:
+        payload = json.dumps(normalized, ensure_ascii=True, sort_keys=True)
+    except Exception:
+        payload = str(normalized)
+    return f"{tool_name}:{payload}"
+
+
 def _log_agent_turn_start(
     *,
     turn: int,
@@ -618,6 +665,27 @@ def _repeated_tool_signature_message(
     return (
         "I stopped after repeating the same tool cycle without enough progress. "
         f"Repeated tools: {tool_label}. Try narrowing the scope or giving me a more specific target."
+    )
+
+
+def _repeated_semantic_research_message(
+    *,
+    tool_calls: List[Any],
+    history: List[Dict[str, Any]],
+) -> str:
+    tool_names = [name for name in (_tool_call_name(call) for call in tool_calls) if name]
+    tool_label = ", ".join(tool_names[:4]) or "the same research tools"
+    snippets = _recent_tool_snippets(history)
+    if snippets:
+        return (
+            "I stopped because I was repeating the same research search with slightly different limits instead of converging on a summary. "
+            f"Repeated tools: {tool_label}. "
+            f"Recent results were: {' | '.join(snippets)}. "
+            "Try narrowing the time window or topic, or ask me to summarize the strongest results already found."
+        )
+    return (
+        "I stopped because I was repeating the same research search with slightly different limits instead of converging on a summary. "
+        f"Repeated tools: {tool_label}. Try narrowing the time window or topic, or ask me to summarize the strongest results already found."
     )
 
 
@@ -1004,6 +1072,8 @@ async def run_agent(
     consecutive_failed_search_turns = 0
     previous_tool_signature = ""
     repeated_tool_signature_count = 0
+    previous_semantic_tool_signature = ""
+    repeated_semantic_tool_signature_count = 0
     recent_exploration_signatures: List[str] = []
     recent_exploration_signatures: List[str] = []
 
@@ -1047,11 +1117,17 @@ async def run_agent(
             tool_results = await dispatch_tool_calls(message.tool_calls, user_context)
             history.extend(tool_results)
             current_tool_signature = _tool_call_signature(message.tool_calls, tool_results)
+            current_semantic_tool_signature = _semantic_tool_signature(message.tool_calls)
             if current_tool_signature == previous_tool_signature:
                 repeated_tool_signature_count += 1
             else:
                 repeated_tool_signature_count = 0
                 previous_tool_signature = current_tool_signature
+            if current_semantic_tool_signature and current_semantic_tool_signature == previous_semantic_tool_signature:
+                repeated_semantic_tool_signature_count += 1
+            else:
+                repeated_semantic_tool_signature_count = 0
+                previous_semantic_tool_signature = current_semantic_tool_signature or ""
             if _is_exploration_tool_turn(message.tool_calls):
                 recent_exploration_signatures.append(current_tool_signature)
                 recent_exploration_signatures = recent_exploration_signatures[
@@ -1111,6 +1187,25 @@ async def run_agent(
                 return _repeated_tool_signature_message(
                     tool_calls=message.tool_calls,
                     repeated_count=repeated_tool_signature_count,
+                    history=history,
+                )
+            if (
+                current_semantic_tool_signature
+                and repeated_semantic_tool_signature_count >= int(settings.agent_repeated_semantic_tool_signature_threshold)
+            ):
+                _record_loop_event(
+                    event_type="repeated_semantic_tool_signature",
+                    stage=stage,
+                    mode=mode,
+                    model=selected_model,
+                    details={
+                        "turn": turn_number,
+                        "repeated_count": repeated_semantic_tool_signature_count,
+                        "tool_signature": current_semantic_tool_signature,
+                    },
+                )
+                return _repeated_semantic_research_message(
+                    tool_calls=message.tool_calls,
                     history=history,
                 )
             if _exploration_churn_detected(recent_exploration_signatures):
@@ -1180,6 +1275,8 @@ async def stream_agent(
     consecutive_failed_search_turns = 0
     previous_tool_signature = ""
     repeated_tool_signature_count = 0
+    previous_semantic_tool_signature = ""
+    repeated_semantic_tool_signature_count = 0
 
     for turn in range(max_turns):
         turn_number = turn + 1
@@ -1227,11 +1324,17 @@ async def stream_agent(
             tool_results = await dispatch_tool_calls(message.tool_calls, user_context)
             history.extend(tool_results)
             current_tool_signature = _tool_call_signature(message.tool_calls, tool_results)
+            current_semantic_tool_signature = _semantic_tool_signature(message.tool_calls)
             if current_tool_signature == previous_tool_signature:
                 repeated_tool_signature_count += 1
             else:
                 repeated_tool_signature_count = 0
                 previous_tool_signature = current_tool_signature
+            if current_semantic_tool_signature and current_semantic_tool_signature == previous_semantic_tool_signature:
+                repeated_semantic_tool_signature_count += 1
+            else:
+                repeated_semantic_tool_signature_count = 0
+                previous_semantic_tool_signature = current_semantic_tool_signature or ""
             if _is_exploration_tool_turn(message.tool_calls):
                 recent_exploration_signatures.append(current_tool_signature)
                 recent_exploration_signatures = recent_exploration_signatures[
@@ -1287,6 +1390,26 @@ async def stream_agent(
                 yield _repeated_tool_signature_message(
                     tool_calls=message.tool_calls,
                     repeated_count=repeated_tool_signature_count,
+                    history=history,
+                )
+                return
+            if (
+                current_semantic_tool_signature
+                and repeated_semantic_tool_signature_count >= int(settings.agent_repeated_semantic_tool_signature_threshold)
+            ):
+                _record_loop_event(
+                    event_type="repeated_semantic_tool_signature",
+                    stage=stage,
+                    mode=mode,
+                    model=selected_model,
+                    details={
+                        "turn": turn_number,
+                        "repeated_count": repeated_semantic_tool_signature_count,
+                        "tool_signature": current_semantic_tool_signature,
+                    },
+                )
+                yield _repeated_semantic_research_message(
+                    tool_calls=message.tool_calls,
                     history=history,
                 )
                 return

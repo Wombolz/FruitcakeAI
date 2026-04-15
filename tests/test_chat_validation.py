@@ -4,6 +4,7 @@ import pytest
 
 from app.agent.chat_validation import (
     build_chat_retry_instruction,
+    should_validate_chat_response,
     validate_chat_response,
 )
 from app.agent.context import UserContext
@@ -41,7 +42,29 @@ def test_validate_chat_response_accepts_valid_research_links():
     assert out.valid_urls == ["https://apnews.com/article/something"]
 
 
+def test_validate_chat_response_flags_tool_call_leakage():
+    out = validate_chat_response(
+        "Check my rss sources for the latest news on Iran and cite sources",
+        "I'll pull a timeline now. (to=functions.search_my_feeds_timeline armat) The tool name must be provided correctly.",
+    )
+    assert out.has_tool_call_leakage is True
+    assert out.should_retry is True
+    assert out.retry_reason == "tool_call_leakage"
+
+
+def test_should_validate_chat_response_enables_research_on_simple_path():
+    assert should_validate_chat_response(
+        user_prompt="Research the latest headlines on Iran and cite sources",
+        effective_complex=False,
+    ) is True
+    assert should_validate_chat_response(
+        user_prompt="Tell me a joke",
+        effective_complex=False,
+    ) is False
+
+
 def test_build_retry_instruction_has_reason_specific_text():
+    assert "internal tool-calling" in build_chat_retry_instruction("tool_call_leakage").lower()
     assert "too brief/empty" in build_chat_retry_instruction("empty_result").lower()
     assert "grounded sources" in build_chat_retry_instruction("missing_links").lower()
     assert "invalid/placeholder links" in build_chat_retry_instruction("invalid_links").lower()
@@ -150,6 +173,53 @@ async def test_send_message_retries_once_for_missing_links_on_complex_prompt(cli
 
 
 @pytest.mark.asyncio
+async def test_send_message_retries_once_for_tool_leakage_on_simple_research_prompt(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "chattoolleak",
+            "email": "chattoolleak@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "chattoolleak", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Validation Research Simple"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", True),
+        patch.object(settings, "chat_complexity_threshold", 99),
+        patch.object(settings, "chat_validation_enabled", True),
+        patch.object(settings, "chat_validation_retry_enabled", True),
+        patch.object(settings, "chat_validation_retry_max_attempts", 1),
+        patch(
+            "app.api.chat.run_agent",
+            new_callable=AsyncMock,
+            side_effect=[
+                "I'll pull more coverage. (to=functions.search_my_feeds_timeline armat) The tool name must be provided correctly.",
+                "Weekend summary:\n1. BBC: [Read](https://www.bbc.com/news/articles/cn9qzl12537o)",
+            ],
+        ) as mock_run,
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "check my rss sources for the latest news on Iran and cite sources"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert "bbc.com/news/articles" in resp.json()["content"]
+    assert mock_run.await_count == 2
+    assert mock_run.await_args_list[0].kwargs["mode"] == "chat"
+
+
+@pytest.mark.asyncio
 async def test_send_message_strips_invalid_links_when_retry_disabled(client):
     await client.post(
         "/auth/register",
@@ -204,6 +274,7 @@ async def test_kill_switch_forces_complex_chat_back_to_simple_mode(client):
         patch.object(settings, "chat_complexity_routing_enabled", True),
         patch.object(settings, "chat_complexity_threshold", 1),
         patch.object(settings, "chat_orchestration_kill_switch", True),
+        patch.object(settings, "chat_validation_enabled", False),
         patch("app.api.chat.run_agent", new_callable=AsyncMock, return_value="ok") as mock_run,
     ):
         resp = await client.post(

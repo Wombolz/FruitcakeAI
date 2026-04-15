@@ -320,6 +320,110 @@ async def test_run_agent_stops_exploration_churn_with_alternating_signatures(mon
     assert any(event.get("type") == "exploration_churn" for event in loop_events if isinstance(event, dict))
 
 
+@pytest.mark.asyncio
+async def test_run_agent_stops_repeated_rss_timeline_expansion_on_same_window(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_repeated_semantic_tool_signature_threshold", 2)
+
+    responses = [
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_1",
+                        "function": {
+                            "name": "search_my_feeds_timeline",
+                            "arguments": json.dumps(
+                                {
+                                    "query": "Iran",
+                                    "start_date": "2026-04-10",
+                                    "end_date": "2026-04-12",
+                                    "max_results_per_day": 6,
+                                    "max_total_results": 30,
+                                    "refresh": True,
+                                }
+                            ),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_2",
+                        "function": {
+                            "name": "search_my_feeds_timeline",
+                            "arguments": json.dumps(
+                                {
+                                    "query": "Iran",
+                                    "start_date": "2026-04-10",
+                                    "end_date": "2026-04-12",
+                                    "max_results_per_day": 8,
+                                    "max_total_results": 40,
+                                    "refresh": True,
+                                }
+                            ),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_3",
+                        "function": {
+                            "name": "search_my_feeds_timeline",
+                            "arguments": json.dumps(
+                                {
+                                    "query": "Iran",
+                                    "start_date": "2026-04-10",
+                                    "end_date": "2026-04-12",
+                                    "max_results_per_day": 10,
+                                    "max_total_results": 50,
+                                    "refresh": True,
+                                }
+                            ),
+                        },
+                    }
+                ]
+            )
+        ),
+    ]
+    tool_results = [
+        [{"role": "tool", "tool_call_id": "rss_1", "content": "Timeline feed results for Iran weekend batch A"}],
+        [{"role": "tool", "tool_call_id": "rss_2", "content": "Timeline feed results for Iran weekend batch B"}],
+        [{"role": "tool", "tool_call_id": "rss_3", "content": "Timeline feed results for Iran weekend batch C"}],
+    ]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"type": "function", "function": {"name": "search_my_feeds_timeline"}},
+            ],
+        ):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(side_effect=tool_results)):
+                with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=responses)):
+                    result = await run_agent(
+                        [{"role": "user", "content": "Summarize how Iran evolved over the weekend from my feeds."}],
+                        ctx,
+                        mode="chat",
+                    )
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert "repeating the same research search" in result.lower()
+    loop_events = diagnostics.get("loop_events") or []
+    assert any(event.get("type") == "repeated_semantic_tool_signature" for event in loop_events if isinstance(event, dict))
+
+
 def test_content_fingerprint_is_deterministic_sha_based():
     value = "  Repo   map  content  "
     first = _content_fingerprint(value)

@@ -522,6 +522,67 @@ async def test_recurring_task_auto_plans_once_when_missing_plan(client):
 
 
 @pytest.mark.asyncio
+async def test_recurring_agent_task_does_not_auto_plan_and_clears_stale_plan(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "agentrunnerowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Primary Repo Map",
+            "instruction": "Refresh a current repo map and workspace orientation artifact.",
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "repo_map_manager",
+                "display_name": "Primary Repo Map",
+                "included_roots": ["/Users/jwomble/Development/fruitcake_v5"],
+                "ignored_paths": [".venv", "__pycache__"],
+                "output_path": "reports/repo_map.md",
+            },
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.has_plan = True
+        task.current_step_index = 8
+        db.add(
+            TaskStep(
+                task_id=task_id,
+                step_index=1,
+                title="Open pull request",
+                instruction="This stale step should be cleared before agent execution.",
+                status="pending",
+            )
+        )
+        await db.commit()
+
+    runner = TaskRunner()
+    task_ref = type("TaskRef", (), {"id": task_id})()
+
+    with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+        with patch("app.autonomy.planner._generate_plan_steps", new=AsyncMock()) as gen_mock:
+            with patch("app.agent.core.run_agent", new=AsyncMock(return_value="repo map updated")) as run_agent_mock:
+                await runner.execute(task_ref)
+
+    assert gen_mock.await_count == 0
+    assert run_agent_mock.await_count == 1
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.has_plan is False
+        rows = await db.execute(select(TaskStep).where(TaskStep.task_id == task_id))
+        assert rows.scalars().all() == []
+
+
+@pytest.mark.asyncio
 async def test_runner_claims_task_once_under_duplicate_dispatch(client):
     from app.autonomy.runner import TaskRunner
 

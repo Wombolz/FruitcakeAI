@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from app.autonomy.approval import ApprovalRequired, _approval_armed
 from app.autonomy.configured_executor import build_preserved_runtime_state, resolve_task_execution_contract
@@ -483,6 +483,13 @@ class TaskRunner:
                 blocked_tools_count=len(resolved.blocked_tools),
             )
 
+            if _is_agent_recipe_task(task) and has_plan:
+                await db.execute(delete(TaskStep).where(TaskStep.task_id == task.id))
+                task.has_plan = False
+                task.current_step_index = None
+                has_plan = False
+                log.info("task.cleared_stale_agent_plan", task_id=task.id)
+
             # Scheduled/autonomous tasks without a plan get an explicit plan once.
             if not has_plan and self._should_auto_plan(task):
                 plan_goal = (task.title or task.instruction or "").strip() or "Scheduled task"
@@ -657,6 +664,8 @@ class TaskRunner:
 
     @staticmethod
     def _should_auto_plan(task: Task) -> bool:
+        if _is_agent_recipe_task(task):
+            return False
         return bool(task.schedule) or task.task_type == "recurring"
 
     async def _execute_planned_steps(
@@ -1406,6 +1415,17 @@ def _classify_llm_unavailable_error(exc: Exception) -> tuple[bool, str]:
     if any(marker in lowered for marker in indicators):
         return True, text or "llm_unavailable"
     return False, ""
+
+
+def _task_recipe_family(task: Task | None) -> str:
+    if task is None:
+        return ""
+    recipe = task.task_recipe if isinstance(task.task_recipe, dict) else {}
+    return str(recipe.get("family") or "").strip().lower()
+
+
+def _is_agent_recipe_task(task: Task | None) -> bool:
+    return _task_recipe_family(task) == "agent"
 
 
 async def _preflight_llm_dispatch() -> tuple[int, str] | None:

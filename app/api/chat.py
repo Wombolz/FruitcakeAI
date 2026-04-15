@@ -37,6 +37,7 @@ from app.agent.chat_orchestration import build_orchestrated_chat_history
 from app.agent.chat_routing import classify_chat_complexity
 from app.agent.chat_validation import (
     build_chat_retry_instruction,
+    should_validate_chat_response,
     validate_chat_response,
 )
 from app.agent.core import (
@@ -551,6 +552,10 @@ async def send_message(
         auto_complex=(decision.is_complex or library_intent),
         preference=getattr(current_user, "chat_routing_preference", None),
     )
+    should_validate = should_validate_chat_response(
+        user_prompt=body.content,
+        effective_complex=effective_complex,
+    )
     stage_started = time.perf_counter()
     execution_history = build_orchestrated_chat_history(
         history,
@@ -589,7 +594,7 @@ async def send_message(
             mode=execution_mode,
             model_override=session.llm_model,
             stage="chat_complex" if effective_complex else "chat_simple",
-            enable_validation=effective_complex,
+            enable_validation=should_validate,
         )
         _record_chat_stage_timing(stage_timings_ms, "model_execution", stage_started)
         reply = _enforce_calendar_mutation_integrity(
@@ -843,6 +848,10 @@ async def _run_websocket_message(
             auto_complex=(decision.is_complex or library_intent),
             preference=getattr(current_user, "chat_routing_preference", None),
         )
+        should_validate = should_validate_chat_response(
+            user_prompt=user_message,
+            effective_complex=effective_complex,
+        )
         stage_started = time.perf_counter()
         execution_history = build_orchestrated_chat_history(
             history,
@@ -865,7 +874,7 @@ async def _run_websocket_message(
             session_id=session_id,
             source="chat_websocket",
         )
-        if effective_complex:
+        if should_validate:
             stage_started = time.perf_counter()
             complete = await _execute_chat_turn(
                 execution_history,
@@ -873,8 +882,8 @@ async def _run_websocket_message(
                 user_prompt=user_message,
                 mode=execution_mode,
                 model_override=session.llm_model,
-                stage="chat_complex",
-                enable_validation=effective_complex,
+                stage="chat_complex" if effective_complex else "chat_simple",
+                enable_validation=True,
             )
             _record_chat_stage_timing(stage_timings_ms, "model_execution", stage_started)
             complete = _enforce_calendar_mutation_integrity(
