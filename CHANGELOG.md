@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.14
+
+- Hardened long-running agent and chat execution with projected-history compaction, tool-result budgeting, overflow retry, persisted compaction markers, and stronger no-progress loop guards.
+- Improved RSS-backed research quality with structured query parsing, relevance-first ranking, a date-bounded timeline retrieval path, and a new `search_my_feeds_timeline` tool for chronology questions.
+- Tightened research-chat reliability by validating simple research turns, rejecting leaked tool-call scaffolding, and stopping repeated semantic RSS re-search loops before they sprawl.
+- Added and installed the `RSS News Research` skill infrastructure, including MCP-backed skill validation fixes and a reusable strategy packet for feed-based news synthesis.
+- Recorded the next follow-up work explicitly in the roadmap and internal planning docs, including the RSS chat convergence bug slice and the known chat model-selector UI issue that remains client-side follow-up work.
+
 ## v0.7.13
 
 - Introduced the first category-and-preset agent registry, with grouped agent selection in task creation and resolved preset/category metadata in task and run inspection.
