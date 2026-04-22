@@ -513,6 +513,102 @@ async def test_list_recent_feed_items_defaults_window_to_all_when_omitted():
 
 
 @pytest.mark.asyncio
+async def test_list_recent_feed_items_dedupes_duplicate_recent_stories():
+    now = datetime.now(timezone.utc)
+    async with TestSessionLocal() as db:
+        source = RSSSource(
+            user_id=12,
+            name="BBC News",
+            url="https://feeds.bbci.co.uk/news/rss.xml",
+            url_canonical="https://feeds.bbci.co.uk/news/rss.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(source)
+        await db.flush()
+        db.add_all(
+            [
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="dup-1",
+                    title="Supreme Court rejects bid to revoke adoption of sisters",
+                    link="https://www.bbc.com/news/articles/c4glkwww345o?at_medium=RSS&at_campaign=rss",
+                    summary="First summary",
+                    published_at=now,
+                ),
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="dup-2",
+                    title="Supreme Court rejects bid to revoke adoption of sisters",
+                    link="https://www.bbc.com/news/articles/c4glkwww345o",
+                    summary="Second summary",
+                    published_at=now - timedelta(minutes=1),
+                ),
+                RSSItem(
+                    source_id=source.id,
+                    item_uid="uniq-1",
+                    title="Another distinct headline",
+                    link="https://www.bbc.com/news/articles/distinct-1",
+                    summary="Distinct summary",
+                    published_at=now - timedelta(minutes=2),
+                ),
+            ]
+        )
+        await db.commit()
+
+    with patch("app.mcp.servers.rss.AsyncSessionLocal", new=TestSessionLocal):
+        result = await call_tool(
+            "list_recent_feed_items",
+            {"max_results": 5, "window": {"mode": "all"}},
+            user_context={"user_id": 12},
+        )
+
+    assert result.count("Supreme Court rejects bid to revoke adoption of sisters") == 1
+    assert "Another distinct headline" in result
+
+
+@pytest.mark.asyncio
+async def test_list_recent_feed_items_trims_long_summaries_for_headline_payload():
+    async with TestSessionLocal() as db:
+        source = RSSSource(
+            user_id=13,
+            name="Headline Feed",
+            url="https://headline.example/feed.xml",
+            url_canonical="https://headline.example/feed.xml",
+            category="news",
+            active=True,
+            trust_level="manual",
+            update_interval_minutes=60,
+        )
+        db.add(source)
+        await db.flush()
+        db.add(
+            RSSItem(
+                source_id=source.id,
+                item_uid="longsum-1",
+                title="Long Summary Headline",
+                link="https://headline.example/a1",
+                summary="X" * 220,
+                published_at=datetime.now(timezone.utc),
+            )
+        )
+        await db.commit()
+
+    with patch("app.mcp.servers.rss.AsyncSessionLocal", new=TestSessionLocal):
+        result = await call_tool(
+            "list_recent_feed_items",
+            {"max_results": 5, "window": {"mode": "all"}},
+            user_context={"user_id": 13},
+        )
+
+    assert "Summary: " in result
+    assert "X" * 160 not in result
+    assert "…" in result
+
+
+@pytest.mark.asyncio
 async def test_list_recent_feed_items_requires_value_for_explicit_days_mode():
     with patch("app.mcp.servers.rss.AsyncSessionLocal", new=TestSessionLocal):
         result = await call_tool(

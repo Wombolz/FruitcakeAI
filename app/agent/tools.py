@@ -758,9 +758,17 @@ async def dispatch_tool_calls(
     """
     results = []
     for call in tool_calls:
-        tool_name = call.function.name
+        if isinstance(call, dict):
+            function = call.get("function") or {}
+            tool_name = str(function.get("name") or "").strip()
+            raw_arguments = function.get("arguments")
+            tool_call_id = str(call.get("id") or "").strip()
+        else:
+            tool_name = str(getattr(getattr(call, "function", None), "name", "") or "").strip()
+            raw_arguments = getattr(getattr(call, "function", None), "arguments", None)
+            tool_call_id = str(getattr(call, "id", "") or "").strip()
         try:
-            arguments = json.loads(call.function.arguments or "{}")
+            arguments = json.loads(raw_arguments or "{}")
         except json.JSONDecodeError:
             arguments = {}
 
@@ -794,7 +802,7 @@ async def dispatch_tool_calls(
         results.append(
             {
                 "role": "tool",
-                "tool_call_id": call.id,
+                "tool_call_id": tool_call_id,
                 "content": result_content,
             }
         )

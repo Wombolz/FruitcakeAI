@@ -41,9 +41,12 @@ from app.agent.chat_validation import (
     validate_chat_response,
 )
 from app.agent.core import (
+    get_agent_runtime_history,
     get_task_handoff_payload,
+    reset_agent_runtime_history,
     reset_task_handoff_payload,
     restore_task_handoff_payload,
+    restore_agent_runtime_history,
     run_agent,
     stream_agent,
 )
@@ -316,7 +319,7 @@ async def get_session(
                 "created_at": m.created_at,
             }
             for m in messages
-            if not _chat_compaction_metadata(m)
+            if not _is_hidden_runtime_message(m)
         ],
     }
 
@@ -573,6 +576,8 @@ async def send_message(
     usage_token = None
     record_token = None
     handoff_token = None
+    runtime_history_token = None
+    runtime_history_messages: List[Dict[str, Any]] = []
     handoff_metadata: Dict[str, Any] = {}
     chat_run_manager = get_chat_run_manager()
     current_task = asyncio.current_task()
@@ -581,6 +586,7 @@ async def send_message(
             await chat_run_manager.register(session_id, current_task)
         record_token = reset_tool_execution_records()
         handoff_token = reset_task_handoff_payload()
+        runtime_history_token = reset_agent_runtime_history()
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
             session_id=session_id,
@@ -602,6 +608,7 @@ async def send_message(
             reply,
             get_tool_execution_records(),
         )
+        runtime_history_messages = get_agent_runtime_history()
         handoff_metadata = get_task_handoff_payload() or {}
     except asyncio.CancelledError:
         log.info("Chat REST run stopped", session_id=session_id, user_id=current_user.id)
@@ -629,8 +636,14 @@ async def send_message(
                 restore_task_handoff_payload(handoff_token)
             except Exception:
                 pass
+        if runtime_history_token is not None:
+            try:
+                restore_agent_runtime_history(runtime_history_token)
+            except Exception:
+                pass
 
     # Store assistant reply
+    await _persist_runtime_history_messages(session_id, runtime_history_messages, db)
     assistant_msg = ChatMessage(session_id=session_id, role="assistant", content=reply)
     db.add(assistant_msg)
     await db.commit()
@@ -868,7 +881,9 @@ async def _run_websocket_message(
 
         record_token = reset_tool_execution_records()
         handoff_token = reset_task_handoff_payload()
+        runtime_history_token = reset_agent_runtime_history()
         handoff_metadata: Dict[str, Any] = {}
+        runtime_history_messages: List[Dict[str, Any]] = []
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
             session_id=session_id,
@@ -916,7 +931,9 @@ async def _run_websocket_message(
                 "".join(full_response),
                 get_tool_execution_records(),
             )
+        runtime_history_messages = get_agent_runtime_history()
         handoff_metadata = get_task_handoff_payload() or {}
+        await _persist_runtime_history_messages(session_id, runtime_history_messages, db)
         assistant_msg = ChatMessage(
             session_id=session_id, role="assistant", content=complete
         )
@@ -981,6 +998,8 @@ async def _run_websocket_message(
             reset_llm_usage_context(usage_token)
         if "handoff_token" in locals():
             restore_task_handoff_payload(handoff_token)
+        if "runtime_history_token" in locals():
+            restore_agent_runtime_history(runtime_history_token)
 
 
 # ── WebSocket /chat/sessions/{id}/ws (streaming) ─────────────────────────────
@@ -1226,7 +1245,7 @@ async def chat_websocket(
                     receive_task.cancel()
                     try:
                         await receive_task
-                    except asyncio.CancelledError:
+                    except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
                         pass
                     payload = None
                 continue
@@ -1653,6 +1672,64 @@ def _decode_chat_json(raw: Any) -> Any:
     return None
 
 
+def _history_message_from_chat_message(message: ChatMessage) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "role": str(message.role or ""),
+        "content": str(message.content or ""),
+    }
+    tool_calls = _decode_chat_json(getattr(message, "tool_calls", None))
+    if isinstance(tool_calls, list) and tool_calls:
+        payload["tool_calls"] = tool_calls
+    tool_payload = _decode_chat_json(getattr(message, "tool_results", None))
+    if isinstance(tool_payload, dict):
+        tool_call_id = str(tool_payload.get("tool_call_id") or "").strip()
+        if tool_call_id:
+            payload["tool_call_id"] = tool_call_id
+    return payload
+
+
+def _is_hidden_runtime_message(message: ChatMessage) -> bool:
+    if _chat_compaction_metadata(message):
+        return True
+    if str(getattr(message, "role", "") or "") == "tool":
+        return True
+    tool_calls = _decode_chat_json(getattr(message, "tool_calls", None))
+    return str(getattr(message, "role", "") or "") == "assistant" and isinstance(tool_calls, list) and bool(tool_calls)
+
+
+async def _persist_runtime_history_messages(
+    session_id: int,
+    runtime_messages: List[Dict[str, Any]],
+    db: AsyncSession,
+) -> None:
+    rows: list[ChatMessage] = []
+    for message in runtime_messages:
+        role = str(message.get("role") or "").strip()
+        if role == "assistant" and message.get("tool_calls"):
+            rows.append(
+                ChatMessage(
+                    session_id=session_id,
+                    role="assistant",
+                    content=str(message.get("content") or ""),
+                    tool_calls=json.dumps(message.get("tool_calls") or [], ensure_ascii=True, sort_keys=True),
+                )
+            )
+        elif role == "tool":
+            tool_payload = {
+                "tool_call_id": str(message.get("tool_call_id") or "").strip(),
+            }
+            rows.append(
+                ChatMessage(
+                    session_id=session_id,
+                    role="tool",
+                    content=str(message.get("content") or ""),
+                    tool_results=json.dumps(tool_payload, ensure_ascii=True, sort_keys=True),
+                )
+            )
+    if rows:
+        db.add_all(rows)
+
+
 def _estimate_chat_history_tokens(history: List[Dict[str, Any]]) -> int:
     return sum(_estimate_chat_message_tokens(message) for message in history)
 
@@ -1791,7 +1868,7 @@ def _project_chat_history(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 
 async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any]]:
-    """Load conversation history as a list of {role, content} dicts."""
+    """Load conversation history while preserving persisted tool metadata."""
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
@@ -1810,7 +1887,7 @@ async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any
         for message in messages
         if not _chat_compaction_metadata(message) and int(message.id or 0) > compacted_until_id
     ]
-    raw_history = [{"role": m.role, "content": m.content} for m in raw_messages]
+    raw_history = [_history_message_from_chat_message(m) for m in raw_messages]
     estimated_tokens_before = _estimate_chat_history_tokens(raw_history)
     if estimated_tokens_before <= int(settings.chat_history_soft_token_limit):
         if latest_marker is not None:
@@ -1825,7 +1902,7 @@ async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any
             return [{"role": "system", "content": latest_marker.content}] + raw_history
         return raw_history
 
-    projected_suffix = [{"role": m.role, "content": m.content} for m in suffix_messages]
+    projected_suffix = [_history_message_from_chat_message(m) for m in suffix_messages]
     estimated_tokens_after = _estimate_chat_history_tokens(projected_suffix)
     marker = await _persist_chat_compaction_marker(
         session_id,
@@ -1836,7 +1913,7 @@ async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any
         db=db,
     )
     marker_content = marker.content if marker is not None else _build_chat_compaction_boundary(
-        [{"role": m.role, "content": m.content} for m in prefix_messages]
+        [_history_message_from_chat_message(m) for m in prefix_messages]
     )["content"]
     return [{"role": "system", "content": marker_content}] + projected_suffix
 

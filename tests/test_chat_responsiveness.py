@@ -5,6 +5,7 @@ from unittest.mock import patch
 from sqlalchemy import select
 
 from app.api.chat import _load_history, _record_chat_stage_timing
+from app.agent.core import _recent_rss_evidence
 from app.db.models import ChatMessage, ChatSession
 from app.metrics import _Metrics
 from tests.conftest import TestSessionLocal
@@ -79,6 +80,92 @@ async def test_load_history_returns_full_history_when_under_budget(monkeypatch):
         {"role": "user", "content": "Hello"},
         {"role": "assistant", "content": "Hi there"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_load_history_preserves_tool_metadata(monkeypatch):
+    monkeypatch.setattr("app.api.chat.settings.chat_history_soft_token_limit", 5000)
+    monkeypatch.setattr("app.api.chat.settings.chat_recent_messages_keep", 2)
+
+    assistant_tool_calls = [
+        {
+            "id": "rss_1",
+            "function": {
+                "name": "list_recent_feed_items",
+                "arguments": "{\"max_results\": 10}",
+            },
+        }
+    ]
+
+    async with TestSessionLocal() as db:
+        session = ChatSession(user_id=1, title="Tool history")
+        db.add(session)
+        await db.flush()
+        db.add_all(
+            [
+                ChatMessage(session_id=session.id, role="user", content="What are the headlines this evening?"),
+                ChatMessage(
+                    session_id=session.id,
+                    role="assistant",
+                    content="",
+                    tool_calls='[{"id":"rss_1","function":{"name":"list_recent_feed_items","arguments":"{\\"max_results\\": 10}"}}]',
+                ),
+                ChatMessage(
+                    session_id=session.id,
+                    role="tool",
+                    content="Recent feed items (10):\n\n[1] Story A\n[2] Story B",
+                    tool_results='{"tool_call_id":"rss_1"}',
+                ),
+            ]
+        )
+        await db.commit()
+
+        history = await _load_history(session.id, db)
+
+    assert history[1]["tool_calls"] == assistant_tool_calls
+    assert history[2]["tool_call_id"] == "rss_1"
+
+
+@pytest.mark.asyncio
+async def test_load_history_compaction_preserves_recent_tool_metadata(monkeypatch):
+    monkeypatch.setattr("app.api.chat.settings.chat_history_soft_token_limit", 40)
+    monkeypatch.setattr("app.api.chat.settings.chat_recent_messages_keep", 3)
+
+    async with TestSessionLocal() as db:
+        session = ChatSession(user_id=1, title="Compaction with tools")
+        db.add(session)
+        await db.flush()
+        db.add_all(
+            [
+                ChatMessage(session_id=session.id, role="user", content="A" * 120),
+                ChatMessage(session_id=session.id, role="assistant", content="B" * 120),
+                ChatMessage(session_id=session.id, role="user", content="What are the headlines this evening?"),
+                ChatMessage(
+                    session_id=session.id,
+                    role="assistant",
+                    content="",
+                    tool_calls='[{"id":"recent_1","function":{"name":"list_recent_feed_items","arguments":"{\\"max_results\\": 10, \\"window\\": {\\"mode\\": \\"hours\\", \\"value\\": 12}}"}}]',
+                ),
+                ChatMessage(
+                    session_id=session.id,
+                    role="tool",
+                    content="Recent feed items (10):\n\n[1] Story A\n[2] Story B",
+                    tool_results='{"tool_call_id":"recent_1"}',
+                ),
+            ]
+        )
+        await db.commit()
+
+        history = await _load_history(session.id, db)
+
+    assert history[0]["role"] == "system"
+    assert history[-2]["tool_calls"][0]["function"]["name"] == "list_recent_feed_items"
+    assert history[-1]["tool_call_id"] == "recent_1"
+
+    evidence = _recent_rss_evidence(history)
+    assert len(evidence) == 1
+    assert evidence[0]["tool_name"] == "list_recent_feed_items"
+    assert evidence[0]["item_count"] == 2
 
 
 @pytest.mark.asyncio

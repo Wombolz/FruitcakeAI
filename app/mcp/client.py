@@ -1,6 +1,6 @@
 """
 FruitcakeAI v5 — MCP Client
-Ported from v4 (production-proven). Supports SSE (HTTP) and stdio (subprocess)
+Ported from v4 (production-proven). Supports HTTP JSON-RPC and stdio
 transports using the JSON-RPC 2.0 MCP wire protocol.
 """
 
@@ -27,7 +27,7 @@ class MCPClient:
 
     Supports two transports:
     - stdio: spawns a subprocess (e.g. `docker run -i --rm <image>`)
-    - sse:   connects to an HTTP MCP server
+    - http:  connects to an HTTP MCP server
     """
 
     def __init__(
@@ -43,7 +43,7 @@ class MCPClient:
         self.command = command
         self.args = args or []
         self.timeout = timeout
-        self.transport_type = "stdio" if command else "sse"
+        self.transport_type = "stdio" if command else "http"
 
         self._client: Optional[httpx.AsyncClient] = None
         self._process: Optional[asyncio.subprocess.Process] = None
@@ -67,18 +67,20 @@ class MCPClient:
     async def connect(self) -> bool:
         if self.transport_type == "stdio":
             return await self._connect_stdio()
-        return await self._connect_sse()
+        return await self._connect_http()
 
-    async def _connect_sse(self) -> bool:
+    async def _connect_http(self) -> bool:
         self._connection_state = "connecting"
         try:
             self._client = httpx.AsyncClient(
                 base_url=self.server_url,
                 timeout=httpx.Timeout(self.timeout),
                 follow_redirects=True,
+                headers={"Connection": "close"},
+                limits=httpx.Limits(max_keepalive_connections=0, max_connections=10),
             )
             response = await self._client.post(
-                "/initialize",
+                "/",
                 json={
                     "jsonrpc": "2.0",
                     "id": self._next_id(),
@@ -96,7 +98,7 @@ class MCPClient:
                 self._connected = True
                 self._connection_state = "connected"
                 await self._discover_tools()
-                log.info("MCP server connected", server=self.server_name, transport="sse")
+                log.info("MCP server connected", server=self.server_name, transport="http")
                 return True
             self._last_error = f"HTTP {response.status_code}"
             self._connection_state = "error"
@@ -289,7 +291,7 @@ class MCPClient:
                 if not self._client:
                     return
                 response = await self._client.post(
-                    "/tools/list",
+                    "/",
                     json={
                         "jsonrpc": "2.0",
                         "id": self._next_id(),
@@ -319,7 +321,7 @@ class MCPClient:
         """Execute a tool. Returns {"success": bool, "result": ..., "error": ...}."""
         if self.transport_type == "stdio":
             return await self._call_stdio(tool_name, arguments)
-        return await self._call_sse(tool_name, arguments)
+        return await self._call_http(tool_name, arguments)
 
     async def _call_stdio(
         self, tool_name: str, arguments: Dict[str, Any]
@@ -385,14 +387,14 @@ class MCPClient:
         )
         return any(fragment in value for fragment in retryable_fragments)
 
-    async def _call_sse(
+    async def _call_http(
         self, tool_name: str, arguments: Dict[str, Any]
     ) -> Dict[str, Any]:
         try:
             if not self._connected or not self._client:
                 raise RuntimeError(f"Not connected to {self.server_name}")
             response = await self._client.post(
-                "/tools/call",
+                "/",
                 json={
                     "jsonrpc": "2.0",
                     "id": self._next_id(),
@@ -405,7 +407,7 @@ class MCPClient:
                 return {"success": True, "result": result.get("result", result)}
             return {"success": False, "error": f"HTTP {response.status_code}"}
         except Exception as e:
-            log.error("MCP SSE tool call failed", server=self.server_name, tool=tool_name, error=str(e))
+            log.error("MCP HTTP tool call failed", server=self.server_name, tool=tool_name, error=str(e))
             return {"success": False, "error": str(e)}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────

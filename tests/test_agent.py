@@ -23,7 +23,12 @@ from sqlalchemy import select
 
 from app.agent.context import UserContext
 from app.agent.core import (
+    _filter_tools_for_prompt,
+    _is_rss_owned_headline_prompt,
+    _rewrite_headline_rss_tool_calls,
+    _sanitize_history_tool_chains,
     _content_fingerprint,
+    _rss_evidence_summary,
     get_agent_loop_diagnostics,
     reset_agent_loop_diagnostics,
     restore_agent_loop_diagnostics,
@@ -393,6 +398,11 @@ async def test_run_agent_stops_repeated_rss_timeline_expansion_on_same_window(mo
                 ]
             )
         ),
+        _FakeResponse(
+            _FakeMessage(
+                content="From the weekend results already gathered, talks stayed active through Saturday and ended Sunday without a deal."
+            )
+        ),
     ]
     tool_results = [
         [{"role": "tool", "tool_call_id": "rss_1", "content": "Timeline feed results for Iran weekend batch A"}],
@@ -419,9 +429,494 @@ async def test_run_agent_stops_repeated_rss_timeline_expansion_on_same_window(mo
     finally:
         restore_agent_loop_diagnostics(token)
 
-    assert "repeating the same research search" in result.lower()
+    assert "ended sunday without a deal" in result.lower()
     loop_events = diagnostics.get("loop_events") or []
     assert any(event.get("type") == "repeated_semantic_tool_signature" for event in loop_events if isinstance(event, dict))
+
+
+@pytest.mark.asyncio
+async def test_run_agent_converges_after_rss_query_family_reformulations(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_repeated_semantic_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_repeated_rss_query_family_threshold", 3)
+
+    responses = [
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_a",
+                        "function": {
+                            "name": "search_my_feeds",
+                            "arguments": json.dumps(
+                                {
+                                    "query": "Georgia wildfires",
+                                    "max_results": 10,
+                                    "refresh": True,
+                                    "days_back": 10,
+                                }
+                            ),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_b",
+                        "function": {
+                            "name": "search_my_feeds",
+                            "arguments": json.dumps(
+                                {
+                                    "query": "wildfire Georgia",
+                                    "max_results": 10,
+                                    "refresh": True,
+                                    "days_back": 30,
+                                }
+                            ),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_c",
+                        "function": {
+                            "name": "search_my_feeds",
+                            "arguments": json.dumps(
+                                {
+                                    "query": "forest fire Georgia",
+                                    "max_results": 10,
+                                    "refresh": False,
+                                    "days_back": 30,
+                                }
+                            ),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                content="I'm not finding strong Georgia wildfire coverage in your current feeds. I found one loosely related item, but nothing that looks like a solid wildfire update."
+            )
+        ),
+    ]
+    tool_results = [
+        [{"role": "tool", "tool_call_id": "rss_a", "content": "Cached feed results for 'Georgia wildfires' (cache after refreshing 175 source(s)):\n\n[1] Pluralistic: Georgia's voting technology blunder"}],
+        [{"role": "tool", "tool_call_id": "rss_b", "content": "Cached feed results for 'wildfire Georgia' (cache after refreshing 175 source(s)):\n\n[1] Pluralistic: Georgia's voting technology blunder"}],
+        [{"role": "tool", "tool_call_id": "rss_c", "content": "Cached feed results for 'forest fire Georgia' (cache-only):\n\n[1] Reuters World News: unrelated ceasefire article"}],
+    ]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"type": "function", "function": {"name": "search_my_feeds"}},
+            ],
+        ):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(side_effect=tool_results)):
+                with patch("app.agent.core.record_llm_usage_event", new=AsyncMock()):
+                    with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=responses)):
+                        result = await run_agent(
+                            [{"role": "user", "content": "Do I have any news on the wildfires in Georgia in my articles?"}],
+                            ctx,
+                            mode="chat",
+                        )
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert "not finding strong georgia wildfire coverage" in result.lower()
+    loop_events = diagnostics.get("loop_events") or []
+    assert any(event.get("type") == "rss_query_family_churn" for event in loop_events if isinstance(event, dict))
+
+
+@pytest.mark.asyncio
+async def test_run_agent_converges_headline_roundup_after_bounded_rss_turns(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_repeated_semantic_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_headline_roundup_rss_turn_cap", 2)
+
+    responses = [
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "recent_1",
+                        "function": {
+                            "name": "list_recent_feed_items",
+                            "arguments": json.dumps(
+                                {
+                                    "max_results": 5,
+                                    "window": {"mode": "hours", "value": 12},
+                                }
+                            ),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "recent_2",
+                        "function": {
+                            "name": "list_recent_feed_items",
+                            "arguments": json.dumps(
+                                {
+                                    "max_results": 8,
+                                    "window": {"mode": "hours", "value": 12},
+                                }
+                            ),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                content="Here are the strongest headlines this evening from your feeds: Story A, Story B, and Story C."
+            )
+        ),
+    ]
+    tool_results = [
+        [{"role": "tool", "tool_call_id": "recent_1", "content": "Recent feed items (hours=12):\n\n[1] Story A\n[2] Story B"}],
+        [{"role": "tool", "tool_call_id": "recent_2", "content": "Recent feed items (hours=12):\n\n[1] Story A\n[2] Story B\n[3] Story C"}],
+    ]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"type": "function", "function": {"name": "list_recent_feed_items"}},
+            ],
+        ):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(side_effect=tool_results)):
+                with patch("app.agent.core.record_llm_usage_event", new=AsyncMock()):
+                    with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=responses)):
+                        result = await run_agent(
+                            [{"role": "user", "content": "What are the headlines this evening?"}],
+                            ctx,
+                            mode="chat",
+                        )
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert "strongest headlines this evening" in result.lower()
+    loop_events = diagnostics.get("loop_events") or []
+    assert any(event.get("type") == "headline_roundup_convergence" for event in loop_events if isinstance(event, dict))
+
+
+@pytest.mark.asyncio
+async def test_run_agent_falls_back_cleanly_when_rss_synthesis_errors(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_repeated_semantic_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_repeated_rss_query_family_threshold", 3)
+
+    responses = [
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_a",
+                        "function": {
+                            "name": "search_my_feeds",
+                            "arguments": json.dumps({"query": "Georgia wildfires", "max_results": 10, "refresh": True, "days_back": 10}),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_b",
+                        "function": {
+                            "name": "search_my_feeds",
+                            "arguments": json.dumps({"query": "wildfire Georgia", "max_results": 10, "refresh": True, "days_back": 30}),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_c",
+                        "function": {
+                            "name": "search_my_feeds",
+                            "arguments": json.dumps({"query": "forest fire Georgia", "max_results": 10, "refresh": False, "days_back": 30}),
+                        },
+                    }
+                ]
+            )
+        ),
+    ]
+    tool_results = [
+        [{"role": "tool", "tool_call_id": "rss_a", "content": "No results found for 'Georgia wildfires'."}],
+        [{"role": "tool", "tool_call_id": "rss_b", "content": "No results found for 'wildfire Georgia'."}],
+        [{"role": "tool", "tool_call_id": "rss_c", "content": "No results found for 'forest fire Georgia'."}],
+    ]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[{"type": "function", "function": {"name": "search_my_feeds"}}],
+        ):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(side_effect=tool_results)):
+                with patch("app.agent.core._synthesize_from_rss_evidence", new=AsyncMock(side_effect=RuntimeError("boom"))):
+                    with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=responses)):
+                        result = await run_agent(
+                            [{"role": "user", "content": "Do I have any news on the wildfires in Georgia in my articles?"}],
+                            ctx,
+                            mode="chat",
+                        )
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert "repeating the same research search" in result.lower()
+    loop_events = diagnostics.get("loop_events") or []
+    assert any(event.get("type") == "rss_query_family_churn" for event in loop_events if isinstance(event, dict))
+
+
+def test_sanitize_history_tool_chains_preserves_valid_tool_chain():
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {"name": "search_my_feeds", "arguments": "{\"query\":\"Iran\"}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+
+    sanitized, repaired = _sanitize_history_tool_chains(history)
+
+    assert repaired == 0
+    assert sanitized == history
+
+
+def test_sanitize_history_tool_chains_strips_orphaned_tool_calls():
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_orphan",
+                    "function": {"name": "list_recent_feed_items", "arguments": "{\"max_results\":10}"},
+                }
+            ],
+        },
+        {"role": "assistant", "content": "continuing"},
+    ]
+
+    sanitized, repaired = _sanitize_history_tool_chains(history)
+
+    assert repaired == 1
+    assert "tool_calls" not in sanitized[0]
+    assert sanitized[0]["content"] == ""
+
+
+def test_sanitize_history_tool_chains_requires_all_matching_tool_results():
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_a",
+                    "function": {"name": "search_my_feeds", "arguments": "{\"query\":\"A\"}"},
+                },
+                {
+                    "id": "call_b",
+                    "function": {"name": "search_my_feeds", "arguments": "{\"query\":\"B\"}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_a", "content": "only one result"},
+    ]
+
+    sanitized, repaired = _sanitize_history_tool_chains(history)
+
+    assert repaired == 1
+    assert "tool_calls" not in sanitized[0]
+
+
+def test_rss_evidence_summary_preserves_full_recent_items_block():
+    full_block = (
+        "Recent feed items (10):\n\n"
+        "[1] Story 1\n[2] Story 2\n[3] Story 3\n[4] Story 4\n[5] Story 5\n"
+        "[6] Story 6\n[7] Story 7\n[8] Story 8\n[9] Story 9\n[10] Story 10\n"
+    )
+
+    summary = _rss_evidence_summary(
+        [
+            {
+                "tool_name": "list_recent_feed_items",
+                "content": full_block,
+                "item_count": 10,
+                "is_empty": False,
+            }
+        ]
+    )
+
+    assert "item_count=10" in summary
+    assert "[10] Story 10" in summary
+
+
+def test_rss_evidence_summary_omits_recent_item_summaries():
+    summary = _rss_evidence_summary(
+        [
+            {
+                "tool_name": "list_recent_feed_items",
+                "content": (
+                    "Recent feed items (2):\n\n"
+                    "[1] Story 1\n"
+                    "    Source: Feed A\n"
+                    "    Summary: Long summary here\n"
+                    "    URL: https://example.com/1\n"
+                ),
+                "item_count": 2,
+                "is_empty": False,
+            }
+        ]
+    )
+
+    assert "Summary:" not in summary
+    assert "Source: Feed A" in summary
+    assert "URL: https://example.com/1" in summary
+
+
+def test_rss_owned_headline_prompt_defaults_to_feeds_unless_broadened():
+    assert _is_rss_owned_headline_prompt([{"role": "user", "content": "Give me 10 headlines from today's news"}]) is True
+    assert _is_rss_owned_headline_prompt([{"role": "user", "content": "Give me 10 headlines from today's news across the wider web"}]) is False
+
+
+def test_filter_tools_for_prompt_removes_web_search_for_rss_owned_headlines():
+    ctx = _make_context()
+    tools = [
+        {"type": "function", "function": {"name": "web_search"}},
+        {"type": "function", "function": {"name": "list_recent_feed_items"}},
+    ]
+
+    filtered = _filter_tools_for_prompt(
+        tools,
+        rss_owned_headline_prompt=True,
+        mode="chat",
+        stage="chat_simple",
+        selected_model="gpt-5-mini",
+        user_context=ctx,
+    )
+
+    names = [tool["function"]["name"] for tool in filtered]
+    assert names == ["list_recent_feed_items"]
+
+
+def test_rewrite_headline_rss_tool_calls_downgrades_repeat_refresh():
+    ctx = _make_context()
+    tool_calls = [
+        {
+            "id": "recent_2",
+            "function": {
+                "name": "list_recent_feed_items",
+                "arguments": json.dumps(
+                    {"max_results": 10, "window": {"mode": "hours", "value": 24}, "refresh": True}
+                ),
+            },
+        }
+    ]
+
+    rewritten, seen_count = _rewrite_headline_rss_tool_calls(
+        tool_calls,
+        rss_owned_headline_prompt=True,
+        prior_recent_feed_fetches=1,
+        mode="chat",
+        stage="chat_simple",
+        selected_model="gpt-5-mini",
+        user_context=ctx,
+    )
+
+    rewritten_args = json.loads(rewritten[0]["function"]["arguments"])
+    assert rewritten_args["refresh"] is False
+    assert seen_count == 2
+
+
+def test_sanitize_history_tool_chains_coerces_null_content_to_empty_string():
+    history = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_missing",
+                    "function": {"name": "list_recent_feed_items", "arguments": "{\"max_results\":10}"},
+                }
+            ],
+        }
+    ]
+
+    sanitized, repaired = _sanitize_history_tool_chains(history)
+
+    assert repaired == 1
+    assert sanitized[0]["content"] == ""
+    assert "tool_calls" not in sanitized[0]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_replay_strips_orphaned_tool_calls_before_model_request(monkeypatch):
+    ctx = _make_context()
+    seen_messages = []
+
+    async def _fake_acompletion(*, model, messages, **kwargs):
+        seen_messages.append(messages)
+        return _FakeResponse(_FakeMessage(content="safe replay"))
+
+    history = [
+        {"role": "user", "content": "Start"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_missing",
+                    "function": {"name": "list_recent_feed_items", "arguments": "{\"max_results\":10}"},
+                }
+            ],
+        },
+        {"role": "assistant", "content": "Follow-up question"},
+    ]
+
+    with patch("app.agent.core.get_tools_for_user", return_value=[]):
+        with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=_fake_acompletion)):
+            result = await run_agent(history, ctx, mode="chat")
+
+    assert result == "safe replay"
+    model_history = seen_messages[0]
+    assistant_messages = [message for message in model_history if message.get("role") == "assistant"]
+    assert assistant_messages
+    assert all("tool_calls" not in message for message in assistant_messages)
 
 
 def test_content_fingerprint_is_deterministic_sha_based():
@@ -828,6 +1323,28 @@ async def test_dispatch_unknown_tool_returns_error_string():
     assert len(results) == 1
     assert results[0]["role"] == "tool"
     assert "Unknown tool" in results[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_accepts_dict_style_tool_calls():
+    from unittest.mock import AsyncMock, patch
+    import app.agent.tools as tools_module
+
+    ctx = _make_context()
+    dict_call = {
+        "id": "call_dict",
+        "type": "function",
+        "function": {
+            "name": "search_library",
+            "arguments": '{"query": "test"}',
+        },
+    }
+
+    with patch.object(tools_module, "_search_library", new=AsyncMock(return_value="ok")):
+        with patch.object(tools_module, "_write_audit_log", new_callable=AsyncMock):
+            results = await tools_module.dispatch_tool_calls([dict_call], ctx)
+
+    assert results == [{"role": "tool", "tool_call_id": "call_dict", "content": "ok"}]
 
 
 @pytest.mark.asyncio

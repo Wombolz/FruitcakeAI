@@ -30,6 +30,10 @@ _agent_loop_diagnostics: contextvars.ContextVar[dict[str, Any]] = contextvars.Co
     "agent_loop_diagnostics",
     default={},
 )
+_agent_runtime_history: contextvars.ContextVar[list[dict[str, Any]]] = contextvars.ContextVar(
+    "agent_runtime_history",
+    default=[],
+)
 
 # Silence LiteLLM's verbose request logging in production
 litellm.suppress_debug_info = True
@@ -63,6 +67,75 @@ RSS_SEARCH_TOOL_NAMES = {
     "search_my_feeds",
     "search_my_feeds_timeline",
 }
+RSS_RETRIEVAL_TOOL_NAMES = RSS_SEARCH_TOOL_NAMES | {
+    "list_recent_feed_items",
+}
+HEADLINE_ROUNDUP_MARKERS = (
+    "headlines this evening",
+    "headlines tonight",
+    "what are the headlines",
+    "what's new right now",
+    "whats new right now",
+    "top headlines",
+    "latest headlines",
+    "headline roundup",
+    "give me 10 headlines",
+    "give me ten headlines",
+    "headlines today",
+    "today's headlines",
+    "todays headlines",
+)
+HEADLINE_RSS_OWNED_HINTS = (
+    "my feeds",
+    "my feed",
+    "my articles",
+    "my article",
+    "in my feeds",
+    "in my articles",
+)
+HEADLINE_BROADER_WEB_HINTS = (
+    "wider web",
+    "across the web",
+    "outside my feeds",
+    "outside my feed",
+    "outside my articles",
+    "news sites",
+    "from the web",
+    "web coverage",
+)
+RSS_QUERY_FAMILY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "any",
+    "article",
+    "articles",
+    "current",
+    "evening",
+    "feed",
+    "feeds",
+    "headline",
+    "headlines",
+    "in",
+    "latest",
+    "my",
+    "news",
+    "now",
+    "of",
+    "on",
+    "right",
+    "the",
+    "this",
+    "tonight",
+    "top",
+    "what",
+}
+RSS_SYNONYM_NORMALIZATIONS = (
+    (r"\bwild[\s-]?fires?\b", "wildfire"),
+    (r"\bforest fire(s)?\b", "wildfire"),
+    (r"\bbrush fire(s)?\b", "wildfire"),
+    (r"\bheadlines?\b", "headline"),
+)
 TASK_ID_RE = re.compile(r'"task_id"\s*:\s*(\d+)')
 UNSUPPORTED_ALPHA_VANTAGE_HINT = (
     "I can use Alpha Vantage for quote lookup, daily history, and bounded intraday history right now, "
@@ -90,6 +163,18 @@ def restore_agent_loop_diagnostics(token: contextvars.Token) -> None:
     _agent_loop_diagnostics.reset(token)
 
 
+def reset_agent_runtime_history() -> contextvars.Token:
+    return _agent_runtime_history.set([])
+
+
+def get_agent_runtime_history() -> list[dict[str, Any]]:
+    return list(_agent_runtime_history.get())
+
+
+def restore_agent_runtime_history(token: contextvars.Token) -> None:
+    _agent_runtime_history.reset(token)
+
+
 def _build_messages(
     history: List[Dict[str, Any]],
     user_context: UserContext,
@@ -100,6 +185,43 @@ def _build_messages(
     if followup_hint:
         messages.append({"role": "system", "content": followup_hint})
     return messages + history
+
+
+def _sanitize_history_tool_chains(
+    history: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], int]:
+    if not history:
+        return [], 0
+
+    available_tool_ids: set[str] = set()
+    sanitized_reversed: list[Dict[str, Any]] = []
+    repaired = 0
+
+    for message in reversed(history):
+        role = str(message.get("role") or "").strip()
+        current = dict(message)
+        current["content"] = str(current.get("content") or "")
+
+        if role == "tool":
+            tool_call_id = str(current.get("tool_call_id") or "").strip()
+            if tool_call_id:
+                available_tool_ids.add(tool_call_id)
+            sanitized_reversed.append(current)
+            continue
+
+        tool_calls = current.get("tool_calls") or []
+        if role == "assistant" and tool_calls:
+            required_ids = [tool_call_id for tool_call_id in (_tool_call_id(call) for call in tool_calls) if tool_call_id]
+            if required_ids and not all(tool_call_id in available_tool_ids for tool_call_id in required_ids):
+                current.pop("tool_calls", None)
+                repaired += 1
+            elif current.get("tool_calls"):
+                current = _normalize_tool_calls(current)
+
+        sanitized_reversed.append(current)
+
+    sanitized_reversed.reverse()
+    return sanitized_reversed, repaired
 
 
 async def _acompletion_with_budget(
@@ -119,6 +241,17 @@ async def _acompletion_with_budget(
     stream_kwargs = dict(stream_kwargs or {})
 
     projected_history, report = _project_history_for_model(history, aggressive=False)
+    projected_history, repaired_tool_chains = _sanitize_history_tool_chains(projected_history)
+    if repaired_tool_chains:
+        log.warning(
+            "agent.history_tool_chain_repaired",
+            repaired_count=repaired_tool_chains,
+            stage=stage,
+            mode=mode,
+            model=model,
+            session_id=user_context.session_id,
+            task_id=user_context.task_id,
+        )
     _record_budget_event(report, stage=stage, mode=mode, model=model)
 
     try:
@@ -135,6 +268,18 @@ async def _acompletion_with_budget(
         if not settings.agent_overflow_retry_enabled or not _is_context_window_error(exc):
             raise
         aggressive_history, aggressive_report = _project_history_for_model(history, aggressive=True)
+        aggressive_history, repaired_aggressive_tool_chains = _sanitize_history_tool_chains(aggressive_history)
+        if repaired_aggressive_tool_chains:
+            log.warning(
+                "agent.history_tool_chain_repaired",
+                repaired_count=repaired_aggressive_tool_chains,
+                stage=stage,
+                mode=mode,
+                model=model,
+                session_id=user_context.session_id,
+                task_id=user_context.task_id,
+                aggressive=True,
+            )
         _record_budget_event(aggressive_report, stage=stage, mode=mode, model=model)
         try:
             response = await litellm.acompletion(
@@ -167,12 +312,22 @@ def _normalize_tool_calls(message: Dict[str, Any]) -> Dict[str, Any]:
         return message
     fixed = []
     for tc in message["tool_calls"]:
+        if not isinstance(tc, dict):
+            continue
         fn = tc.get("function", {})
         if isinstance(fn.get("arguments"), dict):
             fn = {**fn, "arguments": json.dumps(fn["arguments"])}
             tc = {**tc, "function": fn}
         fixed.append(tc)
     return {**message, "tool_calls": fixed}
+
+
+def _record_agent_runtime_messages(messages: List[Dict[str, Any]]) -> None:
+    if not messages:
+        return
+    current = list(_agent_runtime_history.get())
+    current.extend(messages)
+    _agent_runtime_history.set(current)
 
 
 def _normalized_local_api_base() -> str:
@@ -200,6 +355,12 @@ def _tool_call_name(call: Any) -> str:
     return str(getattr(getattr(call, "function", None), "name", "") or "").strip()
 
 
+def _tool_call_id(call: Any) -> str:
+    if isinstance(call, dict):
+        return str(call.get("id") or "").strip()
+    return str(getattr(call, "id", "") or "").strip()
+
+
 def _content_fingerprint(value: str, *, length: int = 12) -> str:
     normalized = " ".join(str(value or "").split())
     if not normalized:
@@ -216,11 +377,8 @@ def _estimate_message_tokens(message: Dict[str, Any]) -> int:
     total = _estimate_tokens(str(message.get("content") or ""))
     tool_calls = message.get("tool_calls") or []
     for call in tool_calls:
-        if not isinstance(call, dict):
-            continue
-        function = call.get("function") or {}
-        total += _estimate_tokens(str(function.get("name") or ""))
-        total += _estimate_tokens(str(function.get("arguments") or ""))
+        total += _estimate_tokens(_tool_call_name(call))
+        total += _estimate_tokens(str(_tool_call_arguments(call)))
     return total
 
 
@@ -239,11 +397,8 @@ def _tool_name_lookup(history: List[Dict[str, Any]]) -> dict[str, str]:
     lookup: dict[str, str] = {}
     for message in history:
         for call in message.get("tool_calls") or []:
-            if not isinstance(call, dict):
-                continue
-            call_id = str(call.get("id") or "").strip()
-            function = call.get("function") or {}
-            tool_name = str(function.get("name") or "").strip()
+            call_id = _tool_call_id(call)
+            tool_name = _tool_call_name(call)
             if call_id and tool_name:
                 lookup[call_id] = tool_name
     return lookup
@@ -284,10 +439,7 @@ def _compact_message_summary(
     if message.get("tool_calls"):
         names = []
         for call in message.get("tool_calls") or []:
-            if not isinstance(call, dict):
-                continue
-            function = call.get("function") or {}
-            names.append(str(function.get("name") or "unknown_tool"))
+            names.append(_tool_call_name(call) or "unknown_tool")
         return f"Assistant requested tools: {', '.join(names[:5])}"
     content = _compact_text(str(message.get("content") or ""), max_chars=160)
     return f"{role.capitalize()}: {content}"
@@ -511,6 +663,337 @@ def _semantic_tool_signature(tool_calls: List[Any]) -> str | None:
     except Exception:
         payload = str(normalized)
     return f"{tool_name}:{payload}"
+
+
+def _normalize_query_family(query: str) -> str:
+    text = str(query or "").strip().lower()
+    if not text:
+        return "latest"
+    for pattern, replacement in RSS_SYNONYM_NORMALIZATIONS:
+        text = re.sub(pattern, replacement, text)
+    raw_tokens = re.findall(r"[a-z0-9]+", text)
+    tokens: list[str] = []
+    for token in raw_tokens:
+        if token in RSS_QUERY_FAMILY_STOPWORDS:
+            continue
+        if token.endswith("ies") and len(token) > 4:
+            token = token[:-3] + "y"
+        elif token.endswith("es") and len(token) > 4:
+            token = token[:-2]
+        elif token.endswith("s") and len(token) > 3:
+            token = token[:-1]
+        if token and token not in RSS_QUERY_FAMILY_STOPWORDS:
+            tokens.append(token)
+    if not tokens:
+        return "latest"
+    return "|".join(sorted(dict.fromkeys(tokens)))
+
+
+def _rss_query_family_signature(tool_calls: List[Any]) -> str | None:
+    if len(tool_calls) != 1:
+        return None
+    tool_name = _tool_call_name(tool_calls[0])
+    if tool_name not in RSS_RETRIEVAL_TOOL_NAMES:
+        return None
+    arguments = _tool_call_arguments(tool_calls[0])
+    if tool_name == "search_my_feeds_timeline":
+        query_family = _normalize_query_family(str(arguments.get("query") or ""))
+        start = str(arguments.get("start_date") or "")
+        end = str(arguments.get("end_date") or "")
+        return f"{tool_name}:{query_family}:{start}:{end}"
+    if tool_name == "search_my_feeds":
+        query_family = _normalize_query_family(str(arguments.get("query") or ""))
+        category = str(arguments.get("category") or "")
+        return f"{tool_name}:{query_family}:{category}"
+    sources = arguments.get("sources") or {}
+    window = arguments.get("window") or {}
+    source_mode = str((sources.get("mode") or "all")).strip().lower()
+    window_mode = str((window.get("mode") or "all")).strip().lower()
+    return f"{tool_name}:{source_mode}:{window_mode}"
+
+
+def _is_headline_roundup_prompt(messages: List[Dict[str, Any]]) -> bool:
+    text = _latest_user_message_text(messages).lower()
+    if not text:
+        return False
+    return any(marker in text for marker in HEADLINE_ROUNDUP_MARKERS)
+
+
+def _is_rss_owned_headline_prompt(messages: List[Dict[str, Any]]) -> bool:
+    text = _latest_user_message_text(messages).lower()
+    if not text or not _is_headline_roundup_prompt(messages):
+        return False
+    if any(marker in text for marker in HEADLINE_BROADER_WEB_HINTS):
+        return False
+    return True
+
+
+def _filter_tools_for_prompt(
+    tools: List[Dict[str, Any]],
+    *,
+    rss_owned_headline_prompt: bool,
+    mode: str,
+    stage: str | None,
+    selected_model: str,
+    user_context: UserContext,
+) -> List[Dict[str, Any]]:
+    if not rss_owned_headline_prompt or mode not in {"chat", "chat_orchestrated"}:
+        return tools
+    filtered = [tool for tool in tools if str(((tool.get("function") or {}).get("name") or "")).strip() != "web_search"]
+    if len(filtered) != len(tools):
+        log.info(
+            "agent.headline_roundup_rss_lane",
+            skipped_web_search=True,
+            mode=mode,
+            stage=stage,
+            model=selected_model,
+            session_id=user_context.session_id,
+            task_id=user_context.task_id,
+        )
+    return filtered
+
+
+def _rss_result_item_count(content: str) -> int:
+    text = str(content or "")
+    return len(re.findall(r"\[\d+\]", text))
+
+
+def _is_empty_rss_result(content: str) -> bool:
+    lowered = str(content or "").strip().lower()
+    empty_markers = (
+        "no results found for",
+        "no cached results found for",
+        "no timeline results found for",
+        "no recent cached headlines found",
+        "no recent feed items found",
+        "no active rss sources available",
+    )
+    return any(marker in lowered for marker in empty_markers)
+
+
+def _recent_rss_evidence(history: List[Dict[str, Any]], *, limit: int = 4) -> list[dict[str, Any]]:
+    tool_lookup = _tool_name_lookup(history)
+    evidence: list[dict[str, Any]] = []
+    seen_fingerprints: set[str] = set()
+    for message in reversed(history):
+        if str(message.get("role") or "") != "tool":
+            continue
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        tool_name = tool_lookup.get(tool_call_id) or ""
+        if tool_name not in RSS_RETRIEVAL_TOOL_NAMES:
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        fingerprint = _content_fingerprint(content)
+        if fingerprint in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fingerprint)
+        evidence.append(
+            {
+                "tool_name": tool_name,
+                "content": content,
+                "item_count": _rss_result_item_count(content),
+                "is_empty": _is_empty_rss_result(content),
+            }
+        )
+        if len(evidence) >= limit:
+            break
+    return list(reversed(evidence))
+
+
+def _history_contains_rss_tool_activity(history: List[Dict[str, Any]]) -> bool:
+    tool_lookup = _tool_name_lookup(history)
+    for message in history:
+        for call in message.get("tool_calls") or []:
+            if _tool_call_name(call) in RSS_RETRIEVAL_TOOL_NAMES:
+                return True
+        if str(message.get("role") or "") != "tool":
+            continue
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        if tool_lookup.get(tool_call_id) in RSS_RETRIEVAL_TOOL_NAMES:
+            return True
+    return False
+
+
+def _rss_evidence_summary(evidence: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for index, item in enumerate(evidence, start=1):
+        content = str(item.get("content") or "").strip()
+        if item.get("tool_name") == "list_recent_feed_items":
+            filtered_lines = []
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("Summary:"):
+                    continue
+                filtered_lines.append(line)
+            content = "\n".join(filtered_lines).strip()
+        lines.append(
+            f"Evidence block {index} ({item.get('tool_name')}, item_count={int(item.get('item_count') or 0)}):\n{content}"
+        )
+    return "\n\n".join(lines).strip()
+
+
+def _rewrite_headline_rss_tool_calls(
+    tool_calls: List[Dict[str, Any]],
+    *,
+    rss_owned_headline_prompt: bool,
+    prior_recent_feed_fetches: int,
+    mode: str,
+    stage: str | None,
+    selected_model: str,
+    user_context: UserContext,
+) -> tuple[List[Dict[str, Any]], int]:
+    if not rss_owned_headline_prompt or mode not in {"chat", "chat_orchestrated"}:
+        return tool_calls, prior_recent_feed_fetches
+
+    rewritten: List[Dict[str, Any]] = []
+    downgraded = 0
+    for call in tool_calls:
+        if _tool_call_name(call) != "list_recent_feed_items":
+            rewritten.append(call)
+            continue
+        call_id = _tool_call_id(call)
+        arguments = dict(_tool_call_arguments(call))
+        if prior_recent_feed_fetches > 0 and bool(arguments.get("refresh", False)):
+            arguments["refresh"] = False
+            downgraded += 1
+            function = dict(call.get("function") or {})
+            function["arguments"] = json.dumps(arguments)
+            rewritten.append({**call, "function": function})
+        else:
+            rewritten.append(call)
+        prior_recent_feed_fetches += 1
+
+    if downgraded:
+        log.info(
+            "agent.headline_roundup_refresh_downgraded",
+            downgraded_count=downgraded,
+            mode=mode,
+            stage=stage,
+            model=selected_model,
+            session_id=user_context.session_id,
+            task_id=user_context.task_id,
+        )
+    return rewritten, prior_recent_feed_fetches
+
+
+def _rss_evidence_is_thin(evidence: list[dict[str, Any]]) -> bool:
+    if not evidence:
+        return True
+    total_items = sum(int(item.get("item_count") or 0) for item in evidence)
+    non_empty_blocks = sum(1 for item in evidence if not item.get("is_empty"))
+    return total_items <= 1 or non_empty_blocks <= 1
+
+
+async def _synthesize_from_rss_evidence(
+    *,
+    history: List[Dict[str, Any]],
+    user_context: UserContext,
+    selected_model: str,
+    mode: str,
+    stage: str | None,
+    reason: str,
+) -> str | None:
+    evidence = _recent_rss_evidence(history)
+    if not evidence:
+        if _history_contains_rss_tool_activity(history):
+            log.warning(
+                "agent.rss_evidence_missing_from_history",
+                reason=reason,
+                mode=mode,
+                stage=stage,
+                model=selected_model,
+                session_id=user_context.session_id,
+                task_id=user_context.task_id,
+            )
+        return None
+    latest_user = _latest_user_message_text(history).strip()
+    if not latest_user:
+        return None
+    evidence_summary = _rss_evidence_summary(evidence)
+    if not evidence_summary:
+        return None
+    thin = _rss_evidence_is_thin(evidence)
+    instruction = (
+        "You already searched the user's RSS feeds. Do not call more tools. "
+        "Answer the user's last RSS/news question directly using only the evidence below. "
+        "If the evidence is weak or noisy, say that clearly and briefly instead of pretending there is stronger coverage."
+        if thin
+        else
+        "You already searched the user's RSS feeds. Do not call more tools. "
+        "Answer the user's last RSS/news question directly using only the evidence below. "
+        "Synthesize the strongest relevant items and keep the answer grounded."
+    )
+    reason_line = (
+        "The feed search was starting to loop through reformulations instead of converging."
+        if reason == "rss_query_family_churn"
+        else "The feed search should stop here and synthesize from the evidence already gathered."
+    )
+    synthesis_history = [
+        message
+        for message in history
+        if str(message.get("role") or "") in {"user", "assistant"}
+    ][-4:]
+    synthesis_history.append(
+        {
+            "role": "user",
+            "content": (
+                f"{instruction}\n\n"
+                f"Original request:\n{latest_user}\n\n"
+                f"Why you must answer now:\n{reason_line}\n\n"
+                f"RSS evidence:\n{evidence_summary}"
+            ),
+        }
+    )
+    extra = _litellm_kwargs(selected_model)
+    response = await _acompletion_with_budget(
+        history=synthesis_history,
+        user_context=user_context,
+        model=selected_model,
+        mode=mode,
+        stage=f"{stage}_rss_synthesis" if stage else "rss_synthesis",
+        extra_kwargs=extra,
+    )
+    await record_llm_usage_event(
+        response,
+        stage=f"{stage}_rss_synthesis" if stage else "rss_synthesis",
+        model=selected_model,
+    )
+    message = response.choices[0].message
+    return str(message.content or "").strip() or None
+
+
+async def _safe_synthesize_from_rss_evidence(
+    *,
+    history: List[Dict[str, Any]],
+    user_context: UserContext,
+    selected_model: str,
+    mode: str,
+    stage: str | None,
+    reason: str,
+) -> str | None:
+    try:
+        return await _synthesize_from_rss_evidence(
+            history=history,
+            user_context=user_context,
+            selected_model=selected_model,
+            mode=mode,
+            stage=stage,
+            reason=reason,
+        )
+    except Exception as exc:
+        log.warning(
+            "agent.rss_synthesis_failed",
+            error=str(exc),
+            reason=reason,
+            mode=mode,
+            stage=stage,
+            model=selected_model,
+            session_id=user_context.session_id,
+            task_id=user_context.task_id,
+        )
+        return None
 
 
 def _log_agent_turn_start(
@@ -1075,7 +1558,28 @@ async def run_agent(
     previous_semantic_tool_signature = ""
     repeated_semantic_tool_signature_count = 0
     recent_exploration_signatures: List[str] = []
-    recent_exploration_signatures: List[str] = []
+    recent_rss_query_family_signatures: List[str] = []
+    headline_roundup_prompt = _is_headline_roundup_prompt(messages)
+    rss_owned_headline_prompt = _is_rss_owned_headline_prompt(messages)
+    if rss_owned_headline_prompt:
+        log.info(
+            "agent.headline_roundup_classified",
+            rss_owned=True,
+            mode=mode,
+            stage=stage,
+            model=selected_model,
+            session_id=user_context.session_id,
+            task_id=user_context.task_id,
+        )
+    tools = _filter_tools_for_prompt(
+        tools,
+        rss_owned_headline_prompt=rss_owned_headline_prompt,
+        mode=mode,
+        stage=stage,
+        selected_model=selected_model,
+        user_context=user_context,
+    )
+    prior_recent_feed_fetches = 0
 
     for turn in range(max_turns):
         turn_number = turn + 1
@@ -1108,16 +1612,31 @@ async def run_agent(
         finish_reason = response.choices[0].finish_reason
 
         # Append assistant turn to history (normalize tool_call args to str)
-        history.append(_normalize_tool_calls(message.model_dump(exclude_none=True)))
+        normalized_message = _normalize_tool_calls(message.model_dump(exclude_none=True))
+        history.append(normalized_message)
 
         # Check tool_calls directly — some Ollama models return finish_reason="stop"
         # even when tool calls are present, so we can't rely on finish_reason alone.
         if message.tool_calls:
+            normalized_tool_calls = list(normalized_message.get("tool_calls") or [])
+            normalized_tool_calls, prior_recent_feed_fetches = _rewrite_headline_rss_tool_calls(
+                normalized_tool_calls,
+                rss_owned_headline_prompt=rss_owned_headline_prompt,
+                prior_recent_feed_fetches=prior_recent_feed_fetches,
+                mode=mode,
+                stage=stage,
+                selected_model=selected_model,
+                user_context=user_context,
+            )
+            normalized_message["tool_calls"] = normalized_tool_calls
+            history[-1] = normalized_message
             # Execute all tool calls, append results, then loop
-            tool_results = await dispatch_tool_calls(message.tool_calls, user_context)
+            tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
             history.extend(tool_results)
-            current_tool_signature = _tool_call_signature(message.tool_calls, tool_results)
-            current_semantic_tool_signature = _semantic_tool_signature(message.tool_calls)
+            _record_agent_runtime_messages([normalized_message, *tool_results])
+            current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
+            current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
+            current_rss_query_family_signature = _rss_query_family_signature(normalized_tool_calls)
             if current_tool_signature == previous_tool_signature:
                 repeated_tool_signature_count += 1
             else:
@@ -1135,24 +1654,27 @@ async def run_agent(
                 ]
             else:
                 recent_exploration_signatures = []
+            if current_rss_query_family_signature:
+                recent_rss_query_family_signatures.append(current_rss_query_family_signature)
+                recent_rss_query_family_signatures = recent_rss_query_family_signatures[-6:]
             _log_agent_tool_turn(
                 turn=turn_number,
                 mode=mode,
                 stage=stage,
                 selected_model=selected_model,
                 user_context=user_context,
-                tool_calls=message.tool_calls,
+                tool_calls=normalized_tool_calls,
                 tool_results=tool_results,
                 repeated_signature_count=repeated_tool_signature_count,
             )
-            failed_delete = _failed_delete_message(message.tool_calls, tool_results)
+            failed_delete = _failed_delete_message(normalized_tool_calls, tool_results)
             if failed_delete:
                 return failed_delete
-            task_handoff = _task_handoff_message(messages, message.tool_calls, tool_results)
+            task_handoff = _task_handoff_message(messages, normalized_tool_calls, tool_results)
             if task_handoff:
                 return task_handoff
-            metrics.inc_tool_calls(len(message.tool_calls))
-            if _is_failed_search_turn(message.tool_calls, tool_results):
+            metrics.inc_tool_calls(len(normalized_tool_calls))
+            if _is_failed_search_turn(normalized_tool_calls, tool_results):
                 consecutive_failed_search_turns += 1
                 if consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
                     _record_loop_event(
@@ -1185,7 +1707,7 @@ async def run_agent(
                     },
                 )
                 return _repeated_tool_signature_message(
-                    tool_calls=message.tool_calls,
+                    tool_calls=normalized_tool_calls,
                     repeated_count=repeated_tool_signature_count,
                     history=history,
                 )
@@ -1204,10 +1726,73 @@ async def run_agent(
                         "tool_signature": current_semantic_tool_signature,
                     },
                 )
+                synthesized = await _safe_synthesize_from_rss_evidence(
+                    history=history,
+                    user_context=user_context,
+                    selected_model=selected_model,
+                    mode=mode,
+                    stage=stage,
+                    reason="repeated_semantic_tool_signature",
+                )
+                if synthesized:
+                    return synthesized
                 return _repeated_semantic_research_message(
-                    tool_calls=message.tool_calls,
+                    tool_calls=normalized_tool_calls,
                     history=history,
                 )
+            if current_rss_query_family_signature:
+                family_count = recent_rss_query_family_signatures.count(current_rss_query_family_signature)
+                if family_count >= int(settings.agent_repeated_rss_query_family_threshold):
+                    _record_loop_event(
+                        event_type="rss_query_family_churn",
+                        stage=stage,
+                        mode=mode,
+                        model=selected_model,
+                        details={
+                            "turn": turn_number,
+                            "family_signature": current_rss_query_family_signature,
+                            "family_count": family_count,
+                        },
+                    )
+                    synthesized = await _safe_synthesize_from_rss_evidence(
+                        history=history,
+                        user_context=user_context,
+                        selected_model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        reason="rss_query_family_churn",
+                    )
+                    if synthesized:
+                        return synthesized
+                    return _repeated_semantic_research_message(
+                        tool_calls=normalized_tool_calls,
+                        history=history,
+                    )
+                if (
+                    rss_owned_headline_prompt
+                    and len(recent_rss_query_family_signatures) >= int(settings.agent_headline_roundup_rss_turn_cap)
+                ):
+                    _record_loop_event(
+                        event_type="headline_roundup_convergence",
+                        stage=stage,
+                        mode=mode,
+                        model=selected_model,
+                        details={
+                            "turn": turn_number,
+                            "family_signature": current_rss_query_family_signature,
+                            "rss_turns": len(recent_rss_query_family_signatures),
+                        },
+                    )
+                    synthesized = await _safe_synthesize_from_rss_evidence(
+                        history=history,
+                        user_context=user_context,
+                        selected_model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        reason="headline_roundup_convergence",
+                    )
+                    if synthesized:
+                        return synthesized
             if _exploration_churn_detected(recent_exploration_signatures):
                 _record_loop_event(
                     event_type="exploration_churn",
@@ -1222,13 +1807,13 @@ async def run_agent(
                     },
                 )
                 return _exploration_churn_message(
-                    tool_calls=message.tool_calls,
+                    tool_calls=normalized_tool_calls,
                     history=history,
                 )
             log.info(
                 "Tool calls executed",
                 turn=turn + 1,
-                tools=[_tool_call_name(tc) for tc in message.tool_calls],
+                tools=[_tool_call_name(tc) for tc in normalized_tool_calls],
                 model=selected_model,
                 mode=mode,
                 stage=stage,
@@ -1277,6 +1862,29 @@ async def stream_agent(
     repeated_tool_signature_count = 0
     previous_semantic_tool_signature = ""
     repeated_semantic_tool_signature_count = 0
+    recent_exploration_signatures: List[str] = []
+    recent_rss_query_family_signatures: List[str] = []
+    headline_roundup_prompt = _is_headline_roundup_prompt(messages)
+    rss_owned_headline_prompt = _is_rss_owned_headline_prompt(messages)
+    if rss_owned_headline_prompt:
+        log.info(
+            "agent.headline_roundup_classified",
+            rss_owned=True,
+            mode=mode,
+            stage=stage,
+            model=selected_model,
+            session_id=user_context.session_id,
+            task_id=user_context.task_id,
+        )
+    tools = _filter_tools_for_prompt(
+        tools,
+        rss_owned_headline_prompt=rss_owned_headline_prompt,
+        mode=mode,
+        stage=stage,
+        selected_model=selected_model,
+        user_context=user_context,
+    )
+    prior_recent_feed_fetches = 0
 
     for turn in range(max_turns):
         turn_number = turn + 1
@@ -1320,11 +1928,26 @@ async def stream_agent(
         message = response.choices[0].message
 
         if message.tool_calls:
-            history.append(_normalize_tool_calls(message.model_dump(exclude_none=True)))
-            tool_results = await dispatch_tool_calls(message.tool_calls, user_context)
+            normalized_message = _normalize_tool_calls(message.model_dump(exclude_none=True))
+            history.append(normalized_message)
+            normalized_tool_calls = list(normalized_message.get("tool_calls") or [])
+            normalized_tool_calls, prior_recent_feed_fetches = _rewrite_headline_rss_tool_calls(
+                normalized_tool_calls,
+                rss_owned_headline_prompt=rss_owned_headline_prompt,
+                prior_recent_feed_fetches=prior_recent_feed_fetches,
+                mode=mode,
+                stage=stage,
+                selected_model=selected_model,
+                user_context=user_context,
+            )
+            normalized_message["tool_calls"] = normalized_tool_calls
+            history[-1] = normalized_message
+            tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
             history.extend(tool_results)
-            current_tool_signature = _tool_call_signature(message.tool_calls, tool_results)
-            current_semantic_tool_signature = _semantic_tool_signature(message.tool_calls)
+            _record_agent_runtime_messages([normalized_message, *tool_results])
+            current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
+            current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
+            current_rss_query_family_signature = _rss_query_family_signature(normalized_tool_calls)
             if current_tool_signature == previous_tool_signature:
                 repeated_tool_signature_count += 1
             else:
@@ -1335,33 +1958,36 @@ async def stream_agent(
             else:
                 repeated_semantic_tool_signature_count = 0
                 previous_semantic_tool_signature = current_semantic_tool_signature or ""
-            if _is_exploration_tool_turn(message.tool_calls):
+            if _is_exploration_tool_turn(normalized_tool_calls):
                 recent_exploration_signatures.append(current_tool_signature)
                 recent_exploration_signatures = recent_exploration_signatures[
                     -max(2, int(settings.agent_exploration_churn_window)) :
                 ]
             else:
                 recent_exploration_signatures = []
+            if current_rss_query_family_signature:
+                recent_rss_query_family_signatures.append(current_rss_query_family_signature)
+                recent_rss_query_family_signatures = recent_rss_query_family_signatures[-6:]
             _log_agent_tool_turn(
                 turn=turn_number,
                 mode=mode,
                 stage=stage,
                 selected_model=selected_model,
                 user_context=user_context,
-                tool_calls=message.tool_calls,
+                tool_calls=normalized_tool_calls,
                 tool_results=tool_results,
                 repeated_signature_count=repeated_tool_signature_count,
             )
-            failed_delete = _failed_delete_message(message.tool_calls, tool_results)
+            failed_delete = _failed_delete_message(normalized_tool_calls, tool_results)
             if failed_delete:
                 yield failed_delete
                 return
-            task_handoff = _task_handoff_message(messages, message.tool_calls, tool_results)
+            task_handoff = _task_handoff_message(messages, normalized_tool_calls, tool_results)
             if task_handoff:
                 yield task_handoff
                 return
-            metrics.inc_tool_calls(len(message.tool_calls))
-            if _is_failed_search_turn(message.tool_calls, tool_results):
+            metrics.inc_tool_calls(len(normalized_tool_calls))
+            if _is_failed_search_turn(normalized_tool_calls, tool_results):
                 consecutive_failed_search_turns += 1
                 if consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
                     _record_loop_event(
@@ -1388,7 +2014,7 @@ async def stream_agent(
                     },
                 )
                 yield _repeated_tool_signature_message(
-                    tool_calls=message.tool_calls,
+                    tool_calls=normalized_tool_calls,
                     repeated_count=repeated_tool_signature_count,
                     history=history,
                 )
@@ -1408,11 +2034,78 @@ async def stream_agent(
                         "tool_signature": current_semantic_tool_signature,
                     },
                 )
+                synthesized = await _safe_synthesize_from_rss_evidence(
+                    history=history,
+                    user_context=user_context,
+                    selected_model=selected_model,
+                    mode=mode,
+                    stage=stage,
+                    reason="repeated_semantic_tool_signature",
+                )
+                if synthesized:
+                    yield synthesized
+                    return
                 yield _repeated_semantic_research_message(
-                    tool_calls=message.tool_calls,
+                    tool_calls=normalized_tool_calls,
                     history=history,
                 )
                 return
+            if current_rss_query_family_signature:
+                family_count = recent_rss_query_family_signatures.count(current_rss_query_family_signature)
+                if family_count >= int(settings.agent_repeated_rss_query_family_threshold):
+                    _record_loop_event(
+                        event_type="rss_query_family_churn",
+                        stage=stage,
+                        mode=mode,
+                        model=selected_model,
+                        details={
+                            "turn": turn_number,
+                            "family_signature": current_rss_query_family_signature,
+                            "family_count": family_count,
+                        },
+                    )
+                    synthesized = await _safe_synthesize_from_rss_evidence(
+                        history=history,
+                        user_context=user_context,
+                        selected_model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        reason="rss_query_family_churn",
+                    )
+                    if synthesized:
+                        yield synthesized
+                        return
+                    yield _repeated_semantic_research_message(
+                        tool_calls=normalized_tool_calls,
+                        history=history,
+                    )
+                    return
+                if (
+                    rss_owned_headline_prompt
+                    and len(recent_rss_query_family_signatures) >= int(settings.agent_headline_roundup_rss_turn_cap)
+                ):
+                    _record_loop_event(
+                        event_type="headline_roundup_convergence",
+                        stage=stage,
+                        mode=mode,
+                        model=selected_model,
+                        details={
+                            "turn": turn_number,
+                            "family_signature": current_rss_query_family_signature,
+                            "rss_turns": len(recent_rss_query_family_signatures),
+                        },
+                    )
+                    synthesized = await _safe_synthesize_from_rss_evidence(
+                        history=history,
+                        user_context=user_context,
+                        selected_model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        reason="headline_roundup_convergence",
+                    )
+                    if synthesized:
+                        yield synthesized
+                        return
             if _exploration_churn_detected(recent_exploration_signatures):
                 _record_loop_event(
                     event_type="exploration_churn",
@@ -1427,14 +2120,14 @@ async def stream_agent(
                     },
                 )
                 yield _exploration_churn_message(
-                    tool_calls=message.tool_calls,
+                    tool_calls=normalized_tool_calls,
                     history=history,
                 )
                 return
             log.info(
                 "Tool calls executed (streaming turn)",
                 turn=turn + 1,
-                tools=[_tool_call_name(tc) for tc in message.tool_calls],
+                tools=[_tool_call_name(tc) for tc in normalized_tool_calls],
                 model=selected_model,
                 mode=mode,
                 stage=stage,

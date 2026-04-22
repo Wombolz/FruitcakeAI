@@ -1110,6 +1110,7 @@ def _format_recent_items_results(
     mode: str,
     refreshed_sources: int | None = None,
 ) -> str:
+    trimmed_summaries = 0
     if mode == "since_last_refresh":
         title = f"Recent feed items since last refresh ({len(rows)}):"
     else:
@@ -1128,9 +1129,21 @@ def _format_recent_items_results(
             lines.append(f"    Published: {published}")
         summary = row.get("summary") or ""
         if summary:
-            lines.append(f"    Summary: {summary}")
+            compact_summary = " ".join(str(summary).split()).strip()
+            if len(compact_summary) > 140:
+                compact_summary = compact_summary[:139].rstrip() + "…"
+                trimmed_summaries += 1
+            lines.append(f"    Summary: {compact_summary}")
         url = row.get("url") or ""
         if url:
             lines.append(f"    URL: {url}")
         lines.append("")
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    log.info(
+        "rss.recent_items_payload_built",
+        mode=mode,
+        rows_before_format=len(rows),
+        trimmed_summaries=trimmed_summaries,
+        payload_chars=len(rendered),
+    )
+    return rendered
