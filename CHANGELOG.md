@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.15
+
+- Stabilized RSS-backed chat by keeping feed-owned headline prompts on RSS tools, preventing repeated in-turn refresh churn, and converging headline roundups after one bounded recent-items pass instead of long retrieval loops.
+- Improved RSS evidence quality end-to-end by preserving full recent-items evidence for synthesis, deduping and compacting `list_recent_feed_items` payloads into cleaner headline batches, and keeping recent follow-up answers grounded in the actual returned items.
+- Repaired chat/runtime regressions exposed by compaction work by preserving tool metadata in chat history, sanitizing replayed tool-call chains before model calls, and supporting dict-style tool dispatch in validated chat turns.
+- Tightened chat follow-up hygiene by expanding validation coverage for article/story detail prompts and catching leaked fetch narration or `Compacted tool result.` scaffolding before those responses reach the user.
+- Reduced websocket noise around clean disconnects so normal chat socket shutdown no longer surfaces as an unhandled server error during receive-task cleanup.
+
 ## v0.7.14
 
 - Hardened long-running agent and chat execution with projected-history compaction, tool-result budgeting, overflow retry, persisted compaction markers, and stronger no-progress loop guards.
