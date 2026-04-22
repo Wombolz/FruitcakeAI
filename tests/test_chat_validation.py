@@ -52,9 +52,32 @@ def test_validate_chat_response_flags_tool_call_leakage():
     assert out.retry_reason == "tool_call_leakage"
 
 
+def test_validate_chat_response_flags_fetch_narration_and_compacted_tool_leakage():
+    out = validate_chat_response(
+        "Give me the run down on the Ship Seizure from the 1st article",
+        (
+            "I'll fetch the full page now.\n"
+            "Compacted tool result.\n"
+            "Tool: fetch_page\n"
+            "Tool call id: call_123\n"
+        ),
+    )
+    assert out.has_tool_call_leakage is True
+    assert out.should_retry is True
+    assert out.retry_reason == "tool_call_leakage"
+
+
 def test_should_validate_chat_response_enables_research_on_simple_path():
     assert should_validate_chat_response(
         user_prompt="Research the latest headlines on Iran and cite sources",
+        effective_complex=False,
+    ) is True
+    assert should_validate_chat_response(
+        user_prompt="Give me the run down on the Ship Seizure from the 1st article",
+        effective_complex=False,
+    ) is True
+    assert should_validate_chat_response(
+        user_prompt="Tell me more about the first story",
         effective_complex=False,
     ) is True
     assert should_validate_chat_response(
@@ -215,6 +238,63 @@ async def test_send_message_retries_once_for_tool_leakage_on_simple_research_pro
 
     assert resp.status_code == 200
     assert "bbc.com/news/articles" in resp.json()["content"]
+    assert mock_run.await_count == 2
+    assert mock_run.await_args_list[0].kwargs["mode"] == "chat"
+
+
+@pytest.mark.asyncio
+async def test_send_message_retries_once_for_followup_article_detail_leakage(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "chatdetailleak",
+            "email": "chatdetailleak@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "chatdetailleak", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Follow-up Detail Leak"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", True),
+        patch.object(settings, "chat_complexity_threshold", 99),
+        patch.object(settings, "chat_validation_enabled", True),
+        patch.object(settings, "chat_validation_retry_enabled", True),
+        patch.object(settings, "chat_validation_retry_max_attempts", 1),
+        patch(
+            "app.api.chat.run_agent",
+            new_callable=AsyncMock,
+            side_effect=[
+                (
+                    "I'll fetch the full page now.\n"
+                    "Compacted tool result.\n"
+                    "Tool: fetch_page\n"
+                    "Tool call id: call_123\n"
+                    "Summary: Iran said the ships were seized."
+                ),
+                (
+                    "The rundown: Iran's Revolutionary Guards said they seized two cargo ships near the Strait of Hormuz "
+                    "after the ceasefire extension, and U.K. maritime monitors reported attacks on two vessels."
+                ),
+            ],
+        ) as mock_run,
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "Give me the run down on the Ship Seizure from the 1st article"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert "The rundown:" in resp.json()["content"]
+    assert "Compacted tool result." not in resp.json()["content"]
     assert mock_run.await_count == 2
     assert mock_run.await_args_list[0].kwargs["mode"] == "chat"
 

@@ -20,11 +20,29 @@ RESEARCH_KEYWORDS = {
     "search",
     "compare",
 }
+DETAIL_FOLLOWUP_KEYWORDS = {
+    "article",
+    "articles",
+    "story",
+    "stories",
+    "details",
+    "detail",
+    "first article",
+    "first story",
+    "what happened",
+    "tell me more",
+    "run down",
+    "rundown",
+    "ship seizure",
+}
 TOOL_LEAKAGE_PATTERNS = (
     r"\(to=functions\.[^)]+\)",
     r"\bthe tool name must be provided correctly\b",
     r"\bcalling timeline search\b",
     r"\bcalling .*search\b",
+    r"\bi(?:'|’)ll fetch\b",
+    r"\bfetching the full page\b",
+    r"\bcompacted tool result\.\b",
 )
 
 URL_RE = re.compile(r"https?://[^\s)\]>\"']+", re.IGNORECASE)
@@ -148,7 +166,7 @@ def validate_chat_response(
 ) -> ChatValidationResult:
     prompt = (user_prompt or "").strip().lower()
     text = (response or "").strip()
-    is_research_style = any(word in prompt for word in RESEARCH_KEYWORDS)
+    is_research_style = _is_validation_worthy_prompt(prompt)
     has_tool_call_leakage = _has_tool_call_leakage(text)
     mutation_unconfirmed = _is_calendar_mutation_prompt(prompt) and _claims_calendar_mutation_success(text) and not _calendar_mutation_confirmed(executed_tools or [])
     task_mutation_reason = None
@@ -267,7 +285,13 @@ def should_validate_chat_response(
     if effective_complex:
         return True
     prompt = (user_prompt or "").strip().lower()
-    return any(word in prompt for word in RESEARCH_KEYWORDS)
+    return _is_validation_worthy_prompt(prompt)
+
+
+def _is_validation_worthy_prompt(prompt: str) -> bool:
+    return any(word in prompt for word in RESEARCH_KEYWORDS) or any(
+        phrase in prompt for phrase in DETAIL_FOLLOWUP_KEYWORDS
+    )
 
 
 def _has_tool_call_leakage(text: str) -> bool:

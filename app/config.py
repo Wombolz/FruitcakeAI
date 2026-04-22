@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     # ── Application ──────────────────────────────────────────────────────────
     app_name: str = "FruitcakeAI"
-    app_version: str = "0.7.14"
+    app_version: str = "0.7.15"
     debug: bool = False
     log_level: str = "INFO"
     app_port: int = 30417
@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     agent_overflow_retry_enabled: bool = True
     agent_repeated_tool_signature_threshold: int = 3
     agent_repeated_semantic_tool_signature_threshold: int = 2
+    agent_repeated_rss_query_family_threshold: int = 3
+    agent_headline_roundup_rss_turn_cap: int = 2
     agent_exploration_churn_window: int = 4
     agent_exploration_churn_max_unique_signatures: int = 2
     task_prompt_max_prior_summaries: int = 10

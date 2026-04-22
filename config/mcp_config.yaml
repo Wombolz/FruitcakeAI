@@ -56,6 +56,19 @@ mcp_servers:
       shell_execution: false
       writes_disk: true
 
+  fieldkit:
+    type: http
+    url: http://localhost:47834
+    enabled: true
+    timeout: 30
+    classification: first_class_mcp
+    shipping_default: false
+    trust_boundary:
+      first_party: true
+      uses_network: false
+      shell_execution: false
+      writes_disk: false
+
   # ── Docker stdio servers ─────────────────────────────────────────────────────
   # These require Docker + the image to be available locally.
   # Alpha default: disabled unless intentionally enabled by the operator.

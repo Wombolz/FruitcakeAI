@@ -10,11 +10,14 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
+import structlog
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import RSSItem, RSSSource, RSSSourceCandidate, RSSUserState
 from app.mcp.services.rss_seed import DEFAULT_GLOBAL_RSS_SOURCES
+
+log = structlog.get_logger(__name__)
 
 _TRACKING_QUERY_KEYS = {
     "utm_source",
@@ -595,9 +598,10 @@ async def list_recent_items(
         q = q.where(or_(RSSItem.published_at > since_cursor_at, and_(RSSItem.published_at.is_(None), RSSItem.fetched_at > since_cursor_at)))
     # mode=all applies no additional time filter.
 
-    q = q.order_by(RSSItem.published_at.desc().nullslast(), RSSItem.fetched_at.desc()).limit(max(1, min(max_results, 100)))
+    query_limit = max(1, min(max_results * 3, 200))
+    q = q.order_by(RSSItem.published_at.desc().nullslast(), RSSItem.fetched_at.desc()).limit(query_limit)
     rows = (await db.execute(q)).all()
-    return [
+    serialized = [
         {
             "source_id": source_id,
             "title": item.title,
@@ -609,6 +613,16 @@ async def list_recent_items(
         }
         for item, source_name, source_id in rows
     ]
+    deduped = _dedupe_recent_rows(serialized)
+    log.info(
+        "rss.recent_items_deduped",
+        user_id=user_id,
+        window_mode=mode,
+        query_rows=len(serialized),
+        deduped_rows=len(deduped),
+        returned_rows=min(len(deduped), max(1, min(max_results, 100))),
+    )
+    return deduped[: max(1, min(max_results, 100))]
 
 
 async def list_candidates(
@@ -1167,6 +1181,29 @@ def _dedupe_timeline_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         normalized_title = re.sub(r"\s+", " ", str(row.get("title") or "").strip().lower())
         normalized_url = canonicalize_url(str(row.get("url") or ""))
         key = normalized_url or normalized_title
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def _dedupe_recent_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        normalized_title = re.sub(r"\s+", " ", str(row.get("title") or "").strip().lower())
+        normalized_url = canonicalize_url(str(row.get("url") or ""))
+        url_without_query = ""
+        if normalized_url:
+            try:
+                parsed = urlsplit(normalized_url)
+                url_without_query = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+            except Exception:
+                url_without_query = normalized_url
+        key = normalized_url or normalized_title
+        if normalized_title and url_without_query:
+            key = f"{normalized_title}|{url_without_query}"
         if not key or key in seen:
             continue
         seen.add(key)

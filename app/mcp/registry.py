@@ -2,9 +2,10 @@
 FruitcakeAI v5 — MCP Server Registry
 Auto-discovery from config/mcp_config.yaml.
 
-Supports two server types:
+Supports three server types:
   internal_python  — Python modules that run in-process (calendar, web, rss)
   docker_stdio     — Docker containers invoked via stdio (python_refactoring, playwright, etc.)
+  http             — External MCP servers over HTTP JSON-RPC (first-class companion apps, etc.)
 
 Tool schemas are converted from MCP format → LiteLLM function-calling format at startup.
 Adding a new server requires only a config entry — no code changes.
@@ -87,7 +88,7 @@ class MCPRegistry:
     """
 
     def __init__(self):
-        # docker_stdio: persistent subprocess clients
+        # docker_stdio/http: persistent clients
         self._clients: Dict[str, MCPClient] = {}
         # internal_python: imported modules
         self._modules: Dict[str, Any] = {}
@@ -149,6 +150,8 @@ class MCPRegistry:
                 await self._init_internal(server_name, config)
             elif server_type == "docker_stdio":
                 await self._init_docker(server_name, config)
+            elif server_type == "http":
+                await self._init_http(server_name, config)
             else:
                 log.warning("Unknown MCP server type", server=server_name, type=server_type)
 
@@ -217,6 +220,40 @@ class MCPRegistry:
                 hint=f"docker pull {image}",
             )
 
+    async def _init_http(self, server_name: str, config: Dict[str, Any]) -> None:
+        """
+        Connect to an external HTTP MCP server that speaks JSON-RPC over POST.
+        Failures are non-fatal — the server is simply omitted from the tool list.
+        """
+        server_url = config.get("url")
+        if not server_url:
+            log.error("No url specified for http MCP server", server=server_name)
+            return
+
+        client = MCPClient(
+            server_name=server_name,
+            server_url=server_url,
+            timeout=config.get("timeout", 30),
+        )
+        ok = await client.connect()
+        if ok:
+            self._clients[server_name] = client
+            for tool in client.get_tools():
+                self._register_tool(tool, server_name, "http")
+            log.info(
+                "HTTP MCP server connected",
+                server=server_name,
+                url=server_url,
+                tools=[t["name"] for t in client.get_tools()],
+            )
+        else:
+            log.warning(
+                "HTTP MCP server unavailable",
+                server=server_name,
+                url=server_url,
+                error=client.get_status().get("last_error"),
+            )
+
     # ── Tool access ───────────────────────────────────────────────────────────
 
     def get_tools_for_agent(self) -> List[Dict[str, Any]]:
@@ -255,7 +292,7 @@ class MCPRegistry:
                 log.error("Internal MCP tool failed", tool=tool_name, error=str(e))
                 return f"Tool {tool_name} failed: {e}"
 
-        if server_type == "docker_stdio":
+        if server_type in {"docker_stdio", "http"}:
             client = self._clients.get(server_name)
             if not client or not client.is_connected():
                 return f"MCP server '{server_name}' is not available"
@@ -336,7 +373,7 @@ class MCPRegistry:
                 servers.append(entry)
                 continue
 
-            if server_type == "docker_stdio":
+            if server_type in {"docker_stdio", "http"}:
                 client = self._clients.get(server_name)
                 if client is None:
                     entry["status"] = "not_connected"
