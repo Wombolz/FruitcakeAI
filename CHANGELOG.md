@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.16
+
+- Broadened approval-gated mutation coverage beyond the original narrow high-risk set, including memory writes, task-plan creation, workspace file mutations, and RSS source/catalog review actions.
+- Added conditional approval for market-data tools when `save_to_library=true`, so read-only market lookups remain ungated while persistent library writes still require confirmation.
+- Improved waiting-approval visibility across tasks by adding human-readable `waiting_approval_reason` fields to task list/detail and task-step APIs, and by logging blocked tool reasons in the task runner.
+- Kept approval compatibility stable by preserving `waiting_approval_tool` values while enriching run errors and diagnostics with clearer approval context.
+- Refreshed focused approval/task coverage and aligned a stale task-profile expectation with the current canonical `morning_briefing` -> `briefing` normalization.
+
 ## v0.7.15
 
 - Stabilized RSS-backed chat by keeping feed-owned headline prompts on RSS tools, preventing repeated in-turn refresh churn, and converging headline roundups after one bounded recent-items pass instead of long retrieval loops.
