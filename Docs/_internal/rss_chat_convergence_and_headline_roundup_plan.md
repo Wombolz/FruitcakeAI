@@ -1,5 +1,16 @@
 # RSS Chat Convergence And Headline Roundup Plan
 
+## Status
+Completed on April 22, 2026.
+
+Implemented outcome:
+- replay-time history sanitization now repairs invalid tool-call chains before model calls
+- `list_recent_feed_items` payloads are deduped, more compact, and more headline-oriented
+- feed-owned headline prompts stay in the RSS lane and no longer start with unnecessary `web_search`
+- repeated `refresh=True` churn within a single chat turn is bounded, and headline roundup prompts converge after one useful RSS batch instead of looping
+- RSS synthesis now preserves the full recent-items evidence block instead of truncating it to the first few headlines
+- follow-up article/detail prompts validate more aggressively and retry cleanly when internal fetch narration or compacted tool output leaks into the answer
+
 ## Summary
 Stabilize the general RSS chat pipeline so feed-backed chat stops over-researching and converges on an answer once it has enough evidence.
 

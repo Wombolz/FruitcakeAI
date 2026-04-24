@@ -286,12 +286,20 @@ async def test_tasks_summary_includes_current_step_and_waiting_tool(client):
     listed = next(item for item in list_resp.json() if item["id"] == task_id)
     assert listed["current_step_title"] == "Create calendar event"
     assert listed["waiting_approval_tool"] == "create_event"
+    assert "external calendar" in listed["waiting_approval_reason"]
 
     detail_resp = await client.get(f"/tasks/{task_id}", headers=headers)
     assert detail_resp.status_code == 200
     detail = detail_resp.json()
     assert detail["current_step_title"] == "Create calendar event"
     assert detail["waiting_approval_tool"] == "create_event"
+    assert "external calendar" in detail["waiting_approval_reason"]
+
+    steps_resp = await client.get(f"/tasks/{task_id}/steps", headers=headers)
+    assert steps_resp.status_code == 200
+    waiting_step = next(item for item in steps_resp.json() if item["step_index"] == 2)
+    assert waiting_step["waiting_approval_tool"] == "create_event"
+    assert "external calendar" in waiting_step["waiting_approval_reason"]
 
 
 @pytest.mark.asyncio
@@ -959,7 +967,7 @@ async def test_create_and_patch_task_profile_validation(client):
         headers=headers,
     )
     assert morning.status_code == 201
-    assert morning.json()["profile"] == "morning_briefing"
+    assert morning.json()["profile"] == "briefing"
 
     watcher = await client.post(
         "/tasks",

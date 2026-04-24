@@ -25,6 +25,7 @@ import json
 import re
 
 from app.agent.definition_loader import FruitcakeAgentPreset, get_agent_preset
+from app.autonomy.approval import approval_reason_for_tool
 from app.autonomy.planner import create_task_plan_for_user
 from app.auth.dependencies import get_current_user
 from app.config import settings
@@ -181,6 +182,7 @@ class TaskOut(BaseModel):
     current_step_index: Optional[int]
     current_step_title: Optional[str]
     waiting_approval_tool: Optional[str]
+    waiting_approval_reason: Optional[str] = None
     has_plan: bool
     plan_version: int
     created_at: Optional[datetime]
@@ -702,6 +704,7 @@ class TaskStepOut(BaseModel):
     output_summary: Optional[str]
     error: Optional[str]
     waiting_approval_tool: Optional[str]
+    waiting_approval_reason: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -904,14 +907,14 @@ async def list_task_steps(
     task_id: int,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> List[TaskStep]:
+) -> List[TaskStepOut]:
     await _get_owned_task(task_id, current_user.id, db)
     rows = await db.execute(
         select(TaskStep)
         .where(TaskStep.task_id == task_id)
         .order_by(TaskStep.step_index)
     )
-    return rows.scalars().all()
+    return [_to_task_step_out(step) for step in rows.scalars().all()]
 
 
 @router.patch("/tasks/{task_id}/steps/{step_id}", response_model=TaskStepOut)
@@ -921,7 +924,7 @@ async def update_task_step(
     body: TaskStepPatch,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> TaskStep:
+) -> TaskStepOut:
     await _get_owned_task(task_id, current_user.id, db)
     rows = await db.execute(
         select(TaskStep).where(TaskStep.id == step_id, TaskStep.task_id == task_id)
@@ -945,7 +948,7 @@ async def update_task_step(
             )
         step.status = body.status
     await db.flush()
-    return step
+    return _to_task_step_out(step)
 
 
 @router.post("/tasks/{task_id}/plan", response_model=TaskPlanOut)
@@ -1127,6 +1130,7 @@ def _to_task_out(
     waiting_tool: Optional[str] = None
     if task.status == "waiting_approval" and current_step is not None:
         waiting_tool = current_step.waiting_approval_tool
+    waiting_reason = approval_reason_for_tool(waiting_tool) if waiting_tool else None
     effective_timezone = resolve_effective_timezone(task.active_hours_tz, user_timezone)
     result_markdown = _normalize_result_markdown(final_output or task.result)
     result_format = "markdown" if result_markdown else None
@@ -1156,6 +1160,7 @@ def _to_task_out(
         current_step_index=task.current_step_index,
         current_step_title=current_step.title if current_step is not None else None,
         waiting_approval_tool=waiting_tool,
+        waiting_approval_reason=waiting_reason,
         has_plan=task.has_plan,
         plan_version=task.plan_version,
         created_at=task.created_at,
@@ -1167,6 +1172,22 @@ def _to_task_out(
         next_run_at_localized=format_localized_datetime(task.next_run_at, timezone_name=effective_timezone) or None,
         task_recipe=(task.task_recipe or None) if hasattr(task, "task_recipe") else None,
         resolved_agent=resolved_agent,
+    )
+
+
+def _to_task_step_out(step: TaskStep) -> TaskStepOut:
+    waiting_tool = step.waiting_approval_tool
+    return TaskStepOut(
+        id=step.id,
+        step_index=step.step_index,
+        title=step.title,
+        instruction=step.instruction,
+        status=step.status,
+        requires_approval=step.requires_approval,
+        output_summary=step.output_summary,
+        error=step.error,
+        waiting_approval_tool=waiting_tool,
+        waiting_approval_reason=approval_reason_for_tool(waiting_tool) if waiting_tool else None,
     )
 
 

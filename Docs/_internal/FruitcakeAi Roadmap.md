@@ -4,12 +4,12 @@
 **Status**: Phase 1 ✅ · Phase 2 ✅ · Phase 3 ✅ · Phase 4 ✅ · Phase 5 ✅ · Phase 6 🚧 · Phase 7 ⏳  
 **Philosophy**: Trust · Privacy · Continuity. Local-first, cloud-optional, resilient by construction.  
 **Build Location**: `fruitcake_v5/`  
-**Last Updated**: April 12, 2026  
+**Last Updated**: April 22, 2026  
 **Checkpoint Note**: North Star direction remains the decision filter. Phase 6 is no longer purely deferred: targeted routing/accounting groundwork is now in `main`, while broader cloud judgment rollout and shared memory review remain gated behind measured need and product hardening.
 **Phase 6 Latest Additions**: first-class per-chat model selection and user-visible reasoning controls have landed, using a backend-configured selectable model registry, one credential per provider, and no changes to the underlying Ollama setup in v1.
-**Known Issue Note**: chat model patching appears to work at the backend/session level, but the Swift chat composer can still display a stale selected model after changes. The current evidence points to a UI/state rendering problem in `FruitcakeAi/Views/Chat/ChatView.swift`, not a backend patch failure. Treat this as a focused follow-up UI issue rather than current-branch scope for runtime/agent work.
+**Latest UI Note**: the client-side chat model selector follow-up is now closed. The Swift chat composer keeps a per-session display override and reconciles it against backend-confirmed session state, so model changes now show up immediately instead of only after refresh (`FruitcakeAI_Client` `v0.2.1`).
 **Latest Capability Note**: normal chat can now create, inspect, and update persistent tasks through first-class task tools instead of only building one-shot plan scaffolds. Chat mutation validation now prevents it from claiming a task was created or updated unless the matching task tool explicitly confirmed success.
-**Latest Hardening Note**: chat websocket handling no longer replays stale completed message payloads after `.done`; the backend loop now scopes payload state to each received frame and explicit duplicate guards only trigger on real later receives.
+**Latest Hardening Note**: the RSS chat path has now gone through a full post-compaction repair pass. Replayed histories are tool-chain-safe, RSS recent-item payloads are deduped and headline-oriented, headline roundup prompts stay in the RSS lane and converge quickly, and follow-up article/detail prompts now validate out leaked tool narration instead of surfacing it to users.
 **Immediate Security Triage Note**: the current “Agents of Chaos” review still matters, but its two headline items are no longer in the same state. Linked-folder ingestion is now constrained by `LINKED_SOURCE_ALLOWED_ROOTS` and should be treated as landed hardening. Task creation / task persistence is now approval-safe by default. The remaining trust-focused security follow-up is narrower: broaden approval-gated mutation coverage beyond the current explicit high-risk tool set and make approval-trigger visibility clearer where needed. Other findings remain important, but phaseable.
 **Cross-Cutting Time Note**: time handling is still a named architectural concern, but the status is now mixed rather than wholly open. UTC storage remains the truth, canonical timezone precedence is in place, recurring scheduler behavior follows the normalized timezone path, and task APIs now expose localized companion timestamps. Remaining work is the finish pass: normalize push payloads, exports/reports, and the remaining human-facing display surfaces so they stop inventing time semantics ad hoc.
 **Roadmap Structure Note**: the team intentionally pulled some trusted-local capability work forward before broader Phase 6 architecture was fully settled. As a result, Phase 6 now needs clearer subtracks, while Phase 8 and Phase 9 should be read as future-horizon work rather than near-sequential build steps.
@@ -1502,6 +1502,14 @@ The last few days materially advanced the Phase 6.x architecture track. These sl
   - broader daily briefing inference coverage
   - stale profile carryover fix when task family changes
 
+- `v0.7.15` — RSS chat convergence and replay hardening
+  - replay-time tool-chain sanitization now strips orphaned assistant `tool_calls` and normalizes replayed message content for provider-safe model calls
+  - RSS recent-items payloads are deduped and reformatted into a more compact headline-oriented shape
+  - headline roundup prompts stay in the RSS lane, avoid repeated refresh churn, and synthesize from the first useful recent-items batch
+  - full recent-items evidence now survives RSS synthesis instead of being truncated to the first few headlines
+  - follow-up article/detail prompts validate more aggressively and retry instead of leaking fetch narration or compacted tool scaffolding
+  - websocket cleanup and dict-style tool dispatch were hardened along the way so validated chat paths behave consistently again
+
 These releases moved Fruitcake from “task/runtime direction is mostly planned” to “the core seams are real enough to iterate on product UX instead of only backend plumbing.”
 
 ### Phase 6.x Sprint Proposals And Planning Notes
@@ -2102,16 +2110,15 @@ Planned next phase:
 - this should be treated as the immediate post-7.5 follow-up because first real agent runs exposed prompt-history bloat as the limiting weakness for longer-running background work
 
 Immediate post-branch bug follow-up:
-- after the current branch closes, take a short bug/hardening pass on the RSS chat pipeline
-- priority issue:
-  - RSS-backed chat can still over-research instead of converging on an answer, including on both:
-    - chronology prompts such as weekend/timeline summaries
-    - headline-roundup prompts such as "what are the headlines this evening?"
-- the next slice should:
-  - improve RSS answer convergence
-  - add a cleaner recent-headlines path for roundup prompts
-  - make repeated RSS no-progress states fall through to synthesis from gathered evidence whenever possible
-- treat this as a focused bug/hardening slice after branch close, not more compaction-branch scope
+- this slice has now landed and should be treated as completed follow-through, not future scope
+- RSS-backed chat no longer shows the earlier failure mode where it kept over-researching instead of converging
+- the bug/hardening pass delivered:
+  - provider-safe replay sanitization for compacted / filtered tool-call histories
+  - a cleaner recent-headlines path with recent-item dedupe and compact formatting
+  - stronger answer convergence for both chronology/timeline prompts and headline-roundup prompts
+  - synthesis-first fallback behavior when RSS research is no longer making progress
+  - validation coverage for article/detail follow-ups so internal fetch narration does not leak into final chat answers
+- the next RSS work, if any, should be treated as normal product polish or performance tuning rather than emergency runtime repair
 
 Reference:
 - [first_agent_runs_plan.md](/Users/jwomble/Development/fruitcake_v5/Docs/_internal/first_agent_runs_plan.md)
