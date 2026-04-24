@@ -396,9 +396,14 @@ class TaskRunner:
                     if run is not None:
                         run.status = "waiting_approval"
                         run.finished_at = datetime.now(timezone.utc)
-                        run.error = str(exc)
+                        run.error = f"{exc.tool_name}: {exc.reason}"
                 await db.commit()
-            log.info("task.waiting_approval", task_id=task_id, blocked_tool=str(exc))
+            log.info(
+                "task.waiting_approval",
+                task_id=task_id,
+                blocked_tool=exc.tool_name,
+                reason=exc.reason,
+            )
 
         except Exception as exc:
             await self._handle_error(task_id, exc, task_run_id=task_run_id)

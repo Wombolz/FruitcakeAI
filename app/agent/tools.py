@@ -842,9 +842,11 @@ async def _call_tool(
     """Route a tool call to its implementation."""
     # Approval gate — armed by TaskRunner for tasks with requires_approval=True.
     # Raises ApprovalRequired before executing; the runner catches it and pauses the task.
-    from app.autonomy.approval import _approval_armed, APPROVAL_REQUIRED_TOOLS, ApprovalRequired
-    if _approval_armed.get() and name in APPROVAL_REQUIRED_TOOLS:
-        raise ApprovalRequired(name)
+    from app.autonomy.approval import _approval_armed, approval_requirement_for_tool
+    if _approval_armed.get():
+        approval_requirement = approval_requirement_for_tool(name, arguments)
+        if approval_requirement is not None:
+            raise ApprovalRequired(approval_requirement.tool_name, approval_requirement.reason)
 
     if name == "create_memory":
         return await _create_memory(arguments, user_context)

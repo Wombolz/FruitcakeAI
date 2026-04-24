@@ -1395,6 +1395,63 @@ async def test_dispatch_propagates_approval_required():
 
 
 @pytest.mark.asyncio
+async def test_call_tool_requires_approval_for_memory_mutation():
+    import app.agent.tools as tools_module
+    from app.autonomy.approval import ApprovalRequired, _approval_armed
+
+    ctx = _make_context()
+    token = _approval_armed.set(True)
+    try:
+        with pytest.raises(ApprovalRequired) as exc_info:
+            await tools_module._call_tool(
+                "create_memory",
+                {"memory_type": "semantic", "content": "The user prefers early reminders."},
+                ctx,
+            )
+    finally:
+        _approval_armed.reset(token)
+
+    assert str(exc_info.value) == "create_memory"
+    assert exc_info.value.tool_name == "create_memory"
+    assert "persisted user memory" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+async def test_call_tool_requires_approval_only_when_market_data_saves_to_library():
+    from unittest.mock import AsyncMock, patch
+    import app.agent.tools as tools_module
+    from app.autonomy.approval import ApprovalRequired, _approval_armed
+
+    ctx = _make_context()
+    token = _approval_armed.set(True)
+    try:
+        with patch.object(
+            tools_module,
+            "_get_daily_market_data",
+            new=AsyncMock(return_value="market data"),
+        ) as mock_daily:
+            allowed = await tools_module._call_tool(
+                "get_daily_market_data",
+                {"symbol": "SPY", "save_to_library": False},
+                ctx,
+            )
+            assert allowed == "market data"
+            mock_daily.assert_awaited_once()
+
+        with pytest.raises(ApprovalRequired) as exc_info:
+            await tools_module._call_tool(
+                "get_daily_market_data",
+                {"symbol": "SPY", "save_to_library": True},
+                ctx,
+            )
+    finally:
+        _approval_armed.reset(token)
+
+    assert exc_info.value.tool_name == "get_daily_market_data"
+    assert "persisted user documents" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
 async def test_call_tool_routes_generic_search_to_web_search():
     """Generic MCP 'search' calls should flow through internal web_search when present."""
     from unittest.mock import AsyncMock, MagicMock, patch
