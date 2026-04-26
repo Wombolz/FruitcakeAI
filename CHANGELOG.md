@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.17
+
+- Clarified the current trust boundary in the tracked operator docs, including which mutation families are approval-gated by default, when market-data writes require approval, and how `waiting_approval`, `waiting_approval_tool`, and `waiting_approval_reason` should be interpreted.
+- Enriched `/admin/task-runs/{id}/inspect` with structured approval context so waiting-approval runs expose the blocked tool, human-readable reason, and paused state directly instead of forcing operators to infer it from generic run errors.
+- Mirrored the same additive approval block through `fruitcake_inspect_task_run`, keeping the Fruitcake MCP operator surface aligned with the admin inspection payload for live diagnosis and tooling.
+- Added focused regression coverage for waiting-approval inspection in both the admin API and the MCP server so approval-state visibility remains stable as the operator surfaces evolve.
+- Validated the improved operator surface live against recent successful recurring runs, confirming healthy artifact-rich inspections for sync, RSS refresh, and hourly news tasks while preserving clear separation between approval state and runtime availability issues.
+
 ## v0.7.16
 
 - Broadened approval-gated mutation coverage beyond the original narrow high-risk set, including memory writes, task-plan creation, workspace file mutations, and RSS source/catalog review actions.
