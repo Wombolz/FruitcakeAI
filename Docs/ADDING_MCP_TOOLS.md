@@ -157,3 +157,14 @@ Response includes:
 For alpha operators:
 - if a deployment does not actively need an MCP, leave it disabled
 - prefer first-party core tools for task mutation, secrets, API-backed requests, and place lookup instead of adding overlapping MCPs
+
+## Trust boundary reminder
+
+MCP enablement does not bypass Fruitcake's task approval model.
+
+- If a task execution path reaches a tool that is approval-gated, the task still pauses in `waiting_approval` before the mutation executes.
+- Operators can inspect that pause through:
+  - `/tasks/*` task and step responses (`waiting_approval_tool`, `waiting_approval_reason`)
+  - `/admin/task-runs/{id}/inspect`
+  - the Fruitcake MCP inspect tools such as `fruitcake_inspect_task_run`
+- When reviewing MCP additions, treat any new persistent or external mutation surface as a trust-boundary question first. If it should mutate user data, external state, or trusted catalogs, it should either reuse the current approval boundary or justify why it is safe without it.

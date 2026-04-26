@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.db.models import Document, Task, TaskRun, TaskRunArtifact
+from app.db.models import Document, Task, TaskRun, TaskRunArtifact, TaskStep
 from tests.conftest import TestSessionLocal
 
 
@@ -746,6 +746,72 @@ async def test_mcp_inspect_task_run_returns_latest_summary_and_structured_conten
     assert payload["diagnostics"]["agent_context_budgeting"]["totals"]["tool_results_compacted"] == 4
     assert payload["diagnostics"]["agent_context_budgeting"]["totals"]["loop_events"] == 1
     assert json.loads(result["content"][0]["text"])["task"]["id"] == task_id
+
+
+@pytest.mark.asyncio
+async def test_mcp_inspect_task_run_includes_waiting_approval_context(client):
+    token = await _token(client, "mcpinspectapprovaluser")
+    headers = _auth_headers(token)
+
+    me = await client.get("/auth/me", headers=headers)
+    user_id = int(me.json()["id"])
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=user_id,
+            title="Approval task",
+            instruction="Inspect waiting approval.",
+            task_type="recurring",
+            status="waiting_approval",
+            schedule="every:24h",
+            deliver=True,
+            requires_approval=True,
+            current_step_index=2,
+        )
+        db.add(task)
+        await db.flush()
+        run = TaskRun(
+            task_id=task.id,
+            status="waiting_approval",
+            error="create_event: Creating a calendar event changes an external calendar.",
+        )
+        db.add(run)
+        await db.flush()
+        db.add(
+            TaskStep(
+                task_id=task.id,
+                step_index=2,
+                title="Create calendar event",
+                instruction="Create the event",
+                requires_approval=True,
+                status="waiting_approval",
+                waiting_approval_tool="create_event",
+            )
+        )
+        await db.commit()
+        task_id = task.id
+
+    resp = await client.post(
+        "/mcp/fruitcake/tools/call",
+        json={
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "fruitcake_inspect_task_run",
+                "arguments": {"task_id": task_id, "mode": "latest"},
+            },
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()["result"]["structuredContent"]
+    assert payload["approval"]["is_waiting"] is True
+    assert payload["approval"]["blocked_tool"] == "create_event"
+    assert "external calendar" in payload["approval"]["reason"]
+    assert payload["approval"]["task_status"] == "waiting_approval"
+    assert payload["approval"]["step_status"] == "waiting_approval"
 
 
 @pytest.mark.asyncio

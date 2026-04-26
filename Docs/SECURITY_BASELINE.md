@@ -1,6 +1,6 @@
 # Security Baseline
 
-This document describes the current security baseline for FruitcakeAI as of release `v0.7.1`.
+This document describes the current security baseline for FruitcakeAI as of release `v0.7.16`.
 
 It is not a formal security audit. It is the minimum operator and contributor reference for understanding:
 
@@ -17,7 +17,7 @@ Security priorities in the current architecture are:
 
 1. Keep local use fully functional without requiring cloud providers.
 2. Limit cross-user access through authenticated API boundaries and persona-scoped capability controls.
-3. Require explicit approval before irreversible actions when task approval is enabled.
+3. Require explicit approval before persistent or externally mutating actions when task approval is enabled.
 4. Degrade safely when local dependencies fail instead of continuing in an unknown state.
 5. Treat optional integrations as additive, not load-bearing.
 
@@ -52,9 +52,20 @@ This baseline assumes a trusted local network or a deliberately hardened reverse
 
 ### Task and tool safety
 
-- Approval gating exists for irreversible tools when task approval is enabled.
+- Approval gating exists for persistent or externally mutating tools when task approval is enabled.
+- The current default approval-gated mutation families include:
+  - calendar event creation and deletion
+  - persistent task creation, update, and task-plan creation
+  - memory writes and memory-graph mutations
+  - workspace filesystem mutations such as file writes/appends and directory creation
+  - RSS source/catalog mutations such as adding/removing sources and approving/rejecting candidates
+- Market-data lookups are conditionally approval-gated only when `save_to_library=true`; read-only market lookups remain ungated.
 - Scheduler guardrails pause and requeue on local LLM unavailability instead of repeatedly churning failed runs.
 - Run diagnostics and admin inspection surfaces make tool use, artifacts, and skill injection observable.
+- Waiting approval is exposed explicitly through:
+  - task/task-step API fields `waiting_approval_tool` and `waiting_approval_reason`
+  - admin task-run inspection payloads
+  - Fruitcake MCP inspection payloads for operator/developer workflows
 
 ### Transport and secrets handling
 
@@ -127,6 +138,8 @@ These are mandatory for any deployment beyond personal local testing.
 - `/admin/mcp/diagnostics`
 - `/admin/skills/*`
 
+The task-run inspect surface is the primary operator view for paused approval runs. When a run is waiting for approval, it exposes whether the run is paused, the blocked tool, and the human-readable approval reason.
+
 ## Default Exposure and Trust Assumptions
 
 ### Safe assumptions for local development
@@ -186,6 +199,13 @@ Recommended ongoing hygiene:
 3. Review MCP server updates before enabling new images or configs.
 4. Revisit this baseline whenever a new public integration surface is added.
 5. Keep the set of default shared skills small and reviewed; move experimental skills out of the alpha-default path.
+
+## Approval Model Notes
+
+- `waiting_approval` means execution paused before the gated tool executed.
+- `waiting_approval_tool` is the persisted tool identifier for compatibility and resume logic.
+- `waiting_approval_reason` is the operator-facing explanation for why that tool was paused.
+- Approval visibility is now intended as operability polish, not a missing runtime-safety gap: the core approval boundary is already enforced in the task runner and surfaced through task, admin, and MCP inspection paths.
 
 ## Minimum Deployment Checklist
 

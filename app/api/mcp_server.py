@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from app.agent.context import UserContext
 from app.agent.definition_loader import get_agent_preset
 from app.auth.dependencies import get_current_user
+from app.autonomy.approval import approval_reason_for_tool
 from app.db.models import User
 
 router = APIRouter()
@@ -411,6 +412,26 @@ def _serialize_run(run: Any, task: Any) -> Dict[str, Any]:
     }
 
 
+def _approval_summary(*, task: Any, run: Any, step: Any | None) -> Dict[str, Any]:
+    blocked_tool = str(getattr(step, "waiting_approval_tool", "") or "").strip() or None
+    step_status = str(getattr(step, "status", "") or "").strip() or None
+    is_waiting = any(
+        status == "waiting_approval"
+        for status in (
+            str(getattr(task, "status", "") or "").strip().lower(),
+            str(getattr(run, "status", "") or "").strip().lower(),
+            str(step_status or "").strip().lower(),
+        )
+    )
+    return {
+        "is_waiting": is_waiting,
+        "blocked_tool": blocked_tool,
+        "reason": approval_reason_for_tool(blocked_tool) if blocked_tool else None,
+        "task_status": getattr(task, "status", None),
+        "step_status": step_status,
+    }
+
+
 def _parse_memory_candidates(payload: Any) -> list[dict[str, Any]]:
     decoded = _decode_json_like(payload)
     if not isinstance(decoded, dict):
@@ -763,6 +784,22 @@ async def _load_run_artifacts(run_id: int, db: Any) -> list[Any]:
     return list(result.scalars().all())
 
 
+async def _load_current_task_step(task: Any, db: Any) -> Any | None:
+    from sqlalchemy import select
+
+    from app.db.models import TaskStep
+
+    if getattr(task, "current_step_index", None) is None:
+        return None
+    result = await db.execute(
+        select(TaskStep).where(
+            TaskStep.task_id == task.id,
+            TaskStep.step_index == task.current_step_index,
+        ).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 def _collect_memory_candidates_from_artifacts(artifacts: list[Any]) -> list[dict[str, Any]]:
     for artifact in artifacts:
         if getattr(artifact, "artifact_type", None) == "memory_candidates":
@@ -794,6 +831,7 @@ def _inspection_payload(
     *,
     task: Any,
     run: Any,
+    current_step: Any | None,
     raw_artifacts: list[Any],
     include_raw_artifacts: bool,
 ) -> Dict[str, Any]:
@@ -808,6 +846,7 @@ def _inspection_payload(
         "found": True,
         "task": _serialize_task(task),
         "run": _serialize_run(run, task),
+        "approval": _approval_summary(task=task, run=run, step=current_step),
         "artifacts": {
             "count": len(artifacts),
             "types": [artifact["artifact_type"] for artifact in artifacts],
@@ -1067,11 +1106,13 @@ async def _tool_inspect_task_run(arguments: Dict[str, Any], user: User) -> Dict[
                 "task": _serialize_task(task),
             }
 
+        current_step = await _load_current_task_step(task, db)
         artifact_rows = await _load_run_artifacts(run.id, db)
 
     return _inspection_payload(
         task=task,
         run=run,
+        current_step=current_step,
         raw_artifacts=artifact_rows,
         include_raw_artifacts=include_raw_artifacts,
     )

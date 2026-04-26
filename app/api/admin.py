@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.definition_loader import get_agent_preset
 from app.auth.dependencies import require_admin
 from app.auth.jwt import hash_password
+from app.autonomy.approval import approval_reason_for_tool
 from app.autonomy.push import get_apns_pusher
 from app.config import settings
 from app.db.models import (
@@ -44,6 +45,7 @@ from app.db.models import (
     Skill,
     Task,
     TaskRun,
+    TaskStep,
     User,
 )
 from app.db.models import TaskRunArtifact
@@ -689,6 +691,7 @@ async def _load_task_run_bundle(
 
 async def _build_task_run_inspect_payload(db: AsyncSession, run_id: int) -> Dict[str, Any]:
     run, task, logs, artifacts = await _load_task_run_bundle(db, run_id)
+    current_step = await _load_current_task_step(db, task)
     ordered_artifacts = [_serialize_artifact(a) for a in sorted(artifacts, key=_artifact_sort_key)]
     tool_timeline = [_tool_call_payload(entry) for entry in logs]
     diagnostics = _normalized_diagnostics(ordered_artifacts)
@@ -713,6 +716,7 @@ async def _build_task_run_inspect_payload(db: AsyncSession, run_id: int) -> Dict
             "profile": task.profile or "default",
             "retry_count": task.retry_count,
         },
+        "approval": _approval_summary(task=task, run=run, step=current_step),
         "execution": {
             "active_skills": diagnostics.get("active_skills", []),
             "skill_selection_mode": diagnostics.get("skill_selection_mode", ""),
@@ -724,6 +728,38 @@ async def _build_task_run_inspect_payload(db: AsyncSession, run_id: int) -> Dict
         "tool_timeline": tool_timeline,
         "artifacts": ordered_artifacts,
         "diagnostics": diagnostics,
+    }
+
+
+async def _load_current_task_step(db: AsyncSession, task: Task) -> TaskStep | None:
+    if task.current_step_index is None:
+        return None
+    result = await db.execute(
+        select(TaskStep).where(
+            TaskStep.task_id == task.id,
+            TaskStep.step_index == task.current_step_index,
+        ).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+def _approval_summary(*, task: Task, run: TaskRun, step: TaskStep | None) -> Dict[str, Any]:
+    blocked_tool = str(getattr(step, "waiting_approval_tool", "") or "").strip() or None
+    step_status = str(getattr(step, "status", "") or "").strip() or None
+    is_waiting = any(
+        status == "waiting_approval"
+        for status in (
+            str(getattr(task, "status", "") or "").strip().lower(),
+            str(getattr(run, "status", "") or "").strip().lower(),
+            str(step_status or "").strip().lower(),
+        )
+    )
+    return {
+        "is_waiting": is_waiting,
+        "blocked_tool": blocked_tool,
+        "reason": approval_reason_for_tool(blocked_tool) if blocked_tool else None,
+        "task_status": task.status,
+        "step_status": step_status,
     }
 
 

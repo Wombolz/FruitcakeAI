@@ -1194,6 +1194,50 @@ async def test_admin_task_run_inspect_returns_ordered_payloads_and_diagnostics(c
 
 
 @pytest.mark.asyncio
+async def test_admin_task_run_inspect_includes_waiting_approval_context(client):
+    admin_headers = await _admin_headers(client, "inspectapprovaladmin")
+    owner_headers = await _headers(client, "inspectapprovalowner")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Needs approval", "instruction": "Pause before mutating"},
+        headers=owner_headers,
+    )
+    assert task_resp.status_code == 201
+    task_id = task_resp.json()["id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.status = "waiting_approval"
+        task.current_step_index = 2
+        run = TaskRun(task_id=task_id, status="waiting_approval", error="create_event: Creating a calendar event changes an external calendar.")
+        db.add(run)
+        await db.flush()
+        step = TaskStep(
+            task_id=task_id,
+            step_index=2,
+            title="Create calendar event",
+            instruction="Create the event",
+            requires_approval=True,
+            status="waiting_approval",
+            waiting_approval_tool="create_event",
+        )
+        db.add(step)
+        await db.commit()
+        run_id = run.id
+
+    inspect = await client.get(f"/admin/task-runs/{run_id}/inspect", headers=admin_headers)
+    assert inspect.status_code == 200
+    payload = inspect.json()
+    assert payload["approval"]["is_waiting"] is True
+    assert payload["approval"]["blocked_tool"] == "create_event"
+    assert "external calendar" in payload["approval"]["reason"]
+    assert payload["approval"]["task_status"] == "waiting_approval"
+    assert payload["approval"]["step_status"] == "waiting_approval"
+
+
+@pytest.mark.asyncio
 async def test_admin_agent_run_create_update_and_inspect(client):
     admin_headers = await _admin_headers(client, "agentrunadmin")
     owner_headers = await _headers(client, "agentrunowner")
