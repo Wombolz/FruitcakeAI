@@ -59,11 +59,13 @@ This baseline assumes a trusted local network or a deliberately hardened reverse
   - memory writes and memory-graph mutations
   - workspace filesystem mutations such as file writes/appends and directory creation
   - RSS source/catalog mutations such as adding/removing sources and approving/rejecting candidates
+- Separately from normal mutation gating, trusted-local agent workflows may pause for explicit approval before expanding read access to a non-workspace host root. This is a distinct approval family from workspace file writes and does not widen the generic workspace filesystem sandbox.
 - Market-data lookups are conditionally approval-gated only when `save_to_library=true`; read-only market lookups remain ungated.
 - Scheduler guardrails pause and requeue on local LLM unavailability instead of repeatedly churning failed runs.
 - Run diagnostics and admin inspection surfaces make tool use, artifacts, and skill injection observable.
 - Waiting approval is exposed explicitly through:
   - task/task-step API fields `waiting_approval_tool` and `waiting_approval_reason`
+  - additive structured waiting-approval payloads when the paused action carries extra context such as requested host-root path and access mode
   - admin task-run inspection payloads
   - Fruitcake MCP inspection payloads for operator/developer workflows
 

@@ -40,6 +40,7 @@ from app.managed_agent_presets import (
     update_agent_instance,
 )
 from app.memory.service import get_memory_service
+from app.host_root_access import activate_host_root_grant
 from app.mcp.servers.filesystem import resolve_workspace_path_for_user, write_workspace_text
 from app.task_service import TaskValidationError, UNSET, create_task_record, update_task_record
 from app.time_utils import format_localized_datetime, resolve_effective_timezone
@@ -183,6 +184,7 @@ class TaskOut(BaseModel):
     current_step_title: Optional[str]
     waiting_approval_tool: Optional[str]
     waiting_approval_reason: Optional[str] = None
+    waiting_approval: Optional[Dict[str, Any]] = None
     has_plan: bool
     plan_version: int
     created_at: Optional[datetime]
@@ -327,12 +329,14 @@ async def list_tasks(
     tasks = result.scalars().all()
     step_lookup = await _load_current_steps(db, tasks)
     final_output_lookup = await _load_latest_final_outputs(db, tasks)
+    run_lookup = await _load_latest_runs(db, tasks)
     return [
         _to_task_out(
             task,
             step_lookup.get((task.id, task.current_step_index)),
             user_timezone=current_user.active_hours_tz,
             final_output=final_output_lookup.get(task.id),
+            latest_run=run_lookup.get(task.id),
         )
         for task in tasks
     ]
@@ -449,11 +453,13 @@ async def get_task(
     task = await _get_owned_task(task_id, current_user.id, db)
     step_lookup = await _load_current_steps(db, [task])
     final_output_lookup = await _load_latest_final_outputs(db, [task])
+    run_lookup = await _load_latest_runs(db, [task])
     return _to_task_out(
         task,
         step_lookup.get((task.id, task.current_step_index)),
         user_timezone=current_user.active_hours_tz,
         final_output=final_output_lookup.get(task.id),
+        latest_run=run_lookup.get(task.id),
     )
 
 
@@ -473,10 +479,39 @@ async def update_task(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Task is not waiting for approval (status={task.status})",
             )
+        current_step = await _load_current_steps(db, [task])
+        step = current_step.get((task.id, task.current_step_index))
+        run_lookup = await _load_latest_runs(db, [task])
+        latest_run = run_lookup.get(task.id)
+        waiting_payload = getattr(step, "waiting_approval_payload", None) if step is not None else None
+        if not isinstance(waiting_payload, dict) and latest_run is not None:
+            waiting_payload = getattr(latest_run, "waiting_approval_payload", None)
+        waiting_kind = str(getattr(step, "waiting_approval_kind", "") or "").strip() or ""
+        if not waiting_kind and latest_run is not None:
+            waiting_kind = str(getattr(latest_run, "waiting_approval_kind", "") or "").strip()
+        waiting_kind = waiting_kind or "tool"
         if body.approved:
+            if waiting_kind == "host_root_access" and isinstance(waiting_payload, dict):
+                requested_path = str(waiting_payload.get("requested_path") or "").strip()
+                requested_access_mode = str(waiting_payload.get("requested_access_mode") or "read_only").strip() or "read_only"
+                if requested_path:
+                    await activate_host_root_grant(
+                        db,
+                        user_id=int(current_user.id),
+                        raw_path=requested_path,
+                        created_by_user_id=int(current_user.id),
+                        access_mode=requested_access_mode,
+                    )
             task.status = "pending"
             task.next_run_at = datetime.now(timezone.utc)
             task.pre_approved = True
+            if step is not None:
+                step.waiting_approval_tool = None
+                step.waiting_approval_kind = None
+                step.waiting_approval_payload = None
+            if latest_run is not None:
+                latest_run.waiting_approval_kind = None
+                latest_run.waiting_approval_payload = None
             await db.commit()
             try:
                 from app.autonomy.runner import get_task_runner
@@ -485,9 +520,33 @@ async def update_task(
             except ImportError:
                 pass
         else:
+            task.error = "Approval denied by user"
             task.status = "cancelled"
+            if step is not None:
+                step.status = "failed"
+                step.error = "Approval denied by user"
+                step.waiting_approval_tool = None
+                step.waiting_approval_kind = None
+                step.waiting_approval_payload = None
+            run_rows = await db.execute(
+                select(TaskRun)
+                .where(
+                    TaskRun.task_id == task.id,
+                    TaskRun.status.in_(["running", "waiting_approval"]),
+                )
+                .order_by(desc(TaskRun.started_at))
+            )
+            run = run_rows.scalars().first()
+            if run is not None:
+                run.status = "cancelled"
+                run.finished_at = datetime.now(timezone.utc)
+                run.error = "Approval denied by user"
+                run.waiting_approval_kind = None
+                run.waiting_approval_payload = None
+            await db.commit()
         step_lookup = await _load_current_steps(db, [task])
-        return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
+        run_lookup = await _load_latest_runs(db, [task])
+        return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz, latest_run=run_lookup.get(task.id))
 
     try:
         fields_set = getattr(body, "model_fields_set", set())
@@ -514,7 +573,8 @@ async def update_task(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     step_lookup = await _load_current_steps(db, [task])
-    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
+    run_lookup = await _load_latest_runs(db, [task])
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz, latest_run=run_lookup.get(task.id))
 
 
 @router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -542,7 +602,8 @@ async def stop_task(
 
     if task.status in {"completed", "failed", "cancelled"}:
         step_lookup = await _load_current_steps(db, [task])
-        return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
+        run_lookup = await _load_latest_runs(db, [task])
+        return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz, latest_run=run_lookup.get(task.id))
 
     from app.autonomy.runner import get_task_runner
 
@@ -568,6 +629,8 @@ async def stop_task(
             step.status = "skipped"
             step.error = "Stopped by user"
             step.waiting_approval_tool = None
+            step.waiting_approval_kind = None
+            step.waiting_approval_payload = None
 
     run_rows = await db.execute(
         select(TaskRun)
@@ -584,7 +647,8 @@ async def stop_task(
         run.error = "Stopped by user"
 
     step_lookup = await _load_current_steps(db, [task])
-    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
+    run_lookup = await _load_latest_runs(db, [task])
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz, latest_run=run_lookup.get(task.id))
 
 
 @router.post("/tasks/{task_id}/run", response_model=Dict[str, Any])
@@ -659,7 +723,8 @@ async def reset_task(
     else:
         task.status = "cancelled"
     step_lookup = await _load_current_steps(db, [task])
-    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz)
+    run_lookup = await _load_latest_runs(db, [task])
+    return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz, latest_run=run_lookup.get(task.id))
 
 
 # ── GET /tasks/{id}/audit ─────────────────────────────────────────────────────
@@ -705,6 +770,7 @@ class TaskStepOut(BaseModel):
     error: Optional[str]
     waiting_approval_tool: Optional[str]
     waiting_approval_reason: Optional[str] = None
+    waiting_approval: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -1073,6 +1139,23 @@ async def _get_owned_task_run(task_id: int, run_id: int, user_id: int, db: Async
     return run
 
 
+async def _load_latest_runs(db: AsyncSession, tasks: List[Task]) -> Dict[int, TaskRun]:
+    task_ids = [int(task.id) for task in tasks if getattr(task, "id", None) is not None]
+    if not task_ids:
+        return {}
+    rows = await db.execute(
+        select(TaskRun)
+        .where(TaskRun.task_id.in_(task_ids))
+        .order_by(TaskRun.task_id, desc(TaskRun.started_at), desc(TaskRun.id))
+    )
+    lookup: Dict[int, TaskRun] = {}
+    for run in rows.scalars().all():
+        task_id = int(run.task_id)
+        if task_id not in lookup:
+            lookup[task_id] = run
+    return lookup
+
+
 async def _get_memory_candidate_artifact(task_run_id: int, db: AsyncSession) -> TaskRunArtifact:
     result = await db.execute(
         select(TaskRunArtifact)
@@ -1126,11 +1209,19 @@ def _to_task_out(
     *,
     user_timezone: Optional[str],
     final_output: Optional[str] = None,
+    latest_run: Optional[TaskRun] = None,
 ) -> TaskOut:
     waiting_tool: Optional[str] = None
     if task.status == "waiting_approval" and current_step is not None:
         waiting_tool = current_step.waiting_approval_tool
-    waiting_reason = approval_reason_for_tool(waiting_tool) if waiting_tool else None
+    elif task.status == "waiting_approval" and latest_run is not None:
+        waiting_tool = latest_run.waiting_approval_tool if hasattr(latest_run, "waiting_approval_tool") else waiting_tool
+    waiting_approval = _serialize_waiting_approval(current_step, latest_run=latest_run)
+    if waiting_tool is None and waiting_approval is not None:
+        waiting_tool = str(waiting_approval.get("blocked_tool") or "").strip() or None
+    waiting_reason = str(waiting_approval.get("reason") or "") if waiting_approval else None
+    if waiting_tool and not waiting_reason:
+        waiting_reason = approval_reason_for_tool(waiting_tool)
     effective_timezone = resolve_effective_timezone(task.active_hours_tz, user_timezone)
     result_markdown = _normalize_result_markdown(final_output or task.result)
     result_format = "markdown" if result_markdown else None
@@ -1161,6 +1252,7 @@ def _to_task_out(
         current_step_title=current_step.title if current_step is not None else None,
         waiting_approval_tool=waiting_tool,
         waiting_approval_reason=waiting_reason,
+        waiting_approval=waiting_approval,
         has_plan=task.has_plan,
         plan_version=task.plan_version,
         created_at=task.created_at,
@@ -1177,6 +1269,7 @@ def _to_task_out(
 
 def _to_task_step_out(step: TaskStep) -> TaskStepOut:
     waiting_tool = step.waiting_approval_tool
+    waiting_approval = _serialize_waiting_approval(step)
     return TaskStepOut(
         id=step.id,
         step_index=step.step_index,
@@ -1187,8 +1280,43 @@ def _to_task_step_out(step: TaskStep) -> TaskStepOut:
         output_summary=step.output_summary,
         error=step.error,
         waiting_approval_tool=waiting_tool,
-        waiting_approval_reason=approval_reason_for_tool(waiting_tool) if waiting_tool else None,
+        waiting_approval_reason=(
+            str(waiting_approval.get("reason") or "")
+            if waiting_approval
+            else approval_reason_for_tool(waiting_tool) if waiting_tool else None
+        ),
+        waiting_approval=waiting_approval,
     )
+
+
+def _serialize_waiting_approval(
+    step: TaskStep | None,
+    *,
+    latest_run: TaskRun | None = None,
+) -> Optional[Dict[str, Any]]:
+    blocked_tool = str(getattr(step, "waiting_approval_tool", "") or "").strip() or None
+    if not blocked_tool and latest_run is not None:
+        blocked_tool = str(getattr(latest_run, "error", "") or "").split(":", 1)[0].strip() or None
+    if not blocked_tool:
+        return None
+    kind = str(getattr(step, "waiting_approval_kind", "") or "").strip() or "tool"
+    if latest_run is not None and not getattr(step, "waiting_approval_kind", None):
+        kind = str(getattr(latest_run, "waiting_approval_kind", "") or "").strip() or kind
+    payload = getattr(step, "waiting_approval_payload", None)
+    if not isinstance(payload, dict) and latest_run is not None:
+        payload = getattr(latest_run, "waiting_approval_payload", None)
+    payload = payload if isinstance(payload, dict) else {}
+    reason = str(payload.get("reason") or "").strip() or approval_reason_for_tool(blocked_tool)
+    summary: Dict[str, Any] = {
+        "kind": kind,
+        "blocked_tool": blocked_tool,
+        "reason": reason,
+    }
+    if kind == "host_root_access":
+        summary["requested_path"] = str(payload.get("requested_path") or "").strip() or None
+        summary["requested_access_mode"] = str(payload.get("requested_access_mode") or "").strip() or None
+        summary["requester"] = str(payload.get("requester") or "").strip() or None
+    return summary
 
 
 def _resolved_agent_summary(preset: FruitcakeAgentPreset | None) -> Optional[Dict[str, Any]]:

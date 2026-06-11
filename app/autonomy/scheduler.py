@@ -501,6 +501,8 @@ async def recover_stale_running_tasks() -> int:
                     step.status = "pending"
                     step.error = "Recovered stale running step after restart/sleep."
                     step.waiting_approval_tool = None
+                    step.waiting_approval_kind = None
+                    step.waiting_approval_payload = None
 
             run.status = "failed"
             run.finished_at = now

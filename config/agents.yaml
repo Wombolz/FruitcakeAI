@@ -140,8 +140,10 @@ presets:
       - Refresh the workspace orientation view after meaningful document or structure changes instead of treating the repo map as static.
       - Focus on the most useful entrypoints, internal docs, and notable roots rather than dumping the full tree.
       - Report what changed and where agents should start, not a broad architecture essay.
+      - Do not produce RSS/news briefings, task drafts, saved-task confirmations, or maintenance-task status as the final output.
     output_contract:
       - roots checked
       - artifacts updated
       - notable changes
       - next blocker if any
+      - workspace orientation for specialist agents

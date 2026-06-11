@@ -25,6 +25,10 @@ class TaskExecutionProfile(ABC):
             "skill_injection_events": run_debug.get("skill_injection_events", []),
             "agent_context_budgeting": run_debug.get("agent_context_budgeting", []),
         }
+        if run_debug.get("repo_map_contract"):
+            diagnostics["repo_map_contract"] = run_debug.get("repo_map_contract")
+        if run_debug.get("last_tool_records"):
+            diagnostics["last_tool_records"] = run_debug.get("last_tool_records")
         if isinstance(extra, dict):
             diagnostics.update(extra)
         return diagnostics
@@ -81,6 +85,14 @@ class TaskExecutionProfile(ABC):
     ) -> None:
         return None
 
+    def augment_run_debug(
+        self,
+        *,
+        run_debug: Dict[str, Any],
+        run_context: Dict[str, Any],
+    ) -> None:
+        return None
+
     def validate_finalize(
         self,
         *,
@@ -101,6 +113,9 @@ class TaskExecutionProfile(ABC):
         out: List[Dict[str, Any]] = []
         if final_markdown:
             out.append({"artifact_type": "final_output", "content_text": final_markdown})
+        grounding = run_debug.get("grounding_report")
+        if grounding:
+            out.append({"artifact_type": "validation_report", "content_json": grounding})
         out.append({"artifact_type": "run_diagnostics", "content_json": diagnostics})
         return out
 

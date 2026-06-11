@@ -1543,9 +1543,10 @@ async def run_agent(
 
     Returns the assistant's final response as a plain string.
     """
-    unsupported_api_message = _unsupported_alphavantage_request_message(messages)
-    if unsupported_api_message:
-        return unsupported_api_message
+    if mode == "chat":
+        unsupported_api_message = _unsupported_alphavantage_request_message(messages)
+        if unsupported_api_message:
+            return unsupported_api_message
 
     tools = get_tools_for_user(user_context)
     history = list(messages)

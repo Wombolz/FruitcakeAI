@@ -19,6 +19,7 @@ import asyncio
 import json
 import re
 import logging
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -264,6 +265,8 @@ class TaskRunner:
                         active_run.status = "running"
                         active_run.finished_at = None
                         active_run.error = None
+                        active_run.waiting_approval_kind = None
+                        active_run.waiting_approval_payload = None
                         if resolved_run_kind == "agent":
                             active_run.run_kind = "agent"
                             active_run.agent_role = resolved_agent_role
@@ -391,19 +394,24 @@ class TaskRunner:
                     if step is not None:
                         step.status = "waiting_approval"
                         step.waiting_approval_tool = str(exc)
+                        step.waiting_approval_kind = str(getattr(exc, "approval_kind", "") or "tool")
+                        step.waiting_approval_payload = getattr(exc, "payload", None)
                 if task_run_id:
                     run = await db.get(TaskRun, task_run_id)
                     if run is not None:
                         run.status = "waiting_approval"
                         run.finished_at = datetime.now(timezone.utc)
                         run.error = f"{exc.tool_name}: {exc.reason}"
+                        run.waiting_approval_kind = str(getattr(exc, "approval_kind", "") or "tool")
+                        run.waiting_approval_payload = getattr(exc, "payload", None)
                 await db.commit()
             log.info(
                 "task.waiting_approval",
                 task_id=task_id,
-                blocked_tool=exc.tool_name,
-                reason=exc.reason,
-            )
+                        blocked_tool=exc.tool_name,
+                        reason=exc.reason,
+                        approval_kind=getattr(exc, "approval_kind", "tool"),
+                    )
 
         except Exception as exc:
             await self._handle_error(task_id, exc, task_run_id=task_run_id)
@@ -442,6 +450,7 @@ class TaskRunner:
         task_profile = None
         preloaded_required_context = ""
         loaded_required_context_sources: list[str] = []
+        run_context: dict[str, object] = {}
 
         async with AsyncSessionLocal() as db:
             task = await db.get(Task, task_id)
@@ -529,8 +538,14 @@ class TaskRunner:
                 task.last_session_id = session_id
             if task_run_id:
                 run = await db.get(TaskRun, task_run_id)
-                if run is not None:
-                    run.session_id = session_id
+            if run is not None:
+                run.session_id = session_id
+            run_context = await task_profile.prepare_run_context(
+                db=db,
+                user_id=task.user_id,
+                task_id=task.id,
+                task_run_id=task_run_id,
+            )
             await db.commit()
 
         # Build UserContext (re-fetch user while session open so from_user can read attributes)
@@ -544,11 +559,28 @@ class TaskRunner:
                 raise ValueError(f"User {task_user_id} not found for task {task_id}")
             user_context = UserContext.from_user(user, persona_name=persona_name)
             user_context.allowed_tool_cap = list(resolved.allowed_tools)
-            user_context = await hydrate_user_context(
-                db,
-                user_context,
-                query=(task_instruction or task_title or ""),
-            )
+            if task_profile:
+                blocked = set(user_context.blocked_tools or [])
+                blocked.update(task_profile.effective_blocked_tools(run_context=run_context))
+                allowed_cap = list(user_context.allowed_tool_cap or [])
+                profile_allowed = task_profile.effective_allowed_tools(run_context=run_context)
+                if profile_allowed is not None:
+                    if allowed_cap:
+                        overlap = sorted(set(allowed_cap).intersection(profile_allowed))
+                        allowed_cap = overlap or sorted(profile_allowed)
+                    else:
+                        allowed_cap = sorted(profile_allowed)
+                user_context.blocked_tools = sorted(blocked)
+                user_context.allowed_tool_cap = allowed_cap
+            skills_enabled = not task_profile or task_profile.allow_skill_injection(run_context=run_context)
+            if skills_enabled:
+                user_context = await hydrate_user_context(
+                    db,
+                    user_context,
+                    query=(task_instruction or task_title or ""),
+                )
+            elif agent_role:
+                user_context.skill_selection_mode = "disabled_for_agent_role"
         if agent_role:
             preset = get_agent_preset(agent_role)
             combined_context_sources: list[str] = []
@@ -610,6 +642,12 @@ class TaskRunner:
             parts.append(preloaded_required_context)
         parts.append(f"[Task: {task_title}]")
         parts.append(task_instruction or "")
+        if task_profile:
+            task_profile.augment_prompt(
+                prompt_parts=parts,
+                run_context=run_context,
+                is_final_step=True,
+            )
         parts.append(f"\nCurrent time: {now_str}")
 
         arm_approval = task_requires_approval and not pre_approved
@@ -627,7 +665,9 @@ class TaskRunner:
             restore_agent_loop_diagnostics,
         )
         diagnostics_token = reset_agent_loop_diagnostics()
+        tool_record_token = reset_tool_execution_records()
         agent_loop_diagnostics: dict[str, object] = {}
+        tool_records: list[dict[str, Any]] = []
         try:
             try:
                 result = await run_agent(
@@ -639,9 +679,12 @@ class TaskRunner:
                 )
             finally:
                 agent_loop_diagnostics = get_agent_loop_diagnostics()
+                tool_records = get_tool_execution_records()
                 restore_agent_loop_diagnostics(diagnostics_token)
+                restore_tool_execution_records(tool_record_token)
             run_debug = {
                 "profile": getattr(task_profile, "name", "default"),
+                "agent_role": agent_role or "",
                 "required_context_sources": loaded_required_context_sources,
                 "active_skills": list(user_context.active_skill_slugs or []),
                 "skill_selection_mode": user_context.skill_selection_mode or "",
@@ -654,6 +697,10 @@ class TaskRunner:
                     }
                 ],
             }
+            if isinstance(run_context, dict):
+                run_context["last_tool_records"] = tool_records
+            if task_profile and isinstance(run_context, dict):
+                task_profile.augment_run_debug(run_debug=run_debug, run_context=run_context)
             _append_agent_context_budgeting(
                 run_debug,
                 stage="task_single_stage",
@@ -662,6 +709,36 @@ class TaskRunner:
             )
             if recalled_memory_ids:
                 await svc.mark_accessed(sorted(recalled_memory_ids), mode="task_materialized")
+            validation_report = None
+            if task_profile and isinstance(run_context, dict):
+                result, validation_report = task_profile.validate_finalize(
+                    result=result,
+                    prior_full_outputs=[],
+                    run_context=run_context,
+                    is_final_step=True,
+                )
+            if validation_report is not None:
+                run_debug["grounding_report"] = validation_report
+                if validation_report.get("fatal"):
+                    message = str(
+                        validation_report.get("fatal_reason")
+                        or "Agent output failed semantic validation."
+                    )
+                    if task_run_id:
+                        async with AsyncSessionLocal() as db:
+                            run = await db.get(TaskRun, task_run_id)
+                            if run is not None:
+                                run.status = "failed"
+                                run.finished_at = datetime.now(timezone.utc)
+                                run.error = message
+                            await _persist_run_artifacts(
+                                db,
+                                task_run_id=task_run_id,
+                                final_markdown=result,
+                                run_debug=run_debug,
+                            )
+                            await db.commit()
+                    raise NonRetriableTaskOutputError(message)
             return result, run_debug
         finally:
             reset_llm_usage_context(usage_token)
@@ -745,7 +822,8 @@ class TaskRunner:
             profile_allowed = task_profile.effective_allowed_tools(run_context=run_context)
             if profile_allowed is not None:
                 if allowed_cap:
-                    allowed_cap = sorted(set(allowed_cap).intersection(profile_allowed))
+                    overlap = sorted(set(allowed_cap).intersection(profile_allowed))
+                    allowed_cap = overlap or sorted(profile_allowed)
                 else:
                     allowed_cap = sorted(profile_allowed)
             step_user_context = replace(
@@ -786,6 +864,8 @@ class TaskRunner:
                 step_row.status = "running"
                 step_row.error = None
                 step_row.waiting_approval_tool = None
+                step_row.waiting_approval_kind = None
+                step_row.waiting_approval_payload = None
                 await db.commit()
 
             async with AsyncSessionLocal() as db:
@@ -944,10 +1024,16 @@ class TaskRunner:
                 async with AsyncSessionLocal() as db:
                     task = await db.get(Task, task_id)
                     step_row = await db.get(TaskStep, step.id)
+                    run = await db.get(TaskRun, task_run_id) if task_run_id else None
                     task.status = "waiting_approval"
                     task.current_step_index = step_row.step_index
                     step_row.status = "waiting_approval"
                     step_row.waiting_approval_tool = str(exc)
+                    step_row.waiting_approval_kind = str(getattr(exc, "approval_kind", "") or "tool")
+                    step_row.waiting_approval_payload = getattr(exc, "payload", None)
+                    if run is not None:
+                        run.waiting_approval_kind = str(getattr(exc, "approval_kind", "") or "tool")
+                        run.waiting_approval_payload = getattr(exc, "payload", None)
                     await db.commit()
                 raise
             except Exception as exc:
@@ -1204,6 +1290,8 @@ class TaskRunner:
             step.result = None
             step.error = None
             step.waiting_approval_tool = None
+            step.waiting_approval_kind = None
+            step.waiting_approval_payload = None
 
         task = await db.get(Task, task_id)
         task.current_step_index = 1
@@ -1266,7 +1354,26 @@ class TaskRunner:
                 )
                 return
 
-            if retry < len(RETRY_DELAYS):
+            if isinstance(exc, NonRetriableTaskOutputError):
+                now = datetime.now(timezone.utc)
+                task.error = str(exc)
+                task.last_run_at = now
+                task.next_retry_at = None
+                if task.task_type == "recurring" and task.schedule:
+                    user = await db.get(User, task.user_id)
+                    task.status = "pending"
+                    task.retry_count = 0
+                    task.next_run_at = compute_next_run_at(
+                        task.schedule,
+                        task_timezone=task.active_hours_tz,
+                        user_timezone=getattr(user, "active_hours_tz", None),
+                        after=now,
+                    )
+                else:
+                    task.status = "failed"
+                    task.next_run_at = None
+                log.warning("task.non_retriable_output_failure", task_id=task_id)
+            elif retry < len(RETRY_DELAYS):
                 delay = RETRY_DELAYS[retry]
                 task.status = "pending"
                 task.retry_count = retry + 1
@@ -1431,6 +1538,10 @@ def _task_recipe_family(task: Task | None) -> str:
 
 def _is_agent_recipe_task(task: Task | None) -> bool:
     return _task_recipe_family(task) == "agent"
+
+
+class NonRetriableTaskOutputError(RuntimeError):
+    """Raised when a task completed operationally but produced incompatible content."""
 
 
 async def _preflight_llm_dispatch() -> tuple[int, str] | None:
