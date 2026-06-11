@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -812,6 +813,67 @@ async def test_mcp_inspect_task_run_includes_waiting_approval_context(client):
     assert "external calendar" in payload["approval"]["reason"]
     assert payload["approval"]["task_status"] == "waiting_approval"
     assert payload["approval"]["step_status"] == "waiting_approval"
+
+
+@pytest.mark.asyncio
+async def test_mcp_inspect_task_run_includes_host_root_approval_context(client):
+    token = await _token(client, "mcpinspecthostrootuser")
+    headers = _auth_headers(token)
+
+    me = await client.get("/auth/me", headers=headers)
+    user_id = int(me.json()["id"])
+    requested_path = str((Path.cwd() / "reports").resolve(strict=False))
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=user_id,
+            title="Host root approval task",
+            instruction="Inspect host-root approval.",
+            task_type="one_shot",
+            status="waiting_approval",
+            deliver=False,
+            requires_approval=False,
+        )
+        db.add(task)
+        await db.flush()
+        run = TaskRun(
+            task_id=task.id,
+            status="waiting_approval",
+            error="host_root_access: Repo map manager needs read-only access.",
+            waiting_approval_kind="host_root_access",
+        )
+        run.waiting_approval_payload = {
+            "requested_path": requested_path,
+            "requested_access_mode": "read_only",
+            "requester": "repo_map_manager",
+            "reason": "Repo map manager needs read-only access.",
+        }
+        db.add(run)
+        await db.commit()
+        task_id = task.id
+
+    resp = await client.post(
+        "/mcp/fruitcake/tools/call",
+        json={
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "tools/call",
+            "params": {
+                "name": "fruitcake_inspect_task_run",
+                "arguments": {"task_id": task_id, "mode": "latest"},
+            },
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()["result"]["structuredContent"]
+    assert payload["approval"]["is_waiting"] is True
+    assert payload["approval"]["blocked_tool"] == "host_root_access"
+    assert payload["approval"]["kind"] == "host_root_access"
+    assert payload["approval"]["requested_path"] == requested_path
+    assert payload["approval"]["requested_access_mode"] == "read_only"
+    assert payload["approval"]["requester"] == "repo_map_manager"
 
 
 @pytest.mark.asyncio

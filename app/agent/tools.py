@@ -23,7 +23,7 @@ from app.autonomy.approval import ApprovalRequired
 
 log = structlog.get_logger(__name__)
 
-_tool_execution_records: contextvars.ContextVar[List[Dict[str, str]]] = contextvars.ContextVar(
+_tool_execution_records: contextvars.ContextVar[List[Dict[str, Any]]] = contextvars.ContextVar(
     "tool_execution_records",
     default=[],
 )
@@ -33,7 +33,7 @@ def reset_tool_execution_records() -> contextvars.Token:
     return _tool_execution_records.set([])
 
 
-def get_tool_execution_records() -> List[Dict[str, str]]:
+def get_tool_execution_records() -> List[Dict[str, Any]]:
     return list(_tool_execution_records.get())
 
 
@@ -796,7 +796,7 @@ async def dispatch_tool_calls(
         )
 
         records = list(_tool_execution_records.get())
-        records.append({"tool": tool_name, "result_summary": str(result_content)})
+        records.append({"tool": tool_name, "arguments": arguments, "result_summary": str(result_content)})
         _tool_execution_records.set(records)
 
         results.append(

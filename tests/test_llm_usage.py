@@ -309,6 +309,28 @@ async def test_run_agent_does_not_block_supported_alphavantage_daily_request():
 
 
 @pytest.mark.asyncio
+async def test_run_agent_task_mode_skips_unsupported_alphavantage_fast_fail_for_injected_context():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    prompt = (
+        "[Memory]\n"
+        "A family court order sets a weekly Friday exchange.\n\n"
+        "[Task: Primary Repo Map]\n"
+        "Refresh a repo map for the configured root.\n\n"
+        "Tree preview:\n"
+        "- app/api_adapters/alphavantage.py\n"
+    )
+
+    with patch("app.agent.core.litellm.acompletion", new=AsyncMock(return_value=_fake_response(content="repo map output here"))):
+        result = await run_agent(
+            [{"role": "user", "content": prompt}],
+            user_context,
+            mode="task",
+        )
+
+    assert result == "repo map output here"
+
+
+@pytest.mark.asyncio
 async def test_stream_agent_fails_fast_for_unsupported_alphavantage_indicator_request():
     user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
 

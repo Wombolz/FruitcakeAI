@@ -15,6 +15,8 @@ from typing import Any, Mapping
 class ApprovalRequirement:
     tool_name: str
     reason: str
+    approval_kind: str = "tool"
+    payload: Mapping[str, Any] | None = None
 
 
 class ApprovalRequired(Exception):
@@ -27,9 +29,18 @@ class ApprovalRequired(Exception):
     PATCH /tasks/{id} {"approved": true}, which re-queues the task with
     pre_approved=True so it can proceed.
     """
-    def __init__(self, tool_name: str, reason: str | None = None):
+    def __init__(
+        self,
+        tool_name: str,
+        reason: str | None = None,
+        *,
+        approval_kind: str = "tool",
+        payload: Mapping[str, Any] | None = None,
+    ):
         self.tool_name = str(tool_name or "").strip()
         self.reason = reason or approval_reason_for_tool(self.tool_name)
+        self.approval_kind = str(approval_kind or "tool").strip() or "tool"
+        self.payload = dict(payload or {})
         super().__init__(self.tool_name)
 
     def __str__(self) -> str:
@@ -87,6 +98,7 @@ _APPROVAL_REASONS: dict[str, str] = {
     "reject_rss_source_candidate": "Rejecting an RSS candidate changes persistent candidate review state.",
     "remove_rss_source": "Removing an RSS source changes the user's trusted feed catalog.",
     "run_task_now": "Running a task now changes task scheduling and starts execution.",
+    "host_root_access": "Granting host-root read access expands an autonomous task's filesystem reach.",
     "update_task": "Updating a task changes persisted task behavior.",
     "write_file": "Writing a workspace file changes persisted user workspace data.",
 }

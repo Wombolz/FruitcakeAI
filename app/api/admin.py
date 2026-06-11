@@ -745,6 +745,15 @@ async def _load_current_task_step(db: AsyncSession, task: Task) -> TaskStep | No
 
 def _approval_summary(*, task: Task, run: TaskRun, step: TaskStep | None) -> Dict[str, Any]:
     blocked_tool = str(getattr(step, "waiting_approval_tool", "") or "").strip() or None
+    if not blocked_tool:
+        blocked_tool = str(getattr(run, "error", "") or "").split(":", 1)[0].strip() or None
+    approval_kind = str(getattr(step, "waiting_approval_kind", "") or "").strip() or None
+    if not approval_kind:
+        approval_kind = str(getattr(run, "waiting_approval_kind", "") or "").strip() or None
+    payload = getattr(step, "waiting_approval_payload", None)
+    if not isinstance(payload, dict):
+        payload = getattr(run, "waiting_approval_payload", None)
+    payload = payload if isinstance(payload, dict) else {}
     step_status = str(getattr(step, "status", "") or "").strip() or None
     is_waiting = any(
         status == "waiting_approval"
@@ -757,7 +766,16 @@ def _approval_summary(*, task: Task, run: TaskRun, step: TaskStep | None) -> Dic
     return {
         "is_waiting": is_waiting,
         "blocked_tool": blocked_tool,
-        "reason": approval_reason_for_tool(blocked_tool) if blocked_tool else None,
+        "kind": (approval_kind or "tool") if blocked_tool else None,
+        "reason": (
+            str(payload.get("reason") or "").strip()
+            or approval_reason_for_tool(blocked_tool)
+            if blocked_tool
+            else None
+        ),
+        "requested_path": str(payload.get("requested_path") or "").strip() or None,
+        "requested_access_mode": str(payload.get("requested_access_mode") or "").strip() or None,
+        "requester": str(payload.get("requester") or "").strip() or None,
         "task_status": task.status,
         "step_status": step_status,
     }

@@ -108,6 +108,12 @@ class User(Base):
         back_populates="installer",
         foreign_keys="Skill.installed_by",
     )
+    approved_host_roots = relationship(
+        "ApprovedHostRoot",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="ApprovedHostRoot.user_id",
+    )
 
     @property
     def library_scopes(self) -> list[str]:
@@ -205,6 +211,32 @@ class LinkedSource(Base):
 
     def __repr__(self):
         return f"<LinkedSource(name='{self.name}', type='{self.source_type}', root='{self.root_path}')>"
+
+
+class ApprovedHostRoot(Base):
+    __tablename__ = "approved_host_roots"
+    __table_args__ = (
+        UniqueConstraint("user_id", "canonical_path", "access_mode", name="uq_approved_host_roots_user_path_mode"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    canonical_path = Column(Text, nullable=False)
+    access_mode = Column(String(30), nullable=False, default="read_only")
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    approval_source = Column(String(50), nullable=False, default="task_approval")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User", back_populates="approved_host_roots", foreign_keys=[user_id])
+    approver = relationship("User", foreign_keys=[created_by_user_id])
+
+    def __repr__(self):
+        return (
+            f"<ApprovedHostRoot(user_id={self.user_id}, canonical_path='{self.canonical_path}', "
+            f"access_mode='{self.access_mode}', active={self.is_active})>"
+        )
 
 
 class Secret(Base):
@@ -792,6 +824,8 @@ class TaskStep(Base):
     result = Column(Text)
     error = Column(Text)
     waiting_approval_tool = Column(String(100))
+    waiting_approval_kind = Column(String(50))
+    waiting_approval_payload_json = Column(Text)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -817,6 +851,22 @@ class TaskStep(Base):
     def __repr__(self):
         return f"<TaskStep(task_id={self.task_id}, idx={self.step_index}, status='{self.status}')>"
 
+    @property
+    def waiting_approval_payload(self):
+        if not self.waiting_approval_payload_json:
+            return None
+        try:
+            return json.loads(self.waiting_approval_payload_json)
+        except Exception:
+            return None
+
+    @waiting_approval_payload.setter
+    def waiting_approval_payload(self, value):
+        if value is None:
+            self.waiting_approval_payload_json = None
+            return
+        self.waiting_approval_payload_json = json.dumps(value)
+
 
 class TaskRun(Base):
     """Execution record for one task run attempt."""
@@ -833,6 +883,8 @@ class TaskRun(Base):
     status = Column(String(30), nullable=False, default="running")
     error = Column(Text)
     summary = Column(Text)
+    waiting_approval_kind = Column(String(50))
+    waiting_approval_payload_json = Column(Text)
     run_kind = Column(String(30), nullable=False, default="task", index=True)
     agent_role = Column(String(100), index=True)
     trigger_source = Column(String(100))
@@ -863,6 +915,22 @@ class TaskRun(Base):
             self.source_context_json = value
         else:
             self.source_context_json = json.dumps(value)
+
+    @property
+    def waiting_approval_payload(self):
+        if not self.waiting_approval_payload_json:
+            return None
+        try:
+            return json.loads(self.waiting_approval_payload_json)
+        except Exception:
+            return None
+
+    @waiting_approval_payload.setter
+    def waiting_approval_payload(self, value):
+        if value is None:
+            self.waiting_approval_payload_json = None
+            return
+        self.waiting_approval_payload_json = json.dumps(value)
 
     def __repr__(self):
         return f"<TaskRun(task_id={self.task_id}, status='{self.status}')>"

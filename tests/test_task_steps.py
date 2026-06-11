@@ -7,16 +7,21 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
 
+from app.agent import tools as agent_tools
 from app.config import settings
 from app.autonomy.planner import _normalize_steps
-from app.db.models import AuditLog, ChatSession, LLMUsageEvent, Memory, MemoryProposal, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
+from app.db.models import ApprovedHostRoot, AuditLog, ChatSession, LLMUsageEvent, Memory, MemoryProposal, RSSItem, RSSPublishedItem, RSSSource, Task, TaskRun, TaskRunArtifact, TaskStep
 from app.autonomy.profiles.news_magazine import _ground_output
+from app.autonomy.profiles.repo_map import _build_repo_map_contract, _validate_repo_map_output
+from app.autonomy.profiles.resolver import resolve_task_profile
 from app.autonomy.runner import _format_result_for_inbox, _persist_run_artifacts, _truncate_text_to_estimated_tokens
+from app.skills.service import get_skill_service
 from tests.conftest import TestSessionLocal
 
 
@@ -45,6 +50,23 @@ async def _admin_headers(client, username: str) -> dict[str, str]:
     login = await client.post("/auth/login", json={"username": username, "password": password})
     token = login.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
+
+
+async def _approve_host_root_for_task(task_id: int, path: str) -> None:
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        db.add(
+            ApprovedHostRoot(
+                user_id=task.user_id,
+                canonical_path=str(Path(path).resolve(strict=False)),
+                access_mode="read_only",
+                is_active=True,
+                created_by_user_id=task.user_id,
+                approval_source="test",
+            )
+        )
+        await db.commit()
 
 
 @pytest.mark.asyncio
@@ -369,6 +391,7 @@ async def test_runner_resumes_waiting_approval_run_instead_of_skipping(client):
         headers=headers,
     )
     task_id = created.json()["id"]
+    await _approve_host_root_for_task(task_id, "/Users/jwomble/Development/fruitcake_v5")
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, task_id)
@@ -510,6 +533,7 @@ async def test_recurring_task_auto_plans_once_when_missing_plan(client):
         headers=headers,
     )
     task_id = created.json()["id"]
+    await _approve_host_root_for_task(task_id, repo_root)
 
     fake_steps = [
         {"title": "Collect info", "instruction": "Collect the latest updates", "requires_approval": False},
@@ -533,6 +557,7 @@ async def test_recurring_task_auto_plans_once_when_missing_plan(client):
 async def test_recurring_agent_task_does_not_auto_plan_and_clears_stale_plan(client):
     from app.autonomy.runner import TaskRunner
 
+    repo_root = "/Users/jwomble/Development/fruitcake_v5"
     headers = await _headers(client, "agentrunnerowner")
     created = await client.post(
         "/tasks",
@@ -554,6 +579,7 @@ async def test_recurring_agent_task_does_not_auto_plan_and_clears_stale_plan(cli
         headers=headers,
     )
     task_id = created.json()["id"]
+    await _approve_host_root_for_task(task_id, repo_root)
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, task_id)
@@ -573,10 +599,38 @@ async def test_recurring_agent_task_does_not_auto_plan_and_clears_stale_plan(cli
 
     runner = TaskRunner()
     task_ref = type("TaskRef", (), {"id": task_id})()
+    valid_repo_map_output = (
+        "Roots checked: /Users/jwomble/Development/fruitcake_v5.\n"
+        "Artifacts updated: reports/repo_map.md refreshed.\n"
+        "Repo Overview: backend agent runtime and task execution remain the primary focus areas.\n"
+        "Observed: top-level app/, tests/, config/, and Docs/ remain the main navigation roots.\n"
+        "Key roots: app/, tests/, config/, Docs/.\n"
+        "Entrypoints by subsystem: autonomy=app/autonomy/runner.py, agent=app/agent/core.py.\n"
+        "Tests and validation: tests/test_task_steps.py covers repo-map validation paths.\n"
+        "Notable changes: app/autonomy/runner.py and config/agents.yaml remain the primary task-runner and agent registry entrypoints.\n"
+        "Open markers: none observed in this pass.\n"
+        "Noise / ignore areas: .venv remains excluded.\n"
+        "Secondary context: none emphasized for this top-level repo pass.\n"
+        "Workspace orientation: start with app/autonomy/, app/agent/, config/, tests/ for backend agent-runtime work.\n"
+        "Suggested follow-up: run pytest only after orientation work is complete.\n"
+        "Next blocker if any: none observed."
+    )
+
+    async def _fake_run_agent(*args, **kwargs):
+        agent_tools._tool_execution_records.set(  # type: ignore[attr-defined]
+            [
+                {
+                    "tool": "write_file",
+                    "arguments": {"path": "reports/repo_map.md"},
+                    "result_summary": "Wrote repo map",
+                }
+            ]
+        )
+        return valid_repo_map_output
 
     with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
         with patch("app.autonomy.planner._generate_plan_steps", new=AsyncMock()) as gen_mock:
-            with patch("app.agent.core.run_agent", new=AsyncMock(return_value="repo map updated")) as run_agent_mock:
+            with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_fake_run_agent)) as run_agent_mock:
                 await runner.execute(task_ref)
 
     assert gen_mock.await_count == 0
@@ -588,6 +642,894 @@ async def test_recurring_agent_task_does_not_auto_plan_and_clears_stale_plan(cli
         assert task.has_plan is False
         rows = await db.execute(select(TaskStep).where(TaskStep.task_id == task_id))
         assert rows.scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_repo_map_manager_disables_rss_skill_injection(client):
+    from app.autonomy.runner import TaskRunner
+
+    repo_root = str(Path.cwd())
+    headers = await _headers(client, "repomapskillowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Primary Repo Map",
+            "instruction": "Refresh a current repo map and workspace orientation artifact.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "repo_map_manager",
+                "included_roots": [repo_root],
+                "ignored_paths": [".venv", "__pycache__"],
+                "output_path": "reports/repo_map.md",
+            },
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+    await _approve_host_root_for_task(task_id, repo_root)
+    service = get_skill_service()
+    rss_skill = (
+        "---\n"
+        "name: RSS Grounded Briefing\n"
+        "slug: rss-grounded-briefing\n"
+        "description: Use RSS feeds to write grounded news briefings and headline roundups.\n"
+        "scope: shared\n"
+        "pinned: true\n"
+        "---\n"
+        "When working on RSS or news tasks, prioritize feed evidence and briefing structure.\n"
+    )
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        preview = service.parse_markdown(rss_skill)
+        await service.install_preview(db, preview=preview, installed_by=task.user_id)
+        await db.commit()
+
+    seen = {}
+    valid_repo_map_output = (
+        f"Roots checked: {repo_root}.\n"
+        "Artifacts updated: reports/repo_map.md refreshed.\n"
+        "Repo Overview: this run focuses on backend runtime navigation.\n"
+        "Observed: app/, tests/, and config/ are the primary confirmed roots under the configured repo.\n"
+        "Key roots: app/, tests/, config/.\n"
+        "Entrypoints by subsystem: agent=app/agent/core.py, autonomy=app/autonomy/runner.py.\n"
+        "Tests and validation: tests/ remains the main verification area.\n"
+        "Notable changes: app/autonomy/runner.py, app/agent/context.py, and config/agents.yaml shape agent execution.\n"
+        "Open markers: none observed.\n"
+        "Noise / ignore areas: .venv is intentionally excluded.\n"
+        "Secondary context: worktrees are not part of the primary orientation for this pass.\n"
+        "Workspace orientation: backend runtime starts in app/autonomy/, app/agent/, config/, and tests/.\n"
+        "Suggested follow-up: inspect tests/ after reading the runtime entrypoints.\n"
+        "Next blocker if any: none observed."
+    )
+
+    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None):
+        agent_tools._tool_execution_records.set(  # type: ignore[attr-defined]
+            [
+                {
+                    "tool": "write_file",
+                    "arguments": {"path": "reports/repo_map.md"},
+                    "result_summary": "Wrote repo map",
+                }
+            ]
+        )
+        seen["active_skills"] = list(user_context.active_skill_slugs)
+        seen["skill_prompt_additions"] = list(user_context.skill_prompt_additions)
+        seen["skill_selection_mode"] = user_context.skill_selection_mode
+        seen["behavior_instructions"] = list(user_context.behavior_instructions)
+        seen["allowed_tool_cap"] = list(user_context.allowed_tool_cap)
+        seen["prompt"] = messages[0]["content"]
+        return valid_repo_map_output
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_fake_run_agent)):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    assert seen["active_skills"] == []
+    assert seen["skill_prompt_additions"] == []
+    assert seen["skill_selection_mode"] == "disabled_for_agent_role"
+    assert seen["allowed_tool_cap"] == ["append_file", "write_file"]
+    assert repo_root in seen["prompt"]
+    assert "reports/repo_map.md" in seen["prompt"]
+    assert "Agent output contract" in seen["prompt"]
+    assert "Use the configured included_roots above as the scan base" in seen["prompt"]
+    assert "Backend root preflight below is authoritative" in seen["prompt"]
+
+    async with TestSessionLocal() as db:
+        run = (
+            await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.id.desc())
+            )
+        ).scalars().first()
+        assert run is not None
+        artifact = (
+            await db.execute(
+                select(TaskRunArtifact)
+                .where(TaskRunArtifact.task_run_id == run.id, TaskRunArtifact.artifact_type == "run_diagnostics")
+            )
+        ).scalars().first()
+        payload = json.loads(artifact.content_json or "{}")
+        assert payload["active_skills"] == []
+        assert payload["repo_map_contract"]["included_roots"] == [repo_root]
+        assert payload["repo_map_contract"]["output_path"] == "reports/repo_map.md"
+
+
+@pytest.mark.asyncio
+async def test_repo_map_manager_rejects_wrong_rss_task_draft_completion(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "repomapwrongcontent")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Primary Repo Map",
+            "instruction": "Refresh a current repo map and workspace orientation artifact.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {"agent_role": "repo_map_manager"},
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    runner = TaskRunner()
+    with patch(
+        "app.agent.core.run_agent",
+        new=AsyncMock(return_value="Draft ready: a saved maintenance task, 'Refresh RSS Cache'."),
+    ):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "failed"
+        assert "incompatible task/RSS/news content" in (task.error or "")
+        run = (
+            await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.id.desc())
+            )
+        ).scalars().first()
+        assert run is not None
+        assert run.status == "failed"
+        artifacts = (
+            await db.execute(
+                select(TaskRunArtifact)
+                .where(TaskRunArtifact.task_run_id == run.id)
+            )
+        ).scalars().all()
+        by_type = {artifact.artifact_type: artifact for artifact in artifacts}
+        report = json.loads(by_type["validation_report"].content_json or "{}")
+        assert report["fatal"] is True
+        assert report["validation_mode"] == "repo_map_manager_semantic_contract"
+        assert "draft ready" in report["incompatible_markers"]
+        assert "refresh rss cache" in report["incompatible_markers"]
+
+
+@pytest.mark.asyncio
+async def test_repo_map_manager_rejects_unconfigured_synthetic_output_path(client):
+    from app.autonomy.runner import TaskRunner
+
+    repo_root = str(Path.cwd())
+    headers = await _headers(client, "repomapwrongpath")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Primary Repo Map",
+            "instruction": "Refresh a current repo map and workspace orientation artifact.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "repo_map_manager",
+                "included_roots": [repo_root],
+                "output_path": "reports/repo_map.md",
+            },
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+    await _approve_host_root_for_task(task_id, repo_root)
+    wrong_path_output = (
+        f"Roots checked: {repo_root}.\n"
+        "Artifacts updated: artifacts/primary_repo_map_2026-04-26.md refreshed.\n"
+        "Key roots: app/, tests/, config/.\n"
+        "Notable changes: app/ and tests/ were inspected from the configured root.\n"
+        "Workspace orientation: start in app/autonomy/, app/agent/, config/, and tests/.\n"
+        "Next blocker if any: none."
+    )
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(return_value=wrong_path_output)):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "failed"
+        assert "configured output_path" in (task.error or "")
+        run = (
+            await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.id.desc())
+            )
+        ).scalars().first()
+        report_artifact = (
+            await db.execute(
+                select(TaskRunArtifact)
+                .where(TaskRunArtifact.task_run_id == run.id, TaskRunArtifact.artifact_type == "validation_report")
+            )
+        ).scalars().first()
+        report = json.loads(report_artifact.content_json or "{}")
+        assert report["fatal"] is True
+        assert report["configured_output_path"] == "reports/repo_map.md"
+        assert report["output_path_mismatch"] is True
+        assert report["synthetic_artifact_path_claimed"] is True
+
+
+@pytest.mark.asyncio
+async def test_repo_map_manager_rejects_missing_root_claims_contradicted_by_configured_root(client):
+    from app.autonomy.runner import TaskRunner
+
+    repo_root = str(Path.cwd())
+    headers = await _headers(client, "repomapmissingroots")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Primary Repo Map",
+            "instruction": "Refresh a current repo map and workspace orientation artifact.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "repo_map_manager",
+                "included_roots": [repo_root],
+                "output_path": "reports/repo_map.md",
+            },
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+    await _approve_host_root_for_task(task_id, repo_root)
+    contradicted_output = (
+        f"Roots checked: {repo_root}.\n"
+        "Artifacts updated: reports/repo_map.md refreshed.\n"
+        "Observed: app/, tests/, and config/ are the primary confirmed roots under the configured repo.\n"
+        "Key roots: app/, tests/, config/.\n"
+        "Entrypoints by subsystem: autonomy=app/autonomy/runner.py.\n"
+        "Notable changes: app/ and tests/ are missing from the configured root.\n"
+        "Secondary context: none.\n"
+        "Workspace orientation: use docs/projects/Fruitcake_v5 as the source of truth instead.\n"
+        "Suggested follow-up: none.\n"
+        "Next blocker if any: missing app/ and tests/ directories."
+    )
+
+    runner = TaskRunner()
+    async def _fake_run_agent(*args, **kwargs):
+        agent_tools._tool_execution_records.set(  # type: ignore[attr-defined]
+            [
+                {
+                    "tool": "write_file",
+                    "arguments": {"path": "reports/repo_map.md"},
+                    "result_summary": "Wrote repo map",
+                }
+            ]
+        )
+        return contradicted_output
+
+    with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_fake_run_agent)):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "failed"
+        assert "contradicted actual configured root contents" in (task.error or "")
+        run = (
+            await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.id.desc())
+            )
+        ).scalars().first()
+        report_artifact = (
+            await db.execute(
+                select(TaskRunArtifact)
+                .where(TaskRunArtifact.task_run_id == run.id, TaskRunArtifact.artifact_type == "validation_report")
+            )
+        ).scalars().first()
+        report = json.loads(report_artifact.content_json or "{}")
+        assert report["fatal"] is True
+        assert any(path.endswith("/app") for path in report["contradicted_existing_roots"])
+
+
+def test_repo_map_manager_accepts_absolute_workspace_write_for_relative_output_path():
+    repo_root = str(Path.cwd())
+    workspace_root = Path("/tmp/fake-workspace/1")
+    contract = _build_repo_map_contract(
+        params={
+            "included_roots": [repo_root],
+            "output_path": "reports/repo_map.md",
+        },
+    )
+
+    report = _validate_repo_map_output(
+        result=(
+            f"Roots checked: {repo_root}.\n"
+            f"Artifacts updated: {workspace_root / 'reports/repo_map.md'} refreshed.\n"
+            "Repo Overview: backend runtime navigation remains the focus.\n"
+            "Observed: app/, tests/, and config/ are the primary confirmed roots.\n"
+            "Key roots: app/, tests/, config/.\n"
+            "Entrypoints by subsystem: autonomy=app/autonomy/runner.py, tests=tests/test_task_steps.py.\n"
+            "Tests and validation: tests/test_task_steps.py remains the regression anchor.\n"
+            "Notable changes: app/autonomy/runner.py and tests/test_task_steps.py remain core touchpoints.\n"
+            "Open markers: none observed.\n"
+            "Noise / ignore areas: .venv excluded.\n"
+            "Secondary context: none emphasized.\n"
+            "Workspace orientation: start in app/autonomy/, app/agent/, config/, and tests/.\n"
+            "Suggested follow-up: inspect tests/ after runtime entrypoints.\n"
+            "Next blocker if any: none observed."
+        ),
+        repo_map_contract=contract,
+        tool_records=[
+            {
+                "tool": "write_file",
+                "arguments": {"path": str(workspace_root / "reports/repo_map.md")},
+                "result_summary": "Wrote repo map",
+            }
+        ],
+    )
+
+    assert report is not None
+    assert report["fatal"] is False
+    assert report["output_path_mismatch"] is False
+
+
+def test_repo_map_manager_does_not_flag_contradiction_from_unrelated_missing_text():
+    repo_root = str(Path.cwd())
+    contract = _build_repo_map_contract(
+        params={
+            "included_roots": [repo_root],
+            "output_path": "reports/repo_map.md",
+        },
+    )
+
+    report = _validate_repo_map_output(
+        result=(
+            f"Roots checked: {repo_root}.\n"
+            "Artifacts updated: reports/repo_map.md refreshed.\n"
+            "Repo Overview: backend runtime navigation remains the focus.\n"
+            "Observed: app/, tests/, and config/ are the primary confirmed roots.\n"
+            "Key roots: app/, tests/, config/.\n"
+            "Entrypoints by subsystem: autonomy=app/autonomy/runner.py.\n"
+            "Tests and validation: tests/ should expand around the validator next.\n"
+            "Notable changes: app/autonomy/runner.py remains the task-runner entrypoint; missing tests for the new validator are the next blocker.\n"
+            "Open markers: TODO tests for broader repo-map coverage.\n"
+            "Noise / ignore areas: .venv excluded.\n"
+            "Secondary context: none emphasized.\n"
+            "Workspace orientation: start in app/autonomy/, app/agent/, config/, and tests/.\n"
+            "Suggested follow-up: add the broader repo-map validator checks.\n"
+            "Next blocker if any: add broader repo-map coverage."
+        ),
+        repo_map_contract=contract,
+        tool_records=[
+            {
+                "tool": "write_file",
+                "arguments": {"path": "reports/repo_map.md"},
+                "result_summary": "Wrote repo map",
+            }
+        ],
+    )
+
+    assert report is not None
+    assert report["contradicted_existing_roots"] == []
+    assert report["fatal"] is False
+
+
+def test_repo_map_manager_rejects_workspace_fallback_narration_after_host_root_approval():
+    repo_root = str(Path.cwd())
+    contract = _build_repo_map_contract(
+        params={
+            "included_roots": [repo_root],
+            "ignored_paths": [".venv", "__pycache__"],
+            "output_path": "reports/repo_map.md",
+        },
+    )
+    contract["root_inspections"] = [
+        {
+            "configured_root": repo_root,
+            "resolved_root": repo_root,
+            "exists": True,
+            "is_dir": True,
+            "workspace_path": False,
+            "notable_children": ["app", "tests", "config", "Docs", "README.md"],
+            "tree_lines": ["app/", "tests/", "config/"],
+            "preview_file": "README.md",
+            "preview_text": "# FruitcakeAI",
+        }
+    ]
+
+    report = _validate_repo_map_output(
+        result=(
+            "Thanks — I refreshed the repo orientation using the repo preflight you provided.\n"
+            f"Roots checked: {repo_root}\n"
+            "Intended artifact output path: reports/repo_map.md\n"
+            "I attempted to read the repo directly but hit a workspace path access limitation, "
+            "so I did not write the report file to disk.\n"
+            "Tell me how you want me to save the report and I can paste it here.\n"
+        ),
+        repo_map_contract=contract,
+    )
+
+    assert report["fatal"] is True
+    assert report["failed_host_root_probe"] is False
+    assert "workspace_access_limitation" in report["fallback_markers"]
+    assert "did_not_write_report" in report["fallback_markers"]
+    assert "manual_paste_request" in report["fallback_markers"]
+
+
+def test_repo_map_manager_rejects_generic_host_root_probe_when_backend_scan_exists():
+    repo_root = str(Path.cwd())
+    contract = _build_repo_map_contract(
+        params={
+            "included_roots": [repo_root],
+            "output_path": "reports/repo_map.md",
+        },
+    )
+    contract["root_inspections"] = [
+        {
+            "configured_root": repo_root,
+            "resolved_root": repo_root,
+            "exists": True,
+            "is_dir": True,
+            "workspace_path": False,
+            "notable_children": ["app", "tests", "config"],
+            "tree_lines": ["app/", "tests/", "config/"],
+            "preview_file": "README.md",
+            "preview_text": "# FruitcakeAI",
+        }
+    ]
+
+    report = _validate_repo_map_output(
+        result=(
+            f"Roots checked: {repo_root}.\n"
+            "Artifacts updated: reports/repo_map.md refreshed.\n"
+            "Repo Overview: backend runtime navigation remains the focus.\n"
+            "Observed: app/, tests/, and config/ are the primary confirmed roots.\n"
+            "Key roots: app/, tests/, config/.\n"
+            "Entrypoints by subsystem: autonomy=app/autonomy/profiles/repo_map.py.\n"
+            "Tests and validation: tests/ covers the repo-map validation contract.\n"
+            "Notable changes: app/autonomy/profiles/repo_map.py now owns the repo-map contract.\n"
+            "Open markers: none observed.\n"
+            "Noise / ignore areas: .venv excluded.\n"
+            "Secondary context: none emphasized.\n"
+            "Workspace orientation: start in app/, tests/, and config/.\n"
+            "Suggested follow-up: none.\n"
+            "Next blocker if any: none observed."
+        ),
+        repo_map_contract=contract,
+        tool_records=[
+            {
+                "tool": "list_directory",
+                "arguments": {"path": repo_root},
+                "result_summary": "Tool list_directory failed: Path must stay within the user's workspace",
+            }
+        ],
+    )
+
+    assert report["fatal"] is True
+    assert report["failed_host_root_probe"] is True
+    assert report["fallback_markers"] == []
+
+
+def test_repo_map_manager_rejects_rich_scan_output_without_navigation_sections():
+    repo_root = str(Path.cwd())
+    contract = _build_repo_map_contract(
+        params={
+            "included_roots": [repo_root],
+            "output_path": "reports/repo_map.md",
+        },
+    )
+    contract["root_inspections"] = [
+        {
+            "configured_root": repo_root,
+            "resolved_root": repo_root,
+            "exists": True,
+            "is_dir": True,
+            "workspace_path": False,
+            "notable_children": ["app", "tests", "config"],
+            "tree_lines": ["app/", "tests/", "config/"],
+            "key_roots": [{"path": "app/", "highlights": ["app/agent/", "app/autonomy/"]}],
+            "entrypoints": [{"subsystem": "agent_runtime", "path": "app/agent/core.py"}],
+            "marker_hits": [{"path": "app/agent/core.py", "line": 1, "marker": "TODO", "snippet": "TODO: improve"}],
+            "noise_areas": [".claude"],
+        }
+    ]
+
+    report = _validate_repo_map_output(
+        result=(
+            f"Roots checked: {repo_root}.\n"
+            "Artifacts updated: reports/repo_map.md refreshed.\n"
+            "Notable changes: app/ and tests/ remain the main backend areas.\n"
+            "Workspace orientation: start in app/autonomy/, app/agent/, config/, and tests/.\n"
+            "Next blocker if any: none observed."
+        ),
+        repo_map_contract=contract,
+        tool_records=[
+            {
+                "tool": "write_file",
+                "arguments": {"path": "reports/repo_map.md"},
+                "result_summary": "Wrote repo map",
+            }
+        ],
+    )
+
+    assert report["fatal"] is True
+    assert "observed facts" in report["fatal_reason"]
+
+
+def test_repo_map_manager_rejects_unlabeled_worktree_as_canonical_structure():
+    repo_root = str(Path.cwd())
+    contract = _build_repo_map_contract(
+        params={
+            "included_roots": [repo_root],
+            "output_path": "reports/repo_map.md",
+        },
+    )
+    contract["root_inspections"] = [
+        {
+            "configured_root": repo_root,
+            "resolved_root": repo_root,
+            "exists": True,
+            "is_dir": True,
+            "workspace_path": False,
+            "notable_children": ["app", "tests", "config", ".claude"],
+            "tree_lines": ["app/", "tests/", "config/", ".claude/"],
+            "key_roots": [{"path": "app/", "source_class": "observed_top_level", "highlights": ["app/agent/"]}],
+            "secondary_context": [{"path": ".claude/worktrees/", "source_class": "observed_secondary", "note": "Secondary only"}],
+            "noise_areas": [{"path": ".claude", "source_class": "observed_secondary", "note": "Secondary only"}],
+        }
+    ]
+
+    report = _validate_repo_map_output(
+        result=(
+            f"Roots checked: {repo_root}.\n"
+            "Artifacts updated: reports/repo_map.md refreshed.\n"
+            "Repo Overview: this repo is primarily organized around .claude/worktrees/tender-bouman/app and .claude/worktrees/tender-bouman/config.\n"
+            "Observed: .claude/worktrees/tender-bouman/app is the main runtime root.\n"
+            "Key roots: .claude/worktrees/tender-bouman/app/, .claude/worktrees/tender-bouman/config/.\n"
+            "Entrypoints by subsystem: runtime=.claude/worktrees/tender-bouman/app/api/chat.py.\n"
+            "Tests and validation: .claude/worktrees/tender-bouman/tests/ is the main suite.\n"
+            "Open markers: none observed.\n"
+            "Noise / ignore areas: .venv excluded.\n"
+            "Suggested follow-up: none.\n"
+        ),
+        repo_map_contract=contract,
+        tool_records=[
+            {
+                "tool": "write_file",
+                "arguments": {"path": "reports/repo_map.md"},
+                "result_summary": "Wrote repo map",
+            }
+        ],
+    )
+
+    assert report["fatal"] is True
+    assert "worktree-local paths as canonical" in report["fatal_reason"]
+
+
+def test_repo_map_manager_rejects_over_indexed_worktree_context():
+    repo_root = str(Path.cwd())
+    contract = _build_repo_map_contract(
+        params={
+            "included_roots": [repo_root],
+            "output_path": "reports/repo_map.md",
+        },
+    )
+    contract["root_inspections"] = [
+        {
+            "configured_root": repo_root,
+            "resolved_root": repo_root,
+            "exists": True,
+            "is_dir": True,
+            "workspace_path": False,
+            "notable_children": ["app", "tests", "config", ".claude"],
+            "tree_lines": ["app/", "tests/", "config/", ".claude/"],
+            "key_roots": [{"path": "app/", "source_class": "observed_top_level", "highlights": ["app/agent/"]}],
+            "secondary_context": [{"path": ".claude/worktrees/", "source_class": "observed_secondary", "note": "Secondary only"}],
+            "noise_areas": [{"path": ".claude", "source_class": "observed_secondary", "note": "Secondary only"}],
+        }
+    ]
+
+    report = _validate_repo_map_output(
+        result=(
+            f"Roots checked: {repo_root}.\n"
+            "Artifacts updated: reports/repo_map.md refreshed.\n"
+            "Repo Overview: .claude worktree context dominates this pass.\n"
+            "Observed: worktree-local .claude/worktrees/interesting-hofstadter and worktree-local .claude/worktrees/tender-bouman are both visible.\n"
+            "Secondary context: .claude/worktrees/interesting-hofstadter and .claude/worktrees/tender-bouman are local worktrees.\n"
+            "Key roots: worktree-local .claude/worktrees/interesting-hofstadter/app/, worktree-local .claude/worktrees/tender-bouman/app/.\n"
+            "Entrypoints by subsystem: worktree-local runtime=.claude/worktrees/tender-bouman/app/api/chat.py.\n"
+            "Tests and validation: worktree tests are visible.\n"
+            "Open markers: none observed.\n"
+            "Noise / ignore areas: .claude remains noisy.\n"
+            "Suggested follow-up: none.\n"
+        ),
+        repo_map_contract=contract,
+        tool_records=[
+            {
+                "tool": "write_file",
+                "arguments": {"path": "reports/repo_map.md"},
+                "result_summary": "Wrote repo map",
+            }
+        ],
+    )
+
+    assert report["fatal"] is True
+    assert "over-indexed worktree context" in report["fatal_reason"]
+
+
+def test_repo_map_manager_resolves_to_repo_map_profile():
+    task = type(
+        "TaskStub",
+        (),
+        {
+            "profile": None,
+            "task_recipe": {
+                "family": "agent",
+                "params": {
+                    "agent_role": "repo_map_manager",
+                },
+            },
+        },
+    )()
+
+    profile = resolve_task_profile(task)
+    assert getattr(profile, "name", "") == "repo_map"
+
+
+@pytest.mark.asyncio
+async def test_repo_map_manager_pauses_for_unapproved_host_root_and_exposes_context(client, tmp_path):
+    from app.autonomy.runner import TaskRunner
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("# Repo map test\n", encoding="utf-8")
+    (repo / "app").mkdir()
+    (repo / "app" / "main.py").write_text("print('hi')\n", encoding="utf-8")
+
+    headers = await _headers(client, "repomaphostapproval")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Primary Repo Map",
+            "instruction": "Refresh a current repo map and workspace orientation artifact.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "repo_map_manager",
+                "included_roots": [str(repo)],
+                "ignored_paths": [".venv", "__pycache__"],
+                "output_path": "reports/repo_map.md",
+            },
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(return_value="should not run")) as run_agent_mock:
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    assert run_agent_mock.await_count == 0
+
+    detail = await client.get(f"/tasks/{task_id}", headers=headers)
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["status"] == "waiting_approval"
+    assert payload["waiting_approval_tool"] == "host_root_access"
+    assert payload["waiting_approval"]["kind"] == "host_root_access"
+    assert payload["waiting_approval"]["requested_path"] == str(repo.resolve())
+    assert payload["waiting_approval"]["requested_access_mode"] == "read_only"
+    assert payload["waiting_approval"]["requester"] == "repo_map_manager"
+
+    async with TestSessionLocal() as db:
+        run = (
+            await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.id.desc())
+            )
+        ).scalars().first()
+        assert run is not None
+        assert run.status == "waiting_approval"
+        assert run.waiting_approval_kind == "host_root_access"
+        assert run.waiting_approval_payload["requested_path"] == str(repo.resolve())
+
+
+@pytest.mark.asyncio
+async def test_repo_map_manager_host_root_approval_resume_creates_grant_and_completes(client, tmp_path):
+    from app.autonomy.runner import TaskRunner, get_task_runner
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("# Repo map test\n", encoding="utf-8")
+    (repo / "config").mkdir()
+    (repo / "config" / "app.yaml").write_text("name: fruitcake\n", encoding="utf-8")
+
+    headers = await _headers(client, "repomaphostresume")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Primary Repo Map",
+            "instruction": "Refresh a current repo map and workspace orientation artifact.",
+            "task_type": "one_shot",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {
+                "agent_role": "repo_map_manager",
+                "included_roots": [str(repo)],
+                "ignored_paths": [".venv", "__pycache__"],
+                "output_path": "reports/repo_map.md",
+            },
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(return_value="should not run")):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    blocked_runner = type("RunnerStub", (), {"execute": AsyncMock(return_value=None)})()
+    with patch("app.autonomy.runner.get_task_runner", return_value=blocked_runner):
+        approved = await client.patch(f"/tasks/{task_id}", json={"approved": True}, headers=headers)
+    assert approved.status_code == 200
+    assert blocked_runner.execute.await_count == 1
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        grant = (
+            await db.execute(
+                select(ApprovedHostRoot).where(
+                    ApprovedHostRoot.user_id == task.user_id,
+                    ApprovedHostRoot.canonical_path == str(repo.resolve()),
+                )
+            )
+        ).scalars().first()
+        assert grant is not None
+        assert grant.access_mode == "read_only"
+
+    valid_repo_map_output = (
+        f"Roots checked: {repo.resolve()}.\n"
+        "Artifacts updated: reports/repo_map.md refreshed.\n"
+        "Repo Overview: this root is now approved for navigation-oriented repo mapping.\n"
+        "Observed: README.md and config/ are the main confirmed roots in this fixture repo.\n"
+        "Key roots: config/, README.md.\n"
+        "Entrypoints by subsystem: overview=README.md, config=config/app.yaml.\n"
+        "Tests and validation: none in this temporary fixture root.\n"
+        "Notable changes: config/app.yaml and README.md describe the current repo shape.\n"
+        "Open markers: none observed.\n"
+        "Noise / ignore areas: none observed.\n"
+        "Secondary context: none emphasized.\n"
+        "Workspace orientation: start in config/, README.md, and app/ for a shallow repo pass.\n"
+        "Suggested follow-up: add app/ content before expecting deeper subsystem entrypoints.\n"
+        "Next blocker if any: none observed."
+    )
+
+    async def _fake_run_agent_after_approval(*args, **kwargs):
+        agent_tools._tool_execution_records.set(  # type: ignore[attr-defined]
+            [
+                {
+                    "tool": "write_file",
+                    "arguments": {"path": "reports/repo_map.md"},
+                    "result_summary": "Wrote repo map",
+                }
+            ]
+        )
+        return valid_repo_map_output
+
+    with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=_fake_run_agent_after_approval)):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await get_task_runner().execute(type("TaskRef", (), {"id": task_id})())
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "completed"
+        run = (
+            await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.id.desc())
+            )
+        ).scalars().first()
+        assert run is not None
+        assert run.status == "completed"
+        assert run.waiting_approval_kind is None
+
+
+@pytest.mark.asyncio
+async def test_recurring_repo_map_manager_semantic_failure_remains_schedulable(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "recurringrepomapwrongcontent")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Primary Repo Map",
+            "instruction": "Refresh a current repo map and workspace orientation artifact.",
+            "task_type": "recurring",
+            "schedule": "every:1d",
+            "deliver": False,
+            "recipe_family": "agent",
+            "recipe_params": {"agent_role": "repo_map_manager"},
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        queued_run_at = task.next_run_at
+
+    assert queued_run_at is not None
+
+    runner = TaskRunner()
+    with patch(
+        "app.agent.core.run_agent",
+        new=AsyncMock(return_value="Draft ready: a saved maintenance task, 'Refresh RSS Cache'."),
+    ):
+        with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+            await runner.execute(type("TaskRef", (), {"id": task_id, "next_run_at": queued_run_at})())
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "pending"
+        assert "incompatible task/RSS/news content" in (task.error or "")
+        assert task.next_run_at is not None
+        next_run_at = task.next_run_at
+        if next_run_at.tzinfo is None:
+            next_run_at = next_run_at.replace(tzinfo=timezone.utc)
+        assert next_run_at > datetime.now(timezone.utc)
+
+        run = (
+            await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.id.desc())
+            )
+        ).scalars().first()
+        assert run is not None
+        assert run.status == "failed"
+
+        artifact = (
+            await db.execute(
+                select(TaskRunArtifact)
+                .where(TaskRunArtifact.task_run_id == run.id, TaskRunArtifact.artifact_type == "validation_report")
+            )
+        ).scalars().first()
+        assert artifact is not None
+        report = json.loads(artifact.content_json or "{}")
+        assert report["fatal"] is True
+        assert report["validation_mode"] == "repo_map_manager_semantic_contract"
 
 
 @pytest.mark.asyncio
@@ -1235,6 +2177,51 @@ async def test_admin_task_run_inspect_includes_waiting_approval_context(client):
     assert "external calendar" in payload["approval"]["reason"]
     assert payload["approval"]["task_status"] == "waiting_approval"
     assert payload["approval"]["step_status"] == "waiting_approval"
+
+
+@pytest.mark.asyncio
+async def test_admin_task_run_inspect_includes_host_root_approval_context(client):
+    admin_headers = await _admin_headers(client, "inspecthostrootadmin")
+    owner_headers = await _headers(client, "inspecthostrootowner")
+
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Needs host-root approval", "instruction": "Pause before scanning host root"},
+        headers=owner_headers,
+    )
+    assert task_resp.status_code == 201
+    task_id = task_resp.json()["id"]
+
+    requested_path = str((Path.cwd() / "reports").resolve(strict=False))
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.status = "waiting_approval"
+        run = TaskRun(
+            task_id=task_id,
+            status="waiting_approval",
+            error="host_root_access: Repo map manager needs read-only access.",
+            waiting_approval_kind="host_root_access",
+        )
+        run.waiting_approval_payload = {
+            "requested_path": requested_path,
+            "requested_access_mode": "read_only",
+            "requester": "repo_map_manager",
+            "reason": "Repo map manager needs read-only access.",
+        }
+        db.add(run)
+        await db.commit()
+        run_id = run.id
+
+    inspect = await client.get(f"/admin/task-runs/{run_id}/inspect", headers=admin_headers)
+    assert inspect.status_code == 200
+    payload = inspect.json()
+    assert payload["approval"]["is_waiting"] is True
+    assert payload["approval"]["blocked_tool"] == "host_root_access"
+    assert payload["approval"]["kind"] == "host_root_access"
+    assert payload["approval"]["requested_path"] == requested_path
+    assert payload["approval"]["requested_access_mode"] == "read_only"
+    assert payload["approval"]["requester"] == "repo_map_manager"
 
 
 @pytest.mark.asyncio

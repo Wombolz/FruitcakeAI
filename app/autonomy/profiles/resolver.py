@@ -5,6 +5,7 @@ from app.autonomy.profiles.iss_pass_watcher import ISSPassWatcherExecutionProfil
 from app.autonomy.profiles.maintenance import MaintenanceExecutionProfile
 from app.autonomy.profiles.morning_briefing import BriefingExecutionProfile, MorningBriefingExecutionProfile
 from app.autonomy.profiles.news_magazine import NewsMagazineExecutionProfile
+from app.autonomy.profiles.repo_map import RepoMapExecutionProfile
 from app.autonomy.profiles.weather_conditions import WeatherConditionsExecutionProfile
 from app.autonomy.profiles.topic_watcher import TopicWatcherExecutionProfile
 
@@ -23,6 +24,14 @@ ALLOWED_TASK_PROFILES = {
 
 
 def resolve_task_profile(task, user=None):
+    del user
+    recipe = getattr(task, "task_recipe", None)
+    if isinstance(recipe, dict):
+        family = str(recipe.get("family") or "").strip().lower()
+        params = recipe.get("params") if isinstance(recipe.get("params"), dict) else {}
+        agent_role = str(params.get("agent_role") or "").strip().lower()
+        if family == "agent" and agent_role == "repo_map_manager":
+            return RepoMapExecutionProfile()
     value = (getattr(task, "profile", None) or "").strip().lower()
     return resolve_task_profile_by_name(value)
 
