@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.18
+
+- Isolated `repo_map_manager` into a dedicated execution profile so repo-map contract shaping, skill-injection suppression, host-root preflight, and semantic validation no longer live in the generic task runner.
+- Added approval-gated read-only host-root access for autonomous repo-map tasks, including persisted approved-root grants, pause/resume semantics in `waiting_approval`, and backend-only host-root scan support bounded to approved paths.
+- Improved operator visibility for paused host-root requests by enriching existing task, admin, and Fruitcake MCP inspection payloads with structured approval context such as requested path, access mode, requester, and reason.
+- Strengthened repo-map runtime correctness with configured-root/output-path validation, workspace-artifact enforcement, richer navigation-oriented scan summaries, and better evidence discipline around top-level roots versus secondary `.claude` worktrees.
+- Fixed a task-mode regression where repo-map runs could be short-circuited by the Alpha Vantage unsupported-request fast-fail path when injected context contained unrelated finance markers.
+
 ## v0.7.17
 
 - Clarified the current trust boundary in the tracked operator docs, including which mutation families are approval-gated by default, when market-data writes require approval, and how `waiting_approval`, `waiting_approval_tool`, and `waiting_approval_reason` should be interpreted.
