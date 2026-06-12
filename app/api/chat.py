@@ -16,6 +16,7 @@ import contextlib
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import sqlalchemy as sa
@@ -41,6 +42,7 @@ from app.agent.chat_validation import (
     validate_chat_response,
 )
 from app.agent.core import (
+    CHAT_COMPACTION_BOUNDARY_HEADER,
     get_agent_runtime_history,
     get_task_handoff_payload,
     reset_agent_runtime_history,
@@ -58,6 +60,7 @@ from app.chat_runtime import get_chat_run_manager
 from app.llm_registry import available_llm_models, is_configured_model
 from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
+from app.mcp.servers.filesystem import resolve_workspace_path_for_user
 from app.memory.service import get_memory_service
 from app.skills.service import hydrate_user_context
 from app.agent.tools import (
@@ -73,6 +76,49 @@ log = structlog.get_logger(__name__)
 router = APIRouter()
 _CHAT_ESTIMATED_CHARS_PER_TOKEN = 4
 _CHAT_COMPACTION_MARKER_KIND = "history_compaction"
+_WORKSPACE_FILE_TOOL_NAMES = {"read_file", "write_file", "append_file", "stat_file"}
+_WORKSPACE_CONTEXT_TOOL_NAMES = _WORKSPACE_FILE_TOOL_NAMES | {"find_files", "list_directory", "make_directory"}
+_WORKSPACE_EXPLICIT_HINTS = (
+    "workspace",
+    "working on",
+    "just created",
+    "you were just working on",
+    "you were working on",
+    "that file",
+    "this file",
+    "the file",
+    "that doc",
+    "this doc",
+    "the doc",
+    "that document",
+    "this document",
+    "the document",
+    "again",
+)
+_WORKSPACE_ACTION_HINTS = {
+    "read",
+    "open",
+    "append",
+    "update",
+    "edit",
+    "write",
+    "continue",
+    "add",
+}
+
+
+@dataclass
+class RecentWorkspaceArtifactContext:
+    active_path: str | None
+    recent_read_path: str | None
+    recent_write_path: str | None
+    recent_paths: list[str]
+    recent_actions: list[str]
+    recent_document_names: list[str]
+
+    @property
+    def has_context(self) -> bool:
+        return bool(self.active_path or self.recent_paths)
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -498,6 +544,11 @@ async def send_message(
     stage_started = time.perf_counter()
     history = await _load_history(session_id, db)
     _record_chat_stage_timing(stage_timings_ms, "history_load", stage_started)
+    workspace_context = await _load_recent_workspace_context(
+        session_id,
+        user_id=current_user.id,
+        db=db,
+    )
 
     # Store user message
     user_msg = ChatMessage(session_id=session_id, role="user", content=body.content)
@@ -525,9 +576,15 @@ async def send_message(
         body.content,
     )
     _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
-    library_list_intent = is_library_lookup_intent(body.content)
-    library_summary_intent = is_library_summary_intent(body.content)
-    library_detail_intent = is_library_detail_or_excerpt_intent(body.content)
+    workspace_followup = _is_recent_workspace_followup_prompt(body.content, workspace_context)
+    history = _apply_workspace_followup_grounding(
+        history,
+        user_prompt=body.content,
+        context=workspace_context,
+    )
+    library_list_intent = (not workspace_followup) and is_library_lookup_intent(body.content)
+    library_summary_intent = (not workspace_followup) and is_library_summary_intent(body.content)
+    library_detail_intent = (not workspace_followup) and is_library_detail_or_excerpt_intent(body.content)
     library_intent = library_list_intent or library_summary_intent or library_detail_intent
     stage_started = time.perf_counter()
     history = await _apply_required_library_grounding(
@@ -558,7 +615,7 @@ async def send_message(
     should_validate = should_validate_chat_response(
         user_prompt=body.content,
         effective_complex=effective_complex,
-    )
+    ) or workspace_followup
     stage_started = time.perf_counter()
     execution_history = build_orchestrated_chat_history(
         history,
@@ -808,6 +865,11 @@ async def _run_websocket_message(
         stage_started = time.perf_counter()
         history = await _load_history(session_id, db)
         _record_chat_stage_timing(stage_timings_ms, "history_load", stage_started)
+        workspace_context = await _load_recent_workspace_context(
+            session_id,
+            user_id=current_user.id,
+            db=db,
+        )
 
         user_context = UserContext.from_user(current_user, persona_name=session.persona)
         _apply_tool_overrides(
@@ -827,9 +889,15 @@ async def _run_websocket_message(
             user_message,
         )
         _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
-        library_list_intent = is_library_lookup_intent(user_message)
-        library_summary_intent = is_library_summary_intent(user_message)
-        library_detail_intent = is_library_detail_or_excerpt_intent(user_message)
+        workspace_followup = _is_recent_workspace_followup_prompt(user_message, workspace_context)
+        history = _apply_workspace_followup_grounding(
+            history,
+            user_prompt=user_message,
+            context=workspace_context,
+        )
+        library_list_intent = (not workspace_followup) and is_library_lookup_intent(user_message)
+        library_summary_intent = (not workspace_followup) and is_library_summary_intent(user_message)
+        library_detail_intent = (not workspace_followup) and is_library_detail_or_excerpt_intent(user_message)
         library_intent = (
             library_list_intent
             or library_summary_intent
@@ -864,7 +932,7 @@ async def _run_websocket_message(
         should_validate = should_validate_chat_response(
             user_prompt=user_message,
             effective_complex=effective_complex,
-        )
+        ) or workspace_followup
         stage_started = time.perf_counter()
         execution_history = build_orchestrated_chat_history(
             history,
@@ -1672,6 +1740,210 @@ def _decode_chat_json(raw: Any) -> Any:
     return None
 
 
+def _tool_call_name_from_payload(call: Any) -> str:
+    if isinstance(call, dict):
+        function = call.get("function") or {}
+        return str(function.get("name") or "").strip()
+    function = getattr(call, "function", None)
+    return str(getattr(function, "name", "") or "").strip()
+
+
+def _tool_call_arguments_from_payload(call: Any) -> Dict[str, Any]:
+    if isinstance(call, dict):
+        raw = ((call.get("function") or {}).get("arguments"))
+    else:
+        raw = getattr(getattr(call, "function", None), "arguments", None)
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(str(raw))
+    except Exception:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _normalize_workspace_relative_path(user_id: int, raw_path: str) -> str | None:
+    candidate = str(raw_path or "").strip()
+    if not candidate:
+        return None
+    try:
+        workspace_root, path = resolve_workspace_path_for_user(user_id, candidate)
+    except Exception:
+        return None
+    try:
+        return str(path.relative_to(workspace_root))
+    except Exception:
+        return None
+
+
+def _workspace_basename_matches(prompt: str, path: str) -> bool:
+    lowered = str(prompt or "").strip().lower()
+    if not lowered:
+        return False
+    stem = Path(path).name.strip().lower()
+    if not stem:
+        return False
+    return stem in lowered or Path(stem).stem.lower() in lowered
+
+
+def _collect_recent_workspace_artifact_context(
+    messages: List[ChatMessage],
+    *,
+    user_id: int,
+    limit: int = 80,
+) -> RecentWorkspaceArtifactContext:
+    relevant = list(messages[-max(1, limit):])
+    tool_calls_by_id: dict[str, dict[str, Any]] = {}
+    recent_paths: list[str] = []
+    recent_actions: list[str] = []
+    recent_document_names: list[str] = []
+    recent_read_path: str | None = None
+    recent_write_path: str | None = None
+
+    for message in relevant:
+        tool_calls = _decode_chat_json(getattr(message, "tool_calls", None))
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                call_id = str(call.get("id") or "").strip()
+                if call_id:
+                    tool_calls_by_id[call_id] = call
+
+    for message in reversed(relevant):
+        if str(getattr(message, "role", "") or "") != "tool":
+            continue
+        tool_payload = _decode_chat_json(getattr(message, "tool_results", None))
+        if not isinstance(tool_payload, dict):
+            continue
+        tool_call_id = str(tool_payload.get("tool_call_id") or "").strip()
+        if not tool_call_id:
+            continue
+        call = tool_calls_by_id.get(tool_call_id)
+        if not isinstance(call, dict):
+            continue
+        tool_name = _tool_call_name_from_payload(call)
+        if tool_name not in _WORKSPACE_CONTEXT_TOOL_NAMES:
+            continue
+        arguments = _tool_call_arguments_from_payload(call)
+        normalized_path = _normalize_workspace_relative_path(user_id, str(arguments.get("path") or ""))
+        if tool_name in _WORKSPACE_FILE_TOOL_NAMES and normalized_path:
+            if normalized_path not in recent_paths:
+                recent_paths.append(normalized_path)
+            if tool_name == "read_file" and recent_read_path is None:
+                recent_read_path = normalized_path
+            if tool_name in {"write_file", "append_file"} and recent_write_path is None:
+                recent_write_path = normalized_path
+        if tool_name in {"read_file", "write_file", "append_file"} and normalized_path:
+            recent_actions.append(f"{tool_name}:{normalized_path}")
+        elif tool_name == "find_files":
+            query = str(arguments.get("query") or "").strip()
+            if query:
+                recent_actions.append(f"find_files:{query}")
+        elif tool_name == "list_directory":
+            target = normalized_path or str(arguments.get("path") or ".").strip()
+            if target:
+                recent_actions.append(f"list_directory:{target}")
+
+    for path in recent_paths:
+        name = Path(path).name
+        stem = Path(path).stem
+        for value in (name, stem):
+            lowered = value.strip().lower()
+            if lowered and lowered not in recent_document_names:
+                recent_document_names.append(lowered)
+
+    active_path = recent_write_path or recent_read_path or (recent_paths[0] if recent_paths else None)
+    return RecentWorkspaceArtifactContext(
+        active_path=active_path,
+        recent_read_path=recent_read_path,
+        recent_write_path=recent_write_path,
+        recent_paths=recent_paths[:6],
+        recent_actions=recent_actions[:8],
+        recent_document_names=recent_document_names[:8],
+    )
+
+
+def _is_recent_workspace_followup_prompt(
+    prompt: str,
+    context: RecentWorkspaceArtifactContext,
+) -> bool:
+    if not context.has_context:
+        return False
+    lowered = str(prompt or "").strip().lower()
+    if not lowered:
+        return False
+    if any(marker in lowered for marker in ("library", "uploaded", "search my docs", "search the library")):
+        return False
+    if any(_workspace_basename_matches(lowered, path) for path in context.recent_paths):
+        return True
+    if any(name in lowered for name in context.recent_document_names):
+        return True
+    has_file_target = any(term in lowered for term in _WORKSPACE_EXPLICIT_HINTS) or any(
+        token in lowered for token in ("file", "doc", "document", "report", "notes", "key points")
+    )
+    has_action = any(token in lowered for token in _WORKSPACE_ACTION_HINTS)
+    return has_file_target and has_action
+
+
+def _workspace_followup_system_note(
+    context: RecentWorkspaceArtifactContext,
+) -> str | None:
+    if not context.has_context:
+        return None
+    lines = [
+        "Recent workspace file context for this chat session:",
+    ]
+    if context.active_path:
+        lines.append(f"- Active workspace file: {context.active_path}")
+    if context.recent_write_path and context.recent_write_path != context.active_path:
+        lines.append(f"- Most recent edited file: {context.recent_write_path}")
+    if context.recent_read_path and context.recent_read_path not in {context.active_path, context.recent_write_path}:
+        lines.append(f"- Most recent read file: {context.recent_read_path}")
+    if context.recent_paths:
+        lines.append(f"- Recent workspace paths: {', '.join(context.recent_paths[:4])}")
+    lines.append(
+        "- If the user refers to the file or document you were just working on, prefer workspace filesystem tools before any library search."
+    )
+    return "\n".join(lines)
+
+
+def _apply_workspace_followup_grounding(
+    history: List[Dict[str, Any]],
+    *,
+    user_prompt: str,
+    context: RecentWorkspaceArtifactContext,
+) -> List[Dict[str, Any]]:
+    if not _is_recent_workspace_followup_prompt(user_prompt, context):
+        return history
+    note = _workspace_followup_system_note(context)
+    if not note:
+        return history
+    grounded = list(history)
+    if grounded and grounded[-1].get("role") == "user":
+        return grounded[:-1] + [{"role": "system", "content": note}, grounded[-1]]
+    return grounded + [{"role": "system", "content": note}]
+
+
+async def _load_recent_workspace_context(
+    session_id: int,
+    *,
+    user_id: int,
+    db: AsyncSession,
+    limit: int = 80,
+) -> RecentWorkspaceArtifactContext:
+    result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+        .limit(limit)
+    )
+    messages = list(reversed(list(result.scalars().all())))
+    return _collect_recent_workspace_artifact_context(messages, user_id=user_id, limit=limit)
+
+
 def _history_message_from_chat_message(message: ChatMessage) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "role": str(message.role or ""),
@@ -1753,21 +2025,88 @@ def _compact_chat_message_summary(message: Dict[str, Any]) -> str:
     return f"{role.capitalize()}: {content}" if content else f"{role.capitalize()}:"
 
 
-def _build_chat_compaction_boundary(prefix: List[Dict[str, Any]]) -> Dict[str, Any]:
-    lines = [
-        "Earlier chat history was compacted to keep the live context focused.",
-        "Use this as a compact recap unless newer turns contradict it:",
-    ]
+def _is_high_signal_chat_recap_message(message: Dict[str, Any]) -> bool:
+    role = str(message.get("role") or "")
+    if role == "user":
+        return True
+    return role == "assistant" and not message.get("tool_calls")
+
+
+def _select_chat_recap_messages(
+    prefix: List[Dict[str, Any]],
+    *,
+    head_count: int = 3,
+    tail_count: int = 9,
+) -> List[Dict[str, Any]]:
+    """Keep early framing turns plus the turns nearest the cut, preferring
+    user messages and assistant conclusions over tool chatter."""
+    if len(prefix) <= head_count + tail_count:
+        return list(prefix)
+    head = prefix[:head_count]
+    rest = prefix[head_count:]
+    selected = {
+        index
+        for index in [i for i, message in enumerate(rest) if _is_high_signal_chat_recap_message(message)][-tail_count:]
+    }
+    for index in range(len(rest) - 1, -1, -1):
+        if len(selected) >= tail_count:
+            break
+        selected.add(index)
+    tail = [rest[index] for index in sorted(selected)]
+    return head + tail
+
+
+def _chat_recap_summaries(prefix: List[Dict[str, Any]]) -> list[str]:
     summaries: list[str] = []
-    for message in prefix:
+    for message in _select_chat_recap_messages(prefix):
         summary = _compact_chat_message_summary(message)
         if summary:
-            summaries.append(f"- {summary}")
+            summaries.append(summary)
         if len(summaries) >= 12:
             break
+    return summaries
+
+
+def _build_chat_compaction_boundary(
+    prefix: List[Dict[str, Any]],
+    *,
+    continuity: Dict[str, Any] | None = None,
+    carried_recap: List[str] | None = None,
+) -> Dict[str, Any]:
+    lines = [
+        CHAT_COMPACTION_BOUNDARY_HEADER,
+        "Use this as a compact recap unless newer turns contradict it:",
+    ]
+    carried = [str(item).strip() for item in (carried_recap or []) if str(item).strip()]
+    if carried:
+        lines.append("Previously compacted (older context):")
+        lines.extend(f"- {item}" for item in carried)
+        lines.append("Recently compacted turns:")
+    summaries = [f"- {summary}" for summary in _chat_recap_summaries(prefix)]
     if not summaries:
         summaries.append("- Earlier user and assistant turns were compacted.")
     lines.extend(summaries)
+    continuity = continuity or {}
+    continuity_lines: list[str] = []
+    active_workspace_file = str(continuity.get("active_workspace_file") or "").strip()
+    active_document = str(continuity.get("active_document") or "").strip()
+    pending_objective = str(continuity.get("pending_objective") or "").strip()
+    recent_actions = [
+        str(item).strip()
+        for item in (continuity.get("recent_actions") or [])
+        if str(item).strip()
+    ]
+    if active_workspace_file:
+        continuity_lines.append(f"- Active workspace file: {active_workspace_file}")
+    if active_document:
+        continuity_lines.append(f"- Active document target: {active_document}")
+    if pending_objective:
+        continuity_lines.append(f"- Pending objective: {pending_objective}")
+    if recent_actions:
+        continuity_lines.append(f"- Recent tool actions: {', '.join(recent_actions[:4])}")
+    if continuity_lines:
+        lines.append("Operational continuity:")
+        lines.extend(continuity_lines)
     return {"role": "system", "content": "\n".join(lines)}
 
 
@@ -1796,13 +2135,70 @@ def _serialize_chat_compaction_event(message: ChatMessage) -> Dict[str, Any] | N
         "estimated_tokens_before": payload.get("estimated_tokens_before"),
         "estimated_tokens_after": payload.get("estimated_tokens_after"),
         "recent_messages_kept": payload.get("recent_messages_kept"),
+        "continuity": payload.get("continuity") or {},
     }
+
+
+def _build_chat_continuity_metadata(prefix_messages: List[ChatMessage], *, user_id: int) -> Dict[str, Any]:
+    if not prefix_messages:
+        return {}
+    context = _collect_recent_workspace_artifact_context(
+        prefix_messages,
+        user_id=user_id,
+        limit=len(prefix_messages),
+    )
+    active_document = ""
+    pending_objective = ""
+    for message in reversed(prefix_messages):
+        role = str(getattr(message, "role", "") or "")
+        content = " ".join(str(getattr(message, "content", "") or "").split()).strip()
+        if not content:
+            continue
+        if not pending_objective and role == "user":
+            pending_objective = content[:220]
+        if not active_document and role in {"user", "assistant"}:
+            match = re.search(r"\b([A-Za-z0-9_. -]+\.(?:pdf|md|txt|docx?|csv|json))\b", content, flags=re.IGNORECASE)
+            if match:
+                active_document = match.group(1).strip()
+        if pending_objective and active_document:
+            break
+    return {
+        "active_workspace_file": context.active_path or "",
+        "active_document": active_document,
+        "pending_objective": pending_objective,
+        "recent_actions": context.recent_actions[:4],
+    }
+
+
+def _marker_recap_lines(payload: Dict[str, Any], content: str) -> list[str]:
+    """Recover the recap lines from an existing marker, preferring structured
+    metadata and falling back to parsing legacy marker content."""
+    recap = payload.get("recap")
+    if isinstance(recap, list) and recap:
+        return [str(item).strip() for item in recap if str(item).strip()]
+    lines: list[str] = []
+    for line in str(content or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Operational continuity:"):
+            break
+        if stripped.startswith("- "):
+            lines.append(stripped[2:].strip())
+    return [line for line in lines if line]
+
+
+def _condense_carried_recap(lines: List[str], *, max_lines: int = 6) -> list[str]:
+    cleaned = [str(line).strip() for line in lines if str(line).strip()]
+    if len(cleaned) <= max_lines:
+        return cleaned
+    return cleaned[:2] + cleaned[-(max_lines - 2):]
 
 
 async def _persist_chat_compaction_marker(
     session_id: int,
     *,
+    user_id: int,
     prefix_messages: List[ChatMessage],
+    continuity_messages: List[ChatMessage] | None = None,
     recent_messages_kept: int,
     estimated_tokens_before: int,
     estimated_tokens_after: int,
@@ -1810,19 +2206,6 @@ async def _persist_chat_compaction_marker(
 ) -> ChatMessage | None:
     if not prefix_messages:
         return None
-
-    boundary = _build_chat_compaction_boundary(
-        [{"role": str(message.role), "content": str(message.content)} for message in prefix_messages]
-    )
-    compacted_until_message_id = int(prefix_messages[-1].id)
-    metadata = {
-        "kind": _CHAT_COMPACTION_MARKER_KIND,
-        "compacted_until_message_id": compacted_until_message_id,
-        "compacted_message_count": len(prefix_messages),
-        "estimated_tokens_before": estimated_tokens_before,
-        "estimated_tokens_after": estimated_tokens_after,
-        "recent_messages_kept": recent_messages_kept,
-    }
 
     result = await db.execute(
         select(ChatMessage)
@@ -1833,6 +2216,37 @@ async def _persist_chat_compaction_marker(
     compaction_rows = [row for row in system_rows if _chat_compaction_metadata(row)]
     marker = compaction_rows[0] if compaction_rows else None
     stale_rows = compaction_rows[1:] if len(compaction_rows) > 1 else []
+
+    carried_recap: list[str] = []
+    if marker is not None:
+        prior_payload = _chat_compaction_metadata(marker) or {}
+        prior_carried = [
+            str(item).strip()
+            for item in (prior_payload.get("carried_recap") or [])
+            if str(item).strip()
+        ]
+        prior_recap = _marker_recap_lines(prior_payload, str(marker.content or ""))
+        carried_recap = _condense_carried_recap(prior_carried + prior_recap)
+
+    prefix_payloads = [_history_message_from_chat_message(message) for message in prefix_messages]
+    continuity = _build_chat_continuity_metadata(continuity_messages or prefix_messages, user_id=user_id)
+    boundary = _build_chat_compaction_boundary(
+        prefix_payloads,
+        continuity=continuity,
+        carried_recap=carried_recap,
+    )
+    compacted_until_message_id = int(prefix_messages[-1].id)
+    metadata = {
+        "kind": _CHAT_COMPACTION_MARKER_KIND,
+        "compacted_until_message_id": compacted_until_message_id,
+        "compacted_message_count": len(prefix_messages),
+        "estimated_tokens_before": estimated_tokens_before,
+        "estimated_tokens_after": estimated_tokens_after,
+        "recent_messages_kept": recent_messages_kept,
+        "continuity": continuity,
+        "recap": _chat_recap_summaries(prefix_payloads),
+        "carried_recap": carried_recap,
+    }
 
     if marker is None:
         marker = ChatMessage(
@@ -1851,20 +2265,12 @@ async def _persist_chat_compaction_marker(
     return marker
 
 
-def _project_chat_history(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not history:
-        return []
-
-    estimated_tokens = _estimate_chat_history_tokens(history)
-    if estimated_tokens <= int(settings.chat_history_soft_token_limit):
-        return history
-
-    keep_recent = max(1, int(settings.chat_recent_messages_keep))
-    prefix = history[:-keep_recent]
-    suffix = history[-keep_recent:]
-    if not prefix:
-        return history
-    return [_build_chat_compaction_boundary(prefix)] + suffix
+def _snap_chat_cut_to_tool_chain(messages: List[ChatMessage], cut_index: int) -> int:
+    """Move a prefix/suffix cut backwards so a suffix never starts with tool
+    results whose assistant tool-call message landed in the prefix."""
+    while 0 < cut_index < len(messages) and str(getattr(messages[cut_index], "role", "") or "") == "tool":
+        cut_index -= 1
+    return cut_index
 
 
 async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any]]:
@@ -1895,8 +2301,9 @@ async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any
         return raw_history
 
     keep_recent = max(1, int(settings.chat_recent_messages_keep))
-    prefix_messages = raw_messages[:-keep_recent]
-    suffix_messages = raw_messages[-keep_recent:]
+    cut = _snap_chat_cut_to_tool_chain(raw_messages, max(0, len(raw_messages) - keep_recent))
+    prefix_messages = raw_messages[:cut]
+    suffix_messages = raw_messages[cut:]
     if not prefix_messages:
         if latest_marker is not None:
             return [{"role": "system", "content": latest_marker.content}] + raw_history
@@ -1904,9 +2311,18 @@ async def _load_history(session_id: int, db: AsyncSession) -> List[Dict[str, Any
 
     projected_suffix = [_history_message_from_chat_message(m) for m in suffix_messages]
     estimated_tokens_after = _estimate_chat_history_tokens(projected_suffix)
+    session_row = await db.get(ChatSession, session_id)
+    prefix_until_id = int(prefix_messages[-1].id)
+    continuity_messages = [
+        message
+        for message in messages
+        if int(message.id or 0) > compacted_until_id and int(message.id or 0) <= prefix_until_id
+    ]
     marker = await _persist_chat_compaction_marker(
         session_id,
+        user_id=int(getattr(session_row, "user_id", 0) or 0),
         prefix_messages=prefix_messages,
+        continuity_messages=continuity_messages,
         recent_messages_kept=keep_recent,
         estimated_tokens_before=estimated_tokens_before,
         estimated_tokens_after=estimated_tokens_after,

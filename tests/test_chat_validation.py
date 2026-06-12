@@ -67,6 +67,20 @@ def test_validate_chat_response_flags_fetch_narration_and_compacted_tool_leakage
     assert out.retry_reason == "tool_call_leakage"
 
 
+def test_validate_chat_response_flags_library_search_narration_leakage():
+    out = validate_chat_response(
+        "Read the file you were just working on again",
+        (
+            "Searching library for the file now.\n"
+            "Tool: search_library\n"
+            "Tool call id: call_456\n"
+        ),
+    )
+    assert out.has_tool_call_leakage is True
+    assert out.should_retry is True
+    assert out.retry_reason == "tool_call_leakage"
+
+
 def test_should_validate_chat_response_enables_research_on_simple_path():
     assert should_validate_chat_response(
         user_prompt="Research the latest headlines on Iran and cite sources",

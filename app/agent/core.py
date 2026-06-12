@@ -47,6 +47,15 @@ TURN_LIMITS: Dict[str, int] = {
 
 REPEATED_FAILED_SEARCH_TURN_THRESHOLD = 5
 ESTIMATED_CHARS_PER_TOKEN = 4
+
+# First lines of compaction boundary system messages. Runtime projection must
+# recognize and preserve these verbatim instead of re-summarizing them away.
+RUNTIME_COMPACTION_BOUNDARY_HEADER = "Earlier conversation was compacted to stay within the context budget."
+CHAT_COMPACTION_BOUNDARY_HEADER = "Earlier chat history was compacted to keep the live context focused."
+_COMPACTION_BOUNDARY_HEADERS = (
+    RUNTIME_COMPACTION_BOUNDARY_HEADER,
+    CHAT_COMPACTION_BOUNDARY_HEADER,
+)
 FAILED_SEARCH_PREFIXES = (
     "no results found for:",
     "tool web_search failed:",
@@ -69,6 +78,10 @@ RSS_SEARCH_TOOL_NAMES = {
 }
 RSS_RETRIEVAL_TOOL_NAMES = RSS_SEARCH_TOOL_NAMES | {
     "list_recent_feed_items",
+}
+DOCUMENT_RETRIEVAL_TOOL_NAMES = {
+    "search_library",
+    "summarize_document",
 }
 HEADLINE_ROUNDUP_MARKERS = (
     "headlines this evening",
@@ -129,6 +142,33 @@ RSS_QUERY_FAMILY_STOPWORDS = {
     "tonight",
     "top",
     "what",
+}
+DOCUMENT_QUERY_FAMILY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "document",
+    "documents",
+    "doc",
+    "docs",
+    "file",
+    "files",
+    "library",
+    "uploaded",
+    "the",
+    "this",
+    "that",
+    "more",
+    "again",
+    "remaining",
+    "extract",
+    "explain",
+    "summary",
+    "summarize",
+    "section",
+    "sections",
+    "details",
+    "detail",
 }
 RSS_SYNONYM_NORMALIZATIONS = (
     (r"\bwild[\s-]?fires?\b", "wildfire"),
@@ -445,17 +485,55 @@ def _compact_message_summary(
     return f"{role.capitalize()}: {content}"
 
 
+def _is_compaction_boundary_message(message: Dict[str, Any]) -> bool:
+    if str(message.get("role") or "") != "system":
+        return False
+    content = str(message.get("content") or "").lstrip()
+    return content.startswith(_COMPACTION_BOUNDARY_HEADERS)
+
+
+def _is_high_signal_recap_message(message: Dict[str, Any]) -> bool:
+    role = str(message.get("role") or "")
+    if role == "user":
+        return True
+    return role == "assistant" and not message.get("tool_calls")
+
+
+def _select_recap_messages(
+    prefix: List[Dict[str, Any]],
+    *,
+    head_count: int,
+    tail_count: int,
+) -> List[Dict[str, Any]]:
+    """Keep early framing turns plus the turns nearest the cut, preferring
+    user messages and assistant conclusions over tool chatter."""
+    if len(prefix) <= head_count + tail_count:
+        return list(prefix)
+    head = prefix[:head_count]
+    rest = prefix[head_count:]
+    selected = {
+        index
+        for index in [i for i, message in enumerate(rest) if _is_high_signal_recap_message(message)][-tail_count:]
+    }
+    for index in range(len(rest) - 1, -1, -1):
+        if len(selected) >= tail_count:
+            break
+        selected.add(index)
+    tail = [rest[index] for index in sorted(selected)]
+    return head + tail
+
+
 def _build_compaction_boundary_message(
     prefix: List[Dict[str, Any]],
     *,
     tool_name_lookup: dict[str, str],
 ) -> Dict[str, Any]:
     lines = [
-        "Earlier conversation was compacted to stay within the context budget.",
+        RUNTIME_COMPACTION_BOUNDARY_HEADER,
         "Preserve these compacted facts unless later context contradicts them:",
     ]
     summaries: list[str] = []
-    for message in prefix:
+    for message in _select_recap_messages(prefix, head_count=3, tail_count=7):
         summary = _compact_message_summary(message, tool_name_lookup=tool_name_lookup)
         if summary:
             summaries.append(f"- {summary}")
@@ -465,6 +543,14 @@ def _build_compaction_boundary_message(
         summaries.append("- Earlier tool and assistant turns were compacted.")
     lines.extend(summaries)
     return {"role": "system", "content": "\n".join(lines)}
+
+
+def _snap_cut_to_tool_chain(history: List[Dict[str, Any]], cut_index: int) -> int:
+    """Move a prefix/suffix cut backwards so a suffix never starts with tool
+    results whose assistant tool-call message landed in the prefix."""
+    while 0 < cut_index < len(history) and str(history[cut_index].get("role") or "") == "tool":
+        cut_index -= 1
+    return cut_index
 
 
 def _project_history_for_model(
@@ -480,6 +566,7 @@ def _project_history_for_model(
         "tool_results_compacted": 0,
         "compaction_boundary_applied": False,
         "boundary_messages_collapsed": 0,
+        "boundary_messages_preserved": 0,
     }
     tool_lookup = _tool_name_lookup(history)
     tool_indices = [index for index, message in enumerate(projected) if str(message.get("role") or "") == "tool"]
@@ -505,12 +592,23 @@ def _project_history_for_model(
     estimated_after = _estimate_history_tokens(projected)
     keep_recent_messages = max(1, int(settings.agent_recent_messages_keep))
     if projected and (aggressive or estimated_after > int(settings.agent_history_soft_token_limit)):
-        prefix = projected[:-keep_recent_messages]
-        suffix = projected[-keep_recent_messages:]
+        cut = _snap_cut_to_tool_chain(projected, max(0, len(projected) - keep_recent_messages))
+        prefix = projected[:cut]
+        suffix = projected[cut:]
         if prefix:
-            projected = [_build_compaction_boundary_message(prefix, tool_name_lookup=tool_lookup)] + suffix
-            report["compaction_boundary_applied"] = True
-            report["boundary_messages_collapsed"] = len(prefix)
+            pinned_boundaries = [message for message in prefix if _is_compaction_boundary_message(message)]
+            collapsible = [message for message in prefix if not _is_compaction_boundary_message(message)]
+            if collapsible:
+                projected = (
+                    pinned_boundaries
+                    + [_build_compaction_boundary_message(collapsible, tool_name_lookup=tool_lookup)]
+                    + suffix
+                )
+                report["compaction_boundary_applied"] = True
+                report["boundary_messages_collapsed"] = len(collapsible)
+            else:
+                projected = pinned_boundaries + suffix
+            report["boundary_messages_preserved"] = len(pinned_boundaries)
             estimated_after = _estimate_history_tokens(projected)
 
     report["estimated_tokens_after"] = estimated_after
@@ -642,9 +740,20 @@ def _semantic_tool_signature(tool_calls: List[Any]) -> str | None:
     if len(tool_calls) != 1:
         return None
     tool_name = _tool_call_name(tool_calls[0])
+    arguments = _tool_call_arguments(tool_calls[0])
+    if tool_name in DOCUMENT_RETRIEVAL_TOOL_NAMES:
+        target = str(
+            arguments.get("document_name")
+            or arguments.get("query")
+            or arguments.get("filename")
+            or ""
+        ).strip().lower()
+        if not target:
+            return None
+        family = _normalize_document_query_family(target)
+        return f"{tool_name}:{family}"
     if tool_name not in RSS_SEARCH_TOOL_NAMES:
         return None
-    arguments = _tool_call_arguments(tool_calls[0])
     ignored_keys = {
         "refresh",
         "max_results",
@@ -663,6 +772,21 @@ def _semantic_tool_signature(tool_calls: List[Any]) -> str | None:
     except Exception:
         payload = str(normalized)
     return f"{tool_name}:{payload}"
+
+
+def _normalize_document_query_family(query: str) -> str:
+    text = str(query or "").strip().lower()
+    if not text:
+        return "document"
+    raw_tokens = re.findall(r"[a-z0-9_.-]+", text)
+    tokens: list[str] = []
+    for token in raw_tokens:
+        if token in DOCUMENT_QUERY_FAMILY_STOPWORDS:
+            continue
+        tokens.append(token)
+    if not tokens:
+        return text
+    return "|".join(dict.fromkeys(tokens))
 
 
 def _normalize_query_family(query: str) -> str:
@@ -800,6 +924,88 @@ def _recent_rss_evidence(history: List[Dict[str, Any]], *, limit: int = 4) -> li
         if len(evidence) >= limit:
             break
     return list(reversed(evidence))
+
+
+def _is_empty_document_result(content: str) -> bool:
+    lowered = str(content or "").strip().lower()
+    empty_markers = (
+        "no matching documents found",
+        "no documents found",
+        "no excerpts found",
+        "no relevant excerpts found",
+        "could not find a document",
+        "multiple documents match",
+    )
+    return any(marker in lowered for marker in empty_markers)
+
+
+def _recent_document_evidence(history: List[Dict[str, Any]], *, limit: int = 4) -> list[dict[str, Any]]:
+    tool_lookup = _tool_name_lookup(history)
+    arguments_lookup: dict[str, Dict[str, Any]] = {}
+    for message in history:
+        for call in message.get("tool_calls") or []:
+            call_id = _tool_call_id(call)
+            if call_id:
+                arguments_lookup[call_id] = _tool_call_arguments(call)
+    evidence: list[dict[str, Any]] = []
+    seen_fingerprints: set[str] = set()
+    for message in reversed(history):
+        if str(message.get("role") or "") != "tool":
+            continue
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        tool_name = tool_lookup.get(tool_call_id) or ""
+        if tool_name not in DOCUMENT_RETRIEVAL_TOOL_NAMES:
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        fingerprint = _content_fingerprint(content)
+        if fingerprint in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fingerprint)
+        arguments = arguments_lookup.get(tool_call_id) or {}
+        target = str(
+            arguments.get("document_name")
+            or arguments.get("query")
+            or arguments.get("filename")
+            or ""
+        ).strip()
+        evidence.append(
+            {
+                "tool_name": tool_name,
+                "target": target,
+                "content": content,
+                "is_empty": _is_empty_document_result(content),
+            }
+        )
+        if len(evidence) >= limit:
+            break
+    return list(reversed(evidence))
+
+
+def _history_contains_document_tool_activity(history: List[Dict[str, Any]]) -> bool:
+    tool_lookup = _tool_name_lookup(history)
+    for message in history:
+        for call in message.get("tool_calls") or []:
+            if _tool_call_name(call) in DOCUMENT_RETRIEVAL_TOOL_NAMES:
+                return True
+        if str(message.get("role") or "") != "tool":
+            continue
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        if tool_lookup.get(tool_call_id) in DOCUMENT_RETRIEVAL_TOOL_NAMES:
+            return True
+    return False
+
+
+def _document_evidence_summary(evidence: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for index, item in enumerate(evidence, start=1):
+        target = str(item.get("target") or "").strip()
+        label = f"{item.get('tool_name')}"
+        if target:
+            label += f", target={target}"
+        lines.append(f"Evidence block {index} ({label}):\n{str(item.get('content') or '').strip()}")
+    return "\n\n".join(lines).strip()
 
 
 def _history_contains_rss_tool_activity(history: List[Dict[str, Any]]) -> bool:
@@ -996,6 +1202,110 @@ async def _safe_synthesize_from_rss_evidence(
         return None
 
 
+async def _synthesize_from_document_evidence(
+    *,
+    history: List[Dict[str, Any]],
+    user_context: UserContext,
+    selected_model: str,
+    mode: str,
+    stage: str | None,
+    reason: str,
+) -> str | None:
+    evidence = _recent_document_evidence(history)
+    if not evidence:
+        if _history_contains_document_tool_activity(history):
+            log.warning(
+                "agent.document_evidence_missing_from_history",
+                reason=reason,
+                mode=mode,
+                stage=stage,
+                model=selected_model,
+                session_id=user_context.session_id,
+                task_id=user_context.task_id,
+            )
+        return None
+    latest_user = _latest_user_message_text(history).strip()
+    if not latest_user:
+        return None
+    evidence_summary = _document_evidence_summary(evidence)
+    if not evidence_summary:
+        return None
+    instruction = (
+        "You already retrieved library/document evidence. Do not call more tools. "
+        "Answer the user's last document question directly using only the evidence below. "
+        "If the evidence is partial, say what is known and what remains unresolved."
+    )
+    reason_line = (
+        "The document lookup was repeating the same target instead of converging."
+        if reason == "document_query_family_churn"
+        else "The document workflow should stop here and synthesize from the evidence already gathered."
+    )
+    synthesis_history = [
+        message
+        for message in history
+        if str(message.get("role") or "") in {"user", "assistant"}
+    ][-4:]
+    synthesis_history.append(
+        {
+            "role": "user",
+            "content": (
+                f"{instruction}\n\n"
+                f"Original request:\n{latest_user}\n\n"
+                f"Why you must answer now:\n{reason_line}\n\n"
+                f"Document evidence:\n{evidence_summary}"
+            ),
+        }
+    )
+    extra = _litellm_kwargs(selected_model)
+    response = await _acompletion_with_budget(
+        history=synthesis_history,
+        user_context=user_context,
+        model=selected_model,
+        mode=mode,
+        stage=f"{stage}_document_synthesis" if stage else "document_synthesis",
+        extra_kwargs=extra,
+    )
+    await record_llm_usage_event(
+        response,
+        stage=f"{stage}_document_synthesis" if stage else "document_synthesis",
+        model=selected_model,
+    )
+    message = response.choices[0].message
+    return str(message.content or "").strip() or None
+
+
+async def _safe_synthesize_from_document_evidence(
+    *,
+    history: List[Dict[str, Any]],
+    user_context: UserContext,
+    selected_model: str,
+    mode: str,
+    stage: str | None,
+    reason: str,
+) -> str | None:
+    try:
+        return await _synthesize_from_document_evidence(
+            history=history,
+            user_context=user_context,
+            selected_model=selected_model,
+            mode=mode,
+            stage=stage,
+            reason=reason,
+        )
+    except Exception as exc:
+        log.warning(
+            "agent.document_synthesis_failed",
+            error=str(exc),
+            reason=reason,
+            mode=mode,
+            stage=stage,
+            model=selected_model,
+            session_id=user_context.session_id,
+            task_id=user_context.task_id,
+        )
+        return None
+
+
 def _log_agent_turn_start(
     *,
     turn: int,
@@ -1172,6 +1482,31 @@ def _repeated_semantic_research_message(
     )
 
 
+def _repeated_document_retrieval_message(
+    *,
+    tool_calls: List[Any],
+    history: List[Dict[str, Any]],
+) -> str:
+    tool_names = [name for name in (_tool_call_name(call) for call in tool_calls) if name]
+    tool_label = ", ".join(tool_names[:4]) or "the same document tools"
+    snippets = _recent_tool_snippets(history)
+    if snippets:
+        return (
+            "I stopped because I was repeating the same document lookup instead of converging on an answer. "
+            f"Repeated tools: {tool_label}. "
+            f"Recent results were: {' | '.join(snippets)}. "
+            "Ask me to summarize what I already found or name the exact file you want."
+        )
+    return (
+        "I stopped because I was repeating the same document lookup instead of converging on an answer. "
+        f"Repeated tools: {tool_label}. Ask me to summarize what I already found or name the exact file you want."
+    )
+
+
+def _is_document_tool_signature(signature: str | None) -> bool:
+    return bool(signature) and any(signature.startswith(f"{name}:") for name in DOCUMENT_RETRIEVAL_TOOL_NAMES)
+
+
 def _is_exploration_tool_turn(tool_calls: List[Any]) -> bool:
     tool_names = [name for name in (_tool_call_name(call) for call in tool_calls) if name]
     return bool(tool_names) and all(name in EXPLORATION_TOOL_NAMES for name in tool_names)
@@ -1210,6 +1545,17 @@ def _exploration_churn_message(
 
 
 def _max_turns_message(history: List[Dict[str, Any]]) -> str:
+    document_evidence = _recent_document_evidence(history, limit=1)
+    if document_evidence:
+        target = str(document_evidence[0].get("target") or "").strip()
+        snippets = _recent_tool_snippets(history)
+        if target and snippets:
+            return (
+                "I ran out of turns before I could finish that document workflow cleanly. "
+                f"I was working on {target}. "
+                f"Recent evidence was: {' | '.join(snippets)}. "
+                "Ask me to summarize what I already found or narrow the exact section you want."
+            )
     snippets = _recent_tool_snippets(history)
     if snippets:
         return (
@@ -1637,6 +1983,7 @@ async def run_agent(
             _record_agent_runtime_messages([normalized_message, *tool_results])
             current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
             current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
+            current_is_document_signature = _is_document_tool_signature(current_semantic_tool_signature)
             current_rss_query_family_signature = _rss_query_family_signature(normalized_tool_calls)
             if current_tool_signature == previous_tool_signature:
                 repeated_tool_signature_count += 1
@@ -1727,6 +2074,21 @@ async def run_agent(
                         "tool_signature": current_semantic_tool_signature,
                     },
                 )
+                if current_is_document_signature:
+                    synthesized = await _safe_synthesize_from_document_evidence(
+                        history=history,
+                        user_context=user_context,
+                        selected_model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        reason="document_query_family_churn",
+                    )
+                    if synthesized:
+                        return synthesized
+                    return _repeated_document_retrieval_message(
+                        tool_calls=normalized_tool_calls,
+                        history=history,
+                    )
                 synthesized = await _safe_synthesize_from_rss_evidence(
                     history=history,
                     user_context=user_context,
@@ -1794,6 +2156,17 @@ async def run_agent(
                     )
                     if synthesized:
                         return synthesized
+            if current_is_document_signature and turn_number >= max_turns - 1:
+                synthesized = await _safe_synthesize_from_document_evidence(
+                    history=history,
+                    user_context=user_context,
+                    selected_model=selected_model,
+                    mode=mode,
+                    stage=stage,
+                    reason="turn_budget_near_exhaustion",
+                )
+                if synthesized:
+                    return synthesized
             if _exploration_churn_detected(recent_exploration_signatures):
                 _record_loop_event(
                     event_type="exploration_churn",
@@ -1948,6 +2321,7 @@ async def stream_agent(
             _record_agent_runtime_messages([normalized_message, *tool_results])
             current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
             current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
+            current_is_document_signature = _is_document_tool_signature(current_semantic_tool_signature)
             current_rss_query_family_signature = _rss_query_family_signature(normalized_tool_calls)
             if current_tool_signature == previous_tool_signature:
                 repeated_tool_signature_count += 1
@@ -2035,6 +2409,23 @@ async def stream_agent(
                         "tool_signature": current_semantic_tool_signature,
                     },
                 )
+                if current_is_document_signature:
+                    synthesized = await _safe_synthesize_from_document_evidence(
+                        history=history,
+                        user_context=user_context,
+                        selected_model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        reason="document_query_family_churn",
+                    )
+                    if synthesized:
+                        yield synthesized
+                        return
+                    yield _repeated_document_retrieval_message(
+                        tool_calls=normalized_tool_calls,
+                        history=history,
+                    )
+                    return
                 synthesized = await _safe_synthesize_from_rss_evidence(
                     history=history,
                     user_context=user_context,
@@ -2107,6 +2498,18 @@ async def stream_agent(
                     if synthesized:
                         yield synthesized
                         return
+            if current_is_document_signature and turn_number >= max_turns - 1:
+                synthesized = await _safe_synthesize_from_document_evidence(
+                    history=history,
+                    user_context=user_context,
+                    selected_model=selected_model,
+                    mode=mode,
+                    stage=stage,
+                    reason="turn_budget_near_exhaustion",
+                )
+                if synthesized:
+                    yield synthesized
+                    return
             if _exploration_churn_detected(recent_exploration_signatures):
                 _record_loop_event(
                     event_type="exploration_churn",
