@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.19
+
+- Improved chat continuity for workspace and document follow-ups by grounding recent workspace artifact context into follow-up turns and steering those prompts away from unnecessary library re-search.
+- Hardened chat history compaction across both persisted chat history and runtime projection by preserving existing compaction markers, carrying forward prior recap on re-compaction, and keeping recap sampling anchored to both early framing and turns nearest the cut.
+- Prevented compaction from splitting assistant tool-call messages away from their tool results, reducing follow-up drift and keeping replayed tool chains coherent for later synthesis and validation.
+- Expanded chat validation leakage detection for internal tool narration and compacted-tool scaffolding so cleanup retries catch more non-user-facing artifacts before delivery.
+- Added focused regression coverage for chat continuity, re-compaction recap carry-forward, near-cut recap preservation, and tool-chain-safe compaction boundaries.
+
 ## v0.7.18
 
 - Isolated `repo_map_manager` into a dedicated execution profile so repo-map contract shaping, skill-injection suppression, host-root preflight, and semantic validation no longer live in the generic task runner.
