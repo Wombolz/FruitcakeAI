@@ -43,6 +43,11 @@ TOOL_LEAKAGE_PATTERNS = (
     r"\bi(?:'|’)ll fetch\b",
     r"\bfetching the full page\b",
     r"\bcompacted tool result\.\b",
+    r"\bsearching library\b",
+    r"\bsearching the library\b",
+    r"\blooking through the library\b",
+    r"\btool call id:\b",
+    r"\btool:\s*[a-z_]+\b",
 )
 
 URL_RE = re.compile(r"https?://[^\s)\]>\"']+", re.IGNORECASE)

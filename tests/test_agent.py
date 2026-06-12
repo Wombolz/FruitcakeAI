@@ -172,6 +172,65 @@ async def test_run_agent_stops_repeated_identical_tool_cycles(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_agent_synthesizes_after_repeated_document_lookup(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_repeated_semantic_tool_signature_threshold", 1)
+
+    responses = [
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "doc_1",
+                        "function": {
+                            "name": "summarize_document",
+                            "arguments": json.dumps({"document_name": "Holiday_Plan.pdf"}),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "doc_2",
+                        "function": {
+                            "name": "summarize_document",
+                            "arguments": json.dumps({"document_name": "Holiday_Plan.pdf"}),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(_FakeMessage(content="Here is the document summary from the evidence already gathered.")),
+    ]
+    tool_results = [
+        [{"role": "tool", "tool_call_id": "doc_1", "content": "Holiday plan summary: Thanksgiving travel starts Friday."}],
+        [{"role": "tool", "tool_call_id": "doc_2", "content": "Holiday plan summary: Thanksgiving travel starts Friday."}],
+    ]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[{"type": "function", "function": {"name": "summarize_document"}}],
+        ):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(side_effect=tool_results)):
+                with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=responses)):
+                    result = await run_agent(
+                        [{"role": "user", "content": "Summarize the holiday plan document and then pull the remaining details."}],
+                        ctx,
+                        mode="chat",
+                    )
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert result == "Here is the document summary from the evidence already gathered."
+
+
+@pytest.mark.asyncio
 async def test_run_agent_repo_map_style_exploration_compacts_multi_turn_history(monkeypatch):
     ctx = _make_context()
     monkeypatch.setattr(settings, "agent_tool_result_max_chars", 120)
@@ -2341,3 +2400,100 @@ async def test_list_tasks_and_get_task_return_owned_task_state():
     assert fetched["schedule"] == "every:8h"
     assert fetched["active_hours_start"] == "07:00"
     assert fetched["active_hours_tz"] == "America/New_York"
+
+
+# ── Runtime projection compaction (Phase 1 regressions) ───────────────────────
+
+def test_project_history_preserves_chat_compaction_marker(monkeypatch):
+    from app.agent.core import (
+        CHAT_COMPACTION_BOUNDARY_HEADER,
+        _project_history_for_model,
+    )
+
+    monkeypatch.setattr(settings, "agent_history_soft_token_limit", 60)
+    monkeypatch.setattr(settings, "agent_recent_messages_keep", 2)
+
+    marker_content = "\n".join(
+        [
+            CHAT_COMPACTION_BOUNDARY_HEADER,
+            "Use this as a compact recap unless newer turns contradict it:",
+            "- User: planned the spring travel itinerary",
+            "Operational continuity:",
+            "- Active workspace file: travel/itinerary.md",
+            "- Pending objective: finish the packing checklist",
+        ]
+    )
+    history = [
+        {"role": "system", "content": marker_content},
+        {"role": "user", "content": "X" * 400},
+        {"role": "assistant", "content": "Y" * 400},
+        {"role": "user", "content": "Latest question"},
+        {"role": "assistant", "content": "Latest answer"},
+    ]
+
+    projected, report = _project_history_for_model(history)
+
+    assert report["compaction_boundary_applied"] is True
+    assert report["boundary_messages_preserved"] == 1
+    assert projected[0]["content"] == marker_content
+    assert "Active workspace file: travel/itinerary.md" in projected[0]["content"]
+    assert projected[-2:] == history[-2:]
+
+
+def test_project_history_recap_includes_messages_near_cut(monkeypatch):
+    from app.agent.core import _project_history_for_model
+
+    monkeypatch.setattr(settings, "agent_history_soft_token_limit", 40)
+    monkeypatch.setattr(settings, "agent_recent_messages_keep", 2)
+
+    history = []
+    for index in range(20):
+        history.append({"role": "user", "content": f"topic_marker_{index} " + "U" * 80})
+        history.append({"role": "assistant", "content": f"answer_marker_{index} " + "A" * 80})
+    history.append({"role": "user", "content": "Latest question"})
+    history.append({"role": "assistant", "content": "Latest answer"})
+
+    projected, report = _project_history_for_model(history)
+
+    assert report["compaction_boundary_applied"] is True
+    boundary = projected[0]["content"]
+    # Early framing context survives…
+    assert "topic_marker_0" in boundary
+    # …and so do the turns nearest the cut, not only the oldest ones.
+    assert "answer_marker_19" in boundary
+
+
+def test_project_history_keeps_tool_chain_on_same_side_of_cut(monkeypatch):
+    from app.agent.core import _project_history_for_model
+
+    monkeypatch.setattr(settings, "agent_history_soft_token_limit", 40)
+    monkeypatch.setattr(settings, "agent_recent_messages_keep", 2)
+    monkeypatch.setattr(settings, "agent_tool_result_max_chars", 4000)
+    monkeypatch.setattr(settings, "agent_tool_recent_keep", 4)
+
+    history = [
+        {"role": "user", "content": "X" * 400},
+        {"role": "assistant", "content": "Y" * 400},
+        {"role": "user", "content": "What are the headlines?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_news_1", "function": {"name": "list_recent_feed_items", "arguments": "{}"}},
+                {"id": "call_news_2", "function": {"name": "list_recent_feed_items", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_news_1", "content": "Story A; Story B"},
+        {"role": "tool", "tool_call_id": "call_news_2", "content": "Story C"},
+    ]
+
+    projected, report = _project_history_for_model(history)
+
+    assert report["compaction_boundary_applied"] is True
+    # The assistant tool-call message stays with its tool results in the suffix.
+    roles = [str(message.get("role")) for message in projected]
+    assert roles[-3:] == ["assistant", "tool", "tool"]
+    assert projected[-3].get("tool_calls")
+    sanitized, repaired = _sanitize_history_tool_chains(projected)
+    assert repaired == 0
+    assert sanitized[-3].get("tool_calls")
