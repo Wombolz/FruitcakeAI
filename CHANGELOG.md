@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.20
+
+- Extracted a shared compaction module for chat/runtime boundary formatting so persisted chat compaction and per-call runtime projection now use the same token estimation, recap selection, structured boundary payload, and renderer.
+- Added a versioned compaction-boundary payload with shared handling for recap, carried recap, continuity, and reserved tool-state fields while preserving compatibility with older persisted chat markers.
+- Kept chat continuity collection and runtime diagnostics/tool-compaction policy in their existing layers, reducing duplication without collapsing the separation between chat persistence and runtime projection.
+- Added focused shared-module coverage plus regression checks for schema versioning, legacy marker compatibility, and continued replay-safe chat compaction behavior.
+
 ## v0.7.19
 
 - Improved chat continuity for workspace and document follow-ups by grounding recent workspace artifact context into follow-up turns and steering those prompts away from unnecessary library re-search.
