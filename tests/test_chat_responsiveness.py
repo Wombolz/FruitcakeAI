@@ -440,3 +440,96 @@ async def test_load_history_compaction_keeps_tool_chain_with_results(monkeypatch
     # The cut snaps back so the assistant tool call stays with its tool result.
     assert history[-2]["tool_calls"][0]["id"] == "recent_1"
     assert history[-1]["tool_call_id"] == "recent_1"
+
+
+@pytest.mark.asyncio
+async def test_load_history_marker_metadata_includes_schema_version(monkeypatch):
+    monkeypatch.setattr("app.api.chat.settings.chat_history_soft_token_limit", 40)
+    monkeypatch.setattr("app.api.chat.settings.chat_recent_messages_keep", 2)
+
+    async with TestSessionLocal() as db:
+        session = ChatSession(user_id=1, title="Schema version test")
+        db.add(session)
+        await db.flush()
+        db.add_all(
+            [
+                ChatMessage(session_id=session.id, role="user", content="A" * 120),
+                ChatMessage(session_id=session.id, role="assistant", content="B" * 120),
+                ChatMessage(session_id=session.id, role="user", content="Latest question"),
+                ChatMessage(session_id=session.id, role="assistant", content="Latest answer"),
+            ]
+        )
+        await db.commit()
+
+        await _load_history(session.id, db)
+        await db.commit()
+
+        marker_rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == session.id, ChatMessage.role == "system")
+            )
+        ).scalars().all()
+
+    import json as _json
+
+    payload = _json.loads(marker_rows[0].tool_results or "{}")
+    assert payload["version"] == 1
+    assert payload["kind"] == "history_compaction"
+    assert payload["mode"] == "chat"
+    assert payload["tool_state"] == []
+
+
+@pytest.mark.asyncio
+async def test_load_history_recompaction_carries_forward_from_legacy_marker(monkeypatch):
+    monkeypatch.setattr("app.api.chat.settings.chat_history_soft_token_limit", 40)
+    monkeypatch.setattr("app.api.chat.settings.chat_recent_messages_keep", 2)
+
+    legacy_content = (
+        "Earlier chat history was compacted to keep the live context focused.\n"
+        "Use this as a compact recap unless newer turns contradict it:\n"
+        "- User: legacy_alpha_topic question\n"
+        "- Assistant: legacy_alpha_topic answer\n"
+        "Operational continuity:\n"
+        "- Active workspace file: old.md"
+    )
+
+    async with TestSessionLocal() as db:
+        session = ChatSession(user_id=1, title="Legacy marker test")
+        db.add(session)
+        await db.flush()
+        compacted = ChatMessage(session_id=session.id, role="user", content="old turn")
+        db.add(compacted)
+        await db.flush()
+        # Legacy marker: no version, no recap/carried_recap metadata.
+        db.add(
+            ChatMessage(
+                session_id=session.id,
+                role="system",
+                content=legacy_content,
+                tool_results=(
+                    '{"kind":"history_compaction","compacted_until_message_id":'
+                    + str(int(compacted.id))
+                    + ',"compacted_message_count":1,"estimated_tokens_before":120,'
+                    '"estimated_tokens_after":30,"recent_messages_kept":2}'
+                ),
+            )
+        )
+        db.add_all(
+            [
+                ChatMessage(session_id=session.id, role="user", content="bravo_topic " + "C" * 120),
+                ChatMessage(session_id=session.id, role="assistant", content="bravo_answer " + "D" * 120),
+                ChatMessage(session_id=session.id, role="user", content="Next question"),
+                ChatMessage(session_id=session.id, role="assistant", content="Next answer"),
+            ]
+        )
+        await db.commit()
+
+        history = await _load_history(session.id, db)
+        await db.commit()
+
+    boundary = history[0]["content"]
+    # Legacy recap lines are parsed out of the old marker content and carried.
+    assert "legacy_alpha_topic" in boundary
+    assert "Previously compacted" in boundary
+    assert "bravo_topic" in boundary

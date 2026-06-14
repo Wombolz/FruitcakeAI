@@ -46,15 +46,15 @@ TURN_LIMITS: Dict[str, int] = {
 }
 
 REPEATED_FAILED_SEARCH_TURN_THRESHOLD = 5
-ESTIMATED_CHARS_PER_TOKEN = 4
-
-# First lines of compaction boundary system messages. Runtime projection must
-# recognize and preserve these verbatim instead of re-summarizing them away.
-RUNTIME_COMPACTION_BOUNDARY_HEADER = "Earlier conversation was compacted to stay within the context budget."
-CHAT_COMPACTION_BOUNDARY_HEADER = "Earlier chat history was compacted to keep the live context focused."
-_COMPACTION_BOUNDARY_HEADERS = (
-    RUNTIME_COMPACTION_BOUNDARY_HEADER,
+from app.agent.compaction import (
     CHAT_COMPACTION_BOUNDARY_HEADER,
+    RUNTIME_COMPACTION_BOUNDARY_HEADER,
+    boundary_message as _shared_boundary_message,
+    build_boundary_payload,
+    compact_text as _compact_text,
+    estimate_history_tokens as _estimate_history_tokens,
+    is_compaction_boundary_text,
+    recap_summaries,
 )
 FAILED_SEARCH_PREFIXES = (
     "no results found for:",
@@ -408,31 +408,6 @@ def _content_fingerprint(value: str, *, length: int = 12) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[: max(1, length)]
 
 
-def _estimate_tokens(text: str) -> int:
-    chars = len(str(text or ""))
-    return max(1, chars // ESTIMATED_CHARS_PER_TOKEN) if chars else 0
-
-
-def _estimate_message_tokens(message: Dict[str, Any]) -> int:
-    total = _estimate_tokens(str(message.get("content") or ""))
-    tool_calls = message.get("tool_calls") or []
-    for call in tool_calls:
-        total += _estimate_tokens(_tool_call_name(call))
-        total += _estimate_tokens(str(_tool_call_arguments(call)))
-    return total
-
-
-def _estimate_history_tokens(history: List[Dict[str, Any]]) -> int:
-    return sum(_estimate_message_tokens(message) for message in history)
-
-
-def _compact_text(value: str, *, max_chars: int) -> str:
-    text = " ".join(str(value or "").split()).strip()
-    if len(text) <= max_chars:
-        return text
-    return text[: max(0, max_chars - 1)].rstrip() + "…"
-
-
 def _tool_name_lookup(history: List[Dict[str, Any]]) -> dict[str, str]:
     lookup: dict[str, str] = {}
     for message in history:
@@ -465,62 +440,10 @@ def _compact_tool_message(
     return {**message, "content": compacted}
 
 
-def _compact_message_summary(
-    message: Dict[str, Any],
-    *,
-    tool_name_lookup: dict[str, str],
-) -> str:
-    role = str(message.get("role") or "").strip() or "unknown"
-    if role == "tool":
-        tool_call_id = str(message.get("tool_call_id") or "").strip()
-        tool_name = tool_name_lookup.get(tool_call_id) or "unknown_tool"
-        content = _compact_text(str(message.get("content") or ""), max_chars=140)
-        return f"Tool {tool_name}: {content}"
-    if message.get("tool_calls"):
-        names = []
-        for call in message.get("tool_calls") or []:
-            names.append(_tool_call_name(call) or "unknown_tool")
-        return f"Assistant requested tools: {', '.join(names[:5])}"
-    content = _compact_text(str(message.get("content") or ""), max_chars=160)
-    return f"{role.capitalize()}: {content}"
-
-
 def _is_compaction_boundary_message(message: Dict[str, Any]) -> bool:
     if str(message.get("role") or "") != "system":
         return False
-    content = str(message.get("content") or "").lstrip()
-    return content.startswith(_COMPACTION_BOUNDARY_HEADERS)
-
-
-def _is_high_signal_recap_message(message: Dict[str, Any]) -> bool:
-    role = str(message.get("role") or "")
-    if role == "user":
-        return True
-    return role == "assistant" and not message.get("tool_calls")
-
-
-def _select_recap_messages(
-    prefix: List[Dict[str, Any]],
-    *,
-    head_count: int,
-    tail_count: int,
-) -> List[Dict[str, Any]]:
-    """Keep early framing turns plus the turns nearest the cut, preferring
-    user messages and assistant conclusions over tool chatter."""
-    if len(prefix) <= head_count + tail_count:
-        return list(prefix)
-    head = prefix[:head_count]
-    rest = prefix[head_count:]
-    selected = {
-        index
-        for index in [i for i, message in enumerate(rest) if _is_high_signal_recap_message(message)][-tail_count:]
-    }
-    for index in range(len(rest) - 1, -1, -1):
-        if len(selected) >= tail_count:
-            break
-        selected.add(index)
-    tail = [rest[index] for index in sorted(selected)]
-    return head + tail
+    return is_compaction_boundary_text(str(message.get("content") or ""))
 
 
 def _build_compaction_boundary_message(
@@ -528,21 +451,14 @@ def _build_compaction_boundary_message(
     *,
     tool_name_lookup: dict[str, str],
 ) -> Dict[str, Any]:
-    lines = [
-        RUNTIME_COMPACTION_BOUNDARY_HEADER,
-        "Preserve these compacted facts unless later context contradicts them:",
-    ]
-    summaries: list[str] = []
-    for message in _select_recap_messages(prefix, head_count=3, tail_count=7):
-        summary = _compact_message_summary(message, tool_name_lookup=tool_name_lookup)
-        if summary:
-            summaries.append(f"- {summary}")
-        if len(summaries) >= 10:
-            break
-    if not summaries:
-        summaries.append("- Earlier tool and assistant turns were compacted.")
-    lines.extend(summaries)
-    return {"role": "system", "content": "\n".join(lines)}
+    recap = recap_summaries(
+        prefix,
+        head_count=3,
+        tail_count=7,
+        max_lines=10,
+        tool_name_lookup=tool_name_lookup,
+    )
+    return _shared_boundary_message(build_boundary_payload(mode="runtime", recap=recap))
 
 
 def _snap_cut_to_tool_chain(history: List[Dict[str, Any]], cut_index: int) -> int:

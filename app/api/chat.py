@@ -41,8 +41,17 @@ from app.agent.chat_validation import (
     should_validate_chat_response,
     validate_chat_response,
 )
+from app.agent.compaction import (
+    COMPACTION_MARKER_KIND,
+    boundary_message as _shared_boundary_message,
+    build_boundary_payload,
+    condense_carried_recap as _condense_carried_recap,
+    estimate_message_tokens as _shared_estimate_message_tokens,
+    recap_lines_from_marker as _marker_recap_lines,
+    recap_summaries,
+    render_boundary_text,
+)
 from app.agent.core import (
-    CHAT_COMPACTION_BOUNDARY_HEADER,
     get_agent_runtime_history,
     get_task_handoff_payload,
     reset_agent_runtime_history,
@@ -74,8 +83,7 @@ from app.agent.tools import (
 log = structlog.get_logger(__name__)
 
 router = APIRouter()
-_CHAT_ESTIMATED_CHARS_PER_TOKEN = 4
-_CHAT_COMPACTION_MARKER_KIND = "history_compaction"
+_CHAT_COMPACTION_MARKER_KIND = COMPACTION_MARKER_KIND
 _WORKSPACE_FILE_TOOL_NAMES = {"read_file", "write_file", "append_file", "stat_file"}
 _WORKSPACE_CONTEXT_TOOL_NAMES = _WORKSPACE_FILE_TOOL_NAMES | {"find_files", "list_directory", "make_directory"}
 _WORKSPACE_EXPLICIT_HINTS = (
@@ -1717,16 +1725,7 @@ async def _get_session_or_404(
 
 
 def _estimate_chat_message_tokens(message: Dict[str, Any]) -> int:
-    total = max(1, len(str(message.get("content") or "")) // _CHAT_ESTIMATED_CHARS_PER_TOKEN) if message.get("content") else 0
-    tool_calls = message.get("tool_calls") or []
-    if isinstance(tool_calls, list):
-        for call in tool_calls:
-            if not isinstance(call, dict):
-                continue
-            function = call.get("function") or {}
-            total += max(1, len(str(function.get("name") or "")) // _CHAT_ESTIMATED_CHARS_PER_TOKEN) if function.get("name") else 0
-            total += max(1, len(str(function.get("arguments") or "")) // _CHAT_ESTIMATED_CHARS_PER_TOKEN) if function.get("arguments") else 0
-    return total
+    return _shared_estimate_message_tokens(message)
 
 
 def _decode_chat_json(raw: Any) -> Any:
@@ -2006,65 +2005,8 @@ def _estimate_chat_history_tokens(history: List[Dict[str, Any]]) -> int:
     return sum(_estimate_chat_message_tokens(message) for message in history)
 
 
-def _compact_chat_message_summary(message: Dict[str, Any]) -> str:
-    role = str(message.get("role") or "").strip() or "unknown"
-    content = " ".join(str(message.get("content") or "").split()).strip()
-    if len(content) > 160:
-        content = content[:159].rstrip() + "…"
-    if role == "assistant" and message.get("tool_calls"):
-        tool_names = []
-        for call in message.get("tool_calls") or []:
-            if not isinstance(call, dict):
-                continue
-            function = call.get("function") or {}
-            name = str(function.get("name") or "").strip()
-            if name:
-                tool_names.append(name)
-        if tool_names:
-            return f"Assistant requested tools: {', '.join(tool_names[:5])}"
-    return f"{role.capitalize()}: {content}" if content else f"{role.capitalize()}:"
-
-
-def _is_high_signal_chat_recap_message(message: Dict[str, Any]) -> bool:
-    role = str(message.get("role") or "")
-    if role == "user":
-        return True
-    return role == "assistant" and not message.get("tool_calls")
-
-
-def _select_chat_recap_messages(
-    prefix: List[Dict[str, Any]],
-    *,
-    head_count: int = 3,
-    tail_count: int = 9,
-) -> List[Dict[str, Any]]:
-    """Keep early framing turns plus the turns nearest the cut, preferring
-    user messages and assistant conclusions over tool chatter."""
-    if len(prefix) <= head_count + tail_count:
-        return list(prefix)
-    head = prefix[:head_count]
-    rest = prefix[head_count:]
-    selected = {
-        index
-        for index in [i for i, message in enumerate(rest) if _is_high_signal_chat_recap_message(message)][-tail_count:]
-    }
-    for index in range(len(rest) - 1, -1, -1):
-        if len(selected) >= tail_count:
-            break
-        selected.add(index)
-    tail = [rest[index] for index in sorted(selected)]
-    return head + tail
-
-
 def _chat_recap_summaries(prefix: List[Dict[str, Any]]) -> list[str]:
-    summaries: list[str] = []
-    for message in _select_chat_recap_messages(prefix):
-        summary = _compact_chat_message_summary(message)
-        if summary:
-            summaries.append(summary)
-        if len(summaries) >= 12:
-            break
-    return summaries
+    return recap_summaries(prefix, head_count=3, tail_count=9, max_lines=12)
 
 
 def _build_chat_compaction_boundary(
@@ -2073,41 +2015,13 @@ def _build_chat_compaction_boundary(
     continuity: Dict[str, Any] | None = None,
     carried_recap: List[str] | None = None,
 ) -> Dict[str, Any]:
-    lines = [
-        CHAT_COMPACTION_BOUNDARY_HEADER,
-        "Use this as a compact recap unless newer turns contradict it:",
-    ]
-    carried = [str(item).strip() for item in (carried_recap or []) if str(item).strip()]
-    if carried:
-        lines.append("Previously compacted (older context):")
-        lines.extend(f"- {item}" for item in carried)
-        lines.append("Recently compacted turns:")
-    summaries = [f"- {summary}" for summary in _chat_recap_summaries(prefix)]
-    if not summaries:
-        summaries.append("- Earlier user and assistant turns were compacted.")
-    lines.extend(summaries)
-    continuity = continuity or {}
-    continuity_lines: list[str] = []
-    active_workspace_file = str(continuity.get("active_workspace_file") or "").strip()
-    active_document = str(continuity.get("active_document") or "").strip()
-    pending_objective = str(continuity.get("pending_objective") or "").strip()
-    recent_actions = [
-        str(item).strip()
-        for item in (continuity.get("recent_actions") or [])
-        if str(item).strip()
-    ]
-    if active_workspace_file:
-        continuity_lines.append(f"- Active workspace file: {active_workspace_file}")
-    if active_document:
-        continuity_lines.append(f"- Active document target: {active_document}")
-    if pending_objective:
-        continuity_lines.append(f"- Pending objective: {pending_objective}")
-    if recent_actions:
-        continuity_lines.append(f"- Recent tool actions: {', '.join(recent_actions[:4])}")
-    if continuity_lines:
-        lines.append("Operational continuity:")
-        lines.extend(continuity_lines)
-    return {"role": "system", "content": "\n".join(lines)}
+    payload = build_boundary_payload(
+        mode="chat",
+        recap=_chat_recap_summaries(prefix),
+        carried_recap=carried_recap,
+        continuity=continuity,
+    )
+    return _shared_boundary_message(payload)
 
 
 def _chat_compaction_metadata(message: ChatMessage) -> Dict[str, Any] | None:
@@ -2170,29 +2084,6 @@ def _build_chat_continuity_metadata(prefix_messages: List[ChatMessage], *, user_
     }
 
 
-def _marker_recap_lines(payload: Dict[str, Any], content: str) -> list[str]:
-    """Recover the recap lines from an existing marker, preferring structured
-    metadata and falling back to parsing legacy marker content."""
-    recap = payload.get("recap")
-    if isinstance(recap, list) and recap:
-        return [str(item).strip() for item in recap if str(item).strip()]
-    lines: list[str] = []
-    for line in str(content or "").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Operational continuity:"):
-            break
-        if stripped.startswith("- "):
-            lines.append(stripped[2:].strip())
-    return [line for line in lines if line]
-
-
-def _condense_carried_recap(lines: List[str], *, max_lines: int = 6) -> list[str]:
-    cleaned = [str(line).strip() for line in lines if str(line).strip()]
-    if len(cleaned) <= max_lines:
-        return cleaned
-    return cleaned[:2] + cleaned[-(max_lines - 2):]
-
-
 async def _persist_chat_compaction_marker(
     session_id: int,
     *,
@@ -2230,34 +2121,32 @@ async def _persist_chat_compaction_marker(
 
     prefix_payloads = [_history_message_from_chat_message(message) for message in prefix_messages]
     continuity = _build_chat_continuity_metadata(continuity_messages or prefix_messages, user_id=user_id)
-    boundary = _build_chat_compaction_boundary(
-        prefix_payloads,
-        continuity=continuity,
+    boundary_payload = build_boundary_payload(
+        mode="chat",
+        recap=_chat_recap_summaries(prefix_payloads),
         carried_recap=carried_recap,
+        continuity=continuity,
     )
-    compacted_until_message_id = int(prefix_messages[-1].id)
+    boundary_content = render_boundary_text(boundary_payload)
     metadata = {
-        "kind": _CHAT_COMPACTION_MARKER_KIND,
-        "compacted_until_message_id": compacted_until_message_id,
+        **boundary_payload,
+        "compacted_until_message_id": int(prefix_messages[-1].id),
         "compacted_message_count": len(prefix_messages),
         "estimated_tokens_before": estimated_tokens_before,
         "estimated_tokens_after": estimated_tokens_after,
         "recent_messages_kept": recent_messages_kept,
-        "continuity": continuity,
-        "recap": _chat_recap_summaries(prefix_payloads),
-        "carried_recap": carried_recap,
     }
 
     if marker is None:
         marker = ChatMessage(
             session_id=session_id,
             role="system",
-            content=boundary["content"],
+            content=boundary_content,
             tool_results=json.dumps(metadata, ensure_ascii=True, sort_keys=True),
         )
         db.add(marker)
     else:
-        marker.content = boundary["content"]
+        marker.content = boundary_content
         marker.tool_results = json.dumps(metadata, ensure_ascii=True, sort_keys=True)
     for stale in stale_rows:
         await db.delete(stale)
