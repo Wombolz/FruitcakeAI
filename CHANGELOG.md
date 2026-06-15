@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.21
+
+- Fixed approval-gated file mutation resume behavior so blocked `append_file` and `write_file` steps can replay the exact persisted tool call after approval instead of restarting the step and losing the pending mutation.
+- Preserved structured blocked-tool approval payloads across the waiting-approval boundary, improving deterministic task resume semantics and making replay/resume state clearer in run diagnostics.
+- Normalized workspace path handling for bare `workspace/...` prefixes so configured executors and workspace filesystem writes no longer produce duplicated `workspace/workspace/...` paths.
+- Added focused regression coverage for approval replay, workspace-path normalization, and additive approval payload expectations while capturing stale unrelated test drift for later cleanup.
+
 ## v0.7.20
 
 - Extracted a shared compaction module for chat/runtime boundary formatting so persisted chat compaction and per-call runtime projection now use the same token estimation, recap selection, structured boundary payload, and renderer.
