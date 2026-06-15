@@ -432,6 +432,147 @@ async def test_runner_resumes_waiting_approval_run_instead_of_skipping(client):
 
 
 @pytest.mark.asyncio
+async def test_approved_append_file_replays_exact_waiting_tool_call_and_advances_step(client, tmp_path, monkeypatch):
+    from app.autonomy.runner import TaskRunner
+    from app.mcp.servers.filesystem import _append_file as filesystem_append_file
+
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    headers = await _headers(client, "approvalappendresumeowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Approval append resume",
+            "instruction": "Append updates after approval",
+            "task_type": "one_shot",
+            "deliver": False,
+            "requires_approval": True,
+        },
+        headers=headers,
+    )
+    task_id = created.json()["id"]
+
+    waiting_payload = {
+        "payload_type": "blocked_tool_call",
+        "resume_action": "replay_tool_call",
+        "tool_name": "append_file",
+        "arguments": {
+            "path": "reports/approval_resume.md",
+            "content": "new line\n",
+        },
+    }
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.status = "waiting_approval"
+        task.current_step_index = 1
+        task.pre_approved = False
+        task.has_plan = True
+        waiting_run = TaskRun(
+            task_id=task_id,
+            status="waiting_approval",
+            error="append_file: Appending to a workspace file changes persisted user workspace data.",
+            waiting_approval_kind="tool",
+        )
+        waiting_run.waiting_approval_payload = dict(waiting_payload)
+        db.add(waiting_run)
+        waiting_step = TaskStep(
+            task_id=task_id,
+            step_index=1,
+            title="Append update",
+            instruction="Append the prepared content to the report file.",
+            requires_approval=False,
+            status="waiting_approval",
+            waiting_approval_tool="append_file",
+            waiting_approval_kind="tool",
+        )
+        waiting_step.waiting_approval_payload = dict(waiting_payload)
+        db.add(waiting_step)
+        db.add(
+            TaskStep(
+                task_id=task_id,
+                step_index=2,
+                title="Confirm outcome",
+                instruction="Confirm the append succeeded.",
+                requires_approval=False,
+                status="pending",
+            )
+        )
+        report_path = tmp_path / str(task.user_id) / "reports" / "approval_resume.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("existing\n", encoding="utf-8")
+        await db.commit()
+        waiting_run_id = waiting_run.id
+
+    runner_stub = type("RunnerStub", (), {"execute": AsyncMock(return_value=None)})()
+    with patch("app.autonomy.runner.get_task_runner", return_value=runner_stub):
+        approved = await client.patch(
+            f"/tasks/{task_id}",
+            json={"approved": True},
+            headers=headers,
+        )
+
+    assert approved.status_code == 200
+    runner_stub.execute.assert_awaited_once()
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        step = (
+            await db.execute(
+                select(TaskStep).where(TaskStep.task_id == task_id, TaskStep.step_index == 1)
+            )
+        ).scalar_one()
+        run = await db.get(TaskRun, waiting_run_id)
+        assert task is not None
+        assert task.status == "pending"
+        assert task.pre_approved is True
+        assert step.waiting_approval_payload["tool_name"] == "append_file"
+        assert step.waiting_approval_payload["arguments"]["path"] == "reports/approval_resume.md"
+        assert run is not None
+        assert run.waiting_approval_payload["arguments"]["content"] == "new line\n"
+
+    original_call_tool = agent_tools._call_tool
+
+    async def _patched_call_tool(name, arguments, user_context):
+        if name == "append_file":
+            return filesystem_append_file(arguments, user_context)
+        return await original_call_tool(name, arguments, user_context)
+
+    runner = TaskRunner()
+    with patch("app.agent.core.run_agent", new=AsyncMock(return_value="append confirmed")):
+        with patch("app.agent.tools._call_tool", new=AsyncMock(side_effect=_patched_call_tool)):
+            with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+                await runner.execute(type("TaskRef", (), {"id": task_id, "next_run_at": None})())
+
+    assert report_path.read_text(encoding="utf-8") == "existing\nnew line\n"
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        run = await db.get(TaskRun, waiting_run_id)
+        step1 = (
+            await db.execute(
+                select(TaskStep).where(TaskStep.task_id == task_id, TaskStep.step_index == 1)
+            )
+        ).scalar_one()
+        step2 = (
+            await db.execute(
+                select(TaskStep).where(TaskStep.task_id == task_id, TaskStep.step_index == 2)
+            )
+        ).scalar_one()
+        assert task is not None
+        assert task.status == "completed"
+        assert task.pre_approved is False
+        assert step1.status == "succeeded"
+        assert "Appended" in (step1.output_summary or "")
+        assert step1.waiting_approval_payload is None
+        assert step2.status == "succeeded"
+        assert run is not None
+        assert run.status == "completed"
+        assert run.error is None
+        assert run.waiting_approval_payload is None
+
+
+@pytest.mark.asyncio
 async def test_task_detail_exposes_markdown_result_sections_from_final_output_artifact(client):
     headers = await _headers(client, "resultsectionsowner")
     task_resp = await client.post(

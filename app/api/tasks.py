@@ -505,13 +505,6 @@ async def update_task(
             task.status = "pending"
             task.next_run_at = datetime.now(timezone.utc)
             task.pre_approved = True
-            if step is not None:
-                step.waiting_approval_tool = None
-                step.waiting_approval_kind = None
-                step.waiting_approval_payload = None
-            if latest_run is not None:
-                latest_run.waiting_approval_kind = None
-                latest_run.waiting_approval_payload = None
             await db.commit()
             try:
                 from app.autonomy.runner import get_task_runner

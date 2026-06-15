@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 import structlog
 
 from app.agent.context import UserContext
-from app.autonomy.approval import ApprovalRequired
+from app.autonomy.approval import ApprovalRequired, build_blocked_tool_approval_payload
 
 log = structlog.get_logger(__name__)
 
@@ -772,32 +772,7 @@ async def dispatch_tool_calls(
         except json.JSONDecodeError:
             arguments = {}
 
-        log.info("Tool call", tool=tool_name, args=arguments, user_id=user_context.user_id)
-
-        try:
-            result_content = await _call_tool(tool_name, arguments, user_context)
-        except ApprovalRequired:
-            # Let the TaskRunner handle approval gating; do not downgrade this
-            # to a tool error string or append a tool result message.
-            raise
-        except Exception as e:
-            log.error("Tool call failed", tool=tool_name, error=str(e))
-            result_content = f"Tool {tool_name} failed: {e}"
-
-        # Audit log — fire and forget, never blocks the agent loop
-        asyncio.create_task(
-            _write_audit_log(
-                user_id=user_context.user_id,
-                session_id=user_context.session_id,
-                tool_name=tool_name,
-                arguments=arguments,
-                result_summary=str(result_content)[:500],
-            )
-        )
-
-        records = list(_tool_execution_records.get())
-        records.append({"tool": tool_name, "arguments": arguments, "result_summary": str(result_content)})
-        _tool_execution_records.set(records)
+        result_content = await _execute_tool_call(tool_name, arguments, user_context)
 
         results.append(
             {
@@ -808,6 +783,52 @@ async def dispatch_tool_calls(
         )
 
     return results
+
+
+async def replay_waiting_approval_tool(
+    payload: Dict[str, Any],
+    user_context: UserContext,
+) -> tuple[str, Dict[str, Any]]:
+    tool_name = str(payload.get("tool_name") or "").strip()
+    arguments = payload.get("arguments")
+    if not tool_name:
+        raise ValueError("Waiting approval payload is missing tool_name")
+    if not isinstance(arguments, dict):
+        raise ValueError("Waiting approval payload is missing tool arguments")
+    result_content = await _execute_tool_call(tool_name, arguments, user_context)
+    return result_content, {"tool_name": tool_name, "arguments": arguments}
+
+
+async def _execute_tool_call(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    user_context: UserContext,
+) -> str:
+    log.info("Tool call", tool=tool_name, args=arguments, user_id=user_context.user_id)
+
+    try:
+        result_content = await _call_tool(tool_name, arguments, user_context)
+    except ApprovalRequired:
+        raise
+    except Exception as e:
+        log.error("Tool call failed", tool=tool_name, error=str(e))
+        result_content = f"Tool {tool_name} failed: {e}"
+
+    # Audit log — fire and forget, never blocks the agent loop
+    asyncio.create_task(
+        _write_audit_log(
+            user_id=user_context.user_id,
+            session_id=user_context.session_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            result_summary=str(result_content)[:500],
+        )
+    )
+
+    records = list(_tool_execution_records.get())
+    records.append({"tool": tool_name, "arguments": arguments, "result_summary": str(result_content)})
+    _tool_execution_records.set(records)
+    return result_content
 
 
 async def _write_audit_log(
@@ -846,7 +867,16 @@ async def _call_tool(
     if _approval_armed.get():
         approval_requirement = approval_requirement_for_tool(name, arguments)
         if approval_requirement is not None:
-            raise ApprovalRequired(approval_requirement.tool_name, approval_requirement.reason)
+            raise ApprovalRequired(
+                approval_requirement.tool_name,
+                approval_requirement.reason,
+                approval_kind=approval_requirement.approval_kind,
+                payload=build_blocked_tool_approval_payload(
+                    approval_requirement.tool_name,
+                    arguments,
+                    payload=approval_requirement.payload,
+                ),
+            )
 
     if name == "create_memory":
         return await _create_memory(arguments, user_context)

@@ -231,8 +231,10 @@ def _strip_workspace_prefix(candidate_raw: str, workspace_root: Path) -> str:
         return text
     parts = [part for part in text.split("/") if part not in {"", "."}]
     root_parts = [part for part in workspace_root.parts if part not in {"", "."}]
-    if len(parts) >= 2 and parts[0].lower() == "workspace" and parts[1] == root_parts[-1]:
-        return "/".join(parts[2:])
+    if parts and parts[0].lower() == "workspace":
+        if len(parts) >= 2 and parts[1] == root_parts[-1]:
+            return "/".join(parts[2:])
+        return "/".join(parts[1:])
     return text
 
 

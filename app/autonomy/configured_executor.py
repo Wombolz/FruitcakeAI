@@ -826,6 +826,12 @@ def _normalize_workspace_path(value: Any) -> str:
     path = str(value or "").strip().replace("\\", "/")
     path = re.sub(r"^(?:at\s+)+", "", path, flags=re.IGNORECASE)
     path = path.lstrip("/")
+    parts = [part for part in path.split("/") if part not in {"", "."}]
+    if parts and parts[0].lower() == "workspace":
+        if len(parts) >= 2 and parts[1].isdigit():
+            path = "/".join(parts[2:])
+        else:
+            path = "/".join(parts[1:])
     if ".." in path.split("/"):
         return ""
     return path
