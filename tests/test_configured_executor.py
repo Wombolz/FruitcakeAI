@@ -78,7 +78,7 @@ def test_infer_configured_executor_for_daily_research_briefing_with_spaced_path_
     assert inferred.executor_config["kind"] == "configured_executor"
     assert inferred.executor_config["input"]["topic"] == "NASA & Artemis II"
     assert inferred.executor_config["input"]["window_hours"] == 24
-    assert inferred.executor_config["persistence"]["path"] == "workspace/NASA Artemis Mission/daily-summary-YYYY-MM-DD.md"
+    assert inferred.executor_config["persistence"]["path"] == "NASA Artemis Mission/daily-summary-YYYY-MM-DD.md"
 
 
 def test_infer_configured_executor_for_daily_analysis_with_mention_language():
@@ -96,7 +96,7 @@ def test_infer_configured_executor_for_daily_analysis_with_mention_language():
     assert inferred.profile is None
     assert inferred.executor_config["kind"] == "configured_executor"
     assert inferred.executor_config["input"]["topic"] == "Trump"
-    assert inferred.executor_config["persistence"]["path"] == "workspace/Politics/Trump/Trump_summary.md"
+    assert inferred.executor_config["persistence"]["path"] == "Politics/Trump/Trump_summary.md"
 
 
 def test_infer_configured_executor_for_briefing_title_with_daily_suffix():
@@ -112,7 +112,24 @@ def test_infer_configured_executor_for_briefing_title_with_daily_suffix():
 
     assert inferred.executor_config["kind"] == "configured_executor"
     assert inferred.executor_config["input"]["topic"] == "US Politics"
-    assert inferred.executor_config["persistence"]["path"] == "workspace/politics/US Politics.md"
+    assert inferred.executor_config["persistence"]["path"] == "politics/US Politics.md"
+
+
+def test_infer_configured_executor_strips_bare_workspace_prefix_from_report_path():
+    inferred = infer_configured_executor(
+        title="Daily Anthropic Fable Briefing",
+        instruction=(
+            "Search my RSS feeds for news on Anthropic Fable regulation by the US government. "
+            "Append any updates to workspace/reports/Anthropic Fable.md each time you run."
+        ),
+        task_type="recurring",
+        requested_profile=None,
+    )
+
+    assert inferred.profile is None
+    assert inferred.executor_config["kind"] == "configured_executor"
+    assert inferred.executor_config["input"]["topic"] == "Anthropic Fable"
+    assert inferred.executor_config["persistence"]["path"] == "reports/Anthropic Fable.md"
 
 
 @pytest.mark.asyncio

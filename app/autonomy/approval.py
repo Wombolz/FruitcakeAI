@@ -8,6 +8,7 @@ concurrent tasks never interfere with each other's approval state.
 
 from contextvars import ContextVar
 from dataclasses import dataclass
+import json
 from typing import Any, Mapping
 
 
@@ -124,12 +125,44 @@ def approval_requirement_for_tool(
     return None
 
 
+def build_blocked_tool_approval_payload(
+    tool_name: str,
+    arguments: Mapping[str, Any] | None = None,
+    *,
+    payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_args = _normalize_approval_arguments(arguments)
+    merged = dict(payload or {})
+    merged.setdefault("payload_type", "blocked_tool_call")
+    merged.setdefault("resume_action", "replay_tool_call")
+    merged["tool_name"] = str(tool_name or "").strip()
+    merged["arguments"] = normalized_args
+    return merged
+
+
 def _coerce_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def _normalize_approval_arguments(arguments: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(arguments, Mapping):
+        return {}
+    try:
+        return json.loads(json.dumps(dict(arguments)))
+    except (TypeError, ValueError):
+        out: dict[str, Any] = {}
+        for key, value in dict(arguments).items():
+            try:
+                json.dumps(value)
+            except (TypeError, ValueError):
+                out[str(key)] = str(value)
+            else:
+                out[str(key)] = value
+        return out
 
 
 # ContextVar: set to True by TaskRunner before calling run_agent() when

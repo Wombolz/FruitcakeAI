@@ -1473,6 +1473,10 @@ async def test_call_tool_requires_approval_for_memory_mutation():
     assert str(exc_info.value) == "create_memory"
     assert exc_info.value.tool_name == "create_memory"
     assert "persisted user memory" in exc_info.value.reason
+    assert exc_info.value.payload["payload_type"] == "blocked_tool_call"
+    assert exc_info.value.payload["resume_action"] == "replay_tool_call"
+    assert exc_info.value.payload["tool_name"] == "create_memory"
+    assert exc_info.value.payload["arguments"]["content"] == "The user prefers early reminders."
 
 
 @pytest.mark.asyncio
@@ -1508,6 +1512,8 @@ async def test_call_tool_requires_approval_only_when_market_data_saves_to_librar
 
     assert exc_info.value.tool_name == "get_daily_market_data"
     assert "persisted user documents" in exc_info.value.reason
+    assert exc_info.value.payload["tool_name"] == "get_daily_market_data"
+    assert exc_info.value.payload["arguments"]["save_to_library"] is True
 
 
 @pytest.mark.asyncio

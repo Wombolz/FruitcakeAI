@@ -38,6 +38,7 @@ from app.metrics import metrics
 from app.task_service import compute_next_run_at
 from app.agent.tools import (
     get_tool_execution_records,
+    replay_waiting_approval_tool,
     reset_tool_execution_records,
     restore_tool_execution_records,
 )
@@ -110,6 +111,39 @@ def _truncate_text_to_estimated_tokens(text: str, *, max_tokens: int) -> str:
     while truncated and _estimate_text_tokens(truncated) > budget:
         truncated = truncated[:-1]
     return truncated.rstrip() + "…"
+
+
+def _enrich_waiting_approval_payload(
+    payload: object,
+    *,
+    task_run_id: int | None,
+    step_index: int | None = None,
+    step_title: str | None = None,
+) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    enriched = dict(payload)
+    if task_run_id is not None:
+        enriched.setdefault("task_run_id", int(task_run_id))
+    if step_index is not None:
+        enriched.setdefault("step_index", int(step_index))
+    if step_title:
+        enriched.setdefault("step_title", str(step_title))
+    return enriched
+
+
+def _replayable_waiting_tool_payload(payload: object) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("payload_type") or "").strip() != "blocked_tool_call":
+        return None
+    if str(payload.get("resume_action") or "").strip() != "replay_tool_call":
+        return None
+    tool_name = str(payload.get("tool_name") or "").strip()
+    arguments = payload.get("arguments")
+    if not tool_name or not isinstance(arguments, dict):
+        return None
+    return dict(payload)
 
 
 class TaskRunner:
@@ -265,8 +299,6 @@ class TaskRunner:
                         active_run.status = "running"
                         active_run.finished_at = None
                         active_run.error = None
-                        active_run.waiting_approval_kind = None
-                        active_run.waiting_approval_payload = None
                         if resolved_run_kind == "agent":
                             active_run.run_kind = "agent"
                             active_run.agent_role = resolved_agent_role
@@ -331,6 +363,8 @@ class TaskRunner:
                         run.status = "completed"
                         run.finished_at = datetime.now(timezone.utc)
                         run.error = None
+                        run.waiting_approval_kind = None
+                        run.waiting_approval_payload = None
                         diagnostics = _format_run_diagnostics(run_debug)
                         if recurring_snapshot:
                             merged = f"{(result or '').strip()}\n\n{recurring_snapshot}".strip()
@@ -392,10 +426,16 @@ class TaskRunner:
                     )
                     step = rows.scalar_one_or_none()
                     if step is not None:
+                        waiting_payload = _enrich_waiting_approval_payload(
+                            getattr(exc, "payload", None),
+                            task_run_id=task_run_id,
+                            step_index=step.step_index,
+                            step_title=step.title,
+                        )
                         step.status = "waiting_approval"
                         step.waiting_approval_tool = str(exc)
                         step.waiting_approval_kind = str(getattr(exc, "approval_kind", "") or "tool")
-                        step.waiting_approval_payload = getattr(exc, "payload", None)
+                        step.waiting_approval_payload = waiting_payload
                 if task_run_id:
                     run = await db.get(TaskRun, task_run_id)
                     if run is not None:
@@ -403,7 +443,12 @@ class TaskRunner:
                         run.finished_at = datetime.now(timezone.utc)
                         run.error = f"{exc.tool_name}: {exc.reason}"
                         run.waiting_approval_kind = str(getattr(exc, "approval_kind", "") or "tool")
-                        run.waiting_approval_payload = getattr(exc, "payload", None)
+                        run.waiting_approval_payload = _enrich_waiting_approval_payload(
+                            getattr(exc, "payload", None),
+                            task_run_id=task_run_id,
+                            step_index=getattr(step, "step_index", None) if 'step' in locals() else None,
+                            step_title=getattr(step, "title", None) if 'step' in locals() else None,
+                        )
                 await db.commit()
             log.info(
                 "task.waiting_approval",
@@ -856,16 +901,26 @@ class TaskRunner:
             if step.step_index < start_index or step.status == "succeeded":
                 continue
 
+            replay_payload: dict[str, object] | None = None
             # Mark running and clear stale error state.
             async with AsyncSessionLocal() as db:
                 task = await db.get(Task, task_id)
                 step_row = await db.get(TaskStep, step.id)
+                run = await db.get(TaskRun, task_run_id) if task_run_id else None
+                if pre_approved:
+                    replay_payload = _replayable_waiting_tool_payload(step_row.waiting_approval_payload)
+                    if replay_payload is None and run is not None:
+                        replay_payload = _replayable_waiting_tool_payload(run.waiting_approval_payload)
                 task.current_step_index = step_row.step_index
                 step_row.status = "running"
                 step_row.error = None
-                step_row.waiting_approval_tool = None
-                step_row.waiting_approval_kind = None
-                step_row.waiting_approval_payload = None
+                if replay_payload is None:
+                    step_row.waiting_approval_tool = None
+                    step_row.waiting_approval_kind = None
+                    step_row.waiting_approval_payload = None
+                    if run is not None:
+                        run.waiting_approval_kind = None
+                        run.waiting_approval_payload = None
                 await db.commit()
 
             async with AsyncSessionLocal() as db:
@@ -893,6 +948,83 @@ class TaskRunner:
                 active_skills.update(step_context.active_skill_slugs or [])
                 run_debug["active_skills"] = sorted(active_skills)
                 run_debug["skill_selection_mode"] = step_context.skill_selection_mode or run_debug.get("skill_selection_mode") or ""
+
+            if replay_payload is not None:
+                try:
+                    replay_result, replay_details = await replay_waiting_approval_tool(
+                        replay_payload,
+                        step_context,
+                    )
+                except ApprovalRequired as exc:
+                    waiting_payload = _enrich_waiting_approval_payload(
+                        getattr(exc, "payload", None),
+                        task_run_id=task_run_id,
+                        step_index=step.step_index,
+                        step_title=step.title,
+                    )
+                    async with AsyncSessionLocal() as db:
+                        task = await db.get(Task, task_id)
+                        step_row = await db.get(TaskStep, step.id)
+                        run = await db.get(TaskRun, task_run_id) if task_run_id else None
+                        task.status = "waiting_approval"
+                        task.current_step_index = step_row.step_index
+                        step_row.status = "waiting_approval"
+                        step_row.waiting_approval_tool = str(exc)
+                        step_row.waiting_approval_kind = str(getattr(exc, "approval_kind", "") or "tool")
+                        step_row.waiting_approval_payload = waiting_payload
+                        if run is not None:
+                            run.status = "waiting_approval"
+                            run.finished_at = datetime.now(timezone.utc)
+                            run.error = f"{exc.tool_name}: {exc.reason}"
+                            run.waiting_approval_kind = str(getattr(exc, "approval_kind", "") or "tool")
+                            run.waiting_approval_payload = waiting_payload
+                        await db.commit()
+                    raise
+                except Exception as exc:
+                    async with AsyncSessionLocal() as db:
+                        task = await db.get(Task, task_id)
+                        step_row = await db.get(TaskStep, step.id)
+                        run = await db.get(TaskRun, task_run_id) if task_run_id else None
+                        task.status = "failed"
+                        step_row.status = "failed"
+                        step_row.error = str(exc)
+                        if run is not None:
+                            run.status = "failed"
+                            run.finished_at = datetime.now(timezone.utc)
+                            run.error = str(exc)
+                        await db.commit()
+                    raise
+                else:
+                    approval_resume_events = run_debug.setdefault("approval_resume_events", [])
+                    if isinstance(approval_resume_events, list):
+                        approval_resume_events.append(
+                            {
+                                "step_index": step.step_index,
+                                "step_title": step.title,
+                                "tool_name": replay_details.get("tool_name"),
+                                "path": (replay_details.get("arguments") or {}).get("path"),
+                                "resumed_from_waiting_approval": True,
+                            }
+                        )
+                    summary = replay_result[:240] if replay_result else ""
+                    final_result = replay_result
+                    async with AsyncSessionLocal() as db:
+                        task = await db.get(Task, task_id)
+                        step_row = await db.get(TaskStep, step.id)
+                        run = await db.get(TaskRun, task_run_id) if task_run_id else None
+                        step_row.status = "succeeded"
+                        step_row.result = replay_result
+                        step_row.output_summary = summary
+                        step_row.waiting_approval_tool = None
+                        step_row.waiting_approval_kind = None
+                        step_row.waiting_approval_payload = None
+                        task.current_step_index = step.step_index + 1
+                        if run is not None:
+                            run.waiting_approval_kind = None
+                            run.waiting_approval_payload = None
+                            run.error = None
+                        await db.commit()
+                    continue
 
             # Summaries from previous succeeded steps keep context compact.
             prior_summaries: list[str] = []
@@ -1025,15 +1157,24 @@ class TaskRunner:
                     task = await db.get(Task, task_id)
                     step_row = await db.get(TaskStep, step.id)
                     run = await db.get(TaskRun, task_run_id) if task_run_id else None
+                    waiting_payload = _enrich_waiting_approval_payload(
+                        getattr(exc, "payload", None),
+                        task_run_id=task_run_id,
+                        step_index=step.step_index,
+                        step_title=step.title,
+                    )
                     task.status = "waiting_approval"
                     task.current_step_index = step_row.step_index
                     step_row.status = "waiting_approval"
                     step_row.waiting_approval_tool = str(exc)
                     step_row.waiting_approval_kind = str(getattr(exc, "approval_kind", "") or "tool")
-                    step_row.waiting_approval_payload = getattr(exc, "payload", None)
+                    step_row.waiting_approval_payload = waiting_payload
                     if run is not None:
+                        run.status = "waiting_approval"
+                        run.finished_at = datetime.now(timezone.utc)
+                        run.error = f"{exc.tool_name}: {exc.reason}"
                         run.waiting_approval_kind = str(getattr(exc, "approval_kind", "") or "tool")
-                        run.waiting_approval_payload = getattr(exc, "payload", None)
+                        run.waiting_approval_payload = waiting_payload
                     await db.commit()
                 raise
             except Exception as exc:
@@ -1606,6 +1747,17 @@ def _format_run_diagnostics(run_debug: dict[str, object]) -> str:
             f"max_estimated_tokens_before={max_before}, "
             f"max_estimated_tokens_after={max_after}"
         )
+    approval_resume_events = run_debug.get("approval_resume_events") or []
+    if isinstance(approval_resume_events, list) and approval_resume_events:
+        lines.append(f"- Approval resumes: {len(approval_resume_events)}")
+        for item in approval_resume_events[:5]:
+            if isinstance(item, dict):
+                lines.append(
+                    "  - "
+                    f"step={item.get('step_index', '?')} "
+                    f"tool={item.get('tool_name', 'unknown')} "
+                    f"path={item.get('path') or '(none)'}"
+                )
     if len(lines) == 1:
         return ""
     return "\n".join(lines)
