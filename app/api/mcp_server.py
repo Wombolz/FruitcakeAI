@@ -1296,7 +1296,7 @@ async def initialize(
             "capabilities": {"tools": {}},
             "serverInfo": {
                 "name": "FruitcakeAI MCP",
-                "version": "0.7.21",
+                "version": "0.7.22",
                 "user": current_user.username,
             },
         },

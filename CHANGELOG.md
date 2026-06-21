@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.22
+
+- Stabilized local `ollama` / `ollama_chat` chat turns by skipping the second final-stream pass for local models and streaming the already-probed final text directly.
+- Added a bounded fallback for known Ollama tool-call JSON parse failures so affected local chat turns retry as context-only answers instead of crashing the session.
+- Introduced narrow `qwen3.6` chat guardrails for risky workspace and library follow-up prompts, preserving safer local chat paths while reducing known malformed tool-call cases.
+- Added structured diagnostics plus focused streaming regressions for local tool-call failures so the temporary containment fix is observable while the deeper Ollama/LiteLLM tool-calling issue remains queued for follow-up.
+
 ## v0.7.21
 
 - Fixed approval-gated file mutation resume behavior so blocked `append_file` and `write_file` steps can replay the exact persisted tool call after approval instead of restarting the step and losing the pending mutation.
