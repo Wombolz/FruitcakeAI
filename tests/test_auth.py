@@ -5,6 +5,7 @@ Uses an in-memory SQLite database so no real postgres is needed.
 
 import asyncio
 import contextlib
+import json
 from types import SimpleNamespace
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -674,7 +675,7 @@ async def test_get_session_history_includes_message_timestamps(client):
     with patch("app.api.chat.run_agent", new_callable=AsyncMock, return_value="ok"):
         sent = await client.post(
             f"/chat/sessions/{session_id}/messages",
-            json={"content": "hello"},
+            json={"content": "hello history timestamp check"},
             headers=headers,
         )
     assert sent.status_code == 200
@@ -684,6 +685,314 @@ async def test_get_session_history_includes_message_timestamps(client):
     messages = history.json()["messages"]
     assert len(messages) >= 2
     assert all("created_at" in msg for msg in messages)
+
+
+@pytest.mark.asyncio
+async def test_chat_history_persists_assistant_task_draft_metadata(client):
+    await client.post("/auth/register", json={
+        "username": "draftpersistuser",
+        "email": "draftpersist@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "draftpersistuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Draft Metadata"}, headers=headers)
+    session_id = create.json()["id"]
+    draft_payload = {
+        "proposed": True,
+        "title": "Review Fed rate-cut timeline",
+        "instruction": "Compare September cut odds against the forward curve before Friday's open.",
+        "persona": "family_assistant",
+        "profile": None,
+        "task_type": "one_shot",
+        "schedule": None,
+        "deliver": True,
+        "requires_approval": True,
+        "task_recipe": None,
+    }
+
+    with (
+        patch("app.api.chat._execute_chat_turn", new_callable=AsyncMock, return_value="Prepared task draft"),
+        patch("app.api.chat.get_task_handoff_payload", return_value={"task_draft": draft_payload}),
+        patch(
+            "app.api.chat.get_tool_execution_records",
+            return_value=[{"tool": "propose_task_draft", "arguments": {}, "result_summary": "ok"}],
+        ),
+    ):
+        sent = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "Make a task to review the rate-cut timeline before Friday and compare it with the forward curve."},
+            headers=headers,
+        )
+
+    assert sent.status_code == 200
+    assert isinstance(sent.json()["message_id"], int)
+    metadata = sent.json()["metadata"]
+    assert metadata["task_draft"]["title"] == "Review Fed rate-cut timeline"
+    assert metadata["task_draft_status"] == "draft"
+    assert metadata["tool_calls"] == ["propose_task_draft"]
+
+    history = await client.get(f"/chat/sessions/{session_id}", headers=headers)
+    assert history.status_code == 200
+    assistant = [msg for msg in history.json()["messages"] if msg["role"] == "assistant"][-1]
+    assert assistant["metadata"]["task_draft"]["title"] == "Review Fed rate-cut timeline"
+    assert assistant["metadata"]["task_draft_status"] == "draft"
+    assert assistant["metadata"]["tool_calls"] == ["propose_task_draft"]
+
+
+@pytest.mark.asyncio
+async def test_accept_task_draft_creates_task_once_and_updates_message_metadata(client):
+    await client.post("/auth/register", json={
+        "username": "draftacceptuser",
+        "email": "draftaccept@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "draftacceptuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Accept Draft"}, headers=headers)
+    session_id = create.json()["id"]
+    draft_payload = {
+        "proposed": True,
+        "title": "Review Fed rate-cut timeline",
+        "instruction": "Compare September cut odds against the forward curve before Friday's open.",
+        "persona": "family_assistant",
+        "profile": None,
+        "llm_model_override": None,
+        "task_type": "one_shot",
+        "schedule": None,
+        "deliver": True,
+        "requires_approval": True,
+        "active_hours_start": None,
+        "active_hours_end": None,
+        "active_hours_tz": None,
+        "task_recipe": None,
+    }
+
+    with (
+        patch("app.api.chat._execute_chat_turn", new_callable=AsyncMock, return_value="Prepared task draft"),
+        patch("app.api.chat.get_task_handoff_payload", return_value={"task_draft": draft_payload}),
+        patch(
+            "app.api.chat.get_tool_execution_records",
+            return_value=[{"tool": "propose_task_draft", "arguments": {}, "result_summary": "ok"}],
+        ),
+    ):
+        sent = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "Make a task to review the rate-cut timeline before Friday."},
+            headers=headers,
+        )
+
+    assert sent.status_code == 200
+    message_id = sent.json()["message_id"]
+    assert isinstance(message_id, int)
+
+    first_accept = await client.post(f"/chat/messages/{message_id}/task-draft/accept", headers=headers)
+    assert first_accept.status_code == 200
+    first_payload = first_accept.json()
+    assert first_payload["created"] is True
+    assert first_payload["reused_existing"] is False
+    assert first_payload["title"] == "Review Fed rate-cut timeline"
+    task_id = first_payload["task_id"]
+    assert first_payload["metadata"]["task_draft_status"] == "accepted"
+    assert first_payload["metadata"]["created_task_id"] == task_id
+
+    second_accept = await client.post(f"/chat/messages/{message_id}/task-draft/accept", headers=headers)
+    assert second_accept.status_code == 200
+    second_payload = second_accept.json()
+    assert second_payload["created"] is True
+    assert second_payload["reused_existing"] is True
+    assert second_payload["task_id"] == task_id
+
+    tasks = await client.get("/tasks", headers=headers)
+    assert tasks.status_code == 200
+    assert len(tasks.json()) == 1
+    assert tasks.json()[0]["id"] == task_id
+
+    refreshed = await client.get(f"/chat/sessions/{session_id}", headers=headers)
+    refreshed_assistant = [msg for msg in refreshed.json()["messages"] if msg["role"] == "assistant"][-1]
+    assert refreshed_assistant["metadata"]["task_draft_status"] == "accepted"
+    assert refreshed_assistant["metadata"]["created_task_id"] == task_id
+
+
+@pytest.mark.asyncio
+async def test_deny_task_draft_updates_message_metadata_without_creating_task(client):
+    await client.post("/auth/register", json={
+        "username": "draftdenyuser",
+        "email": "draftdeny@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "draftdenyuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Deny Draft"}, headers=headers)
+    session_id = create.json()["id"]
+    draft_payload = {
+        "proposed": True,
+        "title": "Monitor gasoline prices",
+        "instruction": "Track local pump prices for the next two weeks.",
+        "persona": "family_assistant",
+        "task_type": "one_shot",
+        "deliver": True,
+        "requires_approval": True,
+    }
+
+    with (
+        patch("app.api.chat._execute_chat_turn", new_callable=AsyncMock, return_value="Prepared task draft"),
+        patch("app.api.chat.get_task_handoff_payload", return_value={"task_draft": draft_payload}),
+        patch(
+            "app.api.chat.get_tool_execution_records",
+            return_value=[{"tool": "propose_task_draft", "arguments": {}, "result_summary": "ok"}],
+        ),
+    ):
+        sent = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "Make a task to monitor gasoline prices."},
+            headers=headers,
+        )
+
+    message_id = sent.json()["message_id"]
+    denied = await client.post(f"/chat/messages/{message_id}/task-draft/deny", headers=headers)
+    assert denied.status_code == 200
+    denied_payload = denied.json()
+    assert denied_payload["denied"] is True
+    assert denied_payload["metadata"]["task_draft_status"] == "denied"
+    assert "created_task_id" not in denied_payload["metadata"]
+
+    denied_again = await client.post(f"/chat/messages/{message_id}/task-draft/deny", headers=headers)
+    assert denied_again.status_code == 200
+    assert denied_again.json()["metadata"]["task_draft_status"] == "denied"
+
+    tasks = await client.get("/tasks", headers=headers)
+    assert tasks.status_code == 200
+    assert tasks.json() == []
+
+    refreshed = await client.get(f"/chat/sessions/{session_id}", headers=headers)
+    refreshed_assistant = [msg for msg in refreshed.json()["messages"] if msg["role"] == "assistant"][-1]
+    assert refreshed_assistant["metadata"]["task_draft_status"] == "denied"
+    assert "created_task_id" not in refreshed_assistant["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_accept_task_draft_can_link_existing_task(client):
+    await client.post("/auth/register", json={
+        "username": "draftlinkuser",
+        "email": "draftlink@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "draftlinkuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    task_resp = await client.post(
+        "/tasks",
+        json={
+            "title": "Edited linked task",
+            "instruction": "Use edited details from the draft sheet.",
+            "task_type": "one_shot",
+            "deliver": True,
+            "requires_approval": True,
+        },
+        headers=headers,
+    )
+    assert task_resp.status_code == 201
+    existing_task_id = task_resp.json()["id"]
+
+    create = await client.post("/chat/sessions", json={"title": "Link Existing Task"}, headers=headers)
+    session_id = create.json()["id"]
+    draft_payload = {
+        "proposed": True,
+        "title": "Original draft title",
+        "instruction": "Original draft instruction.",
+        "persona": "family_assistant",
+        "task_type": "one_shot",
+        "deliver": True,
+        "requires_approval": True,
+    }
+
+    with (
+        patch("app.api.chat._execute_chat_turn", new_callable=AsyncMock, return_value="Prepared task draft"),
+        patch("app.api.chat.get_task_handoff_payload", return_value={"task_draft": draft_payload}),
+        patch(
+            "app.api.chat.get_tool_execution_records",
+            return_value=[{"tool": "propose_task_draft", "arguments": {}, "result_summary": "ok"}],
+        ),
+    ):
+        sent = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "Make a task draft for later editing."},
+            headers=headers,
+        )
+
+    message_id = sent.json()["message_id"]
+    linked = await client.post(
+        f"/chat/messages/{message_id}/task-draft/accept",
+        json={"existing_task_id": existing_task_id},
+        headers=headers,
+    )
+    assert linked.status_code == 200
+    linked_payload = linked.json()
+    assert linked_payload["reused_existing"] is True
+    assert linked_payload["task_id"] == existing_task_id
+    assert linked_payload["metadata"]["task_draft_status"] == "accepted"
+    assert linked_payload["metadata"]["created_task_id"] == existing_task_id
+
+    tasks = await client.get("/tasks", headers=headers)
+    assert tasks.status_code == 200
+    assert len(tasks.json()) == 1
+    assert tasks.json()[0]["id"] == existing_task_id
+
+
+@pytest.mark.asyncio
+async def test_chat_history_normalizes_legacy_created_task_draft_status(client):
+    await client.post("/auth/register", json={
+        "username": "draftlegacyuser",
+        "email": "draftlegacy@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "draftlegacyuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Legacy Draft"}, headers=headers)
+    session_id = create.json()["id"]
+
+    async with TestSessionLocal() as db:
+        session = (
+            await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        ).scalar_one()
+        db.add(
+            ChatMessage(
+                session_id=session.id,
+                role="assistant",
+                content="Legacy accepted draft",
+                tool_results=json.dumps(
+                    {
+                        "kind": "assistant_message_metadata",
+                        "task_draft": {
+                            "title": "Legacy task",
+                            "instruction": "Legacy instruction.",
+                            "task_type": "one_shot",
+                            "deliver": True,
+                            "requires_approval": True,
+                        },
+                        "task_draft_status": "created",
+                        "created_task_id": 42,
+                    }
+                ),
+            )
+        )
+        await db.commit()
+
+    history = await client.get(f"/chat/sessions/{session_id}", headers=headers)
+    assert history.status_code == 200
+    assistant = [msg for msg in history.json()["messages"] if msg["role"] == "assistant"][-1]
+    assert assistant["metadata"]["task_draft_status"] == "accepted"
+    assert assistant["metadata"]["created_task_id"] == 42
 
 
 @pytest.mark.asyncio
@@ -961,6 +1270,73 @@ async def test_websocket_disconnect_does_not_rollback_completed_response(client)
 
         assert [row.role for row in rows] == ["user", "assistant"]
         assert rows[-1].content == "response survives disconnect"
+
+
+@pytest.mark.asyncio
+async def test_websocket_done_payload_includes_message_id_for_task_drafts(client):
+    await client.post("/auth/register", json={
+        "username": "chatdraftwsuser",
+        "email": "chatdraftws@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatdraftwsuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "WS Draft Message ID"}, headers=headers)
+    session_id = create.json()["id"]
+    draft_payload = {
+        "proposed": True,
+        "title": "Prepare shipping summary",
+        "instruction": "Create a follow-up task for the shipping summary.",
+        "persona": "family_assistant",
+        "task_type": "one_shot",
+        "deliver": True,
+        "requires_approval": True,
+    }
+
+    async def fake_stream_agent(*args, **kwargs):
+        yield "Prepared task draft"
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "chatdraftwsuser"))
+        ).scalar_one()
+        session = (
+            await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        ).scalar_one()
+
+        manager = get_chat_run_manager()
+        await manager.clear(session_id)
+        manager._recent_prompts.pop(session_id, None)
+        manager._recent_send_ids.pop(session_id, None)
+
+        websocket = AsyncMock()
+        with (
+            patch("app.api.chat.stream_agent", new=fake_stream_agent),
+            patch("app.api.chat.classify_chat_complexity", return_value=SimpleNamespace(is_complex=False)),
+            patch("app.api.chat.get_task_handoff_payload", return_value={"task_draft": draft_payload}),
+            patch(
+                "app.api.chat.get_tool_execution_records",
+                return_value=[{"tool": "propose_task_draft", "arguments": {}, "result_summary": "ok"}],
+            ),
+        ):
+            await _run_websocket_message(
+                session_id=session_id,
+                websocket=websocket,
+                db=db,
+                current_user=user,
+                session=session,
+                user_message="Make me a task draft for the shipping summary.",
+                client_send_id="draft-message-id-1",
+                allowed_tools=None,
+                blocked_tools=None,
+            )
+
+        payloads = [call.args[0] for call in websocket.send_json.await_args_list]
+        done_payload = next(payload for payload in payloads if payload["type"] == "done")
+        assert isinstance(done_payload["message_id"], int)
+        assert done_payload["metadata"]["task_draft_status"] == "draft"
 
 
 @pytest.mark.asyncio

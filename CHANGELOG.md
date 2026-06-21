@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.23
+
+- Added persistent assistant task-draft metadata to chat history and live responses so inline task cards can survive reloads, session switches, and later resolution against the original assistant message.
+- Returned live assistant `message_id` values from both REST and websocket chat send paths, allowing the client to resolve task drafts immediately instead of waiting for a history round-trip.
+- Added message-scoped task-draft accept and deny endpoints, including support for linking an already-created edited task back to its source assistant message without creating duplicates.
+- Normalized draft history language from legacy `created` to user-facing `accepted` / `denied` states while preserving compatibility with older stored assistant metadata.
+
 ## v0.7.22
 
 - Stabilized local `ollama` / `ollama_chat` chat turns by skipping the second final-stream pass for local models and streaming the already-probed final text directly.
