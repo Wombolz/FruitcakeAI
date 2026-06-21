@@ -63,7 +63,7 @@ from app.agent.core import (
 )
 from app.auth.dependencies import get_current_user
 from app.config import settings
-from app.db.models import ChatMessage, ChatSession, User
+from app.db.models import ChatMessage, ChatSession, Task, User
 from app.db.session import get_db
 from app.chat_runtime import get_chat_run_manager
 from app.llm_registry import available_llm_models, is_configured_model
@@ -79,11 +79,13 @@ from app.agent.tools import (
     reset_tool_execution_records,
     restore_tool_execution_records,
 )
+from app.task_service import TaskValidationError, create_task_record
 
 log = structlog.get_logger(__name__)
 
 router = APIRouter()
 _CHAT_COMPACTION_MARKER_KIND = COMPACTION_MARKER_KIND
+_ASSISTANT_MESSAGE_METADATA_KIND = "assistant_message_metadata"
 _WORKSPACE_FILE_TOOL_NAMES = {"read_file", "write_file", "append_file", "stat_file"}
 _WORKSPACE_CONTEXT_TOOL_NAMES = _WORKSPACE_FILE_TOOL_NAMES | {"find_files", "list_directory", "make_directory"}
 _WORKSPACE_EXPLICIT_HINTS = (
@@ -175,6 +177,23 @@ class MessageOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AcceptTaskDraftResponse(BaseModel):
+    created: bool
+    reused_existing: bool = False
+    task_id: int
+    title: str
+    metadata: Dict[str, Any]
+
+
+class DenyTaskDraftResponse(BaseModel):
+    denied: bool
+    metadata: Dict[str, Any]
+
+
+class AcceptTaskDraftRequest(BaseModel):
+    existing_task_id: Optional[int] = None
 
 
 class SessionOut(BaseModel):
@@ -366,16 +385,139 @@ async def get_session(
         "llm_model": session.llm_model,
         "compaction_events": compaction_events,
         "messages": [
-            {
-                "id": m.id,
-                "role": m.role,
-                "content": m.content,
-                "created_at": m.created_at,
-            }
+            _session_message_payload(m)
             for m in messages
             if not _is_hidden_runtime_message(m)
         ],
     }
+
+
+@router.post("/messages/{message_id:int}/task-draft/accept", response_model=AcceptTaskDraftResponse)
+async def accept_task_draft(
+    message_id: int,
+    body: Optional[AcceptTaskDraftRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AcceptTaskDraftResponse:
+    message = await _get_chat_message_or_404(message_id, current_user.id, db)
+    metadata = _assistant_message_metadata(message)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="Task draft message not found")
+
+    draft = metadata.get("task_draft")
+    if not isinstance(draft, dict) or not draft:
+        raise HTTPException(status_code=409, detail="Message does not contain a task draft")
+
+    normalized_metadata = _normalize_assistant_metadata_payload(metadata)
+    current_status = str(normalized_metadata.get("task_draft_status") or "").strip().lower()
+    if current_status == "denied":
+        raise HTTPException(status_code=409, detail="Task draft has already been denied")
+
+    created_task_id = metadata.get("created_task_id")
+    if created_task_id is not None:
+        existing = await db.get(Task, int(created_task_id))
+        if existing is None or int(existing.user_id) != int(current_user.id):
+            raise HTTPException(status_code=409, detail="Stored created task reference is no longer valid")
+        message.tool_results = _encode_assistant_message_metadata(normalized_metadata)
+        await db.commit()
+        return AcceptTaskDraftResponse(
+            created=True,
+            reused_existing=True,
+            task_id=int(existing.id),
+            title=str(existing.title or ""),
+            metadata=normalized_metadata,
+        )
+
+    if body is not None and body.existing_task_id is not None:
+        existing = await db.get(Task, int(body.existing_task_id))
+        if existing is None or int(existing.user_id) != int(current_user.id):
+            raise HTTPException(status_code=404, detail="Existing task not found")
+        metadata["task_draft_status"] = "accepted"
+        metadata["created_task_id"] = int(existing.id)
+        normalized_metadata = _normalize_assistant_metadata_payload(metadata)
+        message.tool_results = _encode_assistant_message_metadata(normalized_metadata)
+        await db.commit()
+        return AcceptTaskDraftResponse(
+            created=True,
+            reused_existing=True,
+            task_id=int(existing.id),
+            title=str(existing.title or ""),
+            metadata=normalized_metadata,
+        )
+
+    task_recipe = draft.get("task_recipe")
+    recipe_family = None
+    recipe_params = None
+    if isinstance(task_recipe, dict):
+        recipe_family = str(task_recipe.get("family") or "").strip() or None
+        params = task_recipe.get("params")
+        if isinstance(params, dict):
+            recipe_params = params
+
+    try:
+        task = await create_task_record(
+            db,
+            user_id=current_user.id,
+            title=str(draft.get("title") or ""),
+            instruction=str(draft.get("instruction") or ""),
+            persona=str(draft.get("persona") or "").strip() or None,
+            profile=str(draft.get("profile") or "").strip() or None,
+            llm_model_override=str(draft.get("llm_model_override") or "").strip() or None,
+            task_type=str(draft.get("task_type") or "one_shot").strip() or "one_shot",
+            schedule=str(draft.get("schedule") or "").strip() or None,
+            deliver=bool(draft.get("deliver", True)),
+            requires_approval=bool(draft.get("requires_approval", True)),
+            active_hours_start=str(draft.get("active_hours_start") or "").strip() or None,
+            active_hours_end=str(draft.get("active_hours_end") or "").strip() or None,
+            active_hours_tz=str(draft.get("active_hours_tz") or "").strip() or None,
+            user_timezone=getattr(current_user, "active_hours_tz", None),
+            recipe_family=recipe_family,
+            recipe_params=recipe_params,
+        )
+    except TaskValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    metadata["task_draft_status"] = "accepted"
+    metadata["created_task_id"] = int(task.id)
+    normalized_metadata = _normalize_assistant_metadata_payload(metadata)
+    message.tool_results = _encode_assistant_message_metadata(normalized_metadata)
+    await db.commit()
+
+    return AcceptTaskDraftResponse(
+        created=True,
+        reused_existing=False,
+        task_id=int(task.id),
+        title=str(task.title or ""),
+        metadata=normalized_metadata,
+    )
+
+
+@router.post("/messages/{message_id:int}/task-draft/deny", response_model=DenyTaskDraftResponse)
+async def deny_task_draft(
+    message_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DenyTaskDraftResponse:
+    message = await _get_chat_message_or_404(message_id, current_user.id, db)
+    metadata = _assistant_message_metadata(message)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="Task draft message not found")
+
+    draft = metadata.get("task_draft")
+    if not isinstance(draft, dict) or not draft:
+        raise HTTPException(status_code=409, detail="Message does not contain a task draft")
+
+    normalized_metadata = _normalize_assistant_metadata_payload(metadata)
+    current_status = str(normalized_metadata.get("task_draft_status") or "").strip().lower()
+    if current_status == "accepted":
+        raise HTTPException(status_code=409, detail="Task draft has already been accepted")
+
+    metadata.pop("created_task_id", None)
+    metadata["task_draft_status"] = "denied"
+    normalized_metadata = _normalize_assistant_metadata_payload(metadata)
+    message.tool_results = _encode_assistant_message_metadata(normalized_metadata)
+    await db.commit()
+    return DenyTaskDraftResponse(denied=True, metadata=normalized_metadata)
 
 
 # ── PATCH /chat/sessions/{id} ────────────────────────────────────────────────
@@ -707,9 +849,19 @@ async def send_message(
             except Exception:
                 pass
 
+    assistant_metadata = _build_assistant_message_metadata(
+        handoff_metadata=handoff_metadata,
+        executed_tools=get_tool_execution_records(),
+    )
+
     # Store assistant reply
     await _persist_runtime_history_messages(session_id, runtime_history_messages, db)
-    assistant_msg = ChatMessage(session_id=session_id, role="assistant", content=reply)
+    assistant_msg = ChatMessage(
+        session_id=session_id,
+        role="assistant",
+        content=reply,
+        tool_results=_encode_assistant_message_metadata(assistant_metadata) if assistant_metadata else None,
+    )
     db.add(assistant_msg)
     await db.commit()
     _log_chat_latency_breakdown(
@@ -723,10 +875,12 @@ async def send_message(
     return {
         "role": "assistant",
         "content": reply,
+        "message_id": int(assistant_msg.id),
         "session_id": session_id,
         "metadata": {
             "active_skills": list(user_context.active_skill_slugs or []),
             "skill_selection_mode": user_context.skill_selection_mode or "",
+            **(assistant_metadata or {}),
             **handoff_metadata,
         },
     }
@@ -1009,9 +1163,16 @@ async def _run_websocket_message(
             )
         runtime_history_messages = get_agent_runtime_history()
         handoff_metadata = get_task_handoff_payload() or {}
+        assistant_metadata = _build_assistant_message_metadata(
+            handoff_metadata=handoff_metadata,
+            executed_tools=get_tool_execution_records(),
+        )
         await _persist_runtime_history_messages(session_id, runtime_history_messages, db)
         assistant_msg = ChatMessage(
-            session_id=session_id, role="assistant", content=complete
+            session_id=session_id,
+            role="assistant",
+            content=complete,
+            tool_results=_encode_assistant_message_metadata(assistant_metadata) if assistant_metadata else None,
         )
         db.add(assistant_msg)
         await db.commit()
@@ -1027,9 +1188,11 @@ async def _run_websocket_message(
             {
                 "type": "done",
                 "content": complete,
+                "message_id": int(assistant_msg.id),
                 "metadata": {
                     "active_skills": list(user_context.active_skill_slugs or []),
                     "skill_selection_mode": user_context.skill_selection_mode or "",
+                    **(assistant_metadata or {}),
                     **handoff_metadata,
                 },
             }
@@ -1722,6 +1885,117 @@ async def _get_session_or_404(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
+
+
+async def _get_chat_message_or_404(
+    message_id: int,
+    user_id: int,
+    db: AsyncSession,
+) -> ChatMessage:
+    result = await db.execute(
+        select(ChatMessage)
+        .join(ChatSession, ChatSession.id == ChatMessage.session_id)
+        .where(
+            ChatMessage.id == message_id,
+            ChatSession.user_id == user_id,
+        )
+    )
+    message = result.scalar_one_or_none()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Chat message not found")
+    return message
+
+
+def _summarize_executed_tool_names(records: List[Dict[str, Any]]) -> List[str]:
+    seen: set[str] = set()
+    names: list[str] = []
+    for record in records or []:
+        name = str(record.get("tool") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    task_draft = metadata.get("task_draft")
+    if isinstance(task_draft, dict) and task_draft:
+        normalized["task_draft"] = task_draft
+
+    created_task_id = metadata.get("created_task_id")
+    if created_task_id is not None:
+        try:
+            normalized["created_task_id"] = int(created_task_id)
+        except (TypeError, ValueError):
+            pass
+
+    tool_calls = metadata.get("tool_calls")
+    if isinstance(tool_calls, list):
+        cleaned = [str(item).strip() for item in tool_calls if str(item).strip()]
+        if cleaned:
+            normalized["tool_calls"] = cleaned
+
+    status = str(metadata.get("task_draft_status") or "").strip().lower()
+    if status == "created":
+        status = "accepted"
+    if "task_draft" in normalized:
+        if status not in {"draft", "accepted", "denied"}:
+            status = "accepted" if "created_task_id" in normalized else "draft"
+        normalized["task_draft_status"] = status
+    return normalized
+
+
+def _build_assistant_message_metadata(
+    *,
+    handoff_metadata: Dict[str, Any],
+    executed_tools: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    metadata: Dict[str, Any] = {}
+    task_draft = handoff_metadata.get("task_draft")
+    if isinstance(task_draft, dict) and task_draft:
+        metadata["task_draft"] = task_draft
+        metadata["task_draft_status"] = "draft"
+
+    tool_calls = _summarize_executed_tool_names(executed_tools)
+    if tool_calls:
+        metadata["tool_calls"] = tool_calls
+
+    normalized = _normalize_assistant_metadata_payload(metadata)
+    return normalized or None
+
+
+def _encode_assistant_message_metadata(metadata: Dict[str, Any]) -> str:
+    payload = {"kind": _ASSISTANT_MESSAGE_METADATA_KIND, **_normalize_assistant_metadata_payload(metadata)}
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True)
+
+
+def _assistant_message_metadata(message: ChatMessage) -> Dict[str, Any] | None:
+    if str(getattr(message, "role", "") or "") != "assistant":
+        return None
+    payload = _decode_chat_json(getattr(message, "tool_results", None))
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("kind") or "") != _ASSISTANT_MESSAGE_METADATA_KIND:
+        return None
+    metadata = dict(payload)
+    metadata.pop("kind", None)
+    normalized = _normalize_assistant_metadata_payload(metadata)
+    return normalized or None
+
+
+def _session_message_payload(message: ChatMessage) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "id": int(message.id),
+        "role": str(message.role or ""),
+        "content": str(message.content or ""),
+        "created_at": message.created_at,
+    }
+    metadata = _assistant_message_metadata(message)
+    if metadata:
+        payload["metadata"] = metadata
+    return payload
 
 
 def _estimate_chat_message_tokens(message: Dict[str, Any]) -> int:
