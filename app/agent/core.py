@@ -408,6 +408,205 @@ def _content_fingerprint(value: str, *, length: int = 12) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[: max(1, length)]
 
 
+def _chunk_plain_text(content: str, chunk_size: int = 64) -> List[str]:
+    text = str(content or "")
+    if not text:
+        return []
+    size = max(1, int(chunk_size))
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+def _should_skip_final_stream_pass(model: str) -> bool:
+    selected = str(model or "").strip()
+    return selected.startswith(("ollama/", "ollama_chat/"))
+
+
+def _is_local_model(model: str | None) -> bool:
+    selected = str(model or "").strip()
+    return selected.startswith(("ollama/", "ollama_chat/"))
+
+
+def _is_local_tool_json_parse_error(exc: Exception, model: str | None) -> bool:
+    if not _is_local_model(model):
+        return False
+    lowered = str(exc or "").lower()
+    return "failed to parse json" in lowered and "ollama" in lowered
+
+
+def _is_qwen_local_tool_guardrail_model(model: str | None) -> bool:
+    return str(model or "").strip() == "ollama_chat/qwen3.6:35b"
+
+
+def _recent_role_sequence(history: List[Dict[str, Any]], *, limit: int = 5) -> List[str]:
+    return [str(message.get("role") or "") for message in history[-max(1, limit):]]
+
+
+def _sanitize_preview_text(text: str, *, max_chars: int = 180) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max(0, max_chars - 3)] + "..."
+
+
+def _tool_names_from_schemas(tools: List[Dict[str, Any]] | None) -> List[str]:
+    names: List[str] = []
+    for tool in tools or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = str((function or {}).get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _tool_message_preview(history: List[Dict[str, Any]], *, limit: int = 5) -> List[Dict[str, Any]]:
+    preview: List[Dict[str, Any]] = []
+    for message in history[-max(1, limit):]:
+        role = str(message.get("role") or "")
+        row: Dict[str, Any] = {"role": role}
+        content = str(message.get("content") or "")
+        if content:
+            row["content_preview"] = _sanitize_preview_text(content)
+        if role == "assistant":
+            tool_calls = list(message.get("tool_calls") or [])
+            if tool_calls:
+                row["tool_call_names"] = [_tool_call_name(call) for call in tool_calls]
+                row["tool_call_count"] = len(tool_calls)
+        if role == "tool":
+            tool_call_id = str(message.get("tool_call_id") or "").strip()
+            if tool_call_id:
+                row["tool_call_id"] = tool_call_id
+        preview.append(row)
+    return preview
+
+
+def _history_prompt_fingerprint(history: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for message in history[-5:]:
+        role = str(message.get("role") or "")
+        content = _sanitize_preview_text(str(message.get("content") or ""), max_chars=120)
+        parts.append(f"{role}:{content}")
+    return _content_fingerprint(" | ".join(parts), length=16)
+
+
+def _raw_error_preview(exc: Exception) -> str:
+    for attr_name in ("body", "response", "llm_provider_response", "text"):
+        value = getattr(exc, attr_name, None)
+        if not value:
+            continue
+        return _sanitize_preview_text(str(value), max_chars=240)
+    return _sanitize_preview_text(str(exc), max_chars=240)
+
+
+def _local_tool_failure_phase(history: List[Dict[str, Any]]) -> str:
+    saw_tool_result = any(str(message.get("role") or "") == "tool" for message in history)
+    if saw_tool_result:
+        return "after_successful_tool_turn"
+    saw_tool_call = any(
+        str(message.get("role") or "") == "assistant" and bool(message.get("tool_calls"))
+        for message in history
+    )
+    if saw_tool_call:
+        return "after_emitted_tool_calls"
+    return "initial_tool_enabled_turn"
+
+
+def _local_tool_prompt_class(history: List[Dict[str, Any]]) -> str:
+    latest_user = _latest_user_message_text(history).lower()
+    system_notes = "\n".join(
+        str(message.get("content") or "")
+        for message in history
+        if str(message.get("role") or "") == "system"
+    ).lower()
+
+    if (
+        "recent workspace file context for this chat session:" in system_notes
+        or (
+            "workspace" in latest_user
+            and any(token in latest_user for token in ("repo map", "report", "file", "document", "notes", "key points"))
+            and any(token in latest_user for token in ("latest", "recent", "just", "working on", "tell me about", "what is in"))
+        )
+    ):
+        return "workspace_followup"
+    if "required grounding for this turn: this is a library intent." in system_notes:
+        return "library_grounding"
+    return "general"
+
+
+def _local_tool_guardrail(history: List[Dict[str, Any]], *, model: str | None, mode: str) -> Dict[str, Any] | None:
+    if mode not in {"chat", "chat_orchestrated"} or not _is_qwen_local_tool_guardrail_model(model):
+        return None
+    prompt_class = _local_tool_prompt_class(history)
+    if prompt_class == "workspace_followup":
+        return {
+            "prompt_class": prompt_class,
+            "instruction": (
+                "This local model is unreliable at tool calling for workspace follow-up turns. "
+                "Do not call tools. Answer using only the existing conversation context and any workspace grounding already present. "
+                "If you cannot confirm the file contents from existing context, say that clearly and briefly."
+            ),
+        }
+    if prompt_class == "library_grounding":
+        return {
+            "prompt_class": prompt_class,
+            "instruction": (
+                "This local model is unreliable at tool calling for already-grounded library turns. "
+                "Do not call tools. Answer using only the grounding already present in the conversation. "
+                "If the grounding is insufficient, say that briefly instead of inventing details."
+            ),
+        }
+    return None
+
+
+def _build_tool_parse_fallback_history(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    note = (
+        "Tool calling failed for this local model on this turn. "
+        "Do not call tools. Answer using only the existing conversation context and any grounding already present. "
+        "If the answer would require fresh tool access, say that briefly instead of inventing details."
+    )
+    return _insert_system_note_before_latest_user(history, note)
+
+
+def _insert_system_note_before_latest_user(history: List[Dict[str, Any]], note: str) -> List[Dict[str, Any]]:
+    updated = list(history)
+    if updated and updated[-1].get("role") == "user":
+        return updated[:-1] + [{"role": "system", "content": note}, updated[-1]]
+    return updated + [{"role": "system", "content": note}]
+
+
+def _log_local_tool_event(
+    *,
+    event: str,
+    history: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None,
+    model: str | None,
+    mode: str,
+    stage: str | None,
+    user_context: UserContext,
+    error: Exception | None = None,
+    prompt_class: str | None = None,
+    tool_failure_phase: str | None = None,
+    tools_enabled: bool = True,
+) -> None:
+    payload = {
+        "model": str(model or ""),
+        "mode": mode,
+        "stage": stage or "",
+        "session_id": user_context.session_id,
+        "task_id": user_context.task_id,
+        "tools_enabled": tools_enabled,
+        "offered_tools": _tool_names_from_schemas(tools),
+        "recent_roles": _recent_role_sequence(history),
+        "prompt_fingerprint": _content_fingerprint(_latest_user_message_text(history), length=16),
+        "history_fingerprint": _history_prompt_fingerprint(history),
+        "prompt_class": prompt_class or _local_tool_prompt_class(history),
+        "tool_failure_phase": tool_failure_phase or _local_tool_failure_phase(history),
+        "history_preview": _tool_message_preview(history),
+    }
+    if error is not None:
+        payload["error_preview"] = _raw_error_preview(error)
+    log.warning(event, **payload)
+
+
 def _tool_name_lookup(history: List[Dict[str, Any]]) -> dict[str, str]:
     lookup: dict[str, str] = {}
     for message in history:
@@ -1846,6 +2045,24 @@ async def run_agent(
 
     for turn in range(max_turns):
         turn_number = turn + 1
+        turn_tools = tools
+        turn_history = history
+        guardrail = _local_tool_guardrail(history, model=selected_model, mode=mode)
+        if turn_tools and guardrail is not None:
+            turn_history = _insert_system_note_before_latest_user(history, str(guardrail["instruction"]))
+            turn_tools = None
+            _log_local_tool_event(
+                event="LLM local_tool_guardrail_applied",
+                history=history,
+                tools=tools,
+                model=selected_model,
+                mode=mode,
+                stage=stage,
+                user_context=user_context,
+                prompt_class=str(guardrail.get("prompt_class") or ""),
+                tool_failure_phase="guardrail_preemptive_text_only",
+                tools_enabled=False,
+            )
         _log_agent_turn_start(
             turn=turn_number,
             max_turns=max_turns,
@@ -1857,18 +2074,39 @@ async def run_agent(
         )
         try:
             response = await _acompletion_with_budget(
-                history=history,
+                history=turn_history,
                 user_context=user_context,
                 model=selected_model,
                 mode=mode,
                 stage=stage,
-                tools=tools,
+                tools=turn_tools,
                 tool_choice="auto",
                 extra_kwargs=extra,
             )
         except Exception as e:
-            log.error("LLM call failed", error=str(e), model=selected_model, mode=mode, stage=stage)
-            raise
+            if turn_tools and _is_local_tool_json_parse_error(e, selected_model):
+                _log_local_tool_event(
+                    event="LLM local_tool_json_parse_fallback",
+                    history=history,
+                    tools=tools,
+                    model=selected_model,
+                    mode=mode,
+                    stage=stage,
+                    user_context=user_context,
+                    error=e,
+                )
+                fallback_history = _build_tool_parse_fallback_history(history)
+                response = await _acompletion_with_budget(
+                    history=fallback_history,
+                    user_context=user_context,
+                    model=selected_model,
+                    mode=mode,
+                    stage=f"{stage}_local_tool_fallback" if stage else "local_tool_fallback",
+                    extra_kwargs=extra,
+                )
+            else:
+                log.error("LLM call failed", error=str(e), model=selected_model, mode=mode, stage=stage)
+                raise
         await record_llm_usage_event(response, stage=stage, model=selected_model)
 
         message = response.choices[0].message
@@ -2178,6 +2416,24 @@ async def stream_agent(
 
     for turn in range(max_turns):
         turn_number = turn + 1
+        turn_tools = tools
+        turn_history = history
+        guardrail = _local_tool_guardrail(history, model=selected_model, mode=mode)
+        if turn_tools and guardrail is not None:
+            turn_history = _insert_system_note_before_latest_user(history, str(guardrail["instruction"]))
+            turn_tools = None
+            _log_local_tool_event(
+                event="LLM local_tool_guardrail_applied",
+                history=history,
+                tools=tools,
+                model=selected_model,
+                mode=mode,
+                stage=stage,
+                user_context=user_context,
+                prompt_class=str(guardrail.get("prompt_class") or ""),
+                tool_failure_phase="guardrail_preemptive_text_only",
+                tools_enabled=False,
+            )
         _log_agent_turn_start(
             turn=turn_number,
             max_turns=max_turns,
@@ -2190,25 +2446,46 @@ async def stream_agent(
         # Probe turn non-streaming so intermediate tool turns stay internal.
         try:
             response = await _acompletion_with_budget(
-                history=history,
+                history=turn_history,
                 user_context=user_context,
                 model=selected_model,
                 mode=mode,
                 stage=stage,
                 stream=False,
-                tools=tools,
+                tools=turn_tools,
                 tool_choice="auto",
                 extra_kwargs=extra,
             )
         except Exception as e:
-            log.error(
-                "LLM call failed (streaming turn)",
-                error=str(e),
-                model=selected_model,
-                mode=mode,
-                stage=stage,
-            )
-            raise
+            if turn_tools and _is_local_tool_json_parse_error(e, selected_model):
+                _log_local_tool_event(
+                    event="LLM local_tool_json_parse_fallback",
+                    history=history,
+                    tools=tools,
+                    model=selected_model,
+                    mode=mode,
+                    stage=stage,
+                    user_context=user_context,
+                    error=e,
+                )
+                fallback_history = _build_tool_parse_fallback_history(history)
+                response = await _acompletion_with_budget(
+                    history=fallback_history,
+                    user_context=user_context,
+                    model=selected_model,
+                    mode=mode,
+                    stage=f"{stage}_local_tool_fallback" if stage else "local_tool_fallback",
+                    extra_kwargs=extra,
+                )
+            else:
+                log.error(
+                    "LLM call failed (streaming turn)",
+                    error=str(e),
+                    model=selected_model,
+                    mode=mode,
+                    stage=stage,
+                )
+                raise
         await record_llm_usage_event(
             response,
             stage=f"{stage}_probe" if stage else "stream_probe",
@@ -2461,6 +2738,10 @@ async def stream_agent(
                 user_context=user_context,
                 content=message.content or "",
             )
+            if _should_skip_final_stream_pass(selected_model):
+                for token in _chunk_plain_text(message.content or ""):
+                    yield token
+                return
             async for token in _stream_final_response(
                 history,
                 user_context,
