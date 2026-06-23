@@ -45,6 +45,91 @@ async def test_create_task_defaults_to_requires_approval_true(client):
 
 
 @pytest.mark.asyncio
+async def test_task_presentation_persists_across_create_patch_and_get(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskpresentationuser",
+            "email": "taskpresentation@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskpresentationuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Accent task",
+            "instruction": "Keep this visually distinct.",
+            "task_type": "one_shot",
+            "presentation": {"accent_hex": "4F46E5"},
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    created_payload = created.json()
+    assert created_payload["presentation"] == {"accent_hex": "#4F46E5"}
+    task_id = created_payload["id"]
+
+    patched = await client.patch(
+        f"/tasks/{task_id}",
+        json={"presentation": {"accent_hex": "#10B981"}},
+        headers=headers,
+    )
+    assert patched.status_code == 200
+    patched_payload = patched.json()
+    assert patched_payload["presentation"] == {"accent_hex": "#10B981"}
+
+    fetched = await client.get(f"/tasks/{task_id}", headers=headers)
+    assert fetched.status_code == 200
+    assert fetched.json()["presentation"] == {"accent_hex": "#10B981"}
+
+    listed = await client.get("/tasks", headers=headers)
+    assert listed.status_code == 200
+    listed_payload = listed.json()
+    matching = next(item for item in listed_payload if item["id"] == task_id)
+    assert matching["presentation"] == {"accent_hex": "#10B981"}
+
+
+@pytest.mark.asyncio
+async def test_create_task_rejects_invalid_presentation_accent(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskbadaccentuser",
+            "email": "taskbadaccent@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskbadaccentuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Bad accent task",
+            "instruction": "Reject this.",
+            "task_type": "one_shot",
+            "presentation": {"accent_hex": "blue"},
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 400
+    assert "presentation.accent_hex" in created.text
+
+
+@pytest.mark.asyncio
 async def test_create_task_computes_next_run_at_from_task_timezone(client):
     await client.post(
         "/auth/register",
@@ -969,6 +1054,62 @@ async def test_patch_task_can_change_one_shot_to_recurring(client):
     assert payload["task_type"] == "recurring"
     assert payload["schedule"] == "every:1d"
     assert payload["next_run_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_task_draft_returns_editor_ready_payload(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "taskduplicateuser",
+            "email": "taskduplicate@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "taskduplicateuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "NASA Artemis Watcher",
+            "instruction": "Keep this focused on major launches and mission updates.",
+            "task_type": "recurring",
+            "schedule": "every:2h",
+            "deliver": True,
+            "requires_approval": True,
+            "active_hours_tz": "America/New_York",
+            "recipe_family": "topic_watcher",
+            "recipe_params": {
+                "topic": "NASA + Artemis",
+                "threshold": "high",
+                "sources": ["NASA Breaking News", "SpaceNews"],
+            },
+            "presentation": {"accent_hex": "#F59E0B"},
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    duplicate = await client.post(f"/tasks/{task_id}/duplicate-draft", headers=headers)
+    assert duplicate.status_code == 200
+    payload = duplicate.json()
+    assert payload["source_task_id"] == task_id
+    assert payload["title"].startswith("Copy of ")
+    assert "Artemis" in payload["title"]
+    assert "NASA + Artemis" in payload["instruction"]
+    assert payload["task_type"] == "recurring"
+    assert payload["schedule"] == "every:2h"
+    assert payload["effective_timezone"] == "America/New_York"
+    assert payload["recipe_family"] == "topic_watcher"
+    assert payload["recipe_params"]["topic"] == "NASA + Artemis"
+    assert payload["presentation"] == {"accent_hex": "#F59E0B"}
 
 
 @pytest.mark.asyncio

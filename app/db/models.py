@@ -635,6 +635,7 @@ class Task(Base):
     profile = Column(String(50), nullable=True)
     executor_config_json = Column(Text, default="{}", nullable=False)
     task_recipe_json = Column(Text, default="{}", nullable=False)
+    presentation_json = Column(Text, default="{}", nullable=False)
     # Optional explicit model override for all LLM stages of this task.
     llm_model_override = Column(String(200), nullable=True)
 
@@ -725,6 +726,14 @@ class Task(Base):
     @task_recipe.setter
     def task_recipe(self, value: dict):
         self.task_recipe_json = json.dumps(value or {})
+
+    @property
+    def presentation(self) -> dict:
+        return json.loads(self.presentation_json or "{}")
+
+    @presentation.setter
+    def presentation(self, value: dict):
+        self.presentation_json = json.dumps(value or {})
 
     def __repr__(self):
         return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"

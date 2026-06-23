@@ -24,6 +24,7 @@ class TaskValidationError(ValueError):
 
 UNSET = object()
 _TASK_TITLE_MAX_LENGTH = 255
+_TASK_ACCENT_HEX_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
 
 def _normalize_task_title(value: str) -> str:
@@ -33,6 +34,34 @@ def _normalize_task_title(value: str) -> str:
     if len(title) > _TASK_TITLE_MAX_LENGTH:
         raise TaskValidationError(f"title must be {_TASK_TITLE_MAX_LENGTH} characters or fewer.")
     return title
+
+
+def build_duplicate_task_title(value: str) -> str:
+    title = _normalize_task_title(value)
+    prefix = "Copy of "
+    if title.startswith(prefix):
+        return title
+    remaining = _TASK_TITLE_MAX_LENGTH - len(prefix)
+    trimmed = title[:remaining].rstrip()
+    return f"{prefix}{trimmed}"
+
+
+def normalize_task_presentation(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TaskValidationError("presentation must be an object.")
+    accent_hex = value.get("accent_hex")
+    if accent_hex is None:
+        return {}
+    normalized = str(accent_hex).strip()
+    if not normalized:
+        return {}
+    if not _TASK_ACCENT_HEX_RE.fullmatch(normalized):
+        raise TaskValidationError("presentation.accent_hex must be a 6-digit hex color like #4F46E5.")
+    if not normalized.startswith("#"):
+        normalized = f"#{normalized}"
+    return {"accent_hex": normalized.upper()}
 
 
 def compute_next_run_at(
@@ -404,6 +433,7 @@ async def create_task_record(
     user_timezone: Optional[str] = None,
     recipe_family: Optional[str] = None,
     recipe_params: Optional[dict] = None,
+    presentation: Optional[dict[str, Any]] = None,
 ) -> Task:
     draft = await build_task_draft_payload(
         db,
@@ -432,6 +462,7 @@ async def create_task_record(
         profile=draft.profile,
         executor_config=draft.executor_config,
         task_recipe=draft.task_recipe,
+        presentation=normalize_task_presentation(presentation),
         llm_model_override=draft.llm_model_override,
         task_type=draft.task_type,
         status="pending",
@@ -467,6 +498,7 @@ async def update_task_record(
     user_timezone: Optional[str] = None,
     recipe_family=UNSET,
     recipe_params=UNSET,
+    presentation=UNSET,
 ) -> TaskUpdateResult:
     title_changed = False
     instruction_changed = False
@@ -502,6 +534,8 @@ async def update_task_record(
     if llm_model_override is not UNSET:
         task.llm_model_override = (str(llm_model_override).strip() or None) if llm_model_override is not None else None
         plan_inputs_changed = True
+    if presentation is not UNSET:
+        task.presentation = normalize_task_presentation(presentation)
     if deliver is not UNSET:
         task.deliver = bool(deliver)
     if requires_approval is not UNSET:

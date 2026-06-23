@@ -42,7 +42,13 @@ from app.managed_agent_presets import (
 from app.memory.service import get_memory_service
 from app.host_root_access import activate_host_root_grant
 from app.mcp.servers.filesystem import resolve_workspace_path_for_user, write_workspace_text
-from app.task_service import TaskValidationError, UNSET, create_task_record, update_task_record
+from app.task_service import (
+    TaskValidationError,
+    UNSET,
+    build_duplicate_task_title,
+    create_task_record,
+    update_task_record,
+)
 from app.time_utils import format_localized_datetime, resolve_effective_timezone
 
 router = APIRouter()
@@ -66,6 +72,7 @@ class TaskCreate(BaseModel):
     active_hours_tz: Optional[str] = None
     recipe_family: Optional[str] = None
     recipe_params: Optional[Dict[str, Any]] = None
+    presentation: Optional[Dict[str, Any]] = None
 
 
 class TaskPatch(BaseModel):
@@ -83,8 +90,13 @@ class TaskPatch(BaseModel):
     active_hours_tz: Optional[str] = None
     recipe_family: Optional[str] = None
     recipe_params: Optional[Dict[str, Any]] = None
+    presentation: Optional[Dict[str, Any]] = None
     # Approval flow: set approved=True/False to resume or cancel a waiting_approval task
     approved: Optional[bool] = None
+
+
+class TaskPresentation(BaseModel):
+    accent_hex: Optional[str] = None
 
 
 class AgentInstanceCreate(BaseModel):
@@ -195,6 +207,7 @@ class TaskOut(BaseModel):
     last_run_at_localized: Optional[str]
     next_run_at_localized: Optional[str]
     task_recipe: Optional[Dict[str, Any]]
+    presentation: Optional[TaskPresentation] = None
     resolved_agent: Optional[Dict[str, Any]] = None
 
     class Config:
@@ -217,6 +230,26 @@ class MemoryCandidateApprovalOut(BaseModel):
     candidate_index: int
     candidate: Dict[str, Any]
     memory: ApprovedMemoryOut
+
+
+class TaskDuplicateDraftOut(BaseModel):
+    source_task_id: int
+    title: str
+    instruction: str
+    persona: Optional[str] = None
+    profile: Optional[str] = None
+    llm_model_override: Optional[str] = None
+    task_type: str
+    schedule: Optional[str] = None
+    deliver: bool
+    requires_approval: bool
+    active_hours_start: Optional[str] = None
+    active_hours_end: Optional[str] = None
+    active_hours_tz: Optional[str] = None
+    effective_timezone: str
+    recipe_family: Optional[str] = None
+    recipe_params: Optional[Dict[str, Any]] = None
+    presentation: Optional[TaskPresentation] = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -309,6 +342,7 @@ async def create_task(
             active_hours_tz=body.active_hours_tz,
             recipe_family=body.recipe_family,
             recipe_params=body.recipe_params,
+            presentation=body.presentation,
             user_timezone=current_user.active_hours_tz,
         )
     except TaskValidationError as exc:
@@ -560,6 +594,7 @@ async def update_task(
             active_hours_tz=body.active_hours_tz if "active_hours_tz" in fields_set else UNSET,
             recipe_family=body.recipe_family if "recipe_family" in fields_set else UNSET,
             recipe_params=body.recipe_params if "recipe_params" in fields_set else UNSET,
+            presentation=body.presentation if "presentation" in fields_set else UNSET,
             user_timezone=current_user.active_hours_tz,
         )
     except TaskValidationError as exc:
@@ -568,6 +603,37 @@ async def update_task(
     step_lookup = await _load_current_steps(db, [task])
     run_lookup = await _load_latest_runs(db, [task])
     return _to_task_out(task, step_lookup.get((task.id, task.current_step_index)), user_timezone=current_user.active_hours_tz, latest_run=run_lookup.get(task.id))
+
+
+@router.post("/tasks/{task_id}/duplicate-draft", response_model=TaskDuplicateDraftOut)
+async def duplicate_task_draft(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    task = await _get_owned_task(task_id, current_user.id, db)
+    recipe = task.task_recipe if isinstance(task.task_recipe, dict) else {}
+    params = recipe.get("params") if isinstance(recipe.get("params"), dict) else None
+    effective_timezone = resolve_effective_timezone(task.active_hours_tz, current_user.active_hours_tz)
+    return TaskDuplicateDraftOut(
+        source_task_id=task.id,
+        title=build_duplicate_task_title(task.title),
+        instruction=task.instruction,
+        persona=task.persona,
+        profile=task.profile,
+        llm_model_override=task.llm_model_override,
+        task_type=task.task_type,
+        schedule=task.schedule,
+        deliver=task.deliver,
+        requires_approval=task.requires_approval,
+        active_hours_start=task.active_hours_start,
+        active_hours_end=task.active_hours_end,
+        active_hours_tz=task.active_hours_tz,
+        effective_timezone=effective_timezone,
+        recipe_family=str(recipe.get("family") or "").strip() or None,
+        recipe_params=params,
+        presentation=(task.presentation or None) if hasattr(task, "presentation") else None,
+    )
 
 
 @router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1256,6 +1322,7 @@ def _to_task_out(
         last_run_at_localized=format_localized_datetime(task.last_run_at, timezone_name=effective_timezone) or None,
         next_run_at_localized=format_localized_datetime(task.next_run_at, timezone_name=effective_timezone) or None,
         task_recipe=(task.task_recipe or None) if hasattr(task, "task_recipe") else None,
+        presentation=(task.presentation or None) if hasattr(task, "presentation") else None,
         resolved_agent=resolved_agent,
     )
 
