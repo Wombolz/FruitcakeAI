@@ -21,7 +21,6 @@ def test_resolve_task_profile_aliases_to_rss_newspaper():
     assert resolve_task_profile_by_name("briefing").name == "briefing"
     assert resolve_task_profile_by_name("topic_watcher").name == "topic_watcher"
 
-
 def test_maintenance_model_profile_prefers_small_model():
     task = SimpleNamespace(profile="maintenance")
     user = SimpleNamespace()

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.24
+
+- Added task presentation metadata support so tasks can carry lightweight UI styling such as validated accent colors through create, patch, list, and detail flows.
+- Added a duplicate-draft task endpoint that returns an editor-ready payload with schedule, recipe, timezone, and presentation fields prefilled for safe task cloning in the client.
+- Added the task presentation persistence migration and focused backend coverage for presentation validation, duplicate-draft payloads, and related task API round-trips.
+
 ## v0.7.23
 
 - Added persistent assistant task-draft metadata to chat history and live responses so inline task cards can survive reloads, session switches, and later resolution against the original assistant message.
