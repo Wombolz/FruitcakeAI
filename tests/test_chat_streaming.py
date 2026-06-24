@@ -187,6 +187,40 @@ async def test_run_agent_preemptively_disables_tools_for_qwen_workspace_followup
 
 
 @pytest.mark.asyncio
+async def test_run_agent_restricts_qwen_manual_fact_lookup_to_search_tools():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+
+    with (
+        patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"function": {"name": "search_library"}},
+                {"function": {"name": "summarize_document"}},
+                {"function": {"name": "list_library_documents"}},
+            ],
+        ),
+        patch(
+            "app.agent.core.litellm.acompletion",
+            new=AsyncMock(return_value=_fake_response(content="The manual says the default IP address is 192.168.0.10.")),
+        ) as mock_completion,
+    ):
+        result = await run_agent(
+            [{"role": "user", "content": "What does the AW-UE160P manual say the default IP address is for the camera?"}],
+            user_context,
+            mode="chat_orchestrated",
+            model_override="ollama_chat/qwen3.6:35b",
+            stage="chat_complex",
+        )
+
+    assert result == "The manual says the default IP address is 192.168.0.10."
+    allowed_tools = mock_completion.await_args.kwargs.get("tools") or []
+    tool_names = [tool.get("function", {}).get("name") for tool in allowed_tools]
+    assert "search_library" in tool_names
+    assert "list_library_documents" in tool_names
+    assert "summarize_document" not in tool_names
+
+
+@pytest.mark.asyncio
 async def test_run_agent_does_not_disable_tools_for_cloud_workspace_followup():
     user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
 

@@ -231,6 +231,107 @@ async def test_run_agent_synthesizes_after_repeated_document_lookup(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_run_agent_synthesizes_when_search_repeats_after_document_summary(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_repeated_semantic_tool_signature_threshold", 10)
+
+    responses = [
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "doc_search_1",
+                        "function": {
+                            "name": "search_library",
+                            "arguments": json.dumps({"query": "AW-UE160P default IP address"}),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "doc_summary_1",
+                        "function": {
+                            "name": "summarize_document",
+                            "arguments": json.dumps({"document_name": "AW-UE160P Operation Manual.pdf"}),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "doc_search_2",
+                        "function": {
+                            "name": "search_library",
+                            "arguments": json.dumps({"query": "AW-UE160P default IP address network setup"}),
+                        },
+                    }
+                ]
+            )
+        ),
+        _FakeResponse(_FakeMessage(content="The AW-UE160P manual says the default IP is 192.168.0.10.")),
+    ]
+    tool_results = [
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "doc_search_1",
+                "content": "Search results for: AW-UE160P default IP address\\n\\n[1] Source: AW-UE160P Operation Manual.pdf\\npages 19 to 21\\nDefault IP address: 192.168.0.10",
+            }
+        ],
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "doc_summary_1",
+                "content": "**Summary of 'AW-UE160P Operation Manual.pdf' (50 total sections):**\\n\\nThe manual states the factory default IP address is 192.168.0.10 and describes Easy IP Setup.",
+            }
+        ],
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "doc_search_2",
+                "content": "Search results for: AW-UE160P default IP address network setup\\n\\n[1] Source: AW-UE160P Operation Manual.pdf\\npages 19 to 21\\nDefault IP address: 192.168.0.10",
+            }
+        ],
+    ]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"type": "function", "function": {"name": "search_library"}},
+                {"type": "function", "function": {"name": "summarize_document"}},
+            ],
+        ):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(side_effect=tool_results)):
+                with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=responses)):
+                    result = await run_agent(
+                        [{"role": "user", "content": "What does the AW-UE160P manual say the default IP address is?"}],
+                        ctx,
+                        mode="chat",
+                    )
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert result == "The AW-UE160P manual says the default IP is 192.168.0.10."
+    loop_events = diagnostics.get("loop_events") or []
+    assert any(
+        event.get("type") == "document_summary_followed_by_search"
+        for event in loop_events
+        if isinstance(event, dict)
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_agent_repo_map_style_exploration_compacts_multi_turn_history(monkeypatch):
     ctx = _make_context()
     monkeypatch.setattr(settings, "agent_tool_result_max_chars", 120)

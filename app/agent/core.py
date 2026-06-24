@@ -518,6 +518,8 @@ def _local_tool_prompt_class(history: List[Dict[str, Any]]) -> str:
         if str(message.get("role") or "") == "system"
     ).lower()
 
+    if _is_narrow_document_fact_lookup(latest_user):
+        return "document_fact_lookup"
     if (
         "recent workspace file context for this chat session:" in system_notes
         or (
@@ -532,10 +534,44 @@ def _local_tool_prompt_class(history: List[Dict[str, Any]]) -> str:
     return "general"
 
 
+def _is_narrow_document_fact_lookup(latest_user: str) -> bool:
+    text = str(latest_user or "").strip().lower()
+    if not text:
+        return False
+    if any(token in text for token in ("summarize", "summary", "overview", "recap")):
+        return False
+    doc_markers = ("manual", "document", "pdf", "user guide", "operation manual")
+    fact_markers = (
+        "default",
+        "ip address",
+        "address",
+        "port",
+        "setting",
+        "parameter",
+        "what does",
+        "what is",
+        "which",
+        "where",
+        "page",
+        "say",
+    )
+    return any(marker in text for marker in doc_markers) and any(marker in text for marker in fact_markers)
+
+
 def _local_tool_guardrail(history: List[Dict[str, Any]], *, model: str | None, mode: str) -> Dict[str, Any] | None:
     if mode not in {"chat", "chat_orchestrated"} or not _is_qwen_local_tool_guardrail_model(model):
         return None
     prompt_class = _local_tool_prompt_class(history)
+    if prompt_class == "document_fact_lookup":
+        return {
+            "prompt_class": prompt_class,
+            "instruction": (
+                "This local model is unreliable when narrow manual/document fact lookups escalate into full-document summaries. "
+                "If tools are needed, prefer search_library excerpts and answer directly from those excerpts. "
+                "Do not call summarize_document unless the user explicitly asked for a summary or the excerpts are clearly insufficient."
+            ),
+            "allowed_tool_names": ["search_library", "list_library_documents"],
+        }
     if prompt_class == "workspace_followup":
         return {
             "prompt_class": prompt_class,
@@ -564,6 +600,59 @@ def _build_tool_parse_fallback_history(history: List[Dict[str, Any]]) -> List[Di
         "If the answer would require fresh tool access, say that briefly instead of inventing details."
     )
     return _insert_system_note_before_latest_user(history, note)
+
+
+def _apply_local_tool_guardrail(
+    *,
+    history: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None,
+    model: str,
+    mode: str,
+    stage: str | None,
+    user_context: UserContext,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]] | None]:
+    turn_history = history
+    turn_tools = tools
+    guardrail = _local_tool_guardrail(history, model=model, mode=mode)
+    if not turn_tools or guardrail is None:
+        return turn_history, turn_tools
+
+    turn_history = _insert_system_note_before_latest_user(history, str(guardrail["instruction"]))
+    allowed_tool_names = [str(name).strip() for name in (guardrail.get("allowed_tool_names") or []) if str(name).strip()]
+    if allowed_tool_names:
+        filtered = [
+            tool for tool in turn_tools
+            if str(((tool or {}).get("function") or {}).get("name") or "").strip() in set(allowed_tool_names)
+        ]
+        turn_tools = filtered or None
+        _log_local_tool_event(
+            event="LLM local_tool_guardrail_applied",
+            history=history,
+            tools=tools,
+            model=model,
+            mode=mode,
+            stage=stage,
+            user_context=user_context,
+            prompt_class=str(guardrail.get("prompt_class") or ""),
+            tool_failure_phase="guardrail_restrict_tools",
+            tools_enabled=bool(turn_tools),
+        )
+        return turn_history, turn_tools
+
+    turn_tools = None
+    _log_local_tool_event(
+        event="LLM local_tool_guardrail_applied",
+        history=history,
+        tools=tools,
+        model=model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+        prompt_class=str(guardrail.get("prompt_class") or ""),
+        tool_failure_phase="guardrail_preemptive_text_only",
+        tools_enabled=False,
+    )
+    return turn_history, turn_tools
 
 
 def _insert_system_note_before_latest_user(history: List[Dict[str, Any]], note: str) -> List[Dict[str, Any]]:
@@ -1121,6 +1210,16 @@ def _document_evidence_summary(evidence: list[dict[str, Any]]) -> str:
             label += f", target={target}"
         lines.append(f"Evidence block {index} ({label}):\n{str(item.get('content') or '').strip()}")
     return "\n\n".join(lines).strip()
+
+
+def _has_nonempty_document_summary_evidence(history: List[Dict[str, Any]]) -> bool:
+    evidence = _recent_document_evidence(history, limit=6)
+    for item in evidence:
+        if str(item.get("tool_name") or "") != "summarize_document":
+            continue
+        if not bool(item.get("is_empty")):
+            return True
+    return False
 
 
 def _history_contains_rss_tool_activity(history: List[Dict[str, Any]]) -> bool:
@@ -2047,22 +2146,14 @@ async def run_agent(
         turn_number = turn + 1
         turn_tools = tools
         turn_history = history
-        guardrail = _local_tool_guardrail(history, model=selected_model, mode=mode)
-        if turn_tools and guardrail is not None:
-            turn_history = _insert_system_note_before_latest_user(history, str(guardrail["instruction"]))
-            turn_tools = None
-            _log_local_tool_event(
-                event="LLM local_tool_guardrail_applied",
-                history=history,
-                tools=tools,
-                model=selected_model,
-                mode=mode,
-                stage=stage,
-                user_context=user_context,
-                prompt_class=str(guardrail.get("prompt_class") or ""),
-                tool_failure_phase="guardrail_preemptive_text_only",
-                tools_enabled=False,
-            )
+        turn_history, turn_tools = _apply_local_tool_guardrail(
+            history=history,
+            tools=tools,
+            model=selected_model,
+            mode=mode,
+            stage=stage,
+            user_context=user_context,
+        )
         _log_agent_turn_start(
             turn=turn_number,
             max_turns=max_turns,
@@ -2310,6 +2401,28 @@ async def run_agent(
                     )
                     if synthesized:
                         return synthesized
+            if current_is_document_signature and _has_nonempty_document_summary_evidence(history):
+                if any(_tool_call_name(call) == "search_library" for call in normalized_tool_calls):
+                    _record_loop_event(
+                        event_type="document_summary_followed_by_search",
+                        stage=stage,
+                        mode=mode,
+                        model=selected_model,
+                        details={
+                            "turn": turn_number,
+                            "tool_names": [_tool_call_name(call) for call in normalized_tool_calls],
+                        },
+                    )
+                    synthesized = await _safe_synthesize_from_document_evidence(
+                        history=history,
+                        user_context=user_context,
+                        selected_model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        reason="document_summary_already_available",
+                    )
+                    if synthesized:
+                        return synthesized
             if current_is_document_signature and turn_number >= max_turns - 1:
                 synthesized = await _safe_synthesize_from_document_evidence(
                     history=history,
@@ -2418,22 +2531,14 @@ async def stream_agent(
         turn_number = turn + 1
         turn_tools = tools
         turn_history = history
-        guardrail = _local_tool_guardrail(history, model=selected_model, mode=mode)
-        if turn_tools and guardrail is not None:
-            turn_history = _insert_system_note_before_latest_user(history, str(guardrail["instruction"]))
-            turn_tools = None
-            _log_local_tool_event(
-                event="LLM local_tool_guardrail_applied",
-                history=history,
-                tools=tools,
-                model=selected_model,
-                mode=mode,
-                stage=stage,
-                user_context=user_context,
-                prompt_class=str(guardrail.get("prompt_class") or ""),
-                tool_failure_phase="guardrail_preemptive_text_only",
-                tools_enabled=False,
-            )
+        turn_history, turn_tools = _apply_local_tool_guardrail(
+            history=history,
+            tools=tools,
+            model=selected_model,
+            mode=mode,
+            stage=stage,
+            user_context=user_context,
+        )
         _log_agent_turn_start(
             turn=turn_number,
             max_turns=max_turns,
@@ -2687,6 +2792,29 @@ async def stream_agent(
                         mode=mode,
                         stage=stage,
                         reason="headline_roundup_convergence",
+                    )
+                    if synthesized:
+                        yield synthesized
+                        return
+            if current_is_document_signature and _has_nonempty_document_summary_evidence(history):
+                if any(_tool_call_name(call) == "search_library" for call in normalized_tool_calls):
+                    _record_loop_event(
+                        event_type="document_summary_followed_by_search",
+                        stage=stage,
+                        mode=mode,
+                        model=selected_model,
+                        details={
+                            "turn": turn_number,
+                            "tool_names": [_tool_call_name(call) for call in normalized_tool_calls],
+                        },
+                    )
+                    synthesized = await _safe_synthesize_from_document_evidence(
+                        history=history,
+                        user_context=user_context,
+                        selected_model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        reason="document_summary_already_available",
                     )
                     if synthesized:
                         yield synthesized
