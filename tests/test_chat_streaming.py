@@ -7,6 +7,7 @@ import pytest
 
 from app.agent.context import UserContext
 from app.agent.core import run_agent, stream_agent
+from app.config import settings
 
 
 class _FakeMessage:
@@ -298,8 +299,94 @@ async def test_run_agent_logs_structured_local_tool_parse_diagnostics_after_succ
     assert fallback_call.kwargs["tool_failure_phase"] == "after_successful_tool_turn"
     assert fallback_call.kwargs["prompt_class"] == "general"
     assert fallback_call.kwargs["offered_tools"] == ["get_weather"]
+    assert fallback_call.kwargs["offered_tool_count"] == 1
+    assert fallback_call.kwargs["offered_has_browser_tools"] is False
     assert fallback_call.kwargs["history_preview"]
     assert "failed to parse JSON" in fallback_call.kwargs["error_preview"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_investigation_filter_can_drop_browser_tools_for_qwen(monkeypatch):
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    monkeypatch.setattr(settings, "local_tool_investigation_enabled", True)
+    monkeypatch.setattr(settings, "local_tool_investigation_drop_browser_tools", True)
+    monkeypatch.setattr(settings, "local_tool_investigation_max_tools", 0)
+
+    with (
+        patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"function": {"name": "search_library"}},
+                {"function": {"name": "browser_navigate"}},
+                {"function": {"name": "browser_click"}},
+            ],
+        ),
+        patch(
+            "app.agent.core.litellm.acompletion",
+            new=AsyncMock(return_value=_fake_response(content="Search-only response"))),
+        patch("app.agent.core.log.warning") as mock_warning,
+    ):
+        result = await run_agent(
+            [{"role": "user", "content": "Find the note in my library."}],
+            user_context,
+            mode="chat_orchestrated",
+            model_override="ollama_chat/qwen3.6:35b",
+            stage="chat_complex",
+        )
+
+    assert result == "Search-only response"
+    investigation_call = None
+    for call in mock_warning.call_args_list:
+        if call.args and call.args[0] == "LLM local_tool_investigation_filter_applied":
+            investigation_call = call
+            break
+    assert investigation_call is not None
+    assert investigation_call.kwargs["investigation_reasons"] == ["drop_browser_tools"]
+    assert investigation_call.kwargs["raw_tool_surface"]["offered_tool_count"] == 3
+    assert investigation_call.kwargs["raw_tool_surface"]["offered_browser_tool_count"] == 2
+    assert investigation_call.kwargs["effective_tool_surface"]["offered_tools"] == ["search_library"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_investigation_filter_can_cap_local_qwen_tool_count(monkeypatch):
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    monkeypatch.setattr(settings, "local_tool_investigation_enabled", True)
+    monkeypatch.setattr(settings, "local_tool_investigation_drop_browser_tools", False)
+    monkeypatch.setattr(settings, "local_tool_investigation_max_tools", 2)
+
+    with (
+        patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"function": {"name": "search_library"}},
+                {"function": {"name": "list_library_documents"}},
+                {"function": {"name": "summarize_document"}},
+            ],
+        ),
+        patch(
+            "app.agent.core.litellm.acompletion",
+            new=AsyncMock(return_value=_fake_response(content="Capped tool response")),
+        ) as mock_completion,
+        patch("app.agent.core.log.warning") as mock_warning,
+    ):
+        result = await run_agent(
+            [{"role": "user", "content": "Tell me about my documents."}],
+            user_context,
+            mode="chat_orchestrated",
+            model_override="ollama_chat/qwen3.6:35b",
+            stage="chat_complex",
+        )
+
+    assert result == "Capped tool response"
+    tool_names = [tool.get("function", {}).get("name") for tool in (mock_completion.await_args.kwargs.get("tools") or [])]
+    assert tool_names == ["search_library", "list_library_documents"]
+    investigation_call = None
+    for call in mock_warning.call_args_list:
+        if call.args and call.args[0] == "LLM local_tool_investigation_filter_applied":
+            investigation_call = call
+            break
+    assert investigation_call is not None
+    assert investigation_call.kwargs["investigation_reasons"] == ["cap_tools:2"]
 
 
 @pytest.mark.asyncio

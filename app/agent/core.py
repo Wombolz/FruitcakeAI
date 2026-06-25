@@ -224,6 +224,9 @@ def _build_messages(
     followup_hint = _recent_task_followup_hint(history)
     if followup_hint:
         messages.append({"role": "system", "content": followup_hint})
+    immediate_action_hint = _recent_immediate_action_followup_hint(history)
+    if immediate_action_hint:
+        messages.append({"role": "system", "content": immediate_action_hint})
     return messages + history
 
 
@@ -458,6 +461,37 @@ def _tool_names_from_schemas(tools: List[Dict[str, Any]] | None) -> List[str]:
     return names
 
 
+def _is_browserish_tool_name(name: str) -> bool:
+    normalized = str(name or "").strip().lower()
+    if not normalized:
+        return False
+    browser_tokens = (
+        "browser",
+        "playwright",
+        "page",
+        "navigate",
+        "click",
+        "type",
+        "tab",
+        "dom",
+        "selector",
+        "screenshot",
+    )
+    return any(token in normalized for token in browser_tokens)
+
+
+def _tool_surface_summary(tools: List[Dict[str, Any]] | None) -> Dict[str, Any]:
+    tool_names = _tool_names_from_schemas(tools)
+    browser_tools = [name for name in tool_names if _is_browserish_tool_name(name)]
+    return {
+        "offered_tools": tool_names,
+        "offered_tool_count": len(tool_names),
+        "offered_browser_tools": browser_tools,
+        "offered_browser_tool_count": len(browser_tools),
+        "offered_has_browser_tools": bool(browser_tools),
+    }
+
+
 def _tool_message_preview(history: List[Dict[str, Any]], *, limit: int = 5) -> List[Dict[str, Any]]:
     preview: List[Dict[str, Any]] = []
     for message in history[-max(1, limit):]:
@@ -655,6 +689,56 @@ def _apply_local_tool_guardrail(
     return turn_history, turn_tools
 
 
+def _apply_local_tool_investigation_filters(
+    *,
+    tools: List[Dict[str, Any]] | None,
+    model: str,
+    mode: str,
+    stage: str | None,
+    user_context: UserContext,
+    history: List[Dict[str, Any]],
+) -> List[Dict[str, Any]] | None:
+    if not tools or not settings.local_tool_investigation_enabled or not _is_qwen_local_tool_guardrail_model(model):
+        return tools
+
+    filtered = list(tools)
+    reasons: List[str] = []
+
+    if settings.local_tool_investigation_drop_browser_tools:
+        browser_filtered = [
+            tool
+            for tool in filtered
+            if not _is_browserish_tool_name(str(((tool or {}).get("function") or {}).get("name") or ""))
+        ]
+        if len(browser_filtered) != len(filtered):
+            filtered = browser_filtered
+            reasons.append("drop_browser_tools")
+
+    max_tools = max(0, int(settings.local_tool_investigation_max_tools or 0))
+    if max_tools and len(filtered) > max_tools:
+        filtered = filtered[:max_tools]
+        reasons.append(f"cap_tools:{max_tools}")
+
+    if reasons:
+        _log_local_tool_event(
+            event="LLM local_tool_investigation_filter_applied",
+            history=history,
+            tools=filtered,
+            model=model,
+            mode=mode,
+            stage=stage,
+            user_context=user_context,
+            prompt_class=_local_tool_prompt_class(history),
+            tool_failure_phase="investigation_filter",
+            tools_enabled=bool(filtered),
+            raw_tool_surface=_tool_surface_summary(tools),
+            effective_tool_surface=_tool_surface_summary(filtered),
+            investigation_reasons=reasons,
+        )
+
+    return filtered or None
+
+
 def _insert_system_note_before_latest_user(history: List[Dict[str, Any]], note: str) -> List[Dict[str, Any]]:
     updated = list(history)
     if updated and updated[-1].get("role") == "user":
@@ -675,7 +759,11 @@ def _log_local_tool_event(
     prompt_class: str | None = None,
     tool_failure_phase: str | None = None,
     tools_enabled: bool = True,
+    raw_tool_surface: Dict[str, Any] | None = None,
+    effective_tool_surface: Dict[str, Any] | None = None,
+    investigation_reasons: List[str] | None = None,
 ) -> None:
+    tool_surface = _tool_surface_summary(tools)
     payload = {
         "model": str(model or ""),
         "mode": mode,
@@ -683,7 +771,7 @@ def _log_local_tool_event(
         "session_id": user_context.session_id,
         "task_id": user_context.task_id,
         "tools_enabled": tools_enabled,
-        "offered_tools": _tool_names_from_schemas(tools),
+        **tool_surface,
         "recent_roles": _recent_role_sequence(history),
         "prompt_fingerprint": _content_fingerprint(_latest_user_message_text(history), length=16),
         "history_fingerprint": _history_prompt_fingerprint(history),
@@ -693,6 +781,12 @@ def _log_local_tool_event(
     }
     if error is not None:
         payload["error_preview"] = _raw_error_preview(error)
+    if raw_tool_surface is not None:
+        payload["raw_tool_surface"] = raw_tool_surface
+    if effective_tool_surface is not None:
+        payload["effective_tool_surface"] = effective_tool_surface
+    if investigation_reasons:
+        payload["investigation_reasons"] = investigation_reasons
     log.warning(event, **payload)
 
 
@@ -1826,6 +1920,49 @@ def _recent_task_followup_hint(messages: List[Dict[str, Any]]) -> str | None:
     )
 
 
+def _recent_immediate_action_followup_hint(messages: List[Dict[str, Any]]) -> str | None:
+    latest_user = _latest_user_message_text(messages).strip().lower()
+    if latest_user not in {"yes", "yes.", "yes please", "please do", "go ahead", "go ahead.", "proceed", "proceed.", "do it", "do it.", "run it", "run it."}:
+        return None
+
+    previous_assistant = ""
+    for message in reversed(messages[:-1]):
+        if str(message.get("role") or "") == "assistant":
+            previous_assistant = str(message.get("content") or "").strip().lower()
+            break
+    if not previous_assistant:
+        return None
+
+    immediate_markers = (
+        "shall i run this now",
+        "shall i proceed",
+        "want me to proceed",
+        "want me to run this now",
+        "should i run this now",
+        "i can run this now",
+        "i can do this now",
+    )
+    action_markers = (
+        "workspace",
+        "file",
+        "archive",
+        "trim",
+        "append",
+        "write",
+        "report",
+        "directory",
+    )
+    if not any(marker in previous_assistant for marker in immediate_markers):
+        return None
+    if not any(marker in previous_assistant for marker in action_markers):
+        return None
+
+    return (
+        "The user's latest short confirmation is approval to execute the concrete action proposed in the prior assistant message now in this chat. "
+        "Prefer performing the action with available tools. Do not use propose_task_draft or create_task unless the user explicitly asks to save, schedule, automate, or create a task."
+    )
+
+
 def _recent_conversation_text(messages: List[Dict[str, Any]], *, limit: int = 6) -> str:
     recent: list[str] = []
     for message in reversed(messages):
@@ -2108,10 +2245,18 @@ async def run_agent(
         if unsupported_api_message:
             return unsupported_api_message
 
-    tools = get_tools_for_user(user_context)
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
     selected_model = model_override or settings.llm_model
+    tools = get_tools_for_user(user_context)
+    tools = _apply_local_tool_investigation_filters(
+        tools=tools,
+        model=selected_model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+        history=history,
+    )
     extra = _litellm_kwargs(selected_model)
     consecutive_failed_search_turns = 0
     previous_tool_signature = ""
@@ -2493,10 +2638,18 @@ async def stream_agent(
         yield unsupported_api_message
         return
 
-    tools = get_tools_for_user(user_context)
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
     selected_model = model_override or settings.llm_model
+    tools = get_tools_for_user(user_context)
+    tools = _apply_local_tool_investigation_filters(
+        tools=tools,
+        model=selected_model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+        history=history,
+    )
     extra = _litellm_kwargs(selected_model)
     consecutive_failed_search_turns = 0
     previous_tool_signature = ""

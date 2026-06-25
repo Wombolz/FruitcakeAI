@@ -23,6 +23,7 @@ from sqlalchemy import select
 
 from app.agent.context import UserContext
 from app.agent.core import (
+    _build_messages,
     _filter_tools_for_prompt,
     _is_rss_owned_headline_prompt,
     _rewrite_headline_rss_tool_calls,
@@ -34,7 +35,7 @@ from app.agent.core import (
     restore_agent_loop_diagnostics,
     run_agent,
 )
-from app.agent.tools import TOOL_SCHEMAS, _parse_iso_datetime, get_tools_for_user
+from app.agent.tools import TOOL_SCHEMAS, _parse_iso_datetime, _sample_document_chunks_evenly, get_tools_for_user
 from app.config import settings
 from tests.conftest import TestSessionLocal
 
@@ -1123,6 +1124,17 @@ def test_summarize_document_has_document_name_parameter():
     assert "document_name" in required
 
 
+def test_sample_document_chunks_evenly_covers_start_middle_and_end():
+    chunks = [f"chunk-{i}" for i in range(129)]
+    sampled = _sample_document_chunks_evenly(chunks, max_chunks=64)
+
+    assert len(sampled) == 64
+    assert sampled[0] == "chunk-0"
+    assert sampled[-1] == "chunk-128"
+    assert any(item in sampled for item in ("chunk-63", "chunk-64", "chunk-65"))
+    assert any(int(item.split("-")[1]) >= 120 for item in sampled)
+
+
 def test_list_library_documents_schema_fields():
     schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "list_library_documents")
     props = schema["function"]["parameters"]["properties"]
@@ -1171,6 +1183,21 @@ def test_system_prompt_requires_task_draft_before_create_or_update():
     assert "propose_task_draft" in prompt
     assert "review the draft in the task editor before anything is persisted" in prompt
     assert "high-confidence task recipe" in prompt
+    assert "do not turn a short confirmation like 'yes' into a new saved task" in prompt
+
+
+def test_build_messages_adds_immediate_action_followup_hint_for_yes_after_run_now_offer():
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    history = [
+        {"role": "assistant", "content": "I can trim the workspace report and archive older entries now. Shall I run this now?"},
+        {"role": "user", "content": "yes"},
+    ]
+
+    messages = _build_messages(history, ctx)
+    system_messages = [m["content"].lower() for m in messages if m["role"] == "system"]
+
+    assert any("approval to execute the concrete action proposed" in msg for msg in system_messages)
+    assert any("do not use propose_task_draft or create_task" in msg for msg in system_messages)
 
 
 def test_system_prompt_includes_persona_behavior_instructions():
@@ -2473,6 +2500,31 @@ async def test_propose_task_draft_tool_returns_normalized_draft_without_persisti
     async with TestSessionLocal() as db:
         rows = await db.execute(select(Task))
         assert rows.scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_propose_task_draft_rejects_unsupported_explicit_maintenance_recipe():
+    import app.agent.tools as tools_module
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._propose_task_draft(
+            {
+                "title": "Archive and summarize Anthropic report",
+                "instruction": "Trim and archive /workspace/reports/Anthropic Fable.md and build a compact summary.",
+                "task_type": "one_shot",
+                "deliver": True,
+                "recipe_family": "maintenance",
+                "recipe_params": {
+                    "retention_days": 60,
+                    "source_file": "/workspace/reports/Anthropic Fable.md",
+                },
+            },
+            ctx,
+        )
+
+    assert "Could not build the selected task family 'maintenance'" in result
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     local_api_base: str = "http://localhost:11434/v1"
     local_api_key: str = "sk-local"
     local_model: str = "qwen2.5:32b"
+    document_summary_model: str = "ollama_chat/qwen2.5:14b"
     # Task-stage routing (Phase 5.4.x)
     task_small_model: str = "ollama_chat/qwen2.5:14b"
     task_large_model: str = "ollama_chat/qwen2.5:32b"
@@ -93,6 +94,10 @@ class Settings(BaseSettings):
     chat_validation_enabled: bool = True
     chat_validation_retry_enabled: bool = True
     chat_validation_retry_max_attempts: int = 1
+    # Local-model tool-calling investigation toggles
+    local_tool_investigation_enabled: bool = False
+    local_tool_investigation_drop_browser_tools: bool = False
+    local_tool_investigation_max_tools: int = 0
     # Sprint 5.6.5 knowledge skills
     skills_preview_allowed_domains: List[str] = [
         "github.com",
@@ -117,8 +122,8 @@ class Settings(BaseSettings):
     workspace_dir: str = "./workspace"
     linked_source_allowed_roots: str = ""
     upload_max_size_mb: int = 50
-    filesystem_mcp_max_read_bytes: int = 100_000
-    filesystem_mcp_max_write_bytes: int = 100_000
+    filesystem_mcp_max_read_bytes: int = 250_000
+    filesystem_mcp_max_write_bytes: int = 240_000
     filesystem_mcp_max_search_results: int = 50
 
     # ── CORS ──────────────────────────────────────────────────────────────────

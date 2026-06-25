@@ -112,6 +112,19 @@ def resolve_document_name(query: str, filenames: List[str]) -> tuple[str | None,
         return substring_matches[0], []
     return None, []
 
+
+def _sample_document_chunks_evenly(all_chunks: List[str], *, max_chunks: int) -> List[str]:
+    if max_chunks <= 0 or len(all_chunks) <= max_chunks:
+        return list(all_chunks)
+    if max_chunks == 1:
+        return [all_chunks[0]]
+    last_index = len(all_chunks) - 1
+    indices = {
+        round(i * last_index / (max_chunks - 1))
+        for i in range(max_chunks)
+    }
+    return [all_chunks[index] for index in sorted(indices)]
+
 # ── Tool schema definitions ───────────────────────────────────────────────────
 # These are sent to the LLM so it knows what tools it can call.
 
@@ -1357,11 +1370,9 @@ async def _summarize_document(
 
     display_name = doc.original_filename or doc_name
 
-    # Stride-sample if the document exceeds the chunk budget
-    sampled = total <= MAX_CHUNKS
+    # Evenly sample if the document exceeds the chunk budget
     if total > MAX_CHUNKS:
-        stride = total // MAX_CHUNKS
-        chunks = all_chunks[::stride][:MAX_CHUNKS]
+        chunks = _sample_document_chunks_evenly(all_chunks, max_chunks=MAX_CHUNKS)
         coverage_note = (
             f"Note: This document has {total} sections. "
             f"The summary covers {len(chunks)} evenly-spaced samples from throughout."
@@ -1376,22 +1387,23 @@ async def _summarize_document(
     async def summarize_batch(texts: List[str], label: str = "") -> str:
         combined = "\n\n---\n\n".join(texts)
         suffix = f" ({label})" if label else ""
+        summary_model = settings.document_summary_model or settings.llm_model
         prompt = (
             f"Summarize the following sections from '{display_name}'{suffix}. "
             "Be thorough — capture all key people, events, dates, decisions, "
             "and themes:\n\n" + combined
         )
         resp = await litellm.acompletion(
-            model=settings.llm_model,
+            model=summary_model,
             messages=[{"role": "user", "content": prompt}],
-            **_litellm_kwargs(),
+            **_litellm_kwargs(summary_model),
         )
         await record_llm_usage_event(
             resp,
             user_id=user_context.user_id,
             source="tool_document_summary",
             stage="tool_document_summary",
-            model=settings.llm_model,
+            model=summary_model,
         )
         return resp.choices[0].message.content.strip()
 
