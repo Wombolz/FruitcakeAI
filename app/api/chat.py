@@ -786,6 +786,8 @@ async def send_message(
     runtime_history_token = None
     runtime_history_messages: List[Dict[str, Any]] = []
     handoff_metadata: Dict[str, Any] = {}
+    assistant_metadata: Dict[str, Any] | None = None
+    persisted_runtime_message_count = 0
     chat_run_manager = get_chat_run_manager()
     current_task = asyncio.current_task()
     try:
@@ -799,30 +801,103 @@ async def send_message(
             session_id=session_id,
             source="chat_rest",
         )
+
+        async def _flush_runtime_messages(new_messages: List[Dict[str, Any]]) -> None:
+            nonlocal persisted_runtime_message_count
+            added = await _persist_runtime_history_messages(session_id, new_messages, db)
+            if added:
+                persisted_runtime_message_count += added
+                await db.commit()
+
+        async def _flush_pending_runtime_history() -> None:
+            nonlocal persisted_runtime_message_count, runtime_history_messages
+            runtime_history_messages = get_agent_runtime_history()
+            pending = runtime_history_messages[persisted_runtime_message_count:]
+            added = await _persist_runtime_history_messages(session_id, pending, db)
+            if added:
+                persisted_runtime_message_count += added
+                await db.commit()
+
         stage_started = time.perf_counter()
-        reply = await _execute_chat_turn(
-            execution_history,
-            user_context,
-            user_prompt=body.content,
-            mode=execution_mode,
-            model_override=session.llm_model,
-            stage="chat_complex" if effective_complex else "chat_simple",
-            enable_validation=should_validate,
-        )
+        try:
+            reply = await _execute_chat_turn(
+                execution_history,
+                user_context,
+                user_prompt=body.content,
+                mode=execution_mode,
+                model_override=session.llm_model,
+                stage="chat_complex" if effective_complex else "chat_simple",
+                enable_validation=should_validate,
+                runtime_message_callback=_flush_runtime_messages,
+            )
+        except Exception as e:
+            await _flush_pending_runtime_history()
+            handoff_metadata = get_task_handoff_payload() or {}
+            if _is_local_chat_model(session.llm_model) and _runtime_history_has_completed_tool_turn(runtime_history_messages):
+                reply = _build_local_post_tool_synthesis_recovery_message(runtime_history_messages)
+                log.warning(
+                    "chat.local_post_tool_synthesis_recovered",
+                    session_id=session_id,
+                    user_id=current_user.id,
+                    model=session.llm_model,
+                    mode=execution_mode,
+                    stage="chat_complex" if effective_complex else "chat_simple",
+                    tool_names=_runtime_history_tool_names(runtime_history_messages),
+                    runtime_history_message_count=len(runtime_history_messages),
+                    persisted_runtime_messages=persisted_runtime_message_count,
+                    error=str(e),
+                    failure_phase="post_tool_synthesis",
+                )
+            else:
+                log.exception("Agent error in REST handler", session_id=session_id)
+                raise HTTPException(status_code=500, detail="Agent error — check server logs for details")
         _record_chat_stage_timing(stage_timings_ms, "model_execution", stage_started)
         reply = _enforce_calendar_mutation_integrity(
             body.content,
             reply,
             get_tool_execution_records(),
         )
-        runtime_history_messages = get_agent_runtime_history()
+        await _flush_pending_runtime_history()
         handoff_metadata = get_task_handoff_payload() or {}
+        assistant_metadata = _build_assistant_message_metadata(
+            handoff_metadata=handoff_metadata,
+            executed_tools=get_tool_execution_records(),
+        )
+
+        assistant_msg = ChatMessage(
+            session_id=session_id,
+            role="assistant",
+            content=reply,
+            tool_results=_encode_assistant_message_metadata(assistant_metadata) if assistant_metadata else None,
+        )
+        db.add(assistant_msg)
+        await db.commit()
+        _log_chat_latency_breakdown(
+            session_id=session_id,
+            mode=execution_mode,
+            total_started=request_started,
+            stage_timings_ms=stage_timings_ms,
+            transport="rest",
+        )
+
+        return {
+            "role": "assistant",
+            "content": reply,
+            "message_id": int(assistant_msg.id),
+            "session_id": session_id,
+            "metadata": {
+                "active_skills": list(user_context.active_skill_slugs or []),
+                "skill_selection_mode": user_context.skill_selection_mode or "",
+                **(assistant_metadata or {}),
+                **handoff_metadata,
+            },
+        }
     except asyncio.CancelledError:
         log.info("Chat REST run stopped", session_id=session_id, user_id=current_user.id)
         return JSONResponse(status_code=409, content={"detail": "Chat stopped by user"})
-    except Exception as e:
-        log.exception("Agent error in REST handler", session_id=session_id)
-        raise HTTPException(status_code=500, detail="Agent error — check server logs for details")
+    except Exception:
+        await db.rollback()
+        raise
     finally:
         if prompt_claimed:
             await chat_run_manager.mark_prompt_finished(session_id, body.content)
@@ -848,42 +923,6 @@ async def send_message(
                 restore_agent_runtime_history(runtime_history_token)
             except Exception:
                 pass
-
-    assistant_metadata = _build_assistant_message_metadata(
-        handoff_metadata=handoff_metadata,
-        executed_tools=get_tool_execution_records(),
-    )
-
-    # Store assistant reply
-    await _persist_runtime_history_messages(session_id, runtime_history_messages, db)
-    assistant_msg = ChatMessage(
-        session_id=session_id,
-        role="assistant",
-        content=reply,
-        tool_results=_encode_assistant_message_metadata(assistant_metadata) if assistant_metadata else None,
-    )
-    db.add(assistant_msg)
-    await db.commit()
-    _log_chat_latency_breakdown(
-        session_id=session_id,
-        mode=execution_mode,
-        total_started=request_started,
-        stage_timings_ms=stage_timings_ms,
-        transport="rest",
-    )
-
-    return {
-        "role": "assistant",
-        "content": reply,
-        "message_id": int(assistant_msg.id),
-        "session_id": session_id,
-        "metadata": {
-            "active_skills": list(user_context.active_skill_slugs or []),
-            "skill_selection_mode": user_context.skill_selection_mode or "",
-            **(assistant_metadata or {}),
-            **handoff_metadata,
-        },
-    }
 
 
 @router.post("/sessions/{session_id}/stop", response_model=StopChatResponse)
@@ -1114,22 +1153,64 @@ async def _run_websocket_message(
         runtime_history_token = reset_agent_runtime_history()
         handoff_metadata: Dict[str, Any] = {}
         runtime_history_messages: List[Dict[str, Any]] = []
+        persisted_runtime_message_count = 0
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
             session_id=session_id,
             source="chat_websocket",
         )
+
+        async def _flush_runtime_messages(new_messages: List[Dict[str, Any]]) -> None:
+            nonlocal persisted_runtime_message_count
+            added = await _persist_runtime_history_messages(session_id, new_messages, db)
+            if added:
+                persisted_runtime_message_count += added
+                await db.commit()
+
+        async def _flush_pending_runtime_history() -> None:
+            nonlocal persisted_runtime_message_count, runtime_history_messages
+            runtime_history_messages = get_agent_runtime_history()
+            pending = runtime_history_messages[persisted_runtime_message_count:]
+            added = await _persist_runtime_history_messages(session_id, pending, db)
+            if added:
+                persisted_runtime_message_count += added
+                await db.commit()
+
         if should_validate:
             stage_started = time.perf_counter()
-            complete = await _execute_chat_turn(
-                execution_history,
-                user_context,
-                user_prompt=user_message,
-                mode=execution_mode,
-                model_override=session.llm_model,
-                stage="chat_complex" if effective_complex else "chat_simple",
-                enable_validation=True,
-            )
+            try:
+                complete = await _execute_chat_turn(
+                    execution_history,
+                    user_context,
+                    user_prompt=user_message,
+                    mode=execution_mode,
+                    model_override=session.llm_model,
+                    stage="chat_complex" if effective_complex else "chat_simple",
+                    enable_validation=True,
+                    runtime_message_callback=_flush_runtime_messages,
+                )
+            except Exception as e:
+                await _flush_pending_runtime_history()
+                handoff_metadata = get_task_handoff_payload() or {}
+                if _is_local_chat_model(session.llm_model) and _runtime_history_has_completed_tool_turn(runtime_history_messages):
+                    complete = _build_local_post_tool_synthesis_recovery_message(runtime_history_messages)
+                    log.warning(
+                        "chat.local_post_tool_synthesis_recovered",
+                        session_id=session_id,
+                        user_id=current_user.id,
+                        websocket_id=websocket_id,
+                        client_send_id=client_send_id or "",
+                        model=session.llm_model,
+                        mode=execution_mode,
+                        stage="chat_complex" if effective_complex else "chat_simple",
+                        tool_names=_runtime_history_tool_names(runtime_history_messages),
+                        runtime_history_message_count=len(runtime_history_messages),
+                        persisted_runtime_messages=persisted_runtime_message_count,
+                        error=str(e),
+                        failure_phase="post_tool_synthesis",
+                    )
+                else:
+                    raise
             _record_chat_stage_timing(stage_timings_ms, "model_execution", stage_started)
             complete = _enforce_calendar_mutation_integrity(
                 user_message,
@@ -1142,32 +1223,62 @@ async def _run_websocket_message(
             complete = "".join(full_response)
         else:
             started = time.perf_counter()
-            async for token_chunk in stream_agent(
-                execution_history,
-                user_context,
-                mode=execution_mode,
-                model_override=session.llm_model,
-                stage="chat_simple",
-            ):
-                full_response.append(token_chunk)
-                await _send_json_if_open({"type": "token", "content": token_chunk})
+            try:
+                async for token_chunk in stream_agent(
+                    execution_history,
+                    user_context,
+                    mode=execution_mode,
+                    model_override=session.llm_model,
+                    stage="chat_simple",
+                    runtime_message_callback=_flush_runtime_messages,
+                ):
+                    full_response.append(token_chunk)
+                    await _send_json_if_open({"type": "token", "content": token_chunk})
+            except Exception as e:
+                await _flush_pending_runtime_history()
+                handoff_metadata = get_task_handoff_payload() or {}
+                if _is_local_chat_model(session.llm_model) and _runtime_history_has_completed_tool_turn(runtime_history_messages):
+                    complete = _build_local_post_tool_synthesis_recovery_message(runtime_history_messages)
+                    full_response = []
+                    for token_chunk in _chunk_text(complete):
+                        full_response.append(token_chunk)
+                        await _send_json_if_open({"type": "token", "content": token_chunk})
+                    log.warning(
+                        "chat.local_post_tool_synthesis_recovered",
+                        session_id=session_id,
+                        user_id=current_user.id,
+                        websocket_id=websocket_id,
+                        client_send_id=client_send_id or "",
+                        model=session.llm_model,
+                        mode=execution_mode,
+                        stage="chat_simple",
+                        tool_names=_runtime_history_tool_names(runtime_history_messages),
+                        runtime_history_message_count=len(runtime_history_messages),
+                        persisted_runtime_messages=persisted_runtime_message_count,
+                        error=str(e),
+                        failure_phase="post_tool_synthesis",
+                    )
+                else:
+                    raise
             metrics.record_chat_latency(
                 mode="chat",
                 elapsed_ms=(time.perf_counter() - started) * 1000.0,
             )
             _record_chat_stage_timing(stage_timings_ms, "model_execution", started)
-            complete = _enforce_calendar_mutation_integrity(
-                user_message,
-                "".join(full_response),
-                get_tool_execution_records(),
-            )
-        runtime_history_messages = get_agent_runtime_history()
+            if not full_response:
+                complete = ""
+            else:
+                complete = _enforce_calendar_mutation_integrity(
+                    user_message,
+                    "".join(full_response),
+                    get_tool_execution_records(),
+                )
+        await _flush_pending_runtime_history()
         handoff_metadata = get_task_handoff_payload() or {}
         assistant_metadata = _build_assistant_message_metadata(
             handoff_metadata=handoff_metadata,
             executed_tools=get_tool_execution_records(),
         )
-        await _persist_runtime_history_messages(session_id, runtime_history_messages, db)
         assistant_msg = ChatMessage(
             session_id=session_id,
             role="assistant",
@@ -1646,6 +1757,7 @@ async def _execute_chat_turn(
     model_override: str | None,
     stage: str,
     enable_validation: bool,
+    runtime_message_callback=None,
 ) -> str:
     started = time.perf_counter()
     reply = await run_agent(
@@ -1654,6 +1766,7 @@ async def _execute_chat_turn(
         mode=mode,
         model_override=model_override,
         stage=stage,
+        runtime_message_callback=runtime_message_callback,
     )
     if not (enable_validation and settings.chat_validation_enabled):
         metrics.record_chat_latency(
@@ -1706,6 +1819,7 @@ async def _execute_chat_turn(
             mode=mode,
             model_override=model_override,
             stage=f"{stage}_retry",
+            runtime_message_callback=runtime_message_callback,
         )
 
 
@@ -2246,7 +2360,7 @@ async def _persist_runtime_history_messages(
     session_id: int,
     runtime_messages: List[Dict[str, Any]],
     db: AsyncSession,
-) -> None:
+) -> int:
     rows: list[ChatMessage] = []
     for message in runtime_messages:
         role = str(message.get("role") or "").strip()
@@ -2273,6 +2387,48 @@ async def _persist_runtime_history_messages(
             )
     if rows:
         db.add_all(rows)
+    return len(rows)
+
+
+def _is_local_chat_model(model: str | None) -> bool:
+    selected = str(model or "").strip()
+    return selected.startswith(("ollama/", "ollama_chat/"))
+
+
+def _runtime_history_has_completed_tool_turn(runtime_messages: List[Dict[str, Any]]) -> bool:
+    saw_assistant_tool_call = any(
+        str(message.get("role") or "") == "assistant" and bool(message.get("tool_calls"))
+        for message in runtime_messages
+    )
+    saw_tool_result = any(str(message.get("role") or "") == "tool" for message in runtime_messages)
+    return saw_assistant_tool_call and saw_tool_result
+
+
+def _runtime_history_tool_names(runtime_messages: List[Dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for message in runtime_messages:
+        for call in message.get("tool_calls") or []:
+            name = _tool_call_name_from_payload(call)
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+    return names
+
+
+def _build_local_post_tool_synthesis_recovery_message(runtime_messages: List[Dict[str, Any]]) -> str:
+    tool_names = _runtime_history_tool_names(runtime_messages)
+    if "summarize_document" in tool_names:
+        return (
+            "I was able to complete the document-summary tool step, but the local model failed while turning that "
+            "saved summary into a final answer. The tool evidence is still in this chat now. Ask me to retry from "
+            "the saved summary or narrow the exact section you want."
+        )
+    return (
+        "I was able to complete the tool step for that request, but the local model failed while turning the saved "
+        "tool result into a final answer. The tool evidence is still in this chat now. Ask me to retry from the "
+        "saved result or narrow the request."
+    )
 
 
 def _estimate_chat_history_tokens(history: List[Dict[str, Any]]) -> int:

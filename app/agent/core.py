@@ -6,11 +6,11 @@ it decides when to call tools and how to synthesize results.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import re
-import contextvars
-from typing import Any, AsyncGenerator, Dict, List
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List
 
 import litellm
 import structlog
@@ -592,6 +592,123 @@ def _is_narrow_document_fact_lookup(latest_user: str) -> bool:
     return any(marker in text for marker in doc_markers) and any(marker in text for marker in fact_markers)
 
 
+_LOCAL_SUMMARY_DIGEST_MAX_CHARS = 2200
+_LOCAL_SUMMARY_DIGEST_MAX_FINDINGS = 6
+
+
+def _latest_large_summarize_document_tool_result(history: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not history:
+        return None
+    tool_lookup = _tool_name_lookup(history)
+    message = history[-1]
+    if str(message.get("role") or "") != "tool":
+        return None
+    tool_call_id = str(message.get("tool_call_id") or "").strip()
+    if tool_lookup.get(tool_call_id) != "summarize_document":
+        return None
+    content = str(message.get("content") or "")
+    if len(content) < _LOCAL_SUMMARY_DIGEST_MAX_CHARS:
+        return None
+    return message
+
+
+def _extract_summary_header_value(pattern: str, content: str) -> str:
+    match = re.search(pattern, content, flags=re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return ""
+    return str(match.group(1) or "").strip()
+
+
+def _summarize_document_tool_result_for_local_synthesis(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return "Document summary digest unavailable."
+
+    document_name = _extract_summary_header_value(r"Summary of '([^']+)'", text)
+    total_sections = _extract_summary_header_value(r"\((\d+)\s+total sections\)", text)
+    coverage_note = _extract_summary_header_value(r"_([^_]*?Note:[^_]*)_", text)
+
+    findings: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("**Summary of '") or line.startswith("_Note:"):
+            continue
+        if line.startswith(("###", "####")):
+            normalized = line.lstrip("#").strip()
+            if normalized and normalized not in findings:
+                findings.append(normalized)
+            continue
+        if line.startswith(("-", "*")):
+            normalized = line.lstrip("-* ").strip()
+            if normalized and normalized not in findings:
+                findings.append(normalized)
+            continue
+        if len(findings) < 2:
+            normalized = _sanitize_preview_text(line, max_chars=140)
+            if normalized and normalized not in findings:
+                findings.append(normalized)
+        if len(findings) >= _LOCAL_SUMMARY_DIGEST_MAX_FINDINGS:
+            break
+
+    if not findings:
+        findings = [_sanitize_preview_text(text, max_chars=180)]
+
+    lines = ["Compacted document summary for local synthesis."]
+    if document_name:
+        lines.append(f"- Document: {document_name}")
+    if total_sections:
+        lines.append(f"- Total sections: {total_sections}")
+    if coverage_note:
+        lines.append(f"- Sampling note: {coverage_note}")
+    lines.append("- Key findings:")
+    for finding in findings[:_LOCAL_SUMMARY_DIGEST_MAX_FINDINGS]:
+        lines.append(f"  - {_sanitize_preview_text(finding, max_chars=180)}")
+    return "\n".join(lines)
+
+
+def _apply_local_document_summary_guardrail(
+    *,
+    history: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None,
+    model: str,
+    mode: str,
+    stage: str | None,
+    user_context: UserContext,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]] | None]:
+    if mode not in {"chat", "chat_orchestrated"} or not _is_qwen_local_tool_guardrail_model(model):
+        return history, tools
+
+    target = _latest_large_summarize_document_tool_result(history)
+    if target is None:
+        return history, tools
+
+    compacted_history = list(history)
+    compacted_tool = dict(target)
+    compacted_tool["content"] = _summarize_document_tool_result_for_local_synthesis(str(target.get("content") or ""))
+    compacted_history[-1] = compacted_tool
+    note = (
+        "A large summarize_document result is already available for this turn. "
+        "Do not call more tools. Use the compacted document-summary evidence already in the conversation "
+        "to answer directly. If the user needs a narrower section, say that briefly."
+    )
+    compacted_history = _insert_system_note_before_latest_user(compacted_history, note)
+    _log_local_tool_event(
+        event="LLM local_tool_guardrail_applied",
+        history=history,
+        tools=tools,
+        model=model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+        prompt_class="document_summary_followup",
+        tool_failure_phase="guardrail_large_document_summary_post_tool_synthesis",
+        tools_enabled=False,
+    )
+    return compacted_history, None
+
+
 def _local_tool_guardrail(history: List[Dict[str, Any]], *, model: str | None, mode: str) -> Dict[str, Any] | None:
     if mode not in {"chat", "chat_orchestrated"} or not _is_qwen_local_tool_guardrail_model(model):
         return None
@@ -647,6 +764,14 @@ def _apply_local_tool_guardrail(
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]] | None]:
     turn_history = history
     turn_tools = tools
+    turn_history, turn_tools = _apply_local_document_summary_guardrail(
+        history=turn_history,
+        tools=turn_tools,
+        model=model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+    )
     guardrail = _local_tool_guardrail(history, model=model, mode=mode)
     if not turn_tools or guardrail is None:
         return turn_history, turn_tools
@@ -2226,6 +2351,7 @@ async def run_agent(
     mode: str = "chat",
     model_override: str | None = None,
     stage: str | None = None,
+    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> str:
     """
     Run the agent loop (non-streaming).
@@ -2370,7 +2496,10 @@ async def run_agent(
             # Execute all tool calls, append results, then loop
             tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
             history.extend(tool_results)
-            _record_agent_runtime_messages([normalized_message, *tool_results])
+            runtime_messages = [normalized_message, *tool_results]
+            _record_agent_runtime_messages(runtime_messages)
+            if runtime_message_callback is not None:
+                await runtime_message_callback(runtime_messages)
             current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
             current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
             current_is_document_signature = _is_document_tool_signature(current_semantic_tool_signature)
@@ -2626,6 +2755,7 @@ async def stream_agent(
     mode: str = "chat",
     model_override: str | None = None,
     stage: str | None = None,
+    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Run the agent loop with streaming.
@@ -2769,7 +2899,10 @@ async def stream_agent(
             history[-1] = normalized_message
             tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
             history.extend(tool_results)
-            _record_agent_runtime_messages([normalized_message, *tool_results])
+            runtime_messages = [normalized_message, *tool_results]
+            _record_agent_runtime_messages(runtime_messages)
+            if runtime_message_callback is not None:
+                await runtime_message_callback(runtime_messages)
             current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
             current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
             current_is_document_signature = _is_document_tool_signature(current_semantic_tool_signature)

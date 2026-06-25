@@ -1340,6 +1340,159 @@ async def test_websocket_done_payload_includes_message_id_for_task_drafts(client
 
 
 @pytest.mark.asyncio
+async def test_rest_local_post_tool_synthesis_recovery_persists_tool_turns(client):
+    await client.post("/auth/register", json={
+        "username": "restrecoveruser",
+        "email": "restrecover@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "restrecoveruser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "REST Recovery"}, headers=headers)
+    session_id = create.json()["id"]
+    runtime_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_sum_1",
+                    "type": "function",
+                    "function": {"name": "summarize_document", "arguments": '{"document_name":"Agents of Chaos.pdf"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_sum_1",
+            "content": "Long saved summary content " * 200,
+        },
+    ]
+
+    async def _failing_execute(*args, **kwargs):
+        callback = kwargs["runtime_message_callback"]
+        await callback(runtime_messages)
+        raise RuntimeError("local synthesis failed after tool execution")
+
+    with (
+        patch("app.api.chat._execute_chat_turn", new=AsyncMock(side_effect=_failing_execute)),
+        patch("app.api.chat.get_agent_runtime_history", return_value=runtime_messages),
+        patch("app.api.chat._apply_required_library_grounding", new=AsyncMock(side_effect=lambda history, *args, **kwargs: history)),
+        patch("app.api.chat._is_local_chat_model", return_value=True),
+        patch("app.api.chat._runtime_history_has_completed_tool_turn", return_value=True),
+    ):
+        sent = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "summarize the agents of chaos document in my library"},
+            headers=headers,
+        )
+
+    assert sent.status_code == 200
+    assert "local model failed" in sent.json()["content"]
+    async with TestSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == session_id)
+                .order_by(ChatMessage.id)
+            )
+        ).scalars().all()
+    assert [row.role for row in rows] == ["user", "assistant", "tool", "assistant"]
+    assert "summarize_document" in (rows[1].tool_calls or "")
+    assert "call_sum_1" in (rows[2].tool_results or "")
+    assert "local model failed" in rows[3].content
+
+
+@pytest.mark.asyncio
+async def test_websocket_local_post_tool_synthesis_recovery_persists_tool_turns(client):
+    await client.post("/auth/register", json={
+        "username": "wsrecoveruser",
+        "email": "wsrecover@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "wsrecoveruser", "password": "pass123"})
+
+    create = await client.post(
+        "/chat/sessions",
+        json={"title": "WS Recovery"},
+        headers={"Authorization": f"Bearer {login.json()['access_token']}"},
+    )
+    session_id = create.json()["id"]
+    runtime_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_sum_1",
+                    "type": "function",
+                    "function": {"name": "summarize_document", "arguments": '{"document_name":"Agents of Chaos.pdf"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_sum_1",
+            "content": "Long saved summary content " * 200,
+        },
+    ]
+
+    async def _failing_execute(*args, **kwargs):
+        callback = kwargs["runtime_message_callback"]
+        await callback(runtime_messages)
+        raise RuntimeError("local synthesis failed after tool execution")
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "wsrecoveruser"))
+        ).scalar_one()
+        session = (
+            await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        ).scalar_one()
+
+        manager = get_chat_run_manager()
+        await manager.clear(session_id)
+        manager._recent_prompts.pop(session_id, None)
+        manager._recent_send_ids.pop(session_id, None)
+
+        websocket = AsyncMock()
+        with (
+            patch("app.api.chat._execute_chat_turn", new=AsyncMock(side_effect=_failing_execute)),
+            patch("app.api.chat.get_agent_runtime_history", return_value=runtime_messages),
+            patch("app.api.chat.classify_chat_complexity", return_value=SimpleNamespace(is_complex=False)),
+            patch("app.api.chat._apply_required_library_grounding", new=AsyncMock(side_effect=lambda history, *args, **kwargs: history)),
+            patch("app.api.chat._is_local_chat_model", return_value=True),
+            patch("app.api.chat._runtime_history_has_completed_tool_turn", return_value=True),
+        ):
+            await _run_websocket_message(
+                session_id=session_id,
+                websocket=websocket,
+                db=db,
+                current_user=user,
+                session=session,
+                user_message="summarize the agents of chaos document in my library",
+                client_send_id="ws-recover-1",
+                allowed_tools=None,
+                blocked_tools=None,
+            )
+
+        payloads = [call.args[0] for call in websocket.send_json.await_args_list]
+        done_payload = next(payload for payload in payloads if payload["type"] == "done")
+        assert "local model failed" in done_payload["content"]
+
+        rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == session_id)
+                .order_by(ChatMessage.id)
+            )
+        ).scalars().all()
+        assert [row.role for row in rows] == ["user", "assistant", "tool", "assistant"]
+
+
+@pytest.mark.asyncio
 async def test_chat_session_status_reports_active_run(client):
     await client.post("/auth/register", json={
         "username": "chatstatususer",

@@ -456,3 +456,60 @@ async def test_stream_agent_stops_after_failed_delete_event_tool_result():
     ]
     assert mock_dispatch.await_count == 1
     assert mock_completion.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_agent_compacts_large_document_summary_and_disables_tools_for_local_followup():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    large_summary = (
+        "**Summary of 'Agents of Chaos.pdf' (67 total sections):**\n"
+        "_Note: This document has 67 sections. The summary covers 64 evenly-spaced samples from throughout._\n\n"
+        + "\n".join(f"- Finding {index}: {'detail ' * 25}" for index in range(1, 12))
+    )
+    tool_calls = [
+        SimpleNamespace(
+            id="call_sum_1",
+            type="function",
+            function=SimpleNamespace(name="summarize_document", arguments='{"document_name":"Agents of Chaos.pdf"}'),
+        )
+    ]
+
+    async def _acompletion(**kwargs):
+        if _acompletion.calls == 0:
+            _acompletion.calls += 1
+            return _fake_response(tool_calls=tool_calls)
+        _acompletion.second_kwargs = kwargs
+        return _fake_response(content="Here is the saved summary in plain text.")
+
+    _acompletion.calls = 0
+    _acompletion.second_kwargs = None
+
+    with (
+        patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"function": {"name": "summarize_document"}},
+                {"function": {"name": "search_library"}},
+            ],
+        ),
+        patch(
+            "app.agent.core.dispatch_tool_calls",
+            new=AsyncMock(
+                return_value=[{"role": "tool", "tool_call_id": "call_sum_1", "content": large_summary}]
+            ),
+        ),
+        patch("app.agent.core.litellm.acompletion", side_effect=_acompletion),
+    ):
+        result = await run_agent(
+            [{"role": "user", "content": "Summarize the agents of chaos document in my library."}],
+            user_context,
+            mode="chat_orchestrated",
+            model_override="ollama_chat/qwen3.6:35b",
+            stage="chat_complex",
+        )
+
+    assert result == "Here is the saved summary in plain text."
+    assert _acompletion.second_kwargs is not None
+    assert _acompletion.second_kwargs.get("tools") is None
+    message_texts = [message.get("content", "") for message in _acompletion.second_kwargs["messages"]]
+    assert any("Compacted document summary for local synthesis." in text for text in message_texts)
