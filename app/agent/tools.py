@@ -125,6 +125,91 @@ def _sample_document_chunks_evenly(all_chunks: List[str], *, max_chunks: int) ->
     }
     return [all_chunks[index] for index in sorted(indices)]
 
+
+_NUMBER_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+}
+_COUNT_TOKEN_PATTERN = r"(?:\d+|" + "|".join(_NUMBER_WORDS.keys()) + r")"
+
+
+def _normalize_precision_text(value: str) -> str:
+    text = (value or "").lower().replace("-", " ")
+    for word, digit in _NUMBER_WORDS.items():
+        text = re.sub(rf"\b{word}\b", digit, text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _source_supports_exact_phrase(source_text: str, phrase: str) -> bool:
+    source = _normalize_precision_text(source_text)
+    target = _normalize_precision_text(phrase)
+    if not source or not target:
+        return False
+    return target in source
+
+
+def _soften_unsupported_summary_totals(summary: str, source_text: str) -> str:
+    if not summary.strip():
+        return summary
+
+    source_normalized = _normalize_precision_text(source_text)
+    if not source_normalized:
+        return summary
+
+    def _replace_case_studies(match: re.Match[str]) -> str:
+        phrase = match.group(0)
+        if _source_supports_exact_phrase(source_text, phrase):
+            return phrase
+        if "representative case studies" in source_normalized:
+            return "representative case studies"
+        if "case studies" in source_normalized or "case study" in source_normalized:
+            return "multiple case studies"
+        return "case studies"
+
+    def _replace_tests(match: re.Match[str]) -> str:
+        phrase = match.group(0)
+        if _source_supports_exact_phrase(source_text, phrase):
+            return phrase
+        if "additional tests" in source_normalized:
+            return "additional tests"
+        if "tests" in source_normalized or "test" in source_normalized:
+            return "multiple tests"
+        return "tests"
+
+    adjusted = re.sub(
+        rf"\b{_COUNT_TOKEN_PATTERN}\s+(?:representative\s+)?case studies\b",
+        _replace_case_studies,
+        summary,
+        flags=re.IGNORECASE,
+    )
+    adjusted = re.sub(
+        rf"\b{_COUNT_TOKEN_PATTERN}\s+(?:additional\s+)?tests\b",
+        _replace_tests,
+        adjusted,
+        flags=re.IGNORECASE,
+    )
+    return adjusted
+
 # ── Tool schema definitions ───────────────────────────────────────────────────
 # These are sent to the LLM so it knows what tools it can call.
 
@@ -1390,8 +1475,20 @@ async def _summarize_document(
         summary_model = settings.document_summary_model or settings.llm_model
         prompt = (
             f"Summarize the following sections from '{display_name}'{suffix}. "
-            "Be thorough — capture all key people, events, dates, decisions, "
-            "and themes:\n\n" + combined
+            "Return plain text using this structure:\n"
+            "### Major sections\n"
+            "- short section or topic bullets\n"
+            "### Key findings\n"
+            "- concrete people, systems, dates, decisions, chronology, and claims supported by the text\n"
+            "### Caveats\n"
+            "- sampling limits, ambiguity, or uncertainty\n\n"
+            "Stay factual and evidence-oriented. "
+            "Preserve concrete grounded details such as named systems, communication channels, model names, deployment surfaces, "
+            "specific failure examples, and timeline details when the text supports them. "
+            "Only state exact counts, totals, durations, or numbered labels when they are explicitly supported by the text. "
+            "If support is mixed or ambiguous, avoid hard totals and use representative phrasing instead. "
+            "Do not add recommendations, workflow advice, or next steps unless the source text itself says them.\n\n"
+            + combined
         )
         resp = await litellm.acompletion(
             model=summary_model,
@@ -1426,6 +1523,8 @@ async def _summarize_document(
             batch_summaries = next_level
 
         summary = await summarize_batch(batch_summaries, "full document")
+
+    summary = _soften_unsupported_summary_totals(summary, "\n\n".join(all_chunks))
 
     header = f"**Summary of '{display_name}' ({total} total sections):**"
     if coverage_note:

@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.agent.context import UserContext
-from app.agent.core import run_agent, stream_agent
+from app.agent.core import build_local_document_summary_digest, run_agent, stream_agent
+from app.agent.tools import _soften_unsupported_summary_totals
 from app.config import settings
 
 
@@ -512,4 +513,64 @@ async def test_run_agent_compacts_large_document_summary_and_disables_tools_for_
     assert _acompletion.second_kwargs is not None
     assert _acompletion.second_kwargs.get("tools") is None
     message_texts = [message.get("content", "") for message in _acompletion.second_kwargs["messages"]]
-    assert any("Compacted document summary for local synthesis." in text for text in message_texts)
+    assert any("Document summary evidence digest." in text for text in message_texts)
+    assert any("- Major sections:" in text for text in message_texts)
+    assert any("- Key findings:" in text for text in message_texts)
+    assert any("- Coverage note:" in text for text in message_texts)
+    assert any("Do not introduce participant counts, durations, environment details" in text for text in message_texts)
+    assert any("If the digest does not specify a detail" in text for text in message_texts)
+
+
+def test_build_local_document_summary_digest_is_structured_and_filters_recommendations():
+    summary = (
+        "**Summary of 'Agents of Chaos.pdf' (67 total sections):**\n"
+        "_Note: This document has 67 sections. The summary covers 64 evenly-spaced samples from throughout._\n\n"
+        "### Major sections\n"
+        "- Election interference timeline\n"
+        "- Social media operations\n"
+        "### Key findings\n"
+        "- Russian actors coordinated influence operations across multiple platforms.\n"
+        "- The report traces escalation across the 2016 cycle.\n"
+        "- Recommendation: the team should build a follow-up workflow.\n"
+        "### Caveats\n"
+        "- Some conclusions depend on sampled sections rather than every page.\n"
+    )
+
+    digest = build_local_document_summary_digest(summary)
+
+    assert "Document summary evidence digest." in digest
+    assert "- Document: Agents of Chaos.pdf" in digest
+    assert "- Total sections: 67" in digest
+    assert "- Coverage note: Note: This document has 67 sections." in digest
+    assert "- Major sections:" in digest
+    assert "Election interference timeline" in digest
+    assert "- Key findings:" in digest
+    assert "Russian actors coordinated influence operations" in digest
+    assert "- Caveats:" in digest
+    assert "sampled sections" in digest
+    assert "Recommendation:" not in digest
+
+
+def test_soften_unsupported_summary_totals_preserves_supported_specifics():
+    source_text = (
+        "We report an exploratory red-teaming study of autonomous language-model-powered agents "
+        "deployed in a live laboratory environment with persistent memory, email accounts, Discord access, "
+        "file systems, and shell execution. Over a two-week period, twenty AI researchers interacted with them. "
+        "We use Claude Opus and Kimi K2.5 as backbone models. We deploy each one to an isolated virtual machine on Fly.io. "
+        "The next section presents ten representative case studies drawn from this two-week period."
+    )
+    summary = (
+        "### Major sections\n"
+        "- Setup & Infrastructure: OpenClaw agents deployed on Fly.io VMs backed by Claude Opus and Kimi K2.5.\n"
+        "### Key findings\n"
+        "- Two-week exploratory red-teaming by 20 AI researchers.\n"
+        "- The study identified 11 case studies and additional tests.\n"
+    )
+
+    adjusted = _soften_unsupported_summary_totals(summary, source_text)
+
+    assert "20 AI researchers" in adjusted
+    assert "Fly.io VMs" in adjusted
+    assert "Claude Opus and Kimi K2.5" in adjusted
+    assert "11 case studies" not in adjusted
+    assert "representative case studies" in adjusted or "multiple case studies" in adjusted

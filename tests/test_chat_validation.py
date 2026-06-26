@@ -500,6 +500,69 @@ async def test_library_summary_intent_uses_summarize_document_grounding(client):
 
 
 @pytest.mark.asyncio
+async def test_library_summary_intent_uses_compact_digest_for_local_model(client):
+    token = await _login_token(client, "chatlibrarylocal", "chatlibrarylocal@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    create = await client.post("/chat/sessions", json={"title": "Local Library Summary Grounding"}, headers=headers)
+    session_id = create.json()["id"]
+
+    raw_summary = (
+        "**Summary of 'Agents of Chaos.pdf' (67 total sections):**\n"
+        "_Note: This document has 67 sections. The summary covers 64 evenly-spaced samples from throughout._\n\n"
+        "### Major sections\n"
+        "- Election interference timeline\n"
+        "### Key findings\n"
+        "- Russian actors coordinated influence operations across multiple platforms.\n"
+        "### Caveats\n"
+        "- Some conclusions depend on sampled sections.\n"
+    )
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", False),
+        patch.object(settings, "chat_orchestration_kill_switch", False),
+        patch(
+            "app.agent.tools._list_library_documents",
+            new_callable=AsyncMock,
+            return_value='{"count":1,"documents":[{"id":17,"filename":"Agents of Chaos.pdf"}]}',
+        ),
+        patch(
+            "app.agent.tools._summarize_document",
+            new_callable=AsyncMock,
+            return_value=raw_summary,
+        ),
+        patch("app.agent.tools._write_audit_log", new_callable=AsyncMock),
+        patch("app.api.chat._is_local_chat_model", return_value=True),
+        patch(
+            "app.api.chat.run_agent",
+            new_callable=AsyncMock,
+            return_value="Grounded local document summary response.",
+        ) as mock_run,
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "summarize the Agents of Chaos.pdf from my library"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    injected_history = mock_run.await_args_list[0].args[0]
+    grounding_messages = [
+        m.get("content", "")
+        for m in injected_history
+        if m.get("role") == "system" and "document summary evidence digest" in m.get("content", "")
+    ]
+    assert grounding_messages
+    grounding = grounding_messages[0]
+    assert "authoritative" in grounding
+    assert "- Major sections:" in grounding
+    assert "- Key findings:" in grounding
+    assert "- Caveats:" in grounding
+    assert "do not add recommendations unless asked" in grounding
+    assert "Do not introduce participant counts, durations, environment details" in grounding
+    assert "If the digest does not specify a detail" in grounding
+
+
+@pytest.mark.asyncio
 async def test_library_summary_intent_returns_ambiguity_prompt_when_multiple_docs_match(client):
     token = await _login_token(client, "chatlibraryambig", "chatlibraryambig@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -548,7 +611,14 @@ async def test_calendar_prompt_with_typo_does_not_block_tools(client):
 
     captured = {}
 
-    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None):
+    async def _fake_run_agent(
+        messages,
+        user_context,
+        mode="chat",
+        model_override=None,
+        stage=None,
+        runtime_message_callback=None,
+    ):
         captured["blocked_tools"] = list(user_context.blocked_tools or [])
         return "ok"
 

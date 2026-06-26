@@ -596,6 +596,105 @@ _LOCAL_SUMMARY_DIGEST_MAX_CHARS = 2200
 _LOCAL_SUMMARY_DIGEST_MAX_FINDINGS = 6
 
 
+def build_local_document_summary_digest(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return "Document summary digest unavailable."
+
+    document_name = _extract_summary_header_value(r"Summary of '([^']+)'", text)
+    total_sections = _extract_summary_header_value(r"\((\d+)\s+total sections\)", text)
+    coverage_note = _extract_summary_header_value(r"_([^_]*?Note:[^_]*)_", text)
+
+    section_lines: list[str] = []
+    finding_lines: list[str] = []
+    caveat_lines: list[str] = []
+    generic_lines: list[str] = []
+    active_bucket = "generic"
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("**Summary of '") or line.startswith("_Note:"):
+            continue
+
+        normalized_heading = line.lstrip("#").strip().lower() if line.startswith("#") else ""
+        if normalized_heading:
+            if "major sections" in normalized_heading or "section overview" in normalized_heading:
+                active_bucket = "sections"
+                continue
+            if "key findings" in normalized_heading or "observed facts" in normalized_heading:
+                active_bucket = "findings"
+                continue
+            if "caveats" in normalized_heading or "uncertainty" in normalized_heading:
+                active_bucket = "caveats"
+                continue
+            active_bucket = "generic"
+
+        if line.startswith(("-", "*")):
+            normalized = _sanitize_preview_text(line.lstrip("-* ").strip(), max_chars=180)
+            if not normalized:
+                continue
+            lower = normalized.lower()
+            if "recommend" in lower or "should " in lower or "next step" in lower:
+                continue
+            if active_bucket == "sections":
+                if normalized not in section_lines:
+                    section_lines.append(normalized)
+                continue
+            if active_bucket == "caveats" or "caveat" in lower or "uncertain" in lower:
+                if normalized not in caveat_lines:
+                    caveat_lines.append(normalized)
+                continue
+            if active_bucket == "findings" or len(finding_lines) < _LOCAL_SUMMARY_DIGEST_MAX_FINDINGS:
+                if normalized not in finding_lines:
+                    finding_lines.append(normalized)
+                continue
+        if line.startswith(("###", "####")):
+            normalized = _sanitize_preview_text(line.lstrip("#").strip(), max_chars=140)
+            if normalized and normalized not in section_lines:
+                section_lines.append(normalized)
+            continue
+
+        normalized = _sanitize_preview_text(line, max_chars=180)
+        if not normalized:
+            continue
+        lower = normalized.lower()
+        if ("note:" in lower or "sample" in lower or "coverage" in lower or "uncertain" in lower) and normalized not in caveat_lines:
+            caveat_lines.append(normalized)
+            continue
+        if len(generic_lines) < _LOCAL_SUMMARY_DIGEST_MAX_FINDINGS and normalized not in generic_lines:
+            generic_lines.append(normalized)
+
+    if not section_lines:
+        section_lines = generic_lines[:3]
+    if not finding_lines:
+        finding_lines = generic_lines[:_LOCAL_SUMMARY_DIGEST_MAX_FINDINGS]
+    if not caveat_lines and coverage_note:
+        caveat_lines = [_sanitize_preview_text(coverage_note, max_chars=180)]
+    if not finding_lines:
+        finding_lines = [_sanitize_preview_text(text, max_chars=180)]
+
+    lines = ["Document summary evidence digest."]
+    if document_name:
+        lines.append(f"- Document: {document_name}")
+    if total_sections:
+        lines.append(f"- Total sections: {total_sections}")
+    if coverage_note:
+        lines.append(f"- Coverage note: {coverage_note}")
+    lines.append("- Major sections:")
+    for section in section_lines[:4]:
+        lines.append(f"  - {section}")
+    lines.append("- Key findings:")
+    for finding in finding_lines[:_LOCAL_SUMMARY_DIGEST_MAX_FINDINGS]:
+        lines.append(f"  - {finding}")
+    if caveat_lines:
+        lines.append("- Caveats:")
+        for caveat in caveat_lines[:3]:
+            lines.append(f"  - {caveat}")
+    return "\n".join(lines)
+
+
 def _latest_large_summarize_document_tool_result(history: List[Dict[str, Any]]) -> Dict[str, Any] | None:
     if not history:
         return None
@@ -620,52 +719,7 @@ def _extract_summary_header_value(pattern: str, content: str) -> str:
 
 
 def _summarize_document_tool_result_for_local_synthesis(content: str) -> str:
-    text = str(content or "").strip()
-    if not text:
-        return "Document summary digest unavailable."
-
-    document_name = _extract_summary_header_value(r"Summary of '([^']+)'", text)
-    total_sections = _extract_summary_header_value(r"\((\d+)\s+total sections\)", text)
-    coverage_note = _extract_summary_header_value(r"_([^_]*?Note:[^_]*)_", text)
-
-    findings: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("**Summary of '") or line.startswith("_Note:"):
-            continue
-        if line.startswith(("###", "####")):
-            normalized = line.lstrip("#").strip()
-            if normalized and normalized not in findings:
-                findings.append(normalized)
-            continue
-        if line.startswith(("-", "*")):
-            normalized = line.lstrip("-* ").strip()
-            if normalized and normalized not in findings:
-                findings.append(normalized)
-            continue
-        if len(findings) < 2:
-            normalized = _sanitize_preview_text(line, max_chars=140)
-            if normalized and normalized not in findings:
-                findings.append(normalized)
-        if len(findings) >= _LOCAL_SUMMARY_DIGEST_MAX_FINDINGS:
-            break
-
-    if not findings:
-        findings = [_sanitize_preview_text(text, max_chars=180)]
-
-    lines = ["Compacted document summary for local synthesis."]
-    if document_name:
-        lines.append(f"- Document: {document_name}")
-    if total_sections:
-        lines.append(f"- Total sections: {total_sections}")
-    if coverage_note:
-        lines.append(f"- Sampling note: {coverage_note}")
-    lines.append("- Key findings:")
-    for finding in findings[:_LOCAL_SUMMARY_DIGEST_MAX_FINDINGS]:
-        lines.append(f"  - {_sanitize_preview_text(finding, max_chars=180)}")
-    return "\n".join(lines)
+    return build_local_document_summary_digest(content)
 
 
 def _apply_local_document_summary_guardrail(
@@ -690,8 +744,12 @@ def _apply_local_document_summary_guardrail(
     compacted_history[-1] = compacted_tool
     note = (
         "A large summarize_document result is already available for this turn. "
-        "Do not call more tools. Use the compacted document-summary evidence already in the conversation "
-        "to answer directly. If the user needs a narrower section, say that briefly."
+        "Answer the user's requested summary first using only the document-summary evidence already in the conversation, "
+        "preferably using the same section shape as the evidence when it fits. "
+        "Distinguish observed content from interpretation, and do not add recommendations or workflow suggestions unless asked. "
+        "Do not introduce participant counts, durations, environment details, or other specifics unless they appear explicitly in the evidence. "
+        "If the digest does not specify a detail, say that briefly instead of inferring it. "
+        "Do not call more tools. If the user needs a narrower section, say that briefly."
     )
     compacted_history = _insert_system_note_before_latest_user(compacted_history, note)
     _log_local_tool_event(

@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     task_plan_max_steps: int = 20
     agent_history_soft_token_limit: int = 48000
     agent_recent_messages_keep: int = 12
-    agent_tool_result_max_chars: int = 1600
+    agent_tool_result_max_chars: int = 4000
     agent_tool_recent_keep: int = 4
     agent_overflow_retry_enabled: bool = True
     agent_repeated_tool_signature_threshold: int = 3
@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     # Phase 5.5.1 chat complexity routing
     chat_complexity_routing_enabled: bool = True
     chat_complexity_threshold: int = 3
-    chat_history_soft_token_limit: int = 24000
+    chat_history_soft_token_limit: int = 32000
     chat_recent_messages_keep: int = 16
     # Phase 5.5.2 orchestrated chat path
     chat_orchestration_enabled: bool = True

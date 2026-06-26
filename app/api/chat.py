@@ -52,6 +52,7 @@ from app.agent.compaction import (
     render_boundary_text,
 )
 from app.agent.core import (
+    build_local_document_summary_digest,
     get_agent_runtime_history,
     get_task_handoff_payload,
     reset_agent_runtime_history,
@@ -750,6 +751,7 @@ async def send_message(
                 else ("list_documents" if library_list_intent else None)
             )
         ),
+        selected_model=session.llm_model,
     )
     _record_chat_stage_timing(stage_timings_ms, "library_grounding", stage_started)
 
@@ -1118,6 +1120,7 @@ async def _run_websocket_message(
                     else ("list_documents" if library_list_intent else None)
                 )
             ),
+            selected_model=session.llm_model,
         )
         _record_chat_stage_timing(stage_timings_ms, "library_grounding", stage_started)
         full_response: List[str] = []
@@ -1876,6 +1879,7 @@ async def _apply_required_library_grounding(
     *,
     user_prompt: str,
     intent_type: str | None,
+    selected_model: str | None = None,
 ) -> List[Dict[str, Any]]:
     """
     For explicit library lookup intents, fetch grounded library evidence before
@@ -1946,13 +1950,30 @@ async def _apply_required_library_grounding(
         arguments=args,
         result_summary=str(result)[:500],
     )
-    grounding_note = (
-        "Required grounding for this turn: this is a library intent. "
-        "Prioritize the newest user message over prior context. "
-        "Use only the tool output below as source of truth for document names/metadata. "
-        "If output is empty, explicitly say no documents/excerpts were found.\n\n"
-        f"{tool_name} result:\n{result}"
-    )
+    result_label = f"{tool_name} result"
+    result_body = result
+    if intent_type == "summary" and _is_local_chat_model(selected_model):
+        result_label = "document summary evidence digest"
+        result_body = build_local_document_summary_digest(str(result))
+        grounding_note = (
+            "Required grounding for this turn: this is a library intent. "
+            "Prioritize the newest user message over prior context. "
+            "For this local model, the compact document-summary evidence below is authoritative. "
+            "Answer the user's requested summary first, preferably using the same section shape as the evidence when it fits. "
+            "Distinguish observed content from interpretation, and do not add recommendations unless asked. "
+            "Do not introduce participant counts, durations, environment details, or other specifics unless they appear explicitly in the evidence below. "
+            "If the digest does not specify a detail, say that briefly instead of inferring it. "
+            "If the evidence is empty or insufficient, say so explicitly.\n\n"
+            f"{result_label}:\n{result_body}"
+        )
+    else:
+        grounding_note = (
+            "Required grounding for this turn: this is a library intent. "
+            "Prioritize the newest user message over prior context. "
+            "Use only the tool output below as source of truth for document names/metadata. "
+            "If output is empty, explicitly say no documents/excerpts were found.\n\n"
+            f"{result_label}:\n{result_body}"
+        )
 
     grounded = list(history)
     if grounded and grounded[-1].get("role") == "user":
