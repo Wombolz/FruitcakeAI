@@ -226,6 +226,63 @@ def test_build_hybrid_retriever_fusion_mode_alias_fallback_from_rrf():
     assert postprocessors == []
 
 
+def test_resolve_fusion_mode_coerces_to_installed_enum():
+    """'rrf' must resolve to a mode the installed llama-index accepts.
+
+    QueryFusionRetriever.__init__ does not validate mode — an invalid string
+    is accepted at construction and only blows up at retrieve time, where the
+    service permanently degrades to vector-only. Resolution must therefore
+    happen against the FUSION_MODES enum before construction. This test runs
+    against the real installed enum, so a llama-index upgrade that renames
+    the modes fails CI here instead of silently degrading search.
+    """
+    from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
+
+    from app.rag.retriever import _candidate_fusion_modes, _resolve_fusion_mode
+
+    for configured in ("rrf", "reciprocal_rerank"):
+        resolved = _resolve_fusion_mode(_candidate_fusion_modes(configured))
+        assert isinstance(resolved, FUSION_MODES)
+
+
+def test_resolve_fusion_mode_none_when_no_candidate_supported():
+    from app.rag.retriever import _resolve_fusion_mode
+
+    assert _resolve_fusion_mode(["bogus", "also_bogus"]) is None
+
+
+def test_build_hybrid_retriever_never_passes_unvalidated_mode_string():
+    """Regression for the vector-only degradation bug.
+
+    A constructor that accepts any mode (like the real QueryFusionRetriever)
+    must still only ever receive a valid FUSION_MODES member — passing the
+    configured "rrf" string through used to defer the failure to the first
+    user search.
+    """
+    from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
+
+    from app.rag.retriever import build_hybrid_retriever
+
+    mock_index = MagicMock()
+    mock_vector_retriever = MagicMock(name="vector")
+    mock_bm25_retriever = MagicMock(name="bm25")
+    mock_fusion_retriever = MagicMock(name="fusion")
+    seen_modes = []
+
+    def _accept_any_mode(*args, **kwargs):
+        seen_modes.append(kwargs.get("mode"))
+        return mock_fusion_retriever
+
+    config = {"retrieval": {"vector_top_k": 10, "bm25_top_k": 10, "fusion": "rrf"}}
+    with patch("llama_index.core.retrievers.VectorIndexRetriever", return_value=mock_vector_retriever, create=True):
+        with patch("llama_index.retrievers.bm25.BM25Retriever.from_defaults", return_value=mock_bm25_retriever, create=True):
+            with patch("llama_index.core.retrievers.QueryFusionRetriever", side_effect=_accept_any_mode, create=True):
+                retriever, _ = build_hybrid_retriever(mock_index, config, bm25_nodes=[MagicMock()])
+
+    assert retriever is mock_fusion_retriever
+    assert seen_modes and all(isinstance(mode, FUSION_MODES) for mode in seen_modes)
+
+
 def test_candidate_fusion_modes_supports_legacy_and_new_names():
     from app.rag.retriever import _candidate_fusion_modes
 

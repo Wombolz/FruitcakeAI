@@ -13,7 +13,7 @@ embedding:
 retrieval:
   vector_top_k: 40
   bm25_top_k: 40
-  fusion: rrf                         # Reciprocal Rank Fusion
+  fusion: reciprocal_rerank           # Reciprocal Rank Fusion (llama-index FUSION_MODES label; legacy alias: rrf)
   similarity_cutoff: 0.28
   rerank_top_n: 10
   rerank_model: cross-encoder/ms-marco-MiniLM-L-6-v2
