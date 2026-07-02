@@ -2754,3 +2754,116 @@ def test_project_history_keeps_tool_chain_on_same_side_of_cut(monkeypatch):
     sanitized, repaired = _sanitize_history_tool_chains(projected)
     assert repaired == 0
     assert sanitized[-3].get("tool_calls")
+
+
+# ── litellm ollama tool-history patch ─────────────────────────────────────────
+
+
+def _ollama_transform_request(messages):
+    from litellm.llms.ollama.chat.transformation import OllamaChatConfig
+
+    return OllamaChatConfig().transform_request(
+        model="qwen3.6:35b",
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+
+
+def test_litellm_ollama_transform_preserves_assistant_tool_calls():
+    # Importing app.agent.core installs the patch; the unpatched transform
+    # drops tool_calls from assistant history messages entirely.
+    data = _ollama_transform_request(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "list my docs"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "list_library_documents", "arguments": '{"limit": 5}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "doc1.pdf"},
+            {"role": "user", "content": "summarize doc1"},
+        ]
+    )
+    outgoing = data["messages"]
+    assistant = outgoing[2]
+    assert assistant["role"] == "assistant"
+    assert assistant.get("tool_calls"), "assistant tool_calls must survive translation to Ollama"
+    call = assistant["tool_calls"][0]["function"]
+    assert call["name"] == "list_library_documents"
+    assert call["arguments"] == {"limit": 5}
+
+
+def test_litellm_ollama_transform_sets_tool_name_on_tool_results():
+    data = _ollama_transform_request(
+        [
+            {"role": "user", "content": "list my docs"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_9",
+                        "type": "function",
+                        "function": {"name": "search_library", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_9", "content": "no results"},
+        ]
+    )
+    tool_message = data["messages"][2]
+    assert tool_message["role"] == "tool"
+    assert tool_message.get("tool_name") == "search_library"
+
+
+def test_litellm_ollama_patch_is_idempotent():
+    from app.agent.litellm_ollama_patch import apply_litellm_ollama_tool_history_patch
+
+    # core.py already installed it at import time; a second call must no-op.
+    assert apply_litellm_ollama_tool_history_patch() is False
+
+
+def test_litellm_ollama_transform_coalesces_system_messages():
+    # The app emits persona context + hint system messages at the front and
+    # guardrail/grounding system notes mid-history; strict Jinja templates
+    # 400 on any system message that is not messages[0].
+    data = _ollama_transform_request(
+        [
+            {"role": "system", "content": "You are Fruitcake."},
+            {"role": "system", "content": "Followup hint: prefer the existing task."},
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "Grounding note: use the evidence below."},
+            {"role": "user", "content": "summarize it"},
+        ]
+    )
+    outgoing = data["messages"]
+    system_messages = [m for m in outgoing if m["role"] == "system"]
+    assert len(system_messages) == 1
+    assert outgoing[0]["role"] == "system"
+    content = outgoing[0]["content"]
+    assert "You are Fruitcake." in content
+    assert "Followup hint" in content
+    assert "Grounding note" in content
+    # Non-system order preserved
+    assert [m["role"] for m in outgoing[1:]] == ["user", "user"]
+
+
+def test_litellm_ollama_transform_leaves_single_leading_system_untouched():
+    data = _ollama_transform_request(
+        [
+            {"role": "system", "content": "You are Fruitcake."},
+            {"role": "user", "content": "hello"},
+        ]
+    )
+    outgoing = data["messages"]
+    assert [m["role"] for m in outgoing] == ["system", "user"]
+    assert outgoing[0]["content"] == "You are Fruitcake."
