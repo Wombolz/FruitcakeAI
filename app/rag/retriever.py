@@ -18,7 +18,7 @@ _FUSION_MODE_ALIASES: Dict[str, List[str]] = {
 
 
 def _candidate_fusion_modes(configured_mode: str | None) -> List[str]:
-    base = (configured_mode or "rrf").strip().lower()
+    base = (configured_mode or "reciprocal_rerank").strip().lower()
     candidates = list(_FUSION_MODE_ALIASES.get(base, [base]))
     if "reciprocal_rerank" not in candidates:
         candidates.append("reciprocal_rerank")
@@ -32,6 +32,30 @@ def _candidate_fusion_modes(configured_mode: str | None) -> List[str]:
             seen.add(mode)
             out.append(mode)
     return out
+
+
+def _resolve_fusion_mode(candidates: List[str]) -> Any | None:
+    """Resolve the first candidate the installed llama-index actually supports.
+
+    QueryFusionRetriever.__init__ stores the mode without validating it —
+    "Invalid fusion mode" only raises at retrieve time, inside _fuse_results.
+    Construction-time try/except therefore accepts broken modes and the
+    failure surfaces on the first real search, where the service permanently
+    degrades to vector-only. Coercing through the FUSION_MODES enum is the
+    only check that happens before a user query does.
+    """
+    try:
+        from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
+    except Exception:
+        # Enum moved or unavailable — no pre-validation possible; pass the
+        # first candidate through and let construction-time handling decide.
+        return candidates[0] if candidates else None
+    for mode in candidates:
+        try:
+            return FUSION_MODES(mode)
+        except ValueError:
+            continue
+    return None
 
 
 def build_hybrid_retriever(
@@ -55,7 +79,7 @@ def build_hybrid_retriever(
     ret_cfg = config.get("retrieval", {})
     vector_top_k = int(ret_cfg.get("vector_top_k", 40))
     bm25_top_k = int(ret_cfg.get("bm25_top_k", 40))
-    configured_fusion_mode = str(ret_cfg.get("fusion", "rrf"))
+    configured_fusion_mode = str(ret_cfg.get("fusion", "reciprocal_rerank"))
 
     vector_retriever = VectorIndexRetriever(
         index=index, similarity_top_k=vector_top_k
@@ -111,21 +135,20 @@ def build_hybrid_retriever(
 
             fusion_retriever = None
             mode_candidates = _candidate_fusion_modes(configured_fusion_mode)
-            for mode in mode_candidates:
+            resolved_mode = _resolve_fusion_mode(mode_candidates)
+            if resolved_mode is not None:
                 try:
                     fusion_retriever = QueryFusionRetriever(
                         retrievers=[vector_retriever, bm25_retriever],
                         similarity_top_k=vector_top_k,
                         num_queries=1,
-                        mode=mode,
+                        mode=resolved_mode,
                     )
-                    log.info("Hybrid retriever initialized", fusion_mode=mode)
-                    break
+                    log.info("Hybrid retriever initialized", fusion_mode=str(resolved_mode))
                 except ValueError as e:
-                    # LlamaIndex mode naming has changed across versions.
-                    if "invalid fusion mode" in str(e).lower():
-                        continue
-                    raise
+                    # Older llama-index versions validate mode in __init__.
+                    if "invalid fusion mode" not in str(e).lower():
+                        raise
             if fusion_retriever is None:
                 log.warning(
                     "No supported fusion mode accepted by QueryFusionRetriever; using vector-only",
