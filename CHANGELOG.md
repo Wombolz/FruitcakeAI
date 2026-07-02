@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.27
+
+- Exported `TOKENIZERS_PARALLELISM=false` at config import time so Hugging Face tokenizers stop emitting fork-after-parallelism warnings during later subprocess launches such as MCP stdio servers.
+- Preserved environment override behavior with `setdefault`, allowing deployments to opt into a different tokenizer parallelism setting explicitly when needed.
+- Clarified `.env.example` so `TOKENIZERS_PARALLELISM` is documented as app-managed by default and only needs to be set manually when overriding that behavior.
+
 ## v0.7.26
 
 - Fixed a concrete LiteLLM `ollama_chat` translation bug that was stripping prior assistant `tool_calls` and tool-result `tool_name` fields before requests reached Ollama, restoring coherent multi-turn local tool transcripts for post-tool synthesis and follow-up turns.
