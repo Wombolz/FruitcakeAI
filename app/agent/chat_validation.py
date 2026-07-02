@@ -326,17 +326,27 @@ def _has_continuation_narration(text: str, executed_tools: list[dict[str, Any]])
     lowered = str(text or "").strip().lower()
     if not lowered:
         return False
-    continuation_patterns = (
+    anchored_patterns = (
         r"^\s*let me\s+(?:try|check|grab|fetch|pull|get|look up|use|dig|read)\b",
         r"^\s*i(?:'|’)ll\s+(?:try|check|grab|fetch|pull|get|look up|use|dig|read)\b",
         r"^\s*i will\s+(?:try|check|grab|fetch|pull|get|look up|use|dig|read)\b",
-        r"\blet me\s+(?:try|check|grab|fetch|pull|get|look up|use|dig|read)\b",
     )
-    if not any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in continuation_patterns):
-        return False
     if "want me to" in lowered or "let me know" in lowered:
         return False
-    return True
+    if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in anchored_patterns):
+        return True
+    if len(lowered) > 1200:
+        return False
+    trailing_window = lowered[-220:]
+    if "if you'd like" in trailing_window or "if you would like" in trailing_window or "if you want" in trailing_window:
+        return False
+    return bool(
+        re.search(
+            r"\blet me\s+(?:try|check|grab|fetch|pull|get|look up|use|dig|read)\b",
+            trailing_window,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _extract_urls(text: str) -> list[str]:

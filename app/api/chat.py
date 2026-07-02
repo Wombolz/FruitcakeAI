@@ -17,7 +17,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -789,7 +789,6 @@ async def send_message(
     runtime_history_messages: List[Dict[str, Any]] = []
     handoff_metadata: Dict[str, Any] = {}
     assistant_metadata: Dict[str, Any] | None = None
-    persisted_runtime_message_count = 0
     chat_run_manager = get_chat_run_manager()
     current_task = asyncio.current_task()
     try:
@@ -804,21 +803,13 @@ async def send_message(
             source="chat_rest",
         )
 
-        async def _flush_runtime_messages(new_messages: List[Dict[str, Any]]) -> None:
-            nonlocal persisted_runtime_message_count
-            added = await _persist_runtime_history_messages(session_id, new_messages, db)
-            if added:
-                persisted_runtime_message_count += added
-                await db.commit()
-
-        async def _flush_pending_runtime_history() -> None:
-            nonlocal persisted_runtime_message_count, runtime_history_messages
-            runtime_history_messages = get_agent_runtime_history()
-            pending = runtime_history_messages[persisted_runtime_message_count:]
-            added = await _persist_runtime_history_messages(session_id, pending, db)
-            if added:
-                persisted_runtime_message_count += added
-                await db.commit()
+        _flush_runtime_messages, _flush_pending_runtime_history, _get_consumed_runtime_message_count = (
+            _build_runtime_history_flush_helpers(
+                session_id=session_id,
+                db=db,
+                get_runtime_history=get_agent_runtime_history,
+            )
+        )
 
         stage_started = time.perf_counter()
         try:
@@ -833,7 +824,7 @@ async def send_message(
                 runtime_message_callback=_flush_runtime_messages,
             )
         except Exception as e:
-            await _flush_pending_runtime_history()
+            runtime_history_messages = await _flush_pending_runtime_history()
             handoff_metadata = get_task_handoff_payload() or {}
             if _is_local_chat_model(session.llm_model) and _runtime_history_has_completed_tool_turn(runtime_history_messages):
                 reply = _build_local_post_tool_synthesis_recovery_message(runtime_history_messages)
@@ -846,7 +837,7 @@ async def send_message(
                     stage="chat_complex" if effective_complex else "chat_simple",
                     tool_names=_runtime_history_tool_names(runtime_history_messages),
                     runtime_history_message_count=len(runtime_history_messages),
-                    persisted_runtime_messages=persisted_runtime_message_count,
+                    persisted_runtime_messages=_get_consumed_runtime_message_count(),
                     error=str(e),
                     failure_phase="post_tool_synthesis",
                 )
@@ -859,7 +850,7 @@ async def send_message(
             reply,
             get_tool_execution_records(),
         )
-        await _flush_pending_runtime_history()
+        runtime_history_messages = await _flush_pending_runtime_history()
         handoff_metadata = get_task_handoff_payload() or {}
         assistant_metadata = _build_assistant_message_metadata(
             handoff_metadata=handoff_metadata,
@@ -1156,28 +1147,18 @@ async def _run_websocket_message(
         runtime_history_token = reset_agent_runtime_history()
         handoff_metadata: Dict[str, Any] = {}
         runtime_history_messages: List[Dict[str, Any]] = []
-        persisted_runtime_message_count = 0
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
             session_id=session_id,
             source="chat_websocket",
         )
-
-        async def _flush_runtime_messages(new_messages: List[Dict[str, Any]]) -> None:
-            nonlocal persisted_runtime_message_count
-            added = await _persist_runtime_history_messages(session_id, new_messages, db)
-            if added:
-                persisted_runtime_message_count += added
-                await db.commit()
-
-        async def _flush_pending_runtime_history() -> None:
-            nonlocal persisted_runtime_message_count, runtime_history_messages
-            runtime_history_messages = get_agent_runtime_history()
-            pending = runtime_history_messages[persisted_runtime_message_count:]
-            added = await _persist_runtime_history_messages(session_id, pending, db)
-            if added:
-                persisted_runtime_message_count += added
-                await db.commit()
+        _flush_runtime_messages, _flush_pending_runtime_history, _get_consumed_runtime_message_count = (
+            _build_runtime_history_flush_helpers(
+                session_id=session_id,
+                db=db,
+                get_runtime_history=get_agent_runtime_history,
+            )
+        )
 
         if should_validate:
             stage_started = time.perf_counter()
@@ -1193,7 +1174,7 @@ async def _run_websocket_message(
                     runtime_message_callback=_flush_runtime_messages,
                 )
             except Exception as e:
-                await _flush_pending_runtime_history()
+                runtime_history_messages = await _flush_pending_runtime_history()
                 handoff_metadata = get_task_handoff_payload() or {}
                 if _is_local_chat_model(session.llm_model) and _runtime_history_has_completed_tool_turn(runtime_history_messages):
                     complete = _build_local_post_tool_synthesis_recovery_message(runtime_history_messages)
@@ -1208,7 +1189,7 @@ async def _run_websocket_message(
                         stage="chat_complex" if effective_complex else "chat_simple",
                         tool_names=_runtime_history_tool_names(runtime_history_messages),
                         runtime_history_message_count=len(runtime_history_messages),
-                        persisted_runtime_messages=persisted_runtime_message_count,
+                        persisted_runtime_messages=_get_consumed_runtime_message_count(),
                         error=str(e),
                         failure_phase="post_tool_synthesis",
                     )
@@ -1238,7 +1219,7 @@ async def _run_websocket_message(
                     full_response.append(token_chunk)
                     await _send_json_if_open({"type": "token", "content": token_chunk})
             except Exception as e:
-                await _flush_pending_runtime_history()
+                runtime_history_messages = await _flush_pending_runtime_history()
                 handoff_metadata = get_task_handoff_payload() or {}
                 if _is_local_chat_model(session.llm_model) and _runtime_history_has_completed_tool_turn(runtime_history_messages):
                     complete = _build_local_post_tool_synthesis_recovery_message(runtime_history_messages)
@@ -1257,7 +1238,7 @@ async def _run_websocket_message(
                         stage="chat_simple",
                         tool_names=_runtime_history_tool_names(runtime_history_messages),
                         runtime_history_message_count=len(runtime_history_messages),
-                        persisted_runtime_messages=persisted_runtime_message_count,
+                        persisted_runtime_messages=_get_consumed_runtime_message_count(),
                         error=str(e),
                         failure_phase="post_tool_synthesis",
                     )
@@ -1276,7 +1257,7 @@ async def _run_websocket_message(
                     "".join(full_response),
                     get_tool_execution_records(),
                 )
-        await _flush_pending_runtime_history()
+        runtime_history_messages = await _flush_pending_runtime_history()
         handoff_metadata = get_task_handoff_payload() or {}
         assistant_metadata = _build_assistant_message_metadata(
             handoff_metadata=handoff_metadata,
@@ -2408,6 +2389,41 @@ async def _persist_runtime_history_messages(
     if rows:
         db.add_all(rows)
     return len(rows)
+
+
+def _build_runtime_history_flush_helpers(
+    *,
+    session_id: int,
+    db: AsyncSession,
+    get_runtime_history: Callable[[], List[Dict[str, Any]]],
+) -> tuple[
+    Callable[[List[Dict[str, Any]]], Awaitable[None]],
+    Callable[[], Awaitable[List[Dict[str, Any]]]],
+    Callable[[], int],
+]:
+    consumed_runtime_message_count = 0
+
+    async def _flush_runtime_messages(new_messages: List[Dict[str, Any]]) -> None:
+        nonlocal consumed_runtime_message_count
+        rows_written = await _persist_runtime_history_messages(session_id, new_messages, db)
+        consumed_runtime_message_count += len(new_messages)
+        if rows_written:
+            await db.commit()
+
+    async def _flush_pending_runtime_history() -> List[Dict[str, Any]]:
+        nonlocal consumed_runtime_message_count
+        runtime_history_messages = get_runtime_history()
+        pending = runtime_history_messages[consumed_runtime_message_count:]
+        rows_written = await _persist_runtime_history_messages(session_id, pending, db)
+        consumed_runtime_message_count += len(pending)
+        if rows_written:
+            await db.commit()
+        return runtime_history_messages
+
+    def _get_consumed_runtime_message_count() -> int:
+        return consumed_runtime_message_count
+
+    return _flush_runtime_messages, _flush_pending_runtime_history, _get_consumed_runtime_message_count
 
 
 def _is_local_chat_model(model: str | None) -> bool:

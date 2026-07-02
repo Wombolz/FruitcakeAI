@@ -160,12 +160,11 @@ def _normalize_precision_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _source_supports_exact_phrase(source_text: str, phrase: str) -> bool:
-    source = _normalize_precision_text(source_text)
+def _source_supports_exact_phrase(source_normalized: str, phrase: str) -> bool:
     target = _normalize_precision_text(phrase)
-    if not source or not target:
+    if not source_normalized or not target:
         return False
-    return target in source
+    return target in source_normalized
 
 
 def _soften_unsupported_summary_totals(summary: str, source_text: str) -> str:
@@ -176,9 +175,11 @@ def _soften_unsupported_summary_totals(summary: str, source_text: str) -> str:
     if not source_normalized:
         return summary
 
+    # This hygiene pass is intentionally narrow: we only soften exact totals for the
+    # case-study / test phrases that showed precision drift in observed summaries.
     def _replace_case_studies(match: re.Match[str]) -> str:
         phrase = match.group(0)
-        if _source_supports_exact_phrase(source_text, phrase):
+        if _source_supports_exact_phrase(source_normalized, phrase):
             return phrase
         if "representative case studies" in source_normalized:
             return "representative case studies"
@@ -188,7 +189,7 @@ def _soften_unsupported_summary_totals(summary: str, source_text: str) -> str:
 
     def _replace_tests(match: re.Match[str]) -> str:
         phrase = match.group(0)
-        if _source_supports_exact_phrase(source_text, phrase):
+        if _source_supports_exact_phrase(source_normalized, phrase):
             return phrase
         if "additional tests" in source_normalized:
             return "additional tests"

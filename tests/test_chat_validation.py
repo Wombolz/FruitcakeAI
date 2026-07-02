@@ -97,6 +97,34 @@ def test_validate_chat_response_flags_continuation_narration_after_tool_turn():
     assert out.retry_reason == "continuation_narration"
 
 
+def test_validate_chat_response_does_not_flag_long_answer_with_midtext_let_me():
+    out = validate_chat_response(
+        "summarize this report",
+        (
+            "This report covers the current operating model, the recent incident timeline, and the mitigation plan in detail. "
+            "It describes the service boundaries, the known regressions, and the observed recovery behavior across multiple runs. "
+            "In the middle of the draft the author says let me check one final metric before publishing, but the answer itself "
+            "still includes a full summary of the findings, the risks, and the outstanding work without dangling into a next-step narration. "
+        ) * 4,
+        executed_tools=[{"tool": "read_file", "result_summary": "Loaded report content"}],
+    )
+    assert out.has_continuation_narration is False
+    assert out.retry_reason != "continuation_narration"
+
+
+def test_validate_chat_response_does_not_flag_offer_style_ending():
+    out = validate_chat_response(
+        "tell me what happened",
+        (
+            "The service recovered after the second restart and the queued jobs drained normally. "
+            "If you'd like, let me pull the full report next."
+        ),
+        executed_tools=[{"tool": "fetch_page", "result_summary": "Loaded report page"}],
+    )
+    assert out.has_continuation_narration is False
+    assert out.retry_reason != "continuation_narration"
+
+
 def test_should_validate_chat_response_enables_research_on_simple_path():
     assert should_validate_chat_response(
         user_prompt="Research the latest headlines on Iran and cite sources",

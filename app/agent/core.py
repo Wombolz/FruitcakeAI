@@ -97,6 +97,10 @@ HEADLINE_ROUNDUP_MARKERS = (
     "headlines today",
     "today's headlines",
     "todays headlines",
+    "round up of",
+    "roundup of",
+    "news roundup",
+    "news round up",
 )
 HEADLINE_RSS_OWNED_HINTS = (
     "my feeds",
@@ -1321,26 +1325,31 @@ def _normalize_query_family(query: str) -> str:
 
 
 def _rss_query_family_signature(tool_calls: List[Any]) -> str | None:
-    if len(tool_calls) != 1:
+    signatures: list[str] = []
+    for call in tool_calls:
+        tool_name = _tool_call_name(call)
+        if tool_name not in RSS_RETRIEVAL_TOOL_NAMES:
+            continue
+        arguments = _tool_call_arguments(call)
+        if tool_name == "search_my_feeds_timeline":
+            query_family = _normalize_query_family(str(arguments.get("query") or ""))
+            start = str(arguments.get("start_date") or "")
+            end = str(arguments.get("end_date") or "")
+            signatures.append(f"{tool_name}:{query_family}:{start}:{end}")
+            continue
+        if tool_name == "search_my_feeds":
+            query_family = _normalize_query_family(str(arguments.get("query") or ""))
+            category = str(arguments.get("category") or "")
+            signatures.append(f"{tool_name}:{query_family}:{category}")
+            continue
+        sources = arguments.get("sources") or {}
+        window = arguments.get("window") or {}
+        source_mode = str((sources.get("mode") or "all")).strip().lower()
+        window_mode = str((window.get("mode") or "all")).strip().lower()
+        signatures.append(f"{tool_name}:{source_mode}:{window_mode}")
+    if not signatures:
         return None
-    tool_name = _tool_call_name(tool_calls[0])
-    if tool_name not in RSS_RETRIEVAL_TOOL_NAMES:
-        return None
-    arguments = _tool_call_arguments(tool_calls[0])
-    if tool_name == "search_my_feeds_timeline":
-        query_family = _normalize_query_family(str(arguments.get("query") or ""))
-        start = str(arguments.get("start_date") or "")
-        end = str(arguments.get("end_date") or "")
-        return f"{tool_name}:{query_family}:{start}:{end}"
-    if tool_name == "search_my_feeds":
-        query_family = _normalize_query_family(str(arguments.get("query") or ""))
-        category = str(arguments.get("category") or "")
-        return f"{tool_name}:{query_family}:{category}"
-    sources = arguments.get("sources") or {}
-    window = arguments.get("window") or {}
-    source_mode = str((sources.get("mode") or "all")).strip().lower()
-    window_mode = str((window.get("mode") or "all")).strip().lower()
-    return f"{tool_name}:{source_mode}:{window_mode}"
+    return " || ".join(dict.fromkeys(signatures))
 
 
 def _is_headline_roundup_prompt(messages: List[Dict[str, Any]]) -> bool:

@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     local_api_base: str = "http://localhost:11434/v1"
     local_api_key: str = "sk-local"
     local_model: str = "qwen2.5:32b"
-    document_summary_model: str = "ollama_chat/qwen2.5:14b"
+    document_summary_model: str = ""
     # Task-stage routing (Phase 5.4.x)
     task_small_model: str = "ollama_chat/qwen2.5:14b"
     task_large_model: str = "ollama_chat/qwen2.5:32b"

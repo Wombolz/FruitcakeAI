@@ -1352,6 +1352,10 @@ async def test_rest_local_post_tool_synthesis_recovery_persists_tool_turns(clien
 
     create = await client.post("/chat/sessions", json={"title": "REST Recovery"}, headers=headers)
     session_id = create.json()["id"]
+    manager = get_chat_run_manager()
+    await manager.clear(session_id)
+    manager._recent_prompts.pop(session_id, None)
+    manager._recent_send_ids.pop(session_id, None)
     runtime_messages = [
         {
             "role": "assistant",
@@ -1490,6 +1494,106 @@ async def test_websocket_local_post_tool_synthesis_recovery_persists_tool_turns(
             )
         ).scalars().all()
         assert [row.role for row in rows] == ["user", "assistant", "tool", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_history_flush_skips_non_persistable_messages_without_duplicate_rows(client):
+    await client.post("/auth/register", json={
+        "username": "runtimeflushuser",
+        "email": "runtimeflush@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "runtimeflushuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Runtime Flush"}, headers=headers)
+    session_id = create.json()["id"]
+    manager = get_chat_run_manager()
+    await manager.clear(session_id)
+    manager._recent_prompts.pop(session_id, None)
+    manager._recent_send_ids.pop(session_id, None)
+
+    first_batch = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_sum_1",
+                    "type": "function",
+                    "function": {"name": "summarize_document", "arguments": '{"document_name":"Agents of Chaos.pdf"}'},
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "internal planning note",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_sum_1",
+            "content": "saved tool output",
+        },
+    ]
+    second_batch = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_sum_2",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"workspace/report.md"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_sum_2",
+            "content": "second tool output",
+        },
+    ]
+    runtime_history = [*first_batch, *second_batch]
+    history_state = {"messages": []}
+
+    async def _execute_with_incremental_flush(*args, **kwargs):
+        callback = kwargs["runtime_message_callback"]
+        await callback(first_batch)
+        history_state["messages"] = runtime_history
+        raise RuntimeError("local synthesis failed after incremental flush")
+
+    with (
+        patch("app.api.chat._execute_chat_turn", new=AsyncMock(side_effect=_execute_with_incremental_flush)),
+        patch("app.api.chat._apply_required_library_grounding", new=AsyncMock(side_effect=lambda history, *args, **kwargs: history)),
+        patch("app.api.chat._is_local_chat_model", return_value=True),
+        patch("app.api.chat._runtime_history_has_completed_tool_turn", return_value=True),
+        patch("app.api.chat.get_agent_runtime_history", side_effect=lambda: history_state["messages"]),
+    ):
+        sent = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "summarize the agents of chaos document in my library"},
+            headers=headers,
+        )
+
+    assert sent.status_code == 200
+    async with TestSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == session_id)
+                .order_by(ChatMessage.id)
+            )
+        ).scalars().all()
+
+    roles = [row.role for row in rows]
+    assert roles == ["user", "assistant", "tool", "assistant", "tool", "assistant"]
+    assert "call_sum_1" in (rows[2].tool_results or "")
+    assert "call_sum_2" in (rows[4].tool_results or "")
+    tool_call_payloads = [row.tool_calls for row in rows if row.role == "assistant" and row.tool_calls]
+    assert len(tool_call_payloads) == 2
+    assert sum("call_sum_1" in str(payload or "") for payload in tool_call_payloads) == 1
+    assert sum("call_sum_2" in str(payload or "") for payload in tool_call_payloads) == 1
 
 
 @pytest.mark.asyncio
