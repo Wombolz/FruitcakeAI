@@ -3,10 +3,20 @@ FruitcakeAI v5 — Application Configuration
 Loaded from environment variables / .env file via pydantic-settings.
 """
 
+import os
 from functools import lru_cache
 from typing import List
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The HF tokenizers Rust library reads this from the real process
+# environment, not from pydantic settings — and it must be set before the
+# embedding model first tokenizes anything. After that point, any subprocess
+# launch (MCP stdio servers fork+exec) triggers its "process just got forked
+# after parallelism has already been used" warning. This module is imported
+# before any HF code, so setting it here covers every launch path;
+# setdefault keeps a real environment override in charge.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 class Settings(BaseSettings):
