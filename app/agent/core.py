@@ -16,6 +16,7 @@ import litellm
 import structlog
 
 from app.agent.context import UserContext
+from app.agent.litellm_ollama_patch import apply_litellm_ollama_tool_history_patch
 from app.agent.tools import dispatch_tool_calls, get_tools_for_user
 from app.config import settings
 from app.llm_usage import record_llm_usage_event, stream_usage_enabled
@@ -37,6 +38,11 @@ _agent_runtime_history: contextvars.ContextVar[list[dict[str, Any]]] = contextva
 
 # Silence LiteLLM's verbose request logging in production
 litellm.suppress_debug_info = True
+
+# litellm's ollama_chat request translation drops assistant tool_calls and
+# tool_name from conversation history, corrupting every multi-turn tool
+# transcript sent to local models — see app/agent/litellm_ollama_patch.py.
+apply_litellm_ollama_tool_history_patch()
 
 # Phase 4: task sessions get more turns for multi-step autonomous work
 TURN_LIMITS: Dict[str, int] = {
