@@ -52,4 +52,9 @@ seed_default_users
 
 print_header "Starting FruitcakeAI API"
 echo "  Health check after boot: $(health_url)"
-exec uvicorn app.main:app --host 0.0.0.0 --port "$APP_PORT" --reload
+exec uvicorn app.main:app \
+  --host 0.0.0.0 \
+  --port "$APP_PORT" \
+  --reload \
+  --reload-exclude 'workspace/*' \
+  --reload-exclude 'storage/*'
