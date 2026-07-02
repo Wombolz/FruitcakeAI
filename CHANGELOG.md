@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.26
+
+- Fixed a concrete LiteLLM `ollama_chat` translation bug that was stripping prior assistant `tool_calls` and tool-result `tool_name` fields before requests reached Ollama, restoring coherent multi-turn local tool transcripts for post-tool synthesis and follow-up turns.
+- Added an Ollama-specific system-message coalescing shim so strict Jinja-template local models no longer hard-fail when Fruitcake emits multiple system messages for persona, grounding, and guardrail notes.
+- Added a rerunnable local tool-calling diagnosis harness plus focused coverage around the Ollama/LiteLLM patch, making future regressions easier to verify after model, Ollama, or LiteLLM upgrades.
+- Fixed hybrid RAG fusion-mode handling so configured `rrf` search no longer silently degrades to vector-only retrieval; Fruitcake now resolves the installed llama-index fusion enum before constructing the hybrid retriever.
+- Canonicalized the RAG fusion setting to `reciprocal_rerank` while preserving `rrf` as a supported alias, and added regression tests that fail loudly if future llama-index releases rename the supported fusion modes again.
+
 ## v0.7.25
 
 - Hardened local `ollama` / `ollama_chat` chat turns by persisting assistant tool-call and tool-result history incrementally, recovering visibly when post-tool local synthesis fails, and preserving the saved evidence in the session instead of rolling the turn back.
