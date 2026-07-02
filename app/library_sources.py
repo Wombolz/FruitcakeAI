@@ -64,7 +64,7 @@ def _allowed_linked_source_roots() -> list[Path]:
     return roots
 
 
-def _ensure_path_within_allowed_roots(path: Path) -> None:
+def _ensure_path_within_allowed_roots(path: Path, *, kind: str = "folder") -> None:
     allowed_roots = _allowed_linked_source_roots()
     if not allowed_roots:
         raise ValueError(
@@ -80,13 +80,42 @@ def _ensure_path_within_allowed_roots(path: Path) -> None:
 
     roots_text = ", ".join(str(root) for root in allowed_roots)
     raise ValueError(
-        "Linked folders must be inside an allowed import root. "
+        f"Linked {kind}s must be inside an allowed import root. "
         f"Configured roots: {roots_text}"
     )
 
 
 def _stat_mtime_to_utc(stat_result: Any) -> datetime:
     return datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc)
+
+
+def _same_source_mtime(stored: datetime | None, observed: datetime) -> bool:
+    """Compare a stored modified-at against a fresh stat, tz-defensively.
+
+    Postgres round-trips these as aware datetimes, but SQLite (tests, small
+    deployments) returns them naive — naive != aware always compares unequal,
+    which would make every rescan look like a content change.
+    """
+    if stored is None:
+        return False
+    if stored.tzinfo is None:
+        stored = stored.replace(tzinfo=timezone.utc)
+    return stored == observed
+
+
+def _existing_doc_matches_stat(existing_doc: Document | None, stat_result: Any) -> bool:
+    """True when a linked document's stored metadata matches the on-disk file,
+    meaning the rescan can skip it without opening the file at all."""
+    if existing_doc is None:
+        return False
+    if existing_doc.processing_status == "error":
+        return False
+    if (existing_doc.source_sync_status or "") != "synced":
+        return False
+    return (
+        existing_doc.file_size_bytes == int(stat_result.st_size)
+        and _same_source_mtime(existing_doc.source_modified_at, _stat_mtime_to_utc(stat_result))
+    )
 
 
 def _display_name_for(source: LinkedSource, file_path: Path) -> str:
@@ -201,6 +230,16 @@ async def create_linked_source(
     if source_type == "file":
         if not normalized.exists() or not normalized.is_file():
             raise ValueError("Linked file path does not exist or is not a file.")
+        if _is_sensitive_file(normalized):
+            raise ValueError(
+                f"'{normalized.name}' matches a sensitive filename pattern and cannot be linked."
+            )
+        # Picking a specific file is itself explicit operator consent, so
+        # single files stay linkable when no roots are configured — but once
+        # an operator constrains LINKED_SOURCE_ALLOWED_ROOTS, files must
+        # honor the same boundary as folders.
+        if _allowed_linked_source_roots():
+            _ensure_path_within_allowed_roots(normalized, kind="file")
         if not extractor.supports(normalized):
             raise ExtractionError(f"Unsupported file format: {normalized.name}")
         normalized_excluded_paths: list[str] = []
@@ -327,6 +366,17 @@ async def rescan_linked_source(
                 stats["missing"] += 1
             return stats
 
+        existing_root_doc = existing_docs.get(str(root))
+        if _existing_doc_matches_stat(existing_root_doc, root.stat()):
+            # Stored metadata matches on disk — no content read needed.
+            existing_root_doc.source_last_seen_at = now
+            stats["unchanged"] += 1
+            source.sync_status = "ready"
+            source.error_message = None
+            source.last_scanned_at = now
+            source.skipped_empty_count = 0
+            return stats
+
         if extractor.is_empty_textual_file(root):
             source.sync_status = "ready"
             source.error_message = None
@@ -370,6 +420,14 @@ async def rescan_linked_source(
     for file_path in _iter_supported_files(root, extractor, excluded_paths):
         file_key = str(file_path)
         seen_paths.add(file_key)
+        existing_doc = existing_docs.get(file_key)
+        if _existing_doc_matches_stat(existing_doc, file_path.stat()):
+            # Incremental rescan stays stat-only for the unchanged majority:
+            # skipping the empty-file probe here is what keeps a large linked
+            # repo from being fully re-read on every manual rescan.
+            existing_doc.source_last_seen_at = now
+            stats["unchanged"] += 1
+            continue
         if extractor.is_empty_textual_file(file_path):
             stats["skipped_empty"] += 1
             continue
@@ -516,6 +574,11 @@ async def _sync_file_document(
         await enqueue_document_ingest(db, document=doc)
         return "created"
 
+    # Read before the sync-status assignment below overwrites it — a doc
+    # that was stale/missing and has reappeared must re-ingest even when
+    # its size/mtime happen to match what we last recorded.
+    was_out_of_sync = (existing_doc.source_sync_status or "") != "synced"
+
     existing_doc.scope = source.scope
     existing_doc.file_path = str(file_path)
     existing_doc.filename = file_path.name
@@ -528,9 +591,9 @@ async def _sync_file_document(
 
     changed = (
         existing_doc.file_size_bytes != file_size
-        or existing_doc.source_modified_at != modified_at
+        or not _same_source_mtime(existing_doc.source_modified_at, modified_at)
         or existing_doc.processing_status == "error"
-        or existing_doc.source_sync_status != "synced"
+        or was_out_of_sync
     )
     if not changed:
         return "unchanged"

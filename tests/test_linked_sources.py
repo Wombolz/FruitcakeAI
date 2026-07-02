@@ -48,9 +48,10 @@ async def test_extractor_supports_python_and_yaml(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_link_file_creates_linked_source_and_document(client, tmp_path):
+async def test_link_file_creates_linked_source_and_document(client, tmp_path, monkeypatch):
     token = await _token(client, "linkedfileuser")
     headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", "")
 
     code_file = tmp_path / "notes.py"
     code_file.write_text("print('hello')\n")
@@ -331,3 +332,203 @@ async def test_link_file_remains_allowed_without_folder_roots(client, tmp_path, 
 
     assert resp.status_code == 202
     assert resp.json()["source"]["source_type"] == "file"
+
+
+@pytest.mark.asyncio
+async def test_link_file_rejects_sensitive_filenames(client, tmp_path, monkeypatch):
+    token = await _token(client, "linkedsensitiveuser")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", "")
+
+    secret = tmp_path / ".env"
+    secret.write_text("API_KEY=super-secret\n")
+
+    resp = await client.post(
+        "/library/link-file",
+        headers=headers,
+        json={"path": str(secret), "scope": "personal"},
+    )
+
+    assert resp.status_code == 400
+    assert "sensitive" in resp.json()["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_link_file_enforces_roots_when_configured(client, tmp_path, monkeypatch):
+    token = await _token(client, "linkedfilerootsuser")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    inside = allowed_root / "inside.py"
+    inside.write_text("print('in')\n")
+    outside = tmp_path / "outside.py"
+    outside.write_text("print('out')\n")
+
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(allowed_root))
+
+    rejected = await client.post(
+        "/library/link-file",
+        headers=headers,
+        json={"path": str(outside), "scope": "personal"},
+    )
+    assert rejected.status_code == 400
+    assert "allowed import root" in rejected.json()["error"]
+
+    accepted = await client.post(
+        "/library/link-file",
+        headers=headers,
+        json={"path": str(inside), "scope": "personal"},
+    )
+    assert accepted.status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_rescan_skips_content_reads_for_unchanged_files(client, tmp_path, monkeypatch):
+    token = await _token(client, "linkedincruser")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(tmp_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "steady.py").write_text("print('steady')\n")
+
+    link = await client.post(
+        "/library/link-folder",
+        headers=headers,
+        json={"path": str(repo), "scope": "personal"},
+    )
+    assert link.status_code == 202
+    source_id = link.json()["source"]["id"]
+
+    probed_paths: list[str] = []
+    original_probe = DocumentExtractor.is_empty_textual_file
+
+    def _spying_probe(self, file_path):
+        probed_paths.append(str(file_path))
+        return original_probe(self, file_path)
+
+    monkeypatch.setattr(DocumentExtractor, "is_empty_textual_file", _spying_probe)
+
+    rescan = await client.post(f"/library/sources/{source_id}/rescan", headers=headers)
+    assert rescan.status_code == 202
+    sync = rescan.json()["sync"]
+    assert sync["unchanged"] == 1
+    assert sync["updated"] == 0
+    # The incremental path must decide from stored stat metadata alone —
+    # unchanged files are never opened.
+    assert probed_paths == []
+
+
+@pytest.mark.asyncio
+async def test_missing_then_reappearing_linked_file_is_reindexed(client, tmp_path, monkeypatch):
+    token = await _token(client, "linkedreappearuser")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(tmp_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tracked = repo / "tracked.py"
+    tracked.write_text("print('one')\n")
+
+    link = await client.post(
+        "/library/link-folder",
+        headers=headers,
+        json={"path": str(repo), "scope": "personal"},
+    )
+    assert link.status_code == 202
+    source_id = link.json()["source"]["id"]
+
+    hidden = tmp_path / "tracked.py.hidden"
+    tracked.rename(hidden)
+
+    gone = await client.post(f"/library/sources/{source_id}/rescan", headers=headers)
+    assert gone.status_code == 202
+    assert gone.json()["sync"]["missing"] == 1
+
+    # Restore with identical content: rename preserves size and mtime, so
+    # only the previously-missing status can trigger the re-index.
+    hidden.rename(tracked)
+
+    back = await client.post(f"/library/sources/{source_id}/rescan", headers=headers)
+    assert back.status_code == 202
+    assert back.json()["sync"]["updated"] == 1
+
+    async with TestSessionLocal() as db:
+        doc = (await db.execute(select(Document).where(Document.linked_source_id == source_id))).scalar_one()
+    assert doc.source_sync_status == "synced"
+
+
+@pytest.mark.asyncio
+async def test_missing_backing_file_keeps_indexed_document_for_retrieval(client, tmp_path, monkeypatch):
+    token = await _token(client, "linkedcacheduser")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(tmp_path))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    doomed = repo / "doomed.py"
+    doomed.write_text("print('cache me')\n")
+
+    link = await client.post(
+        "/library/link-folder",
+        headers=headers,
+        json={"path": str(repo), "scope": "personal"},
+    )
+    assert link.status_code == 202
+    source_id = link.json()["source"]["id"]
+
+    deleted_from_index: list[int] = []
+
+    class _RecordingRag:
+        is_ready = True
+
+        async def delete_document(self, document_id: int) -> None:
+            deleted_from_index.append(document_id)
+
+    import app.library_sources as library_sources
+
+    monkeypatch.setattr(library_sources, "get_rag_service", lambda: _RecordingRag())
+
+    doomed.unlink()
+    rescan = await client.post(f"/library/sources/{source_id}/rescan", headers=headers)
+    assert rescan.status_code == 202
+    assert rescan.json()["sync"]["missing"] == 1
+
+    # Cached retrieval contract: a missing backing path marks the document
+    # stale but never evicts its indexed content.
+    assert deleted_from_index == []
+
+    docs = await client.get("/library/documents", headers=headers)
+    assert docs.status_code == 200
+    listed = [d for d in docs.json() if d["linked_source_id"] == source_id]
+    assert len(listed) == 1
+    assert listed[0]["source_sync_status"] == "missing"
+    assert listed[0]["source_path"] == str(doomed)
+
+
+@pytest.mark.asyncio
+async def test_linked_document_exposes_source_path_for_citation(client, tmp_path, monkeypatch):
+    token = await _token(client, "linkedcitationuser")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "linked_source_allowed_roots", str(tmp_path))
+
+    repo = tmp_path / "repo"
+    sub = repo / "app"
+    sub.mkdir(parents=True)
+    module = sub / "worker.py"
+    module.write_text("def work():\n    return 1\n")
+
+    link = await client.post(
+        "/library/link-folder",
+        headers=headers,
+        json={"path": str(repo), "scope": "personal"},
+    )
+    assert link.status_code == 202
+
+    docs = await client.get("/library/documents", headers=headers)
+    assert docs.status_code == 200
+    entries = {d["filename"]: d for d in docs.json()}
+    entry = entries["app/worker.py"]
+    assert entry["source_mode"] == "linked"
+    assert entry["source_path"] == str(module)
