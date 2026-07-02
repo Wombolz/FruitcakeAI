@@ -189,6 +189,61 @@ async def test_run_agent_preemptively_disables_tools_for_qwen_workspace_followup
 
 
 @pytest.mark.asyncio
+async def test_run_agent_preemptively_disables_tools_for_configured_text_only_local_model(monkeypatch):
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    monkeypatch.setattr(settings, "local_tool_text_only_models", "ollama_chat/qwen36-hauhau:q4km")
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[{"function": {"name": "read_file"}}]),
+        patch(
+            "app.agent.core.litellm.acompletion",
+            new=AsyncMock(return_value=_fake_response(content="Text-only local response from existing context.")),
+        ) as mock_completion,
+    ):
+        result = await run_agent(
+            [{"role": "user", "content": "Tell me about my latest repo map report in the workspace."}],
+            user_context,
+            mode="chat_orchestrated",
+            model_override="ollama_chat/qwen36-hauhau:q4km",
+            stage="chat_complex",
+        )
+
+    assert result == "Text-only local response from existing context."
+    assert mock_completion.await_count == 1
+    assert mock_completion.await_args.kwargs.get("tools") is None
+
+
+@pytest.mark.asyncio
+async def test_run_agent_falls_back_to_text_only_when_local_model_does_not_support_tools():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    unsupported_error = RuntimeError(
+        'litellm.APIConnectionError: Ollama_chatException - {"error":"registry.ollama.ai/library/qwen36-hauhau:q4km does not support tools"}'
+    )
+
+    async def _acompletion(**kwargs):
+        if kwargs.get("tools"):
+            raise unsupported_error
+        return _fake_response(content="This model can answer from the current context without tools.")
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[{"function": {"name": "read_file"}}]),
+        patch("app.agent.core.litellm.acompletion", side_effect=_acompletion) as mock_completion,
+    ):
+        result = await run_agent(
+            [{"role": "user", "content": "Tell me about my latest repo map report in the workspace."}],
+            user_context,
+            mode="chat_orchestrated",
+            model_override="ollama_chat/qwen36-hauhau:q4km",
+            stage="chat_complex",
+        )
+
+    assert result == "This model can answer from the current context without tools."
+    assert mock_completion.await_count == 2
+    assert mock_completion.await_args_list[0].kwargs["tools"] is not None
+    assert mock_completion.await_args_list[1].kwargs.get("tools") is None
+
+
+@pytest.mark.asyncio
 async def test_run_agent_restricts_qwen_manual_fact_lookup_to_search_tools():
     user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
 
@@ -517,8 +572,9 @@ async def test_run_agent_compacts_large_document_summary_and_disables_tools_for_
     assert any("- Major sections:" in text for text in message_texts)
     assert any("- Key findings:" in text for text in message_texts)
     assert any("- Coverage note:" in text for text in message_texts)
-    assert any("Do not introduce participant counts, durations, environment details" in text for text in message_texts)
-    assert any("If the digest does not specify a detail" in text for text in message_texts)
+    assert any("source of truth" in text for text in message_texts)
+    assert any("avoid unsupported specifics" in text for text in message_texts)
+    assert any("if a detail is missing or unclear" in text for text in message_texts)
 
 
 def test_build_local_document_summary_digest_is_structured_and_filters_recommendations():

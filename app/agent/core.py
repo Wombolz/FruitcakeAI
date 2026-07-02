@@ -436,6 +436,26 @@ def _is_local_tool_json_parse_error(exc: Exception, model: str | None) -> bool:
     return "failed to parse json" in lowered and "ollama" in lowered
 
 
+def _is_local_tool_unsupported_error(exc: Exception, model: str | None) -> bool:
+    if not _is_local_model(model):
+        return False
+    lowered = str(exc or "").lower()
+    return "does not support tools" in lowered and "ollama" in lowered
+
+
+def _configured_local_text_only_models() -> set[str]:
+    return {
+        str(part).strip()
+        for part in str(settings.local_tool_text_only_models or "").split(",")
+        if str(part).strip()
+    }
+
+
+def _is_configured_local_text_only_model(model: str | None) -> bool:
+    selected = str(model or "").strip()
+    return bool(selected) and selected in _configured_local_text_only_models()
+
+
 def _is_qwen_local_tool_guardrail_model(model: str | None) -> bool:
     return str(model or "").strip() == "ollama_chat/qwen3.6:35b"
 
@@ -744,11 +764,8 @@ def _apply_local_document_summary_guardrail(
     compacted_history[-1] = compacted_tool
     note = (
         "A large summarize_document result is already available for this turn. "
-        "Answer the user's requested summary first using only the document-summary evidence already in the conversation, "
-        "preferably using the same section shape as the evidence when it fits. "
-        "Distinguish observed content from interpretation, and do not add recommendations or workflow suggestions unless asked. "
-        "Do not introduce participant counts, durations, environment details, or other specifics unless they appear explicitly in the evidence. "
-        "If the digest does not specify a detail, say that briefly instead of inferring it. "
+        "Use the compact document-summary evidence already in the conversation as the source of truth and answer the user's summary request directly. "
+        "Stay close to the evidence, avoid unsupported specifics, and if a detail is missing or unclear, say so briefly instead of inferring it. "
         "Do not call more tools. If the user needs a narrower section, say that briefly."
     )
     compacted_history = _insert_system_note_before_latest_user(compacted_history, note)
@@ -768,6 +785,15 @@ def _apply_local_document_summary_guardrail(
 
 
 def _local_tool_guardrail(history: List[Dict[str, Any]], *, model: str | None, mode: str) -> Dict[str, Any] | None:
+    if mode in {"chat", "chat_orchestrated"} and _is_configured_local_text_only_model(model):
+        return {
+            "prompt_class": "configured_text_only_model",
+            "instruction": (
+                "This local model is configured as text-only in Fruitcake. "
+                "Do not call tools. Answer using only the existing conversation context and any grounding already present. "
+                "If fresh tool access would be required, say that briefly instead of inventing details."
+            ),
+        }
     if mode not in {"chat", "chat_orchestrated"} or not _is_qwen_local_tool_guardrail_model(model):
         return None
     prompt_class = _local_tool_prompt_class(history)
@@ -2504,9 +2530,16 @@ async def run_agent(
                 extra_kwargs=extra,
             )
         except Exception as e:
-            if turn_tools and _is_local_tool_json_parse_error(e, selected_model):
+            if turn_tools and (
+                _is_local_tool_json_parse_error(e, selected_model)
+                or _is_local_tool_unsupported_error(e, selected_model)
+            ):
                 _log_local_tool_event(
-                    event="LLM local_tool_json_parse_fallback",
+                    event=(
+                        "LLM local_tool_unsupported_fallback"
+                        if _is_local_tool_unsupported_error(e, selected_model)
+                        else "LLM local_tool_json_parse_fallback"
+                    ),
                     history=history,
                     tools=tools,
                     model=selected_model,
@@ -2903,9 +2936,16 @@ async def stream_agent(
                 extra_kwargs=extra,
             )
         except Exception as e:
-            if turn_tools and _is_local_tool_json_parse_error(e, selected_model):
+            if turn_tools and (
+                _is_local_tool_json_parse_error(e, selected_model)
+                or _is_local_tool_unsupported_error(e, selected_model)
+            ):
                 _log_local_tool_event(
-                    event="LLM local_tool_json_parse_fallback",
+                    event=(
+                        "LLM local_tool_unsupported_fallback"
+                        if _is_local_tool_unsupported_error(e, selected_model)
+                        else "LLM local_tool_json_parse_fallback"
+                    ),
                     history=history,
                     tools=tools,
                     model=selected_model,

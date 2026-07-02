@@ -1771,7 +1771,9 @@ async def _execute_chat_turn(
         stage=stage,
         runtime_message_callback=runtime_message_callback,
     )
-    if not (enable_validation and settings.chat_validation_enabled):
+    executed_tools = get_tool_execution_records()
+    should_run_validation = settings.chat_validation_enabled and (enable_validation or bool(executed_tools))
+    if not should_run_validation:
         metrics.record_chat_latency(
             mode=mode,
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
@@ -1958,11 +1960,8 @@ async def _apply_required_library_grounding(
         grounding_note = (
             "Required grounding for this turn: this is a library intent. "
             "Prioritize the newest user message over prior context. "
-            "For this local model, the compact document-summary evidence below is authoritative. "
-            "Answer the user's requested summary first, preferably using the same section shape as the evidence when it fits. "
-            "Distinguish observed content from interpretation, and do not add recommendations unless asked. "
-            "Do not introduce participant counts, durations, environment details, or other specifics unless they appear explicitly in the evidence below. "
-            "If the digest does not specify a detail, say that briefly instead of inferring it. "
+            "For this local model, the compact document-summary evidence below is the source of truth for the answer. "
+            "Answer the user's summary request directly, stay close to the evidence, and if a detail is missing or unclear, say so briefly instead of inferring it. "
             "If the evidence is empty or insufficient, say so explicitly.\n\n"
             f"{result_label}:\n{result_body}"
         )

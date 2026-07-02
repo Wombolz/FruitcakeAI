@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     local_tool_investigation_enabled: bool = False
     local_tool_investigation_drop_browser_tools: bool = False
     local_tool_investigation_max_tools: int = 0
+    local_tool_text_only_models: str = ""
     # Sprint 5.6.5 knowledge skills
     skills_preview_allowed_domains: List[str] = [
         "github.com",

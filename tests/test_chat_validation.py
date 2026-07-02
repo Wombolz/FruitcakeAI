@@ -81,6 +81,22 @@ def test_validate_chat_response_flags_library_search_narration_leakage():
     assert out.retry_reason == "tool_call_leakage"
 
 
+def test_validate_chat_response_flags_continuation_narration_after_tool_turn():
+    out = validate_chat_response(
+        "go ahead",
+        "Let me try another source for tomorrow's detailed forecast.",
+        executed_tools=[
+            {
+                "tool": "fetch_page",
+                "result_summary": "Page content from https://weather.com/...",
+            }
+        ],
+    )
+    assert out.has_continuation_narration is True
+    assert out.should_retry is True
+    assert out.retry_reason == "continuation_narration"
+
+
 def test_should_validate_chat_response_enables_research_on_simple_path():
     assert should_validate_chat_response(
         user_prompt="Research the latest headlines on Iran and cite sources",
@@ -102,6 +118,7 @@ def test_should_validate_chat_response_enables_research_on_simple_path():
 
 def test_build_retry_instruction_has_reason_specific_text():
     assert "internal tool-calling" in build_chat_retry_instruction("tool_call_leakage").lower()
+    assert "described a next step" in build_chat_retry_instruction("continuation_narration").lower()
     assert "too brief/empty" in build_chat_retry_instruction("empty_result").lower()
     assert "grounded sources" in build_chat_retry_instruction("missing_links").lower()
     assert "invalid/placeholder links" in build_chat_retry_instruction("invalid_links").lower()
@@ -311,6 +328,60 @@ async def test_send_message_retries_once_for_followup_article_detail_leakage(cli
     assert "Compacted tool result." not in resp.json()["content"]
     assert mock_run.await_count == 2
     assert mock_run.await_args_list[0].kwargs["mode"] == "chat"
+
+
+@pytest.mark.asyncio
+async def test_send_message_retries_once_for_continuation_narration_after_tool_turn(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "chatcontinuation",
+            "email": "chatcontinuation@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "chatcontinuation", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Continuation Retry"}, headers=headers)
+    session_id = create.json()["id"]
+
+    tool_records = [{"tool": "fetch_page", "result_summary": "Page content from https://weather.com/..."}]
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", True),
+        patch.object(settings, "chat_complexity_threshold", 99),
+        patch.object(settings, "chat_validation_enabled", True),
+        patch.object(settings, "chat_validation_retry_enabled", True),
+        patch.object(settings, "chat_validation_retry_max_attempts", 1),
+        patch(
+            "app.api.chat.run_agent",
+            new_callable=AsyncMock,
+            side_effect=[
+                "Let me try another source for tomorrow's detailed forecast.",
+                "Tomorrow in Statesboro looks very hot with a high near 97F, partly sunny skies, and a chance of afternoon thunderstorms.",
+            ],
+        ) as mock_run,
+        patch("app.api.chat.get_tool_execution_records", return_value=tool_records),
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "go ahead"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert "Tomorrow in Statesboro" in resp.json()["content"]
+    assert mock_run.await_count == 2
+    retry_history = mock_run.await_args_list[1].args[0]
+    assert any(
+        msg.get("role") == "system" and "described a next step" in str(msg.get("content") or "")
+        for msg in retry_history
+    )
 
 
 @pytest.mark.asyncio
@@ -553,13 +624,12 @@ async def test_library_summary_intent_uses_compact_digest_for_local_model(client
     ]
     assert grounding_messages
     grounding = grounding_messages[0]
-    assert "authoritative" in grounding
+    assert "source of truth" in grounding
     assert "- Major sections:" in grounding
     assert "- Key findings:" in grounding
     assert "- Caveats:" in grounding
-    assert "do not add recommendations unless asked" in grounding
-    assert "Do not introduce participant counts, durations, environment details" in grounding
-    assert "If the digest does not specify a detail" in grounding
+    assert "stay close to the evidence" in grounding
+    assert "if a detail is missing or unclear" in grounding
 
 
 @pytest.mark.asyncio
