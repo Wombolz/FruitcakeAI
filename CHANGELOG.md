@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.25
+
+- Hardened local `ollama` / `ollama_chat` chat turns by persisting assistant tool-call and tool-result history incrementally, recovering visibly when post-tool local synthesis fails, and preserving the saved evidence in the session instead of rolling the turn back.
+- Improved local document-summary behavior with compact synthesis-facing evidence digests, structured `summarize_document` prompting, evenly sampled large-document chunking, and narrower total-softening heuristics that reduce unsupported exact counts while preserving grounded specifics.
+- Added configurable text-only local model support plus a safe fallback for models that explicitly do not support tools, keeping local chat usable while the deeper Qwen/Ollama/LiteLLM tool-calling investigation remains a follow-up.
+- Tightened chat validation and convergence behavior by retrying tool-backed continuation narration, fixing mixed RSS headline-roundup churn so multi-tool RSS turns converge to synthesis, and reducing false positives in the continuation heuristic for long substantive answers or offer-style endings.
+- Fixed two review-blocking correctness issues before merge: `document_summary_model` now falls back safely to `LLM_MODEL` in cloud-only deployments, and runtime-history flush bookkeeping now tracks consumed runtime messages rather than persisted row counts to avoid duplicate tool rows.
+- Preserved the higher chat/tool/filesystem limits introduced during this branch as the current product defaults, reflecting the target operating environment while leaving room to tune them down later if token or runtime costs argue for it.
+
 ## v0.7.24
 
 - Added task presentation metadata support so tasks can carry lightweight UI styling such as validated accent colors through create, patch, list, and detail flows.
