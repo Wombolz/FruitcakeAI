@@ -155,6 +155,7 @@ class ChatValidationResult:
     is_research_style: bool
     is_empty_result: bool
     has_tool_call_leakage: bool
+    has_continuation_narration: bool
     valid_urls: list[str]
     invalid_urls: list[str]
     mutation_unconfirmed: bool
@@ -173,6 +174,7 @@ def validate_chat_response(
     text = (response or "").strip()
     is_research_style = _is_validation_worthy_prompt(prompt)
     has_tool_call_leakage = _has_tool_call_leakage(text)
+    has_continuation_narration = _has_continuation_narration(text, executed_tools or [])
     mutation_unconfirmed = _is_calendar_mutation_prompt(prompt) and _claims_calendar_mutation_success(text) and not _calendar_mutation_confirmed(executed_tools or [])
     task_mutation_reason = None
     if _is_task_mutation_prompt(prompt) and _claims_task_mutation_success(text):
@@ -192,6 +194,9 @@ def validate_chat_response(
         if has_tool_call_leakage:
             should_retry = True
             retry_reason = "tool_call_leakage"
+        elif has_continuation_narration:
+            should_retry = True
+            retry_reason = "continuation_narration"
         elif mutation_unconfirmed:
             should_retry = True
             retry_reason = "calendar_mutation_unconfirmed"
@@ -211,6 +216,9 @@ def validate_chat_response(
         if has_tool_call_leakage:
             should_retry = True
             retry_reason = "tool_call_leakage"
+        elif has_continuation_narration:
+            should_retry = True
+            retry_reason = "continuation_narration"
         elif mutation_unconfirmed:
             should_retry = True
             retry_reason = "calendar_mutation_unconfirmed"
@@ -228,6 +236,7 @@ def validate_chat_response(
         is_research_style=is_research_style,
         is_empty_result=empty_result,
         has_tool_call_leakage=has_tool_call_leakage,
+        has_continuation_narration=has_continuation_narration,
         valid_urls=valid_urls,
         invalid_urls=invalid_urls,
         mutation_unconfirmed=mutation_unconfirmed,
@@ -243,6 +252,11 @@ def build_chat_retry_instruction(reason: str | None) -> str:
         return (
             "Your previous answer exposed internal tool-calling or research narration. "
             "Re-answer for the user directly. Do not include tool-call syntax, function names, or internal search process notes."
+        )
+    if reason == "continuation_narration":
+        return (
+            "Your previous answer described a next step instead of completing the turn. "
+            "Do not narrate what you plan to do next. Either call the next tool now or give the final answer from the evidence already gathered."
         )
     if reason == "empty_result":
         return (
@@ -304,6 +318,35 @@ def _has_tool_call_leakage(text: str) -> bool:
     if not lowered:
         return False
     return any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in TOOL_LEAKAGE_PATTERNS)
+
+
+def _has_continuation_narration(text: str, executed_tools: list[dict[str, Any]]) -> bool:
+    if not executed_tools:
+        return False
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    anchored_patterns = (
+        r"^\s*let me\s+(?:try|check|grab|fetch|pull|get|look up|use|dig|read)\b",
+        r"^\s*i(?:'|’)ll\s+(?:try|check|grab|fetch|pull|get|look up|use|dig|read)\b",
+        r"^\s*i will\s+(?:try|check|grab|fetch|pull|get|look up|use|dig|read)\b",
+    )
+    if "want me to" in lowered or "let me know" in lowered:
+        return False
+    if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in anchored_patterns):
+        return True
+    if len(lowered) > 1200:
+        return False
+    trailing_window = lowered[-220:]
+    if "if you'd like" in trailing_window or "if you would like" in trailing_window or "if you want" in trailing_window:
+        return False
+    return bool(
+        re.search(
+            r"\blet me\s+(?:try|check|grab|fetch|pull|get|look up|use|dig|read)\b",
+            trailing_window,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _extract_urls(text: str) -> list[str]:

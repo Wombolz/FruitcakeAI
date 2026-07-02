@@ -71,7 +71,7 @@ def normalize_task_recipe(
     if family == "weather_conditions":
         return _build_weather_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
     if family == "maintenance":
-        return _build_maintenance_recipe(task_type=task_type, params=params)
+        return _build_maintenance_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
     return None
 
 
@@ -552,8 +552,17 @@ def _build_weather_recipe(
     )
 
 
-def _build_maintenance_recipe(*, task_type: str, params: dict[str, Any]) -> NormalizedTaskRecipe:
-    max_items = _int_param(params, "max_items_per_source") or 20
+def _build_maintenance_recipe(
+    *,
+    title: str,
+    instruction: str,
+    task_type: str,
+    params: dict[str, Any],
+) -> NormalizedTaskRecipe | None:
+    tool_name = _resolve_maintenance_tool(title=title, instruction=instruction, params=params)
+    if tool_name != "refresh_rss_cache":
+        return None
+    max_items = _int_param(params, "max_items_per_source") or _extract_refresh_rss_cache_max_items(instruction) or 20
     args = {"max_items_per_source": max_items}
     return NormalizedTaskRecipe(
         family="maintenance",
@@ -565,6 +574,29 @@ def _build_maintenance_recipe(*, task_type: str, params: dict[str, Any]) -> Norm
         params={"tool": "refresh_rss_cache", "args": args},
         assumptions=["defaulted refresh_rss_cache max_items_per_source to 20"] if "max_items_per_source" not in params else [],
     )
+
+
+def _resolve_maintenance_tool(*, title: str, instruction: str, params: dict[str, Any]) -> str | None:
+    explicit_tool = _string_param(params, "tool")
+    if explicit_tool:
+        return explicit_tool if explicit_tool == "refresh_rss_cache" else None
+
+    lowered = f"{title}\n{instruction}".lower()
+    if "tool: refresh_rss_cache" in lowered:
+        return "refresh_rss_cache"
+    if "refresh_rss_cache" in lowered or ("refresh" in lowered and "rss" in lowered and "cache" in lowered):
+        return "refresh_rss_cache"
+    return None
+
+
+def _extract_refresh_rss_cache_max_items(instruction: str) -> int | None:
+    match = re.search(r'"max_items_per_source"\s*:\s*(\d+)', str(instruction or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
 
 
 def _extract_topic_from_watcher_text(title: str, instruction: str) -> str:

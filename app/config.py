@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     local_api_base: str = "http://localhost:11434/v1"
     local_api_key: str = "sk-local"
     local_model: str = "qwen2.5:32b"
+    document_summary_model: str = ""
     # Task-stage routing (Phase 5.4.x)
     task_small_model: str = "ollama_chat/qwen2.5:14b"
     task_large_model: str = "ollama_chat/qwen2.5:32b"
@@ -60,7 +61,7 @@ class Settings(BaseSettings):
     task_plan_max_steps: int = 20
     agent_history_soft_token_limit: int = 48000
     agent_recent_messages_keep: int = 12
-    agent_tool_result_max_chars: int = 1600
+    agent_tool_result_max_chars: int = 4000
     agent_tool_recent_keep: int = 4
     agent_overflow_retry_enabled: bool = True
     agent_repeated_tool_signature_threshold: int = 3
@@ -83,7 +84,7 @@ class Settings(BaseSettings):
     # Phase 5.5.1 chat complexity routing
     chat_complexity_routing_enabled: bool = True
     chat_complexity_threshold: int = 3
-    chat_history_soft_token_limit: int = 24000
+    chat_history_soft_token_limit: int = 32000
     chat_recent_messages_keep: int = 16
     # Phase 5.5.2 orchestrated chat path
     chat_orchestration_enabled: bool = True
@@ -93,6 +94,11 @@ class Settings(BaseSettings):
     chat_validation_enabled: bool = True
     chat_validation_retry_enabled: bool = True
     chat_validation_retry_max_attempts: int = 1
+    # Local-model tool-calling investigation toggles
+    local_tool_investigation_enabled: bool = False
+    local_tool_investigation_drop_browser_tools: bool = False
+    local_tool_investigation_max_tools: int = 0
+    local_tool_text_only_models: str = ""
     # Sprint 5.6.5 knowledge skills
     skills_preview_allowed_domains: List[str] = [
         "github.com",
@@ -117,8 +123,8 @@ class Settings(BaseSettings):
     workspace_dir: str = "./workspace"
     linked_source_allowed_roots: str = ""
     upload_max_size_mb: int = 50
-    filesystem_mcp_max_read_bytes: int = 100_000
-    filesystem_mcp_max_write_bytes: int = 100_000
+    filesystem_mcp_max_read_bytes: int = 250_000
+    filesystem_mcp_max_write_bytes: int = 240_000
     filesystem_mcp_max_search_results: int = 50
 
     # ── CORS ──────────────────────────────────────────────────────────────────

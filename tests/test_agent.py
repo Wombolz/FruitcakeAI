@@ -23,6 +23,7 @@ from sqlalchemy import select
 
 from app.agent.context import UserContext
 from app.agent.core import (
+    _build_messages,
     _filter_tools_for_prompt,
     _is_rss_owned_headline_prompt,
     _rewrite_headline_rss_tool_calls,
@@ -34,7 +35,7 @@ from app.agent.core import (
     restore_agent_loop_diagnostics,
     run_agent,
 )
-from app.agent.tools import TOOL_SCHEMAS, _parse_iso_datetime, get_tools_for_user
+from app.agent.tools import TOOL_SCHEMAS, _parse_iso_datetime, _sample_document_chunks_evenly, get_tools_for_user
 from app.config import settings
 from tests.conftest import TestSessionLocal
 
@@ -780,6 +781,96 @@ async def test_run_agent_converges_headline_roundup_after_bounded_rss_turns(monk
 
 
 @pytest.mark.asyncio
+async def test_run_agent_converges_headline_roundup_after_bounded_mixed_rss_turns(monkeypatch):
+    ctx = _make_context()
+    monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_repeated_semantic_tool_signature_threshold", 10)
+    monkeypatch.setattr(settings, "agent_headline_roundup_rss_turn_cap", 2)
+
+    responses = [
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_1",
+                        "function": {
+                            "name": "search_my_feeds",
+                            "arguments": json.dumps({"query": "technology tech news", "max_results": 15}),
+                        },
+                    },
+                    {
+                        "id": "src_1",
+                        "function": {
+                            "name": "list_rss_sources",
+                            "arguments": json.dumps({"active_only": True}),
+                        },
+                    },
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(
+                tool_calls=[
+                    {
+                        "id": "rss_2",
+                        "function": {
+                            "name": "search_my_feeds",
+                            "arguments": json.dumps({"query": "technology tech ai software startups", "max_results": 15, "refresh": True}),
+                        },
+                    },
+                    {
+                        "id": "recent_2",
+                        "function": {
+                            "name": "list_recent_feed_items",
+                            "arguments": json.dumps({"max_results": 20, "window": {"mode": "days", "value": 1}, "refresh": True}),
+                        },
+                    },
+                ]
+            )
+        ),
+        _FakeResponse(
+            _FakeMessage(content="Here is today’s tech roundup from your feeds: Story A, Story B, Story C.")
+        ),
+    ]
+    tool_results = [
+        [
+            {"role": "tool", "tool_call_id": "rss_1", "content": "Cached feed results for tech news:\n[1] Story A"},
+            {"role": "tool", "tool_call_id": "src_1", "content": "RSS sources (178):\n[1] 404 Media"},
+        ],
+        [
+            {"role": "tool", "tool_call_id": "rss_2", "content": "Cached feed results for tech ai software startups:\n[1] Story B\n[2] Story C"},
+            {"role": "tool", "tool_call_id": "recent_2", "content": "Recent feed items:\n[1] Story B\n[2] Story C"},
+        ],
+    ]
+
+    token = reset_agent_loop_diagnostics()
+    try:
+        with patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[
+                {"type": "function", "function": {"name": "search_my_feeds"}},
+                {"type": "function", "function": {"name": "list_rss_sources"}},
+                {"type": "function", "function": {"name": "list_recent_feed_items"}},
+            ],
+        ):
+            with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(side_effect=tool_results)):
+                with patch("app.agent.core.record_llm_usage_event", new=AsyncMock()):
+                    with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=responses)):
+                        result = await run_agent(
+                            [{"role": "user", "content": "Give me a round up of Tech news from today"}],
+                            ctx,
+                            mode="chat",
+                        )
+        diagnostics = get_agent_loop_diagnostics()
+    finally:
+        restore_agent_loop_diagnostics(token)
+
+    assert "tech roundup" in result.lower()
+    loop_events = diagnostics.get("loop_events") or []
+    assert any(event.get("type") == "headline_roundup_convergence" for event in loop_events if isinstance(event, dict))
+
+
+@pytest.mark.asyncio
 async def test_run_agent_falls_back_cleanly_when_rss_synthesis_errors(monkeypatch):
     ctx = _make_context()
     monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 10)
@@ -1123,6 +1214,25 @@ def test_summarize_document_has_document_name_parameter():
     assert "document_name" in required
 
 
+def test_settings_document_summary_model_defaults_empty_and_tool_falls_back_to_llm_model():
+    from app.config import Settings
+
+    configured = Settings(_env_file=None, document_summary_model="", llm_model="gpt-5-mini")
+    assert configured.document_summary_model == ""
+    assert (configured.document_summary_model or configured.llm_model) == "gpt-5-mini"
+
+
+def test_sample_document_chunks_evenly_covers_start_middle_and_end():
+    chunks = [f"chunk-{i}" for i in range(129)]
+    sampled = _sample_document_chunks_evenly(chunks, max_chunks=64)
+
+    assert len(sampled) == 64
+    assert sampled[0] == "chunk-0"
+    assert sampled[-1] == "chunk-128"
+    assert any(item in sampled for item in ("chunk-63", "chunk-64", "chunk-65"))
+    assert any(int(item.split("-")[1]) >= 120 for item in sampled)
+
+
 def test_list_library_documents_schema_fields():
     schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "list_library_documents")
     props = schema["function"]["parameters"]["properties"]
@@ -1171,6 +1281,21 @@ def test_system_prompt_requires_task_draft_before_create_or_update():
     assert "propose_task_draft" in prompt
     assert "review the draft in the task editor before anything is persisted" in prompt
     assert "high-confidence task recipe" in prompt
+    assert "do not turn a short confirmation like 'yes' into a new saved task" in prompt
+
+
+def test_build_messages_adds_immediate_action_followup_hint_for_yes_after_run_now_offer():
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    history = [
+        {"role": "assistant", "content": "I can trim the workspace report and archive older entries now. Shall I run this now?"},
+        {"role": "user", "content": "yes"},
+    ]
+
+    messages = _build_messages(history, ctx)
+    system_messages = [m["content"].lower() for m in messages if m["role"] == "system"]
+
+    assert any("approval to execute the concrete action proposed" in msg for msg in system_messages)
+    assert any("do not use propose_task_draft or create_task" in msg for msg in system_messages)
 
 
 def test_system_prompt_includes_persona_behavior_instructions():
@@ -2473,6 +2598,31 @@ async def test_propose_task_draft_tool_returns_normalized_draft_without_persisti
     async with TestSessionLocal() as db:
         rows = await db.execute(select(Task))
         assert rows.scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_propose_task_draft_rejects_unsupported_explicit_maintenance_recipe():
+    import app.agent.tools as tools_module
+
+    ctx = _make_context()
+
+    with patch("app.db.session.AsyncSessionLocal", TestSessionLocal):
+        result = await tools_module._propose_task_draft(
+            {
+                "title": "Archive and summarize Anthropic report",
+                "instruction": "Trim and archive /workspace/reports/Anthropic Fable.md and build a compact summary.",
+                "task_type": "one_shot",
+                "deliver": True,
+                "recipe_family": "maintenance",
+                "recipe_params": {
+                    "retention_days": 60,
+                    "source_file": "/workspace/reports/Anthropic Fable.md",
+                },
+            },
+            ctx,
+        )
+
+    assert "Could not build the selected task family 'maintenance'" in result
 
 
 @pytest.mark.asyncio

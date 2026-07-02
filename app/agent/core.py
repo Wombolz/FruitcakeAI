@@ -6,11 +6,11 @@ it decides when to call tools and how to synthesize results.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import re
-import contextvars
-from typing import Any, AsyncGenerator, Dict, List
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List
 
 import litellm
 import structlog
@@ -97,6 +97,10 @@ HEADLINE_ROUNDUP_MARKERS = (
     "headlines today",
     "today's headlines",
     "todays headlines",
+    "round up of",
+    "roundup of",
+    "news roundup",
+    "news round up",
 )
 HEADLINE_RSS_OWNED_HINTS = (
     "my feeds",
@@ -224,6 +228,9 @@ def _build_messages(
     followup_hint = _recent_task_followup_hint(history)
     if followup_hint:
         messages.append({"role": "system", "content": followup_hint})
+    immediate_action_hint = _recent_immediate_action_followup_hint(history)
+    if immediate_action_hint:
+        messages.append({"role": "system", "content": immediate_action_hint})
     return messages + history
 
 
@@ -433,6 +440,26 @@ def _is_local_tool_json_parse_error(exc: Exception, model: str | None) -> bool:
     return "failed to parse json" in lowered and "ollama" in lowered
 
 
+def _is_local_tool_unsupported_error(exc: Exception, model: str | None) -> bool:
+    if not _is_local_model(model):
+        return False
+    lowered = str(exc or "").lower()
+    return "does not support tools" in lowered and "ollama" in lowered
+
+
+def _configured_local_text_only_models() -> set[str]:
+    return {
+        str(part).strip()
+        for part in str(settings.local_tool_text_only_models or "").split(",")
+        if str(part).strip()
+    }
+
+
+def _is_configured_local_text_only_model(model: str | None) -> bool:
+    selected = str(model or "").strip()
+    return bool(selected) and selected in _configured_local_text_only_models()
+
+
 def _is_qwen_local_tool_guardrail_model(model: str | None) -> bool:
     return str(model or "").strip() == "ollama_chat/qwen3.6:35b"
 
@@ -456,6 +483,37 @@ def _tool_names_from_schemas(tools: List[Dict[str, Any]] | None) -> List[str]:
         if name:
             names.append(name)
     return names
+
+
+def _is_browserish_tool_name(name: str) -> bool:
+    normalized = str(name or "").strip().lower()
+    if not normalized:
+        return False
+    browser_tokens = (
+        "browser",
+        "playwright",
+        "page",
+        "navigate",
+        "click",
+        "type",
+        "tab",
+        "dom",
+        "selector",
+        "screenshot",
+    )
+    return any(token in normalized for token in browser_tokens)
+
+
+def _tool_surface_summary(tools: List[Dict[str, Any]] | None) -> Dict[str, Any]:
+    tool_names = _tool_names_from_schemas(tools)
+    browser_tools = [name for name in tool_names if _is_browserish_tool_name(name)]
+    return {
+        "offered_tools": tool_names,
+        "offered_tool_count": len(tool_names),
+        "offered_browser_tools": browser_tools,
+        "offered_browser_tool_count": len(browser_tools),
+        "offered_has_browser_tools": bool(browser_tools),
+    }
 
 
 def _tool_message_preview(history: List[Dict[str, Any]], *, limit: int = 5) -> List[Dict[str, Any]]:
@@ -558,7 +616,188 @@ def _is_narrow_document_fact_lookup(latest_user: str) -> bool:
     return any(marker in text for marker in doc_markers) and any(marker in text for marker in fact_markers)
 
 
+_LOCAL_SUMMARY_DIGEST_MAX_CHARS = 2200
+_LOCAL_SUMMARY_DIGEST_MAX_FINDINGS = 6
+
+
+def build_local_document_summary_digest(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return "Document summary digest unavailable."
+
+    document_name = _extract_summary_header_value(r"Summary of '([^']+)'", text)
+    total_sections = _extract_summary_header_value(r"\((\d+)\s+total sections\)", text)
+    coverage_note = _extract_summary_header_value(r"_([^_]*?Note:[^_]*)_", text)
+
+    section_lines: list[str] = []
+    finding_lines: list[str] = []
+    caveat_lines: list[str] = []
+    generic_lines: list[str] = []
+    active_bucket = "generic"
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("**Summary of '") or line.startswith("_Note:"):
+            continue
+
+        normalized_heading = line.lstrip("#").strip().lower() if line.startswith("#") else ""
+        if normalized_heading:
+            if "major sections" in normalized_heading or "section overview" in normalized_heading:
+                active_bucket = "sections"
+                continue
+            if "key findings" in normalized_heading or "observed facts" in normalized_heading:
+                active_bucket = "findings"
+                continue
+            if "caveats" in normalized_heading or "uncertainty" in normalized_heading:
+                active_bucket = "caveats"
+                continue
+            active_bucket = "generic"
+
+        if line.startswith(("-", "*")):
+            normalized = _sanitize_preview_text(line.lstrip("-* ").strip(), max_chars=180)
+            if not normalized:
+                continue
+            lower = normalized.lower()
+            if "recommend" in lower or "should " in lower or "next step" in lower:
+                continue
+            if active_bucket == "sections":
+                if normalized not in section_lines:
+                    section_lines.append(normalized)
+                continue
+            if active_bucket == "caveats" or "caveat" in lower or "uncertain" in lower:
+                if normalized not in caveat_lines:
+                    caveat_lines.append(normalized)
+                continue
+            if active_bucket == "findings" or len(finding_lines) < _LOCAL_SUMMARY_DIGEST_MAX_FINDINGS:
+                if normalized not in finding_lines:
+                    finding_lines.append(normalized)
+                continue
+        if line.startswith(("###", "####")):
+            normalized = _sanitize_preview_text(line.lstrip("#").strip(), max_chars=140)
+            if normalized and normalized not in section_lines:
+                section_lines.append(normalized)
+            continue
+
+        normalized = _sanitize_preview_text(line, max_chars=180)
+        if not normalized:
+            continue
+        lower = normalized.lower()
+        if ("note:" in lower or "sample" in lower or "coverage" in lower or "uncertain" in lower) and normalized not in caveat_lines:
+            caveat_lines.append(normalized)
+            continue
+        if len(generic_lines) < _LOCAL_SUMMARY_DIGEST_MAX_FINDINGS and normalized not in generic_lines:
+            generic_lines.append(normalized)
+
+    if not section_lines:
+        section_lines = generic_lines[:3]
+    if not finding_lines:
+        finding_lines = generic_lines[:_LOCAL_SUMMARY_DIGEST_MAX_FINDINGS]
+    if not caveat_lines and coverage_note:
+        caveat_lines = [_sanitize_preview_text(coverage_note, max_chars=180)]
+    if not finding_lines:
+        finding_lines = [_sanitize_preview_text(text, max_chars=180)]
+
+    lines = ["Document summary evidence digest."]
+    if document_name:
+        lines.append(f"- Document: {document_name}")
+    if total_sections:
+        lines.append(f"- Total sections: {total_sections}")
+    if coverage_note:
+        lines.append(f"- Coverage note: {coverage_note}")
+    lines.append("- Major sections:")
+    for section in section_lines[:4]:
+        lines.append(f"  - {section}")
+    lines.append("- Key findings:")
+    for finding in finding_lines[:_LOCAL_SUMMARY_DIGEST_MAX_FINDINGS]:
+        lines.append(f"  - {finding}")
+    if caveat_lines:
+        lines.append("- Caveats:")
+        for caveat in caveat_lines[:3]:
+            lines.append(f"  - {caveat}")
+    return "\n".join(lines)
+
+
+def _latest_large_summarize_document_tool_result(history: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not history:
+        return None
+    tool_lookup = _tool_name_lookup(history)
+    message = history[-1]
+    if str(message.get("role") or "") != "tool":
+        return None
+    tool_call_id = str(message.get("tool_call_id") or "").strip()
+    if tool_lookup.get(tool_call_id) != "summarize_document":
+        return None
+    content = str(message.get("content") or "")
+    if len(content) < _LOCAL_SUMMARY_DIGEST_MAX_CHARS:
+        return None
+    return message
+
+
+def _extract_summary_header_value(pattern: str, content: str) -> str:
+    match = re.search(pattern, content, flags=re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return ""
+    return str(match.group(1) or "").strip()
+
+
+def _summarize_document_tool_result_for_local_synthesis(content: str) -> str:
+    return build_local_document_summary_digest(content)
+
+
+def _apply_local_document_summary_guardrail(
+    *,
+    history: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None,
+    model: str,
+    mode: str,
+    stage: str | None,
+    user_context: UserContext,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]] | None]:
+    if mode not in {"chat", "chat_orchestrated"} or not _is_qwen_local_tool_guardrail_model(model):
+        return history, tools
+
+    target = _latest_large_summarize_document_tool_result(history)
+    if target is None:
+        return history, tools
+
+    compacted_history = list(history)
+    compacted_tool = dict(target)
+    compacted_tool["content"] = _summarize_document_tool_result_for_local_synthesis(str(target.get("content") or ""))
+    compacted_history[-1] = compacted_tool
+    note = (
+        "A large summarize_document result is already available for this turn. "
+        "Use the compact document-summary evidence already in the conversation as the source of truth and answer the user's summary request directly. "
+        "Stay close to the evidence, avoid unsupported specifics, and if a detail is missing or unclear, say so briefly instead of inferring it. "
+        "Do not call more tools. If the user needs a narrower section, say that briefly."
+    )
+    compacted_history = _insert_system_note_before_latest_user(compacted_history, note)
+    _log_local_tool_event(
+        event="LLM local_tool_guardrail_applied",
+        history=history,
+        tools=tools,
+        model=model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+        prompt_class="document_summary_followup",
+        tool_failure_phase="guardrail_large_document_summary_post_tool_synthesis",
+        tools_enabled=False,
+    )
+    return compacted_history, None
+
+
 def _local_tool_guardrail(history: List[Dict[str, Any]], *, model: str | None, mode: str) -> Dict[str, Any] | None:
+    if mode in {"chat", "chat_orchestrated"} and _is_configured_local_text_only_model(model):
+        return {
+            "prompt_class": "configured_text_only_model",
+            "instruction": (
+                "This local model is configured as text-only in Fruitcake. "
+                "Do not call tools. Answer using only the existing conversation context and any grounding already present. "
+                "If fresh tool access would be required, say that briefly instead of inventing details."
+            ),
+        }
     if mode not in {"chat", "chat_orchestrated"} or not _is_qwen_local_tool_guardrail_model(model):
         return None
     prompt_class = _local_tool_prompt_class(history)
@@ -613,6 +852,14 @@ def _apply_local_tool_guardrail(
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]] | None]:
     turn_history = history
     turn_tools = tools
+    turn_history, turn_tools = _apply_local_document_summary_guardrail(
+        history=turn_history,
+        tools=turn_tools,
+        model=model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+    )
     guardrail = _local_tool_guardrail(history, model=model, mode=mode)
     if not turn_tools or guardrail is None:
         return turn_history, turn_tools
@@ -655,6 +902,56 @@ def _apply_local_tool_guardrail(
     return turn_history, turn_tools
 
 
+def _apply_local_tool_investigation_filters(
+    *,
+    tools: List[Dict[str, Any]] | None,
+    model: str,
+    mode: str,
+    stage: str | None,
+    user_context: UserContext,
+    history: List[Dict[str, Any]],
+) -> List[Dict[str, Any]] | None:
+    if not tools or not settings.local_tool_investigation_enabled or not _is_qwen_local_tool_guardrail_model(model):
+        return tools
+
+    filtered = list(tools)
+    reasons: List[str] = []
+
+    if settings.local_tool_investigation_drop_browser_tools:
+        browser_filtered = [
+            tool
+            for tool in filtered
+            if not _is_browserish_tool_name(str(((tool or {}).get("function") or {}).get("name") or ""))
+        ]
+        if len(browser_filtered) != len(filtered):
+            filtered = browser_filtered
+            reasons.append("drop_browser_tools")
+
+    max_tools = max(0, int(settings.local_tool_investigation_max_tools or 0))
+    if max_tools and len(filtered) > max_tools:
+        filtered = filtered[:max_tools]
+        reasons.append(f"cap_tools:{max_tools}")
+
+    if reasons:
+        _log_local_tool_event(
+            event="LLM local_tool_investigation_filter_applied",
+            history=history,
+            tools=filtered,
+            model=model,
+            mode=mode,
+            stage=stage,
+            user_context=user_context,
+            prompt_class=_local_tool_prompt_class(history),
+            tool_failure_phase="investigation_filter",
+            tools_enabled=bool(filtered),
+            raw_tool_surface=_tool_surface_summary(tools),
+            effective_tool_surface=_tool_surface_summary(filtered),
+            investigation_reasons=reasons,
+        )
+
+    return filtered or None
+
+
 def _insert_system_note_before_latest_user(history: List[Dict[str, Any]], note: str) -> List[Dict[str, Any]]:
     updated = list(history)
     if updated and updated[-1].get("role") == "user":
@@ -675,7 +972,11 @@ def _log_local_tool_event(
     prompt_class: str | None = None,
     tool_failure_phase: str | None = None,
     tools_enabled: bool = True,
+    raw_tool_surface: Dict[str, Any] | None = None,
+    effective_tool_surface: Dict[str, Any] | None = None,
+    investigation_reasons: List[str] | None = None,
 ) -> None:
+    tool_surface = _tool_surface_summary(tools)
     payload = {
         "model": str(model or ""),
         "mode": mode,
@@ -683,7 +984,7 @@ def _log_local_tool_event(
         "session_id": user_context.session_id,
         "task_id": user_context.task_id,
         "tools_enabled": tools_enabled,
-        "offered_tools": _tool_names_from_schemas(tools),
+        **tool_surface,
         "recent_roles": _recent_role_sequence(history),
         "prompt_fingerprint": _content_fingerprint(_latest_user_message_text(history), length=16),
         "history_fingerprint": _history_prompt_fingerprint(history),
@@ -693,6 +994,12 @@ def _log_local_tool_event(
     }
     if error is not None:
         payload["error_preview"] = _raw_error_preview(error)
+    if raw_tool_surface is not None:
+        payload["raw_tool_surface"] = raw_tool_surface
+    if effective_tool_surface is not None:
+        payload["effective_tool_surface"] = effective_tool_surface
+    if investigation_reasons:
+        payload["investigation_reasons"] = investigation_reasons
     log.warning(event, **payload)
 
 
@@ -1018,26 +1325,31 @@ def _normalize_query_family(query: str) -> str:
 
 
 def _rss_query_family_signature(tool_calls: List[Any]) -> str | None:
-    if len(tool_calls) != 1:
+    signatures: list[str] = []
+    for call in tool_calls:
+        tool_name = _tool_call_name(call)
+        if tool_name not in RSS_RETRIEVAL_TOOL_NAMES:
+            continue
+        arguments = _tool_call_arguments(call)
+        if tool_name == "search_my_feeds_timeline":
+            query_family = _normalize_query_family(str(arguments.get("query") or ""))
+            start = str(arguments.get("start_date") or "")
+            end = str(arguments.get("end_date") or "")
+            signatures.append(f"{tool_name}:{query_family}:{start}:{end}")
+            continue
+        if tool_name == "search_my_feeds":
+            query_family = _normalize_query_family(str(arguments.get("query") or ""))
+            category = str(arguments.get("category") or "")
+            signatures.append(f"{tool_name}:{query_family}:{category}")
+            continue
+        sources = arguments.get("sources") or {}
+        window = arguments.get("window") or {}
+        source_mode = str((sources.get("mode") or "all")).strip().lower()
+        window_mode = str((window.get("mode") or "all")).strip().lower()
+        signatures.append(f"{tool_name}:{source_mode}:{window_mode}")
+    if not signatures:
         return None
-    tool_name = _tool_call_name(tool_calls[0])
-    if tool_name not in RSS_RETRIEVAL_TOOL_NAMES:
-        return None
-    arguments = _tool_call_arguments(tool_calls[0])
-    if tool_name == "search_my_feeds_timeline":
-        query_family = _normalize_query_family(str(arguments.get("query") or ""))
-        start = str(arguments.get("start_date") or "")
-        end = str(arguments.get("end_date") or "")
-        return f"{tool_name}:{query_family}:{start}:{end}"
-    if tool_name == "search_my_feeds":
-        query_family = _normalize_query_family(str(arguments.get("query") or ""))
-        category = str(arguments.get("category") or "")
-        return f"{tool_name}:{query_family}:{category}"
-    sources = arguments.get("sources") or {}
-    window = arguments.get("window") or {}
-    source_mode = str((sources.get("mode") or "all")).strip().lower()
-    window_mode = str((window.get("mode") or "all")).strip().lower()
-    return f"{tool_name}:{source_mode}:{window_mode}"
+    return " || ".join(dict.fromkeys(signatures))
 
 
 def _is_headline_roundup_prompt(messages: List[Dict[str, Any]]) -> bool:
@@ -1826,6 +2138,49 @@ def _recent_task_followup_hint(messages: List[Dict[str, Any]]) -> str | None:
     )
 
 
+def _recent_immediate_action_followup_hint(messages: List[Dict[str, Any]]) -> str | None:
+    latest_user = _latest_user_message_text(messages).strip().lower()
+    if latest_user not in {"yes", "yes.", "yes please", "please do", "go ahead", "go ahead.", "proceed", "proceed.", "do it", "do it.", "run it", "run it."}:
+        return None
+
+    previous_assistant = ""
+    for message in reversed(messages[:-1]):
+        if str(message.get("role") or "") == "assistant":
+            previous_assistant = str(message.get("content") or "").strip().lower()
+            break
+    if not previous_assistant:
+        return None
+
+    immediate_markers = (
+        "shall i run this now",
+        "shall i proceed",
+        "want me to proceed",
+        "want me to run this now",
+        "should i run this now",
+        "i can run this now",
+        "i can do this now",
+    )
+    action_markers = (
+        "workspace",
+        "file",
+        "archive",
+        "trim",
+        "append",
+        "write",
+        "report",
+        "directory",
+    )
+    if not any(marker in previous_assistant for marker in immediate_markers):
+        return None
+    if not any(marker in previous_assistant for marker in action_markers):
+        return None
+
+    return (
+        "The user's latest short confirmation is approval to execute the concrete action proposed in the prior assistant message now in this chat. "
+        "Prefer performing the action with available tools. Do not use propose_task_draft or create_task unless the user explicitly asks to save, schedule, automate, or create a task."
+    )
+
+
 def _recent_conversation_text(messages: List[Dict[str, Any]], *, limit: int = 6) -> str:
     recent: list[str] = []
     for message in reversed(messages):
@@ -2089,6 +2444,7 @@ async def run_agent(
     mode: str = "chat",
     model_override: str | None = None,
     stage: str | None = None,
+    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> str:
     """
     Run the agent loop (non-streaming).
@@ -2108,10 +2464,18 @@ async def run_agent(
         if unsupported_api_message:
             return unsupported_api_message
 
-    tools = get_tools_for_user(user_context)
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
     selected_model = model_override or settings.llm_model
+    tools = get_tools_for_user(user_context)
+    tools = _apply_local_tool_investigation_filters(
+        tools=tools,
+        model=selected_model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+        history=history,
+    )
     extra = _litellm_kwargs(selected_model)
     consecutive_failed_search_turns = 0
     previous_tool_signature = ""
@@ -2175,9 +2539,16 @@ async def run_agent(
                 extra_kwargs=extra,
             )
         except Exception as e:
-            if turn_tools and _is_local_tool_json_parse_error(e, selected_model):
+            if turn_tools and (
+                _is_local_tool_json_parse_error(e, selected_model)
+                or _is_local_tool_unsupported_error(e, selected_model)
+            ):
                 _log_local_tool_event(
-                    event="LLM local_tool_json_parse_fallback",
+                    event=(
+                        "LLM local_tool_unsupported_fallback"
+                        if _is_local_tool_unsupported_error(e, selected_model)
+                        else "LLM local_tool_json_parse_fallback"
+                    ),
                     history=history,
                     tools=tools,
                     model=selected_model,
@@ -2225,7 +2596,10 @@ async def run_agent(
             # Execute all tool calls, append results, then loop
             tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
             history.extend(tool_results)
-            _record_agent_runtime_messages([normalized_message, *tool_results])
+            runtime_messages = [normalized_message, *tool_results]
+            _record_agent_runtime_messages(runtime_messages)
+            if runtime_message_callback is not None:
+                await runtime_message_callback(runtime_messages)
             current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
             current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
             current_is_document_signature = _is_document_tool_signature(current_semantic_tool_signature)
@@ -2481,6 +2855,7 @@ async def stream_agent(
     mode: str = "chat",
     model_override: str | None = None,
     stage: str | None = None,
+    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Run the agent loop with streaming.
@@ -2493,10 +2868,18 @@ async def stream_agent(
         yield unsupported_api_message
         return
 
-    tools = get_tools_for_user(user_context)
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
     selected_model = model_override or settings.llm_model
+    tools = get_tools_for_user(user_context)
+    tools = _apply_local_tool_investigation_filters(
+        tools=tools,
+        model=selected_model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+        history=history,
+    )
     extra = _litellm_kwargs(selected_model)
     consecutive_failed_search_turns = 0
     previous_tool_signature = ""
@@ -2562,9 +2945,16 @@ async def stream_agent(
                 extra_kwargs=extra,
             )
         except Exception as e:
-            if turn_tools and _is_local_tool_json_parse_error(e, selected_model):
+            if turn_tools and (
+                _is_local_tool_json_parse_error(e, selected_model)
+                or _is_local_tool_unsupported_error(e, selected_model)
+            ):
                 _log_local_tool_event(
-                    event="LLM local_tool_json_parse_fallback",
+                    event=(
+                        "LLM local_tool_unsupported_fallback"
+                        if _is_local_tool_unsupported_error(e, selected_model)
+                        else "LLM local_tool_json_parse_fallback"
+                    ),
                     history=history,
                     tools=tools,
                     model=selected_model,
@@ -2616,7 +3006,10 @@ async def stream_agent(
             history[-1] = normalized_message
             tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
             history.extend(tool_results)
-            _record_agent_runtime_messages([normalized_message, *tool_results])
+            runtime_messages = [normalized_message, *tool_results]
+            _record_agent_runtime_messages(runtime_messages)
+            if runtime_message_callback is not None:
+                await runtime_message_callback(runtime_messages)
             current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
             current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
             current_is_document_signature = _is_document_tool_signature(current_semantic_tool_signature)

@@ -81,6 +81,50 @@ def test_validate_chat_response_flags_library_search_narration_leakage():
     assert out.retry_reason == "tool_call_leakage"
 
 
+def test_validate_chat_response_flags_continuation_narration_after_tool_turn():
+    out = validate_chat_response(
+        "go ahead",
+        "Let me try another source for tomorrow's detailed forecast.",
+        executed_tools=[
+            {
+                "tool": "fetch_page",
+                "result_summary": "Page content from https://weather.com/...",
+            }
+        ],
+    )
+    assert out.has_continuation_narration is True
+    assert out.should_retry is True
+    assert out.retry_reason == "continuation_narration"
+
+
+def test_validate_chat_response_does_not_flag_long_answer_with_midtext_let_me():
+    out = validate_chat_response(
+        "summarize this report",
+        (
+            "This report covers the current operating model, the recent incident timeline, and the mitigation plan in detail. "
+            "It describes the service boundaries, the known regressions, and the observed recovery behavior across multiple runs. "
+            "In the middle of the draft the author says let me check one final metric before publishing, but the answer itself "
+            "still includes a full summary of the findings, the risks, and the outstanding work without dangling into a next-step narration. "
+        ) * 4,
+        executed_tools=[{"tool": "read_file", "result_summary": "Loaded report content"}],
+    )
+    assert out.has_continuation_narration is False
+    assert out.retry_reason != "continuation_narration"
+
+
+def test_validate_chat_response_does_not_flag_offer_style_ending():
+    out = validate_chat_response(
+        "tell me what happened",
+        (
+            "The service recovered after the second restart and the queued jobs drained normally. "
+            "If you'd like, let me pull the full report next."
+        ),
+        executed_tools=[{"tool": "fetch_page", "result_summary": "Loaded report page"}],
+    )
+    assert out.has_continuation_narration is False
+    assert out.retry_reason != "continuation_narration"
+
+
 def test_should_validate_chat_response_enables_research_on_simple_path():
     assert should_validate_chat_response(
         user_prompt="Research the latest headlines on Iran and cite sources",
@@ -102,6 +146,7 @@ def test_should_validate_chat_response_enables_research_on_simple_path():
 
 def test_build_retry_instruction_has_reason_specific_text():
     assert "internal tool-calling" in build_chat_retry_instruction("tool_call_leakage").lower()
+    assert "described a next step" in build_chat_retry_instruction("continuation_narration").lower()
     assert "too brief/empty" in build_chat_retry_instruction("empty_result").lower()
     assert "grounded sources" in build_chat_retry_instruction("missing_links").lower()
     assert "invalid/placeholder links" in build_chat_retry_instruction("invalid_links").lower()
@@ -314,6 +359,60 @@ async def test_send_message_retries_once_for_followup_article_detail_leakage(cli
 
 
 @pytest.mark.asyncio
+async def test_send_message_retries_once_for_continuation_narration_after_tool_turn(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "chatcontinuation",
+            "email": "chatcontinuation@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "chatcontinuation", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "Continuation Retry"}, headers=headers)
+    session_id = create.json()["id"]
+
+    tool_records = [{"tool": "fetch_page", "result_summary": "Page content from https://weather.com/..."}]
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", True),
+        patch.object(settings, "chat_complexity_threshold", 99),
+        patch.object(settings, "chat_validation_enabled", True),
+        patch.object(settings, "chat_validation_retry_enabled", True),
+        patch.object(settings, "chat_validation_retry_max_attempts", 1),
+        patch(
+            "app.api.chat.run_agent",
+            new_callable=AsyncMock,
+            side_effect=[
+                "Let me try another source for tomorrow's detailed forecast.",
+                "Tomorrow in Statesboro looks very hot with a high near 97F, partly sunny skies, and a chance of afternoon thunderstorms.",
+            ],
+        ) as mock_run,
+        patch("app.api.chat.get_tool_execution_records", return_value=tool_records),
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "go ahead"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert "Tomorrow in Statesboro" in resp.json()["content"]
+    assert mock_run.await_count == 2
+    retry_history = mock_run.await_args_list[1].args[0]
+    assert any(
+        msg.get("role") == "system" and "described a next step" in str(msg.get("content") or "")
+        for msg in retry_history
+    )
+
+
+@pytest.mark.asyncio
 async def test_send_message_strips_invalid_links_when_retry_disabled(client):
     await client.post(
         "/auth/register",
@@ -500,6 +599,68 @@ async def test_library_summary_intent_uses_summarize_document_grounding(client):
 
 
 @pytest.mark.asyncio
+async def test_library_summary_intent_uses_compact_digest_for_local_model(client):
+    token = await _login_token(client, "chatlibrarylocal", "chatlibrarylocal@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    create = await client.post("/chat/sessions", json={"title": "Local Library Summary Grounding"}, headers=headers)
+    session_id = create.json()["id"]
+
+    raw_summary = (
+        "**Summary of 'Agents of Chaos.pdf' (67 total sections):**\n"
+        "_Note: This document has 67 sections. The summary covers 64 evenly-spaced samples from throughout._\n\n"
+        "### Major sections\n"
+        "- Election interference timeline\n"
+        "### Key findings\n"
+        "- Russian actors coordinated influence operations across multiple platforms.\n"
+        "### Caveats\n"
+        "- Some conclusions depend on sampled sections.\n"
+    )
+
+    with (
+        patch.object(settings, "chat_complexity_routing_enabled", False),
+        patch.object(settings, "chat_orchestration_kill_switch", False),
+        patch(
+            "app.agent.tools._list_library_documents",
+            new_callable=AsyncMock,
+            return_value='{"count":1,"documents":[{"id":17,"filename":"Agents of Chaos.pdf"}]}',
+        ),
+        patch(
+            "app.agent.tools._summarize_document",
+            new_callable=AsyncMock,
+            return_value=raw_summary,
+        ),
+        patch("app.agent.tools._write_audit_log", new_callable=AsyncMock),
+        patch("app.api.chat._is_local_chat_model", return_value=True),
+        patch(
+            "app.api.chat.run_agent",
+            new_callable=AsyncMock,
+            return_value="Grounded local document summary response.",
+        ) as mock_run,
+    ):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "summarize the Agents of Chaos.pdf from my library"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    injected_history = mock_run.await_args_list[0].args[0]
+    grounding_messages = [
+        m.get("content", "")
+        for m in injected_history
+        if m.get("role") == "system" and "document summary evidence digest" in m.get("content", "")
+    ]
+    assert grounding_messages
+    grounding = grounding_messages[0]
+    assert "source of truth" in grounding
+    assert "- Major sections:" in grounding
+    assert "- Key findings:" in grounding
+    assert "- Caveats:" in grounding
+    assert "stay close to the evidence" in grounding
+    assert "if a detail is missing or unclear" in grounding
+
+
+@pytest.mark.asyncio
 async def test_library_summary_intent_returns_ambiguity_prompt_when_multiple_docs_match(client):
     token = await _login_token(client, "chatlibraryambig", "chatlibraryambig@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -548,7 +709,14 @@ async def test_calendar_prompt_with_typo_does_not_block_tools(client):
 
     captured = {}
 
-    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None):
+    async def _fake_run_agent(
+        messages,
+        user_context,
+        mode="chat",
+        model_override=None,
+        stage=None,
+        runtime_message_callback=None,
+    ):
         captured["blocked_tools"] = list(user_context.blocked_tools or [])
         return "ok"
 
