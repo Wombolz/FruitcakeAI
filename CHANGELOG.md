@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.28
+
+- Closed the linked-source indexing v1 residual gaps by enforcing single-file trust guards, including sensitive filename rejection and configured-root checks when `LINKED_SOURCE_ALLOWED_ROOTS` is set.
+- Made linked-folder rescans truly incremental for unchanged files by using stored stat metadata instead of reopening every discovered file on each manual rescan.
+- Fixed linked documents that disappear and later reappear with identical size/mtime so they re-ingest correctly instead of remaining falsely treated as unchanged.
+- Hardened linked-source modified-time comparison for SQLite and other naive-datetime environments, preventing silent defeat of incremental rescan detection outside Postgres.
+- Added focused linked-source regressions for guard behavior, cached retrieval retention after backing-path loss, source-path citation exposure, and stat-only rescan behavior.
+
 ## v0.7.27
 
 - Exported `TOKENIZERS_PARALLELISM=false` at config import time so Hugging Face tokenizers stop emitting fork-after-parallelism warnings during later subprocess launches such as MCP stdio servers.
