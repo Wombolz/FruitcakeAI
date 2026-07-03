@@ -136,6 +136,7 @@ class RecentWorkspaceArtifactContext:
 
 class CreateSessionRequest(BaseModel):
     title: Optional[str] = None
+    is_incognito: bool = False
 
 
 class SendMessageRequest(BaseModel):
@@ -203,6 +204,7 @@ class SessionOut(BaseModel):
     persona: str
     llm_model: Optional[str]
     sort_order: Optional[int]
+    is_incognito: bool = False
 
     class Config:
         from_attributes = True
@@ -312,12 +314,18 @@ async def create_session(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ChatSession:
+    if body.is_incognito and current_user.role not in settings.admin_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Incognito sessions are limited to admin users.",
+        )
     session = ChatSession(
         user_id=current_user.id,
-        title=body.title or "New conversation",
+        title=body.title or ("Incognito session" if body.is_incognito else "New conversation"),
         persona=current_user.persona or "family_assistant",
         llm_model=settings.llm_model,
         sort_order=0,
+        is_incognito=body.is_incognito,
     )
     db.add(session)
     await db.flush()
@@ -401,6 +409,7 @@ async def accept_task_draft(
     current_user: User = Depends(get_current_user),
 ) -> AcceptTaskDraftResponse:
     message = await _get_chat_message_or_404(message_id, current_user.id, db)
+    await _reject_if_incognito_session(message.session_id, db)
     metadata = _assistant_message_metadata(message)
     if not metadata:
         raise HTTPException(status_code=404, detail="Task draft message not found")
@@ -500,6 +509,7 @@ async def deny_task_draft(
     current_user: User = Depends(get_current_user),
 ) -> DenyTaskDraftResponse:
     message = await _get_chat_message_or_404(message_id, current_user.id, db)
+    await _reject_if_incognito_session(message.session_id, db)
     metadata = _assistant_message_metadata(message)
     if not metadata:
         raise HTTPException(status_code=404, detail="Task draft message not found")
@@ -719,6 +729,7 @@ async def send_message(
     user_context = await hydrate_user_context(db, user_context, query=body.content)
     _record_chat_stage_timing(stage_timings_ms, "context_hydration", stage_started)
     user_context.session_id = session_id
+    user_context.is_incognito = bool(session.is_incognito)
     stage_started = time.perf_counter()
     history, _memory_ids = await _apply_memory_context(
         history,
@@ -1075,6 +1086,7 @@ async def _run_websocket_message(
         user_context = await hydrate_user_context(db, user_context, query=user_message)
         _record_chat_stage_timing(stage_timings_ms, "context_hydration", stage_started)
         user_context.session_id = session_id
+        user_context.is_incognito = bool(session.is_incognito)
         stage_started = time.perf_counter()
         history, _memory_ids = await _apply_memory_context(
             history,
@@ -2019,6 +2031,18 @@ async def _get_chat_message_or_404(
     if message is None:
         raise HTTPException(status_code=404, detail="Chat message not found")
     return message
+
+
+async def _reject_if_incognito_session(session_id: int, db: AsyncSession) -> None:
+    """Persistent mutations (task drafts etc.) are blocked for incognito
+    sessions at the endpoint layer too — the tool surface filter alone can't
+    cover REST flows that act on prior messages."""
+    session = await db.get(ChatSession, session_id)
+    if session is not None and bool(session.is_incognito):
+        raise HTTPException(
+            status_code=409,
+            detail="Persistent actions are disabled in incognito sessions.",
+        )
 
 
 def _summarize_executed_tool_names(records: List[Dict[str, Any]]) -> List[str]:

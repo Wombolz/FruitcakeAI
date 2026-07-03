@@ -209,6 +209,30 @@ Recommended ongoing hygiene:
 - `waiting_approval_reason` is the operator-facing explanation for why that tool was paused.
 - Approval visibility is now intended as operability polish, not a missing runtime-safety gap: the core approval boundary is already enforced in the task runner and surfaced through task, admin, and MCP inspection paths.
 
+## Admin Incognito Sessions
+
+Admins can create incognito chat sessions. The honest trust boundary is:
+
+- **Ephemeral in-app, on manual delete.** Conversation content is stored in
+  the normal chat tables while the session is active and is hard-deleted
+  (session and all message rows) when the admin deletes the session. This is
+  an easy-to-clean-up session, not a no-write ephemeral mode; content exists
+  in the database until the manual delete.
+- **Persistent side effects are blocked while active.** Memory writes, task
+  and task-draft creation, task plans, calendar mutations, RSS/source
+  mutations, configured JSON API calls, and workspace/file writes are removed
+  from the offered tool surface and hard-blocked at dispatch. Task-draft
+  accept/deny endpoints reject incognito sessions.
+- **Minimal metadata is retained.** LLM usage accounting keeps token counts,
+  model, and timing (never prompt/completion bodies). Tool audit rows keep
+  the tool name and session id but redact arguments and results for
+  incognito sessions. Blocked tool attempts are logged by name only.
+- **Not a host-level privacy feature.** Server process logs, database
+  backups taken while the session is active, and anything outside the app
+  boundary are not scrubbed.
+
+Incognito creation is limited to `admin_roles`.
+
 ## Minimum Deployment Checklist
 
 - [ ] `SECRET_KEY` changed
