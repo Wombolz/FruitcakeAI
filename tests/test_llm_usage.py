@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.agent.context import UserContext
 from app.agent.core import run_agent, stream_agent
+from app.config import settings
 from app.autonomy.planner import _generate_plan_steps
 from app.db.models import ChatSession, LLMUsageEvent, Task, User
 from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
@@ -152,7 +153,10 @@ async def test_run_agent_records_usage_event():
 
 
 @pytest.mark.asyncio
-async def test_stream_agent_records_probe_and_stream_usage_events():
+async def test_stream_agent_records_probe_and_stream_usage_events(monkeypatch):
+    # The true-stream second pass only runs for non-local models; pin one
+    # so this test doesn't silently depend on the developer's .env.
+    monkeypatch.setattr(settings, "llm_model", "gpt-5")
     user_id, session_id = await _seed_user_and_session()
     user_context = UserContext(user_id=user_id, username="tester", role="parent", persona="family_assistant")
 

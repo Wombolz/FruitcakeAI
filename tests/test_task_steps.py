@@ -3703,8 +3703,22 @@ async def test_runner_records_agent_context_budgeting_in_run_summary(client):
 
 
 @pytest.mark.asyncio
-async def test_runner_preloads_required_context_sources_for_agent_definition(client):
+async def test_runner_preloads_required_context_sources_for_agent_definition(client, tmp_path, monkeypatch):
+    import app.autonomy.runner as runner_module
     from app.autonomy.runner import TaskRunner
+
+    # The roadmap_verifier preset points at Docs/_internal files that are
+    # untracked (developer-local), so resolve required-context paths against a
+    # temp repo root the test controls instead of the real checkout.
+    monkeypatch.setattr(runner_module, "_REPO_ROOT", tmp_path)
+    for rel, body in [
+        ("app/task_recipes.py", "# recipe registry stub for preload test\n"),
+        ("Docs/_internal/FruitcakeAi Roadmap.md", "# Roadmap stub\nSprint 7.5 notes.\n"),
+        ("Docs/_internal/roadmap_coordination.md", "# Coordination stub\n"),
+    ]:
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
 
     headers = await _headers(client, "requiredcontextowner")
     created = await client.post(
