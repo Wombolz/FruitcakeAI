@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.29
+
+- Added admin-only incognito chat sessions with blocked side effects, ephemeral transcript cleanup on session delete, and minimal non-content retention aligned with the documented trust boundary.
+- Replaced the old unbounded tiered memory injection with Memory v2 foundations: one enforced write pipeline, dedup/conflict supersede handling, directive caps, ranked budgeted retrieval, and assistant metadata that records recalled memory ids.
+- Added a rerunnable memory evaluation harness with baseline results, plus fixes for cross-subject dedup suppression and weak lexical fallback relevance under large synthetic memory stores.
+- Added additive rich-chat backend metadata primitives so websocket chat turns can emit live run-state events and tool-backed assistant messages can carry structured evidence annotations for future UI work.
+- Excluded `workspace/*` and `storage/*` from the dev reload watcher so normal workspace artifact writes no longer restart the backend during active chat or task work.
+
 ## v0.7.28
 
 - Closed the linked-source indexing v1 residual gaps by enforcing single-file trust guards, including sensitive filename rejection and configured-root checks when `LINKED_SOURCE_ALLOWED_ROOTS` is set.
