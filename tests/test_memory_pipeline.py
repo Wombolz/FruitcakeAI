@@ -200,3 +200,27 @@ async def test_create_compat_wrapper_routes_through_pipeline():
         )
         assert isinstance(refused, str)
         assert "task" in refused.lower() or "session" in refused.lower()
+
+
+@pytest.mark.asyncio
+async def test_near_duplicate_never_matches_across_subject_keys():
+    # "Emma attends Lincoln Elementary" vs "Liam attends Lincoln Elementary"
+    # are near-identical strings but distinct facts — cross-subject dedup
+    # would silently swallow the second one (found by the eval harness).
+    user_id = await _make_user("memv2crosssubject")
+    svc = MemoryService()
+    async with TestSessionLocal() as db:
+        first = await svc.propose_write(
+            db, user_id, content="Emma attends Lincoln Elementary school this year.",
+            memory_type="semantic", subject="Emma", attribute="school",
+        )
+        await db.commit()
+        second = await svc.propose_write(
+            db, user_id, content="Liam attends Lincoln Elementary school this year.",
+            memory_type="semantic", subject="Liam", attribute="school",
+        )
+        await db.commit()
+
+        assert first.action == "created"
+        assert second.action == "created"
+        assert first.memory.id != second.memory.id

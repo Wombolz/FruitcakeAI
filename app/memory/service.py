@@ -90,7 +90,7 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(str(text or "")) // 4)
 
 
-_WORD_RE = re.compile(r"[a-z0-9']+")
+_WORD_RE = re.compile(r"[a-z0-9]+")
 
 # Facts never score to zero: a fact with no lexical overlap may still be a
 # vocabulary mismatch rather than a true irrelevance (SQLite deployments have
@@ -109,17 +109,40 @@ def _stem(word: str) -> str:
     return word
 
 
-def _lexical_relevance(query: str, content: str) -> float:
-    """Cheap cross-database relevance: stemmed word overlap weighted by query
-    coverage. Coverage of the QUERY terms matters more than symmetric
-    Jaccard — a short query fully covered by a long memory should score high.
-    """
-    query_words = {_stem(w) for w in _WORD_RE.findall(str(query or "").lower())}
-    content_words = {_stem(w) for w in _WORD_RE.findall(str(content or "").lower())}
-    if not query_words or not content_words:
+def _tokenize(text: str) -> set[str]:
+    return {
+        token
+        for token in (_stem(w) for w in _WORD_RE.findall(str(text or "").lower()))
+        if len(token) > 1
+    }
+
+
+def _build_idf(token_sets: list[set[str]]) -> dict[str, float]:
+    """Inverse document frequency over the candidate pool. Rare terms (names,
+    specific values) discriminate; terms shared across the store ("school",
+    "family") barely count. Measured on the eval harness: flat overlap
+    collapses once contents share vocabulary; IDF weighting restores rank."""
+    import math
+
+    df: dict[str, int] = {}
+    for tokens in token_sets:
+        for token in tokens:
+            df[token] = df.get(token, 0) + 1
+    n_docs = max(1, len(token_sets))
+    return {token: 1.0 + math.log(n_docs / (1 + count)) for token, count in df.items()}
+
+
+def _weighted_relevance(query_tokens: set[str], content_tokens: set[str], idf: dict[str, float]) -> float:
+    if not query_tokens or not content_tokens:
         return 0.0
-    overlap = len(query_words & content_words)
-    return overlap / len(query_words)
+    matchable = [t for t in query_tokens if t in idf]
+    if not matchable:
+        return 0.0
+    denom = sum(idf[t] for t in matchable)
+    if denom <= 0:
+        return 0.0
+    hit = sum(idf[t] for t in query_tokens & content_tokens)
+    return hit / denom
 
 
 def _journal_decay(created_at: datetime | None, now: datetime) -> float:
@@ -254,11 +277,13 @@ class MemoryService:
             .order_by(Memory.created_at.desc())
             .limit(CANDIDATE_POOL_LIMIT)
         )
-        for memory in pool.scalars().all():
-            if memory.id in scored:
-                continue
+        pool_memories = [m for m in pool.scalars().all() if m.id not in scored]
+        content_tokens = {m.id: _tokenize(m.content) for m in pool_memories}
+        idf = _build_idf(list(content_tokens.values()))
+        query_tokens = _tokenize(query_text) if query_text else set()
+        for memory in pool_memories:
             relevance = (
-                _lexical_relevance(query_text, memory.content)
+                _weighted_relevance(query_tokens, content_tokens[memory.id], idf)
                 if query_text
                 else NO_QUERY_NEUTRAL_RELEVANCE
             )
@@ -333,7 +358,9 @@ class MemoryService:
         subject_key = _normalize_subject_key(subject, attribute)
 
         # --- near-duplicate check (pgvector when available, text fallback) ---
-        duplicate = await self._find_near_duplicate(db, user_id, text, resolved_kind)
+        duplicate = await self._find_near_duplicate(
+            db, user_id, text, resolved_kind, subject_key=subject_key
+        )
         if duplicate is not None:
             duplicate.importance = max(duplicate.importance or 0.0, max(0.0, min(1.0, importance)))
             if subject_key and not duplicate.subject_key:
@@ -468,12 +495,19 @@ class MemoryService:
         user_id: int,
         content: str,
         kind: str,
+        *,
+        subject_key: str | None = None,
     ) -> Memory | None:
         """Find an active head memory semantically equivalent to `content`.
 
         Uses pgvector cosine distance when available; otherwise a bounded
         text-similarity fallback so SQLite deployments and tests still get
         write-time dedup rather than silently skipping it.
+
+        Never matches across DIFFERENT subject_keys: "Emma attends Lincoln"
+        and "Liam attends Lincoln" are near-identical strings but distinct
+        facts — treating one as a duplicate of the other would silently
+        swallow corrections (caught by the eval harness's conflict probes).
         """
         if _USE_PGVECTOR:
             embedding = await _embed(content)
@@ -491,7 +525,9 @@ class MemoryService:
                         ).limit(1)
                     )
                     found = dup.scalar_one_or_none()
-                    if found is not None:
+                    if found is not None and not (
+                        found.subject_key and subject_key and found.subject_key != subject_key
+                    ):
                         return found
                 except Exception:
                     log.warning("memory.dedup_check_failed", exc_info=True)
@@ -511,6 +547,8 @@ class MemoryService:
             .limit(200)
         )
         for candidate in recent.scalars().all():
+            if candidate.subject_key and subject_key and candidate.subject_key != subject_key:
+                continue
             if _text_similarity(content, candidate.content or "") >= threshold:
                 return candidate
         return None

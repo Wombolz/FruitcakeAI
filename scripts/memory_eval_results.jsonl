@@ -1,0 +1,6 @@
+{"store_size": 100, "budget": 1200, "metric": "retrieval", "probes": 25, "recall": 1.0, "mean_injected": 53.8, "mean_tokens": 1113.3, "budget_violations": 0, "legacy_mean_injected": 79.0, "legacy_mean_tokens": 1798.0, "elapsed_s": 0.31}
+{"store_size": 100, "metric": "dedup", "reasserted": 10, "new_rows_created": 0, "elapsed_s": 0.31}
+{"store_size": 100, "metric": "conflict", "contradicted": 10, "correct_supersede_chains": 10, "stale_heads_still_retrievable": 0, "elapsed_s": 0.31}
+{"store_size": 1000, "budget": 1200, "metric": "retrieval", "probes": 25, "recall": 1.0, "mean_injected": 50.8, "mean_tokens": 1110.6, "budget_violations": 0, "legacy_mean_injected": 158.0, "legacy_mean_tokens": 3914.0, "elapsed_s": 0.73}
+{"store_size": 1000, "metric": "dedup", "reasserted": 10, "new_rows_created": 0, "elapsed_s": 0.73}
+{"store_size": 1000, "metric": "conflict", "contradicted": 10, "correct_supersede_chains": 10, "stale_heads_still_retrievable": 0, "elapsed_s": 0.73}
