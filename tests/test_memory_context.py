@@ -87,7 +87,7 @@ async def test_chat_rest_injects_memory_context_before_agent_execution(client):
 
     captured: dict[str, object] = {}
 
-    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None):
+    async def _fake_run_agent(messages, user_context, mode="chat", model_override=None, stage=None, **kwargs):
         captured["messages"] = messages
         return "reply"
 
