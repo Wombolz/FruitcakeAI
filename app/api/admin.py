@@ -1609,3 +1609,23 @@ async def download_task_run_edition_pdf(
         media_type="application/pdf",
         filename=f"task-{task.id}-run-{run.id}-edition.pdf",
     )
+
+
+# ── Memory extraction (memory v2, Phase 8 pulled forward) ─────────────────────
+
+@router.post("/memory-extraction/run", status_code=202)
+async def trigger_memory_extraction(
+    since_hours: int = 24,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Manually trigger the nightly memory-extraction pass (admin only).
+
+    Scheduler wiring is a follow-up; this endpoint is the v1 operator
+    control and what a cron/heartbeat hook will call internally.
+    """
+    from app.memory.extraction import run_nightly_memory_extraction
+
+    totals = await run_nightly_memory_extraction(db, since_hours=max(1, min(168, since_hours)))
+    await db.commit()
+    return {"status": "completed", **totals}
