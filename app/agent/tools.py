@@ -358,6 +358,14 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "string",
                         "description": "Optional ISO 8601 datetime after which this memory expires (useful for episodic events).",
                     },
+                    "subject": {
+                        "type": "string",
+                        "description": "For facts: who/what the fact is about (e.g. 'Joey'). Combined with 'attribute' it lets a corrected fact replace the old one instead of coexisting with it.",
+                    },
+                    "attribute": {
+                        "type": "string",
+                        "description": "For facts: which property of the subject (e.g. 'allergy', 'school'). Provide together with 'subject'.",
+                    },
                 },
                 "required": ["memory_type", "content"],
             },
@@ -1655,21 +1663,30 @@ async def _create_memory(
 
     svc = get_memory_service()
     async with AsyncSessionLocal() as db:
-        result = await svc.create(
-            db=db,
-            user_id=user_context.user_id,
-            memory_type=memory_type,
+        result = await svc.propose_write(
+            db,
+            user_context.user_id,
             content=content,
+            memory_type=memory_type,
+            subject=arguments.get("subject"),
+            attribute=arguments.get("attribute"),
             importance=importance,
             tags=tags,
             expires_at=expires_at,
+            source="chat_tool",
         )
         await db.commit()
-        if isinstance(result, str):
-            return result
-        memory_id = result.id  # capture before session closes to avoid DetachedInstanceError
+        if result.memory is None:
+            return f"Memory not saved: {result.reason}"
+        memory_id = result.memory.id  # capture before session closes to avoid DetachedInstanceError
+        action = result.action
+        reason = result.reason
 
-    return f"Memory saved (id={memory_id}, type={memory_type})."
+    if action == "created":
+        return f"Memory saved (id={memory_id}, type={memory_type})."
+    if action == "superseded":
+        return f"Memory saved (id={memory_id}, type={memory_type}). {reason}"
+    return f"Memory not duplicated: {reason} (existing id={memory_id})."
 
 
 async def _create_memory_entities(arguments: Dict[str, Any], user_context: UserContext) -> str:

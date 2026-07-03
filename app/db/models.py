@@ -475,6 +475,20 @@ class Memory(Base):
     # Optional JSON array of string tags for filtering/grouping
     tags = Column(Text, default="[]")
 
+    # Memory v2: retrieval-contract kind — directive | fact | journal.
+    # Distinguished by WHEN a memory deserves prompt tokens, not by
+    # cognitive category (memory_type is retained for API compatibility).
+    kind = Column(String(20), nullable=False, default="fact", index=True)
+    # Normalized subject+attribute identity for facts (e.g. "joey:allergy").
+    # One retrievable head per (user_id, subject_key); conflicts supersede.
+    subject_key = Column(String(200), nullable=True, index=True)
+    # Supersede chain: set on the OLD row when replaced. Only rows with
+    # superseded_by_id NULL and is_active=True are retrievable heads.
+    superseded_by_id = Column(Integer, ForeignKey("memories.id", ondelete="SET NULL"), nullable=True)
+    # chat_tool | extraction | manual | proposal_review | migration
+    source = Column(String(30), nullable=False, default="chat_tool")
+    confidence = Column(Float, nullable=False, default=0.7)
+
     # Soft-delete: deactivate instead of DELETE to preserve audit trail
     is_active = Column(Boolean, default=True, nullable=False)
 

@@ -866,6 +866,7 @@ async def send_message(
         assistant_metadata = _build_assistant_message_metadata(
             handoff_metadata=handoff_metadata,
             executed_tools=get_tool_execution_records(),
+            recalled_memory_ids=_memory_ids,
         )
 
         assistant_msg = ChatMessage(
@@ -1274,6 +1275,7 @@ async def _run_websocket_message(
         assistant_metadata = _build_assistant_message_metadata(
             handoff_metadata=handoff_metadata,
             executed_tools=get_tool_execution_records(),
+            recalled_memory_ids=_memory_ids,
         )
         assistant_msg = ChatMessage(
             session_id=session_id,
@@ -1973,6 +1975,35 @@ async def _apply_required_library_grounding(
     return grounded + [{"role": "system", "content": grounding_note}]
 
 
+def _memory_retrieval_query(
+    history: List[Dict[str, Any]],
+    user_prompt: str,
+    *,
+    prior_user_turns: int = 2,
+    max_chars: int = 900,
+) -> str:
+    """Retrieval text from the latest prompt plus recent user turns.
+
+    A short follow-up ("what about tuesday?") carries almost no retrievable
+    signal by itself; the preceding user turns supply the topic. The latest
+    prompt goes last so lexical/vector matching still weights it most.
+    """
+    parts: list[str] = []
+    prior: list[str] = []
+    for message in reversed(history):
+        if len(prior) >= prior_user_turns:
+            break
+        if str(message.get("role") or "") != "user":
+            continue
+        content = str(message.get("content") or "").strip()
+        if content and content != str(user_prompt or "").strip():
+            prior.append(content)
+    parts.extend(reversed(prior))
+    parts.append(str(user_prompt or "").strip())
+    combined = "\n".join(part for part in parts if part)
+    return combined[-max_chars:]
+
+
 async def _apply_memory_context(
     history: List[Dict[str, Any]],
     db: AsyncSession,
@@ -1983,7 +2014,8 @@ async def _apply_memory_context(
     Inject baseline memory context for the current turn without mutating memory access scores.
     """
     svc = get_memory_service()
-    memories = await svc.retrieve_for_context(db, user_id, query=user_prompt)
+    retrieval_query = _memory_retrieval_query(history, user_prompt)
+    memories = await svc.retrieve_for_context(db, user_id, query=retrieval_query)
     if not memories:
         return history, []
 
@@ -2076,6 +2108,17 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
         if cleaned:
             normalized["tool_calls"] = cleaned
 
+    recalled = metadata.get("recalled_memory_ids")
+    if isinstance(recalled, list):
+        cleaned_ids = []
+        for item in recalled:
+            try:
+                cleaned_ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        if cleaned_ids:
+            normalized["recalled_memory_ids"] = cleaned_ids
+
     status = str(metadata.get("task_draft_status") or "").strip().lower()
     if status == "created":
         status = "accepted"
@@ -2090,6 +2133,7 @@ def _build_assistant_message_metadata(
     *,
     handoff_metadata: Dict[str, Any],
     executed_tools: List[Dict[str, Any]],
+    recalled_memory_ids: List[int] | None = None,
 ) -> Dict[str, Any] | None:
     metadata: Dict[str, Any] = {}
     task_draft = handoff_metadata.get("task_draft")
@@ -2100,6 +2144,9 @@ def _build_assistant_message_metadata(
     tool_calls = _summarize_executed_tool_names(executed_tools)
     if tool_calls:
         metadata["tool_calls"] = tool_calls
+
+    if recalled_memory_ids:
+        metadata["recalled_memory_ids"] = [int(i) for i in recalled_memory_ids]
 
     normalized = _normalize_assistant_metadata_payload(metadata)
     return normalized or None
