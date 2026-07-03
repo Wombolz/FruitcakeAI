@@ -555,7 +555,11 @@ async def test_library_excerpt_intent_uses_search_library_grounding(client):
 
 
 @pytest.mark.asyncio
-async def test_library_summary_intent_uses_summarize_document_grounding(client):
+async def test_library_summary_intent_uses_summarize_document_grounding(client, monkeypatch):
+    # The standard grounding note under test is the non-local path; local
+    # models get a compact digest instead. Pin a cloud model so the test
+    # doesn't depend on the developer's .env (absent in worktrees).
+    monkeypatch.setattr(settings, "llm_model", "gpt-5")
     token = await _login_token(client, "chatlibrarysummary", "chatlibrarysummary@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     create = await client.post("/chat/sessions", json={"title": "Library Summary Grounding"}, headers=headers)

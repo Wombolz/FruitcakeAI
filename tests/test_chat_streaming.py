@@ -57,7 +57,10 @@ async def _fake_stream(*parts: str):
 
 
 @pytest.mark.asyncio
-async def test_stream_agent_uses_true_stream_for_simple_final_turn():
+async def test_stream_agent_uses_true_stream_for_simple_final_turn(monkeypatch):
+    # The true-stream second pass only runs for non-local models; pin one
+    # so this test doesn't silently depend on the developer's .env.
+    monkeypatch.setattr(settings, "llm_model", "gpt-5")
     user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
 
     async def _acompletion(**kwargs):
@@ -446,7 +449,10 @@ async def test_run_agent_investigation_filter_can_cap_local_qwen_tool_count(monk
 
 
 @pytest.mark.asyncio
-async def test_stream_agent_keeps_tool_turns_internal_before_streaming_final():
+async def test_stream_agent_keeps_tool_turns_internal_before_streaming_final(monkeypatch):
+    # The true-stream second pass only runs for non-local models; pin one
+    # so this test doesn't silently depend on the developer's .env.
+    monkeypatch.setattr(settings, "llm_model", "gpt-5")
     user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
     tool_calls = [
         SimpleNamespace(

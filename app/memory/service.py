@@ -1,15 +1,17 @@
 """
 FruitcakeAI v5 — MemoryService
-Phase 4: Persistent per-user memory with 3-tier semantic retrieval.
 
-Tier 1 — Standing: all active semantic + procedural memories (always included)
-Tier 2 — Recent high-importance: episodic, last 7 days, importance >= 0.6
-Tier 3 — Query-similar: top-k episodic via cosine distance (pgvector)
+Memory v2: memory is a budgeted context product, not a store. The store may
+grow without bound; what enters the prompt each turn is small, ranked, and
+budgeted (memory_context_token_budget):
 
-Write-time deduplication: cosine distance < 0.12 suppresses a new memory
-that is semantically equivalent to an existing active one.
+- directive: standing rules, always injected, small by construction (capped)
+- fact:      durable subject-keyed facts, ranked by relevance x importance
+- journal:   time-bound events, additionally decayed by age
 
-Memory immutability: never edit, only deactivate + create new.
+Only heads are retrievable (is_active, not superseded). Writes flow through
+one enforced pipeline (propose_write): exclusions, near-dup, supersede, caps.
+Memory immutability: never edit, only supersede/deactivate + create new.
 """
 
 from __future__ import annotations
@@ -83,15 +85,68 @@ class MemoryWriteResult:
     memory: Memory | None
     reason: str = ""
 
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(str(text or "")) // 4)
+
+
+_WORD_RE = re.compile(r"[a-z0-9']+")
+
+# Facts never score to zero: a fact with no lexical overlap may still be a
+# vocabulary mismatch rather than a true irrelevance (SQLite deployments have
+# no embeddings). The floor keeps high-importance facts able to compete for
+# leftover budget while real matches rank far above them.
+FACT_RELEVANCE_FLOOR = 0.15
+
+
+def _stem(word: str) -> str:
+    """Ultra-light suffix stripping so 'prefers'/'prefer', 'visiting'/'visit'
+    match without a stemming dependency. Deliberately crude — this only backs
+    the lexical fallback path; pgvector handles morphology properly."""
+    for suffix in ("ing", "es", "ed", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _lexical_relevance(query: str, content: str) -> float:
+    """Cheap cross-database relevance: stemmed word overlap weighted by query
+    coverage. Coverage of the QUERY terms matters more than symmetric
+    Jaccard — a short query fully covered by a long memory should score high.
+    """
+    query_words = {_stem(w) for w in _WORD_RE.findall(str(query or "").lower())}
+    content_words = {_stem(w) for w in _WORD_RE.findall(str(content or "").lower())}
+    if not query_words or not content_words:
+        return 0.0
+    overlap = len(query_words & content_words)
+    return overlap / len(query_words)
+
+
+def _journal_decay(created_at: datetime | None, now: datetime) -> float:
+    if created_at is None:
+        return 1.0
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    age_days = max(0.0, (now - created_at).total_seconds() / 86400.0)
+    return 0.5 ** (age_days / JOURNAL_HALF_LIFE_DAYS)
+
+
+def _memory_score(memory: Memory, relevance: float, now: datetime) -> float:
+    importance = max(0.0, min(1.0, memory.importance or 0.5))
+    score = relevance * (0.4 + 0.6 * importance)
+    if (memory.kind or "") == "journal":
+        score *= _journal_decay(memory.created_at, now)
+    return score
+
 # pgvector cosine distance threshold for write-time deduplication
 DEDUP_THRESHOLD = 0.12
 
-# Tier 2: only include recent episodic memories above this importance
-TIER2_IMPORTANCE_FLOOR = 0.6
-TIER2_DAYS = 7
-
-# Tier 3: how many similar episodic memories to include
-TIER3_TOP_K = 5
+# Retrieval scoring
+JOURNAL_HALF_LIFE_DAYS = 14        # journal relevance halves every 2 weeks
+CANDIDATE_POOL_LIMIT = 400         # facts+journal heads considered per turn
+VECTOR_CANDIDATE_LIMIT = 60        # pgvector top-k merged into the pool
+NO_QUERY_NEUTRAL_RELEVANCE = 0.5   # relevance when no query text exists
+DIRECTIVE_BUDGET_FLOOR = 200       # tokens always left for facts/journal
 
 _USE_PGVECTOR = settings.database_url.startswith("postgresql")
 
@@ -133,77 +188,97 @@ class MemoryService:
         db: AsyncSession,
         user_id: int,
         query: str | None = None,
+        *,
+        token_budget: int | None = None,
     ) -> list[Memory]:
         """
-        Build the memory context for an agent session.
+        Build the memory context for an agent turn: ranked and budgeted.
 
-        Returns a deduplicated list of Memory objects across all 3 tiers,
-        ordered: standing (tier 1) → recent high-importance (tier 2) →
-        query-similar (tier 3).
+        - directives are always included (small by construction — write cap)
+        - facts and journal heads are scored relevance x importance, journal
+          additionally decayed by age, then greedily fill the remaining
+          token budget
+        Returns directives first, then scored memories in rank order.
         """
+        budget = int(token_budget or settings.memory_context_token_budget)
         now = datetime.now(timezone.utc)
-        seen_ids: set[int] = set()
-        results: list[Memory] = []
-
-        # --- Tier 1: standing memories (semantic + procedural, always included) ---
-        tier1 = await db.execute(
-            select(Memory).where(
-                and_(
-                    Memory.user_id == user_id,
-                    Memory.is_active == True,
-                    Memory.memory_type.in_(["semantic", "procedural"]),
-                    # exclude expired records
-                    (Memory.expires_at == None) | (Memory.expires_at > now),
-                )
-            )
+        head_conditions = and_(
+            Memory.user_id == user_id,
+            Memory.is_active == True,
+            Memory.superseded_by_id.is_(None),
+            (Memory.expires_at == None) | (Memory.expires_at > now),
         )
-        for m in tier1.scalars().all():
-            seen_ids.add(m.id)
-            results.append(m)
 
-        # --- Tier 2: recent high-importance episodic ---
-        cutoff = now - timedelta(days=TIER2_DAYS)
-        tier2 = await db.execute(
-            select(Memory).where(
-                and_(
-                    Memory.user_id == user_id,
-                    Memory.is_active == True,
-                    Memory.memory_type == "episodic",
-                    Memory.importance >= TIER2_IMPORTANCE_FLOOR,
-                    Memory.created_at >= cutoff,
-                    (Memory.expires_at == None) | (Memory.expires_at > now),
-                )
-            ).order_by(Memory.importance.desc())
+        directives_result = await db.execute(
+            select(Memory)
+            .where(and_(head_conditions, Memory.kind == "directive"))
+            .order_by(Memory.importance.desc(), Memory.created_at.desc())
         )
-        for m in tier2.scalars().all():
-            if m.id not in seen_ids:
-                seen_ids.add(m.id)
-                results.append(m)
+        directives = list(directives_result.scalars().all())
+        results: list[Memory] = list(directives)
+        seen_ids = {m.id for m in directives}
 
-        # --- Tier 3: query-similar episodic (pgvector only) ---
-        if query and _USE_PGVECTOR:
-            embedding = await _embed(query)
+        directive_tokens = sum(_estimate_tokens(m.content) for m in directives)
+        remaining_budget = max(DIRECTIVE_BUDGET_FLOOR, budget - directive_tokens)
+
+        # --- candidate pool: facts + journal heads ---
+        scored: dict[int, tuple[float, Memory]] = {}
+        query_text = str(query or "").strip()
+
+        if query_text and _USE_PGVECTOR:
+            embedding = await _embed(query_text)
             if embedding is not None:
                 try:
-                    tier3 = await db.execute(
-                        select(Memory).where(
+                    distance = Memory.embedding.cosine_distance(embedding).label("distance")
+                    vector_rows = await db.execute(
+                        select(Memory, distance)
+                        .where(
                             and_(
-                                Memory.user_id == user_id,
-                                Memory.is_active == True,
-                                Memory.memory_type == "episodic",
-                                (Memory.expires_at == None) | (Memory.expires_at > now),
+                                head_conditions,
+                                Memory.kind.in_(["fact", "journal"]),
                                 Memory.embedding.isnot(None),
                             )
-                        ).order_by(
-                            Memory.embedding.cosine_distance(embedding)
-                        ).limit(TIER3_TOP_K)
+                        )
+                        .order_by(distance)
+                        .limit(VECTOR_CANDIDATE_LIMIT)
                     )
-                    for m in tier3.scalars().all():
-                        if m.id not in seen_ids:
-                            seen_ids.add(m.id)
-                            results.append(m)
+                    for memory, dist in vector_rows.all():
+                        relevance = max(0.0, 1.0 - float(dist if dist is not None else 1.0))
+                        scored[memory.id] = (_memory_score(memory, relevance, now), memory)
                 except Exception:
-                    log.warning("memory.tier3_failed", exc_info=True)
+                    log.warning("memory.vector_candidates_failed", exc_info=True)
+
+        pool = await db.execute(
+            select(Memory)
+            .where(and_(head_conditions, Memory.kind.in_(["fact", "journal"])))
+            .order_by(Memory.created_at.desc())
+            .limit(CANDIDATE_POOL_LIMIT)
+        )
+        for memory in pool.scalars().all():
+            if memory.id in scored:
+                continue
+            relevance = (
+                _lexical_relevance(query_text, memory.content)
+                if query_text
+                else NO_QUERY_NEUTRAL_RELEVANCE
+            )
+            if (memory.kind or "") == "fact":
+                relevance = max(relevance, FACT_RELEVANCE_FLOOR)
+            score = _memory_score(memory, relevance, now)
+            if score > 0.0:
+                scored[memory.id] = (score, memory)
+
+        # --- greedy budget fill in rank order ---
+        used_tokens = 0
+        for score, memory in sorted(scored.values(), key=lambda pair: pair[0], reverse=True):
+            if memory.id in seen_ids:
+                continue
+            cost = _estimate_tokens(memory.content)
+            if used_tokens + cost > remaining_budget:
+                continue
+            used_tokens += cost
+            seen_ids.add(memory.id)
+            results.append(memory)
 
         return results
 
@@ -524,10 +599,10 @@ class MemoryService:
         lines = ["## What I know about you\n"]
         for m in memories:
             prefix = {
-                "semantic": "[fact]",
-                "procedural": "[rule]",
-                "episodic": "[memory]",
-            }.get(m.memory_type, "[memory]")
+                "directive": "[rule]",
+                "fact": "[fact]",
+                "journal": "[event]",
+            }.get(m.kind or "", "[memory]")
             lines.append(f"{prefix} {m.content}")
         return "\n".join(lines)
 
