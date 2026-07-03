@@ -104,6 +104,10 @@ class Settings(BaseSettings):
     chat_validation_enabled: bool = True
     chat_validation_retry_enabled: bool = True
     chat_validation_retry_max_attempts: int = 1
+    # Memory v2 — budgeted context + write discipline
+    memory_context_token_budget: int = 1200
+    memory_directive_cap: int = 15
+    memory_dedup_similarity_threshold: float = 0.92
     # Local-model tool-calling investigation toggles
     local_tool_investigation_enabled: bool = False
     local_tool_investigation_drop_browser_tools: bool = False
