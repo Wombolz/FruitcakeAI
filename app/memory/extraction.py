@@ -203,6 +203,7 @@ async def run_memory_extraction_for_user(
             proposal_json=encode_proposal_payload(
                 {
                     "memory_type": {"directive": "procedural", "fact": "semantic", "journal": "episodic"}[candidate["kind"]],
+                    "content": candidate["content"],
                     "kind": candidate["kind"],
                     "subject": candidate["subject"],
                     "attribute": candidate["attribute"],

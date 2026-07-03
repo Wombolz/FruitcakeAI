@@ -37,6 +37,21 @@ def _fake_llm(candidates):
     return AsyncMock(return_value=_Resp())
 
 
+async def _headers(client, username: str, *, admin: bool = False) -> dict[str, str]:
+    password = "pass123"
+    await client.post(
+        "/auth/register",
+        json={"username": username, "email": f"{username}@example.com", "password": password},
+    )
+    if admin:
+        async with TestSessionLocal() as db:
+            user = (await db.execute(select(User).where(User.username == username))).scalar_one()
+            user.role = "admin"
+            await db.commit()
+    login = await client.post("/auth/login", json={"username": username, "password": password})
+    return {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+
 async def _seed_user_with_chat(username: str, *, incognito: bool = False) -> int:
     async with TestSessionLocal() as db:
         user = User(username=username, email=f"{username}@example.com", hashed_password="x", role="parent")
@@ -162,25 +177,121 @@ async def test_rerun_does_not_duplicate_proposals():
 
 @pytest.mark.asyncio
 async def test_admin_endpoint_requires_admin_and_runs(client):
-    await client.post("/auth/register", json={
-        "username": "extractadmin", "email": "extractadmin@example.com", "password": "pass123",
-    })
-    async with TestSessionLocal() as db:
-        user = (await db.execute(select(User).where(User.username == "extractadmin"))).scalar_one()
-        user.role = "admin"
-        await db.commit()
-    login = await client.post("/auth/login", json={"username": "extractadmin", "password": "pass123"})
-    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    headers = await _headers(client, "extractadmin", admin=True)
 
     with patch("app.memory.extraction.litellm.acompletion", new=_fake_llm([])):
         resp = await client.post("/admin/memory-extraction/run", headers=headers)
     assert resp.status_code == 202
     assert resp.json()["status"] == "completed"
 
-    await client.post("/auth/register", json={
-        "username": "extractparent", "email": "extractparent@example.com", "password": "pass123",
-    })
-    plogin = await client.post("/auth/login", json={"username": "extractparent", "password": "pass123"})
-    pheaders = {"Authorization": f"Bearer {plogin.json()['access_token']}"}
+    pheaders = await _headers(client, "extractparent")
     denied = await client.post("/admin/memory-extraction/run", headers=pheaders)
     assert denied.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_pending_extraction_fact_can_be_approved_and_preserves_subject_key(client):
+    headers = await _headers(client, "extractapproveowner")
+
+    async with TestSessionLocal() as db:
+        user = (await db.execute(select(User).where(User.username == "extractapproveowner"))).scalar_one()
+        proposal = MemoryProposal(
+            proposal_key="extract-approve-fact",
+            user_id=user.id,
+            proposal_type="flat_memory_create",
+            source_type="nightly_extraction",
+            status="pending",
+            content="Joey is allergic to tree nuts.",
+            confidence=0.84,
+            reason="Queued for operator review.",
+        )
+        proposal.proposal_payload = {
+            "memory_type": "semantic",
+            "content": "Joey is allergic to tree nuts.",
+            "kind": "fact",
+            "subject": "Joey",
+            "attribute": "allergy",
+            "importance": 0.9,
+            "tags": ["nightly_extraction"],
+            "confidence": 0.84,
+        }
+        db.add(proposal)
+        await db.commit()
+        proposal_id = proposal.id
+
+    approve = await client.post(f"/memories/review/{proposal_id}/approve", headers=headers)
+    assert approve.status_code == 200
+    payload = approve.json()
+    assert payload["proposal"]["status"] == "approved"
+    assert payload["memory"]["content"] == "Joey is allergic to tree nuts."
+
+    async with TestSessionLocal() as db:
+        proposal = await db.get(MemoryProposal, proposal_id)
+        memory = await db.get(Memory, proposal.approved_memory_id)
+        assert proposal is not None
+        assert memory is not None
+        assert memory.subject_key == "joey:allergy"
+        assert memory.kind == "fact"
+        assert memory.source == "extraction"
+        assert "nightly_extraction" in memory.tags_list
+
+
+@pytest.mark.asyncio
+async def test_pending_extraction_supersede_approval_replaces_existing_head(client):
+    headers = await _headers(client, "extractsupersedeowner")
+
+    async with TestSessionLocal() as db:
+        user = (await db.execute(select(User).where(User.username == "extractsupersedeowner"))).scalar_one()
+        stale = Memory(
+            user_id=user.id,
+            memory_type="semantic",
+            kind="fact",
+            subject_key="joey:allergy",
+            content="Joey is allergic to peanuts.",
+            importance=0.8,
+            tags="[]",
+            source="manual",
+            is_active=True,
+        )
+        db.add(stale)
+        await db.flush()
+        proposal = MemoryProposal(
+            proposal_key="extract-approve-supersede",
+            user_id=user.id,
+            proposal_type="flat_memory_create",
+            source_type="nightly_extraction",
+            status="pending",
+            content="Joey is allergic to tree nuts.",
+            confidence=0.91,
+            reason="Would replace an existing memory",
+        )
+        proposal.proposal_payload = {
+            "memory_type": "semantic",
+            "content": "Joey is allergic to tree nuts.",
+            "kind": "fact",
+            "subject": "Joey",
+            "attribute": "allergy",
+            "importance": 0.9,
+            "tags": ["nightly_extraction"],
+            "confidence": 0.91,
+        }
+        db.add(proposal)
+        await db.commit()
+        proposal_id = proposal.id
+        stale_id = stale.id
+
+    approve = await client.post(f"/memories/review/{proposal_id}/approve", headers=headers)
+    assert approve.status_code == 200
+    payload = approve.json()
+    assert payload["proposal"]["status"] == "approved"
+    assert payload["memory"]["content"] == "Joey is allergic to tree nuts."
+
+    async with TestSessionLocal() as db:
+        proposal = await db.get(MemoryProposal, proposal_id)
+        old_head = await db.get(Memory, stale_id)
+        new_head = await db.get(Memory, proposal.approved_memory_id)
+        assert old_head is not None and new_head is not None
+        assert old_head.is_active is False
+        assert old_head.superseded_by_id == new_head.id
+        assert new_head.subject_key == "joey:allergy"
+        assert new_head.source == "extraction"

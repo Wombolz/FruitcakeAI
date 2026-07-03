@@ -10,7 +10,9 @@ from sqlalchemy import and_, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Memory, MemoryProposal, TaskRunArtifact
-from app.memory.service import get_memory_service
+from app.memory.service import KIND_FROM_MEMORY_TYPE, VALID_KINDS, get_memory_service
+
+EXTRACTION_SOURCE_TYPE = "nightly_extraction"
 
 
 def decode_proposal_payload(raw: str | None) -> Dict[str, Any]:
@@ -65,7 +67,7 @@ async def find_existing_memory_for_proposal(
 ) -> Optional[Memory]:
     payload = decode_proposal_payload(proposal.proposal_json)
     memory_type = str(payload.get("memory_type") or "").strip()
-    content = str(payload.get("content") or "").strip()
+    content = str(payload.get("content") or proposal.content or "").strip()
     if memory_type not in {"semantic", "procedural", "episodic"} or not content:
         return None
 
@@ -95,7 +97,7 @@ async def create_flat_memory_from_proposal(
 ):
     payload = decode_proposal_payload(proposal.proposal_json)
     memory_type = str(payload.get("memory_type") or "").strip()
-    content = str(payload.get("content") or "").strip()
+    content = str(payload.get("content") or proposal.content or "").strip()
     if proposal.proposal_type != "flat_memory_create" or memory_type not in {"semantic", "procedural", "episodic"} or not content:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -109,6 +111,31 @@ async def create_flat_memory_from_proposal(
         return existing
 
     svc = get_memory_service()
+    if str(proposal.source_type or "").strip() == EXTRACTION_SOURCE_TYPE:
+        resolved_kind = str(payload.get("kind") or "").strip().lower()
+        if resolved_kind not in VALID_KINDS:
+            resolved_kind = KIND_FROM_MEMORY_TYPE.get(memory_type, "")
+        result = await svc.propose_write(
+            db=db,
+            user_id=user_id,
+            content=content,
+            memory_type=memory_type,
+            kind=resolved_kind or None,
+            subject=str(payload.get("subject") or "").strip() or None,
+            attribute=str(payload.get("attribute") or "").strip() or None,
+            importance=float(payload.get("importance") or 0.65),
+            tags=list(payload.get("tags") or []),
+            expires_at=parse_optional_iso_datetime(expires_at) if expires_at else None,
+            source="extraction",
+            confidence=float(payload.get("confidence") or proposal.confidence or 0.7),
+        )
+        if result.memory is not None:
+            return result.memory
+        existing = await find_existing_memory_for_proposal(db, user_id=user_id, proposal=proposal)
+        if existing is not None:
+            return existing
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result.reason or "Memory proposal could not be approved")
+
     result = await svc.create(
         db=db,
         user_id=user_id,
