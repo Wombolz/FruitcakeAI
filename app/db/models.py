@@ -356,6 +356,12 @@ class ChatSession(Base):
     is_task_session = Column(Boolean, default=False, nullable=False)
     sort_order = Column(Integer, nullable=True, index=True)
 
+    # Admin-only easy-cleanup sessions: persistent side effects are blocked
+    # while active, and deleting the session hard-removes all of its content.
+    # Content rows persist normally until that manual delete (operator
+    # decision — this is "easy to clean up", not a no-write ephemeral mode).
+    is_incognito = Column(Boolean, default=False, nullable=False)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

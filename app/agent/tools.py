@@ -818,6 +818,70 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 ]
 
 
+# Persistent tool families blocked in admin incognito sessions. The mode's
+# promise is "no side effects", so anything that creates or mutates durable
+# product state (or external state like calendar/RSS) is unavailable.
+INCOGNITO_BLOCKED_TOOLS: frozenset = frozenset({
+    # memory
+    "create_memory",
+    "create_memory_entities",
+    "create_memory_relations",
+    "add_memory_observations",
+    # tasks / drafts / plans (run_task_now creates durable run artifacts)
+    "propose_task_draft",
+    "create_task",
+    "update_task",
+    "run_task_now",
+    "create_task_plan",
+    "create_and_run_task_plan",
+    # external mutations via configured JSON APIs
+    "api_request",
+    # calendar mutations (MCP)
+    "create_event",
+    "delete_event",
+    "update_event",
+    # RSS/source mutations (MCP) — including candidate management and cache
+    # refresh, all of which write durable feed state
+    "add_rss_source",
+    "remove_rss_source",
+    "approve_rss_source_candidate",
+    "reject_rss_source_candidate",
+    "discover_rss_sources",
+    "refresh_rss_cache",
+    # workspace/filesystem writes (MCP)
+    "write_file",
+    "append_file",
+    "make_directory",
+})
+
+# Safety net for tools added after the explicit list was written: names that
+# look like mutations are treated as blocked in incognito unless reviewed.
+# Biased strict per the incognito coordination note's review guidance.
+_INCOGNITO_MUTATING_PREFIXES = (
+    "create_",
+    "add_",
+    "write_",
+    "append_",
+    "make_",
+    "delete_",
+    "remove_",
+    "update_",
+    "approve_",
+    "reject_",
+    "save_",
+    "set_",
+)
+
+
+def is_incognito_blocked_tool(name: str) -> bool:
+    normalized = str(name or "").strip()
+    if not normalized:
+        return False
+    if normalized in INCOGNITO_BLOCKED_TOOLS:
+        return True
+    return normalized.startswith(_INCOGNITO_MUTATING_PREFIXES)
+
+
 def get_tools_for_user(user_context: UserContext) -> List[Dict[str, Any]]:
     """
     Return the complete tool list for this user/persona.
@@ -848,6 +912,9 @@ def get_tools_for_user(user_context: UserContext) -> List[Dict[str, Any]]:
 
     if allowed_cap:
         tools = [t for t in tools if t["function"]["name"] in allowed_cap]
+
+    if user_context.is_incognito:
+        tools = [t for t in tools if not is_incognito_blocked_tool(t["function"]["name"])]
 
     return tools
 
@@ -911,7 +978,27 @@ async def _execute_tool_call(
     arguments: Dict[str, Any],
     user_context: UserContext,
 ) -> str:
-    log.info("Tool call", tool=tool_name, args=arguments, user_id=user_context.user_id)
+    if user_context.is_incognito and is_incognito_blocked_tool(tool_name):
+        # Hard server-side boundary: even if prompt drift gets the model to
+        # request a persistent tool that was filtered from the offered
+        # surface, it must not execute in an incognito session.
+        log.info(
+            "Incognito blocked tool call",
+            tool=tool_name,
+            user_id=user_context.user_id,
+            session_id=user_context.session_id,
+        )
+        return (
+            f"Tool '{tool_name}' is disabled in this incognito session. "
+            "Persistent actions (memories, tasks, calendar, sources, file writes) "
+            "are blocked; use a normal session for durable work."
+        )
+
+    if user_context.is_incognito:
+        # Content stays out of server logs for incognito turns; tool name only.
+        log.info("Tool call", tool=tool_name, user_id=user_context.user_id, incognito=True)
+    else:
+        log.info("Tool call", tool=tool_name, args=arguments, user_id=user_context.user_id)
 
     try:
         result_content = await _call_tool(tool_name, arguments, user_context)
@@ -921,14 +1008,21 @@ async def _execute_tool_call(
         log.error("Tool call failed", tool=tool_name, error=str(e))
         result_content = f"Tool {tool_name} failed: {e}"
 
-    # Audit log — fire and forget, never blocks the agent loop
+    # Audit log — fire and forget, never blocks the agent loop. Incognito
+    # sessions keep the audit row (tool name, session, timing) but redact
+    # content: audit rows outlive session deletion (SET NULL FK), so storing
+    # arguments/results would silently defeat the purge.
     asyncio.create_task(
         _write_audit_log(
             user_id=user_context.user_id,
             session_id=user_context.session_id,
             tool_name=tool_name,
-            arguments=arguments,
-            result_summary=str(result_content)[:500],
+            arguments={} if user_context.is_incognito else arguments,
+            result_summary=(
+                "[incognito: content withheld]"
+                if user_context.is_incognito
+                else str(result_content)[:500]
+            ),
         )
     )
 

@@ -40,6 +40,9 @@ class UserContext:
     session_id: Optional[int] = None   # set by chat.py for audit logging
     task_id: Optional[int] = None      # set by task runner for task-scoped tool state
     timezone: Optional[str] = None     # IANA tz string, e.g. "America/Chicago"
+    # Admin incognito session: persistent tool families are removed from the
+    # offered surface, hard-blocked at dispatch, and audit rows are redacted.
+    is_incognito: bool = False
 
     @classmethod
     def from_user(
@@ -133,6 +136,15 @@ class UserContext:
                 "- Avoid all adult topics, violence, or inappropriate content.",
                 "- Keep explanations simple and age-appropriate.",
                 "- Gently redirect if asked about blocked topics.",
+            ]
+
+        if self.is_incognito:
+            lines += [
+                "",
+                "Incognito session (admin):",
+                "- Persistent actions are disabled for this session: no memories, tasks, task drafts, task plans, calendar changes, RSS/source changes, or workspace/file writes.",
+                "- Do not offer to save, schedule, remember, or create anything durable; if asked, explain briefly that this is an incognito session and the action is unavailable until they use a normal session.",
+                "- Read-only tools remain available.",
             ]
 
         if self.blocked_tools:
