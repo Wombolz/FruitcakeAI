@@ -901,6 +901,7 @@ async def send_message(
             tool_results=_encode_assistant_message_metadata(assistant_metadata) if assistant_metadata else None,
         )
         db.add(assistant_msg)
+        await _mark_recalled_memories_materialized(db, _memory_ids)
         await db.commit()
         _log_chat_latency_breakdown(
             session_id=session_id,
@@ -1334,6 +1335,7 @@ async def _run_websocket_message(
             tool_results=_encode_assistant_message_metadata(assistant_metadata) if assistant_metadata else None,
         )
         db.add(assistant_msg)
+        await _mark_recalled_memories_materialized(db, _memory_ids)
         await db.commit()
         _log_chat_latency_breakdown(
             session_id=session_id,
@@ -2128,6 +2130,21 @@ async def _apply_memory_context(
     else:
         grounded.append({"role": "system", "content": memory_note})
     return grounded, [int(m.id) for m in memories]
+
+
+async def _mark_recalled_memories_materialized(
+    db: AsyncSession,
+    memory_ids: List[int] | None,
+) -> None:
+    """
+    Chat retrieval stays passive until a turn actually completes.
+    Once we are persisting a successful assistant message, treat recalled
+    memories as materially used and record access in the same transaction.
+    """
+    if not memory_ids:
+        return
+    svc = get_memory_service()
+    await svc.mark_accessed(memory_ids, mode="chat_materialized", db=db)
 
 
 async def _get_session_or_404(

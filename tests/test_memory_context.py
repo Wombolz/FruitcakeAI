@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import select
 
-from app.db.models import Memory, Task
+from app.api.chat import _run_websocket_message, get_chat_run_manager
+from app.db.models import ChatSession, Memory, Task, User
 from app.memory.service import get_memory_service
 from tests.conftest import TestSessionLocal
 
@@ -108,7 +111,88 @@ async def test_chat_rest_injects_memory_context_before_agent_execution(client):
     async with TestSessionLocal() as db:
         memory = await db.get(Memory, memory_id)
         assert memory is not None
+        assert memory.access_count == 1
+        assert memory.last_accessed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_chat_rest_does_not_mark_memory_access_when_turn_fails(client):
+    headers = await _headers(client, "chatmemoryfailuser")
+    user_id = await _user_id(client, headers)
+    memory_id = await _seed_memory(user_id, content="This user likes bullet summaries.")
+
+    session = await client.post("/chat/sessions", headers=headers)
+    session_id = session.json()["id"]
+
+    manager = get_chat_run_manager()
+    await manager.clear(session_id)
+    manager._recent_prompts.pop(session_id, None)
+    manager._recent_send_ids.pop(session_id, None)
+
+    with patch("app.api.chat.run_agent", new=AsyncMock(side_effect=RuntimeError("boom"))):
+        resp = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "How should you respond to me if this turn fails?"},
+            headers=headers,
+        )
+
+    assert resp.status_code == 500
+
+    async with TestSessionLocal() as db:
+        memory = await db.get(Memory, memory_id)
+        assert memory is not None
         assert memory.access_count == 0
+        assert memory.last_accessed_at is None
+
+
+@pytest.mark.asyncio
+async def test_chat_websocket_marks_recalled_memory_accessed_on_success(client):
+    headers = await _headers(client, "chatmemorywsuser")
+    user_id = await _user_id(client, headers)
+    memory_id = await _seed_memory(user_id, content="This user likes bullet summaries.")
+
+    session_resp = await client.post("/chat/sessions", headers=headers)
+    session_id = session_resp.json()["id"]
+
+    async def _fake_stream_agent(*args, **kwargs):
+        yield "reply"
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "chatmemorywsuser"))
+        ).scalar_one()
+        session = (
+            await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        ).scalar_one()
+
+        manager = get_chat_run_manager()
+        await manager.clear(session_id)
+        manager._recent_prompts.pop(session_id, None)
+        manager._recent_send_ids.pop(session_id, None)
+
+        websocket = AsyncMock()
+        with (
+            patch("app.api.chat.classify_chat_complexity", return_value=SimpleNamespace(is_complex=False)),
+            patch("app.api.chat._apply_required_library_grounding", new=AsyncMock(side_effect=lambda history, *args, **kwargs: history)),
+            patch("app.api.chat.stream_agent", side_effect=_fake_stream_agent),
+        ):
+            await _run_websocket_message(
+                session_id=session_id,
+                websocket=websocket,
+                db=db,
+                current_user=user,
+                session=session,
+                user_message="How should you respond to me?",
+                client_send_id="ws-memory-1",
+                allowed_tools=None,
+                blocked_tools=None,
+            )
+
+    async with TestSessionLocal() as db:
+        memory = await db.get(Memory, memory_id)
+        assert memory is not None
+        assert memory.access_count == 1
+        assert memory.last_accessed_at is not None
 
 
 @pytest.mark.asyncio
