@@ -87,8 +87,32 @@ log = structlog.get_logger(__name__)
 router = APIRouter()
 _CHAT_COMPACTION_MARKER_KIND = COMPACTION_MARKER_KIND
 _ASSISTANT_MESSAGE_METADATA_KIND = "assistant_message_metadata"
+_CHAT_LIVE_STATE_VALUES = {
+    "thinking",
+    "tool_active",
+    "waiting_approval",
+    "validating",
+    "retrying",
+    "completed",
+}
 _WORKSPACE_FILE_TOOL_NAMES = {"read_file", "write_file", "append_file", "stat_file"}
 _WORKSPACE_CONTEXT_TOOL_NAMES = _WORKSPACE_FILE_TOOL_NAMES | {"find_files", "list_directory", "make_directory"}
+_LIBRARY_EVIDENCE_TOOL_NAMES = {"search_library", "summarize_document", "list_library_documents"}
+_RSS_EVIDENCE_TOOL_NAMES = {
+    "get_feed_items",
+    "search_feeds",
+    "list_recent_feed_items",
+    "search_my_feeds",
+    "search_my_feeds_timeline",
+}
+_WEB_EVIDENCE_TOOL_NAMES = {
+    "web_search",
+    "fetch_page",
+    "api_request",
+    "get_daily_market_data",
+    "get_intraday_market_data",
+    "search_places",
+}
 _WORKSPACE_EXPLICIT_HINTS = (
     "workspace",
     "working on",
@@ -987,6 +1011,22 @@ async def _run_websocket_message(
             )
             return False
 
+    async def _emit_state(
+        state: str,
+        *,
+        tool_names: List[str] | None = None,
+        retry_reason: str | None = None,
+        attempt: int | None = None,
+    ) -> None:
+        await _send_json_if_open(
+            _build_chat_state_event(
+                state,
+                tool_names=tool_names,
+                retry_reason=retry_reason,
+                attempt=attempt,
+            )
+        )
+
     try:
         message_started = time.perf_counter()
         stage_timings_ms: Dict[str, float] = {}
@@ -1173,6 +1213,14 @@ async def _run_websocket_message(
             )
         )
 
+        async def _flush_runtime_messages_with_state(new_messages: List[Dict[str, Any]]) -> None:
+            await _flush_runtime_messages(new_messages)
+            tool_names = _runtime_messages_tool_names(new_messages)
+            if tool_names:
+                await _emit_state("tool_active", tool_names=tool_names)
+
+        await _emit_state("thinking")
+
         if should_validate:
             stage_started = time.perf_counter()
             try:
@@ -1184,7 +1232,8 @@ async def _run_websocket_message(
                     model_override=session.llm_model,
                     stage="chat_complex" if effective_complex else "chat_simple",
                     enable_validation=True,
-                    runtime_message_callback=_flush_runtime_messages,
+                    runtime_message_callback=_flush_runtime_messages_with_state,
+                    state_callback=_emit_state,
                 )
             except Exception as e:
                 runtime_history_messages = await _flush_pending_runtime_history()
@@ -1227,7 +1276,7 @@ async def _run_websocket_message(
                     mode=execution_mode,
                     model_override=session.llm_model,
                     stage="chat_simple",
-                    runtime_message_callback=_flush_runtime_messages,
+                    runtime_message_callback=_flush_runtime_messages_with_state,
                 ):
                     full_response.append(token_chunk)
                     await _send_json_if_open({"type": "token", "content": token_chunk})
@@ -1293,6 +1342,7 @@ async def _run_websocket_message(
             transport="websocket",
         )
 
+        await _emit_state("completed")
         await _send_json_if_open(
             {
                 "type": "done",
@@ -1724,6 +1774,48 @@ def _resolve_chat_mode(is_complex: bool) -> str:
     return "chat_orchestrated" if is_complex else "chat"
 
 
+def _runtime_messages_tool_names(runtime_messages: List[Dict[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    names: list[str] = []
+    for message in runtime_messages:
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            tool_name = str(function.get("name") or "").strip()
+            if tool_name and tool_name not in seen:
+                seen.add(tool_name)
+                names.append(tool_name)
+    return names
+
+
+def _build_chat_state_event(
+    state: str,
+    *,
+    tool_names: List[str] | None = None,
+    retry_reason: str | None = None,
+    attempt: int | None = None,
+) -> Dict[str, Any]:
+    normalized_state = str(state or "").strip().lower()
+    if normalized_state not in _CHAT_LIVE_STATE_VALUES:
+        raise ValueError(f"Unsupported chat live state: {state}")
+
+    payload: Dict[str, Any] = {
+        "type": "state",
+        "state": normalized_state,
+    }
+    if isinstance(tool_names, list):
+        cleaned_tool_names = [str(item).strip() for item in tool_names if str(item).strip()]
+        if cleaned_tool_names:
+            payload["tool_names"] = cleaned_tool_names
+    if retry_reason:
+        payload["retry_reason"] = str(retry_reason).strip()
+    if attempt is not None:
+        try:
+            payload["attempt"] = int(attempt)
+        except (TypeError, ValueError):
+            pass
+    return payload
+
+
 def _normalize_chat_routing_preference(value: str | None) -> str:
     lowered = str(value or "").strip().lower()
     if lowered in {"auto", "fast", "deep"}:
@@ -1756,6 +1848,7 @@ async def _execute_chat_turn(
     stage: str,
     enable_validation: bool,
     runtime_message_callback=None,
+    state_callback: Callable[..., Awaitable[None]] | None = None,
 ) -> str:
     started = time.perf_counter()
     reply = await run_agent(
@@ -1780,6 +1873,8 @@ async def _execute_chat_turn(
     current = reply
 
     while True:
+        if state_callback is not None:
+            await state_callback("validating")
         validation = validate_chat_response(
             user_prompt,
             current,
@@ -1804,6 +1899,8 @@ async def _execute_chat_turn(
             metrics.inc_chat_validation_empty_retry_count()
         metrics.inc_chat_validation_retry_count()
         attempts += 1
+        if state_callback is not None:
+            await state_callback("retrying", retry_reason=validation.retry_reason, attempt=attempts)
 
         retry_instruction = build_chat_retry_instruction(validation.retry_reason)
         corrective = {"role": "system", "content": retry_instruction}
@@ -2119,6 +2216,40 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
         if cleaned_ids:
             normalized["recalled_memory_ids"] = cleaned_ids
 
+    evidence = metadata.get("evidence")
+    if isinstance(evidence, dict):
+        normalized_evidence: Dict[str, Any] = {}
+        grounded = evidence.get("grounded")
+        if isinstance(grounded, bool):
+            normalized_evidence["grounded"] = grounded
+        evidence_tool_names = evidence.get("tool_names")
+        if isinstance(evidence_tool_names, list):
+            cleaned_tool_names = [
+                str(item).strip() for item in evidence_tool_names if str(item).strip()
+            ]
+            if cleaned_tool_names:
+                normalized_evidence["tool_names"] = cleaned_tool_names
+        source_kinds = evidence.get("source_kinds")
+        if isinstance(source_kinds, list):
+            cleaned_source_kinds = [str(item).strip() for item in source_kinds if str(item).strip()]
+            if cleaned_source_kinds:
+                normalized_evidence["source_kinds"] = cleaned_source_kinds
+        source_counts = evidence.get("source_counts")
+        if isinstance(source_counts, dict):
+            cleaned_counts = {}
+            for key, value in source_counts.items():
+                name = str(key).strip()
+                try:
+                    count = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if name and count > 0:
+                    cleaned_counts[name] = count
+            if cleaned_counts:
+                normalized_evidence["source_counts"] = cleaned_counts
+        if normalized_evidence:
+            normalized["evidence"] = normalized_evidence
+
     status = str(metadata.get("task_draft_status") or "").strip().lower()
     if status == "created":
         status = "accepted"
@@ -2127,6 +2258,45 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
             status = "accepted" if "created_task_id" in normalized else "draft"
         normalized["task_draft_status"] = status
     return normalized
+
+
+def _evidence_kind_for_tool_name(tool_name: str) -> str | None:
+    normalized = str(tool_name or "").strip()
+    if not normalized:
+        return None
+    if normalized in _LIBRARY_EVIDENCE_TOOL_NAMES:
+        return "library"
+    if normalized in _WORKSPACE_CONTEXT_TOOL_NAMES:
+        return "workspace"
+    if normalized in _RSS_EVIDENCE_TOOL_NAMES:
+        return "rss"
+    if normalized in _WEB_EVIDENCE_TOOL_NAMES:
+        return "web"
+    return None
+
+
+def _build_assistant_evidence_metadata(
+    executed_tools: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    tool_names = _summarize_executed_tool_names(executed_tools)
+    if not tool_names:
+        return None
+
+    source_counts: Dict[str, int] = {}
+    for tool_name in tool_names:
+        kind = _evidence_kind_for_tool_name(tool_name)
+        if kind is None:
+            continue
+        source_counts[kind] = source_counts.get(kind, 0) + 1
+
+    evidence: Dict[str, Any] = {
+        "grounded": True,
+        "tool_names": tool_names,
+    }
+    if source_counts:
+        evidence["source_kinds"] = list(source_counts.keys())
+        evidence["source_counts"] = source_counts
+    return evidence
 
 
 def _build_assistant_message_metadata(
@@ -2144,6 +2314,9 @@ def _build_assistant_message_metadata(
     tool_calls = _summarize_executed_tool_names(executed_tools)
     if tool_calls:
         metadata["tool_calls"] = tool_calls
+        evidence = _build_assistant_evidence_metadata(executed_tools)
+        if evidence:
+            metadata["evidence"] = evidence
 
     if recalled_memory_ids:
         metadata["recalled_memory_ids"] = [int(i) for i in recalled_memory_ids]

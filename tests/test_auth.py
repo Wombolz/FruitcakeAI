@@ -14,7 +14,8 @@ from sqlalchemy import select, func
 from sqlalchemy.pool import StaticPool
 from unittest.mock import AsyncMock, patch
 
-from app.api.chat import _run_websocket_message, chat_websocket
+from app.api.chat import _execute_chat_turn, _run_websocket_message, chat_websocket
+from app.agent.context import UserContext
 from app.chat_runtime import get_chat_run_manager
 from app.db.session import Base, get_db
 from app.db.models import ChatMessage, ChatSession, User
@@ -1337,6 +1338,178 @@ async def test_websocket_done_payload_includes_message_id_for_task_drafts(client
         done_payload = next(payload for payload in payloads if payload["type"] == "done")
         assert isinstance(done_payload["message_id"], int)
         assert done_payload["metadata"]["task_draft_status"] == "draft"
+
+
+@pytest.mark.asyncio
+async def test_rest_assistant_metadata_includes_structured_evidence(client):
+    await client.post("/auth/register", json={
+        "username": "evidencerestuser",
+        "email": "evidencerest@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "evidencerestuser", "password": "pass123"})
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post("/chat/sessions", json={"title": "REST Evidence"}, headers=headers)
+    session_id = create.json()["id"]
+
+    with (
+        patch("app.api.chat._execute_chat_turn", new=AsyncMock(return_value="Grounded answer from library tools.")),
+        patch("app.api.chat._apply_required_library_grounding", new=AsyncMock(side_effect=lambda history, *args, **kwargs: history)),
+        patch(
+            "app.api.chat.get_tool_execution_records",
+            return_value=[
+                {"tool": "search_library", "arguments": {}, "result_summary": "match"},
+                {"tool": "summarize_document", "arguments": {}, "result_summary": "summary"},
+            ],
+        ),
+    ):
+        sent = await client.post(
+            f"/chat/sessions/{session_id}/messages",
+            json={"content": "Summarize the library document for me."},
+            headers=headers,
+        )
+
+    assert sent.status_code == 200
+    metadata = sent.json()["metadata"]
+    assert metadata["evidence"]["grounded"] is True
+    assert metadata["evidence"]["tool_names"] == ["search_library", "summarize_document"]
+    assert metadata["evidence"]["source_kinds"] == ["library"]
+    assert metadata["evidence"]["source_counts"]["library"] == 2
+
+    refreshed = await client.get(f"/chat/sessions/{session_id}", headers=headers)
+    assistant = refreshed.json()["messages"][-1]
+    assert assistant["metadata"]["evidence"]["tool_names"] == ["search_library", "summarize_document"]
+    assert assistant["metadata"]["evidence"]["source_counts"]["library"] == 2
+
+
+@pytest.mark.asyncio
+async def test_websocket_emits_live_state_events_for_tool_backed_turn(client):
+    await client.post("/auth/register", json={
+        "username": "chatstatewsuser",
+        "email": "chatstatews@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatstatewsuser", "password": "pass123"})
+
+    create = await client.post(
+        "/chat/sessions",
+        json={"title": "WS State Events"},
+        headers={"Authorization": f"Bearer {login.json()['access_token']}"},
+    )
+    session_id = create.json()["id"]
+    runtime_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_lib_1",
+                    "type": "function",
+                    "function": {"name": "summarize_document", "arguments": '{"document_name":"Agents of Chaos.pdf"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_lib_1",
+            "content": "Saved summary",
+        },
+    ]
+
+    async def _tool_backed_execute(*args, **kwargs):
+        callback = kwargs["runtime_message_callback"]
+        await callback(runtime_messages)
+        return "Grounded answer from tool output."
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "chatstatewsuser"))
+        ).scalar_one()
+        session = (
+            await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        ).scalar_one()
+
+        manager = get_chat_run_manager()
+        await manager.clear(session_id)
+        manager._recent_prompts.pop(session_id, None)
+        manager._recent_send_ids.pop(session_id, None)
+
+        websocket = AsyncMock()
+        with (
+            patch("app.api.chat._execute_chat_turn", new=AsyncMock(side_effect=_tool_backed_execute)),
+            patch("app.api.chat.classify_chat_complexity", return_value=SimpleNamespace(is_complex=False)),
+            patch("app.api.chat._apply_required_library_grounding", new=AsyncMock(side_effect=lambda history, *args, **kwargs: history)),
+            patch(
+                "app.api.chat.get_tool_execution_records",
+                return_value=[{"tool": "summarize_document", "arguments": {}, "result_summary": "Saved summary"}],
+            ),
+        ):
+            await _run_websocket_message(
+                session_id=session_id,
+                websocket=websocket,
+                db=db,
+                current_user=user,
+                session=session,
+                user_message="Summarize the document in my library.",
+                client_send_id="ws-state-1",
+                allowed_tools=None,
+                blocked_tools=None,
+            )
+
+        payloads = [call.args[0] for call in websocket.send_json.await_args_list]
+        state_payloads = [payload for payload in payloads if payload["type"] == "state"]
+        assert [payload["state"] for payload in state_payloads] == ["thinking", "tool_active", "completed"]
+        assert state_payloads[1]["tool_names"] == ["summarize_document"]
+        done_payload = next(payload for payload in payloads if payload["type"] == "done")
+        assert done_payload["metadata"]["evidence"]["source_kinds"] == ["library"]
+
+
+@pytest.mark.asyncio
+async def test_execute_chat_turn_emits_validating_and_retrying_states():
+    user_context = UserContext(user_id=1, username="stateuser", role="parent")
+    history = [{"role": "user", "content": "Give me a cleaned-up answer."}]
+    captured_states = []
+
+    async def _capture_state(state, **kwargs):
+        captured_states.append({"state": state, **kwargs})
+
+    validations = [
+        SimpleNamespace(
+            invalid_urls=[],
+            should_retry=True,
+            retry_reason="tool_call_leakage",
+            cleaned_content="",
+        ),
+        SimpleNamespace(
+            invalid_urls=[],
+            should_retry=False,
+            retry_reason=None,
+            cleaned_content="",
+        ),
+    ]
+
+    with (
+        patch("app.api.chat.run_agent", new=AsyncMock(side_effect=["Draft answer", "Clean answer"])),
+        patch("app.api.chat.validate_chat_response", side_effect=validations),
+        patch("app.api.chat.build_chat_retry_instruction", return_value="Retry cleanly."),
+    ):
+        reply = await _execute_chat_turn(
+            history,
+            user_context,
+            user_prompt="Give me a cleaned-up answer.",
+            mode="chat",
+            model_override="gpt-5-mini",
+            stage="chat_simple",
+            enable_validation=True,
+            state_callback=_capture_state,
+        )
+
+    assert reply == "Clean answer"
+    assert [item["state"] for item in captured_states] == ["validating", "retrying", "validating"]
+    assert captured_states[1]["retry_reason"] == "tool_call_leakage"
+    assert captured_states[1]["attempt"] == 1
 
 
 @pytest.mark.asyncio
