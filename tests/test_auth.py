@@ -1360,8 +1360,8 @@ async def test_rest_assistant_metadata_includes_structured_evidence(client):
         patch(
             "app.api.chat.get_tool_execution_records",
             return_value=[
-                {"tool": "search_library", "arguments": {}, "result_summary": "match"},
-                {"tool": "summarize_document", "arguments": {}, "result_summary": "summary"},
+                {"tool": "search_library", "arguments": {"query": "Agents of Chaos"}, "result_summary": "match"},
+                {"tool": "summarize_document", "arguments": {"document_name": "Agents of Chaos.pdf"}, "result_summary": "summary"},
             ],
         ),
     ):
@@ -1377,11 +1377,26 @@ async def test_rest_assistant_metadata_includes_structured_evidence(client):
     assert metadata["evidence"]["tool_names"] == ["search_library", "summarize_document"]
     assert metadata["evidence"]["source_kinds"] == ["library"]
     assert metadata["evidence"]["source_counts"]["library"] == 2
+    assert metadata["evidence"]["tool_details"] == [
+        {
+            "tool_name": "search_library",
+            "detail_kind": "query",
+            "label": "Query",
+            "value": "Agents of Chaos",
+        },
+        {
+            "tool_name": "summarize_document",
+            "detail_kind": "document",
+            "label": "Document",
+            "value": "Agents of Chaos.pdf",
+        },
+    ]
 
     refreshed = await client.get(f"/chat/sessions/{session_id}", headers=headers)
     assistant = refreshed.json()["messages"][-1]
     assert assistant["metadata"]["evidence"]["tool_names"] == ["search_library", "summarize_document"]
     assert assistant["metadata"]["evidence"]["source_counts"]["library"] == 2
+    assert assistant["metadata"]["evidence"]["tool_details"][0]["value"] == "Agents of Chaos"
 
 
 @pytest.mark.asyncio
@@ -1443,7 +1458,7 @@ async def test_websocket_emits_live_state_events_for_tool_backed_turn(client):
             patch("app.api.chat._apply_required_library_grounding", new=AsyncMock(side_effect=lambda history, *args, **kwargs: history)),
             patch(
                 "app.api.chat.get_tool_execution_records",
-                return_value=[{"tool": "summarize_document", "arguments": {}, "result_summary": "Saved summary"}],
+                return_value=[{"tool": "summarize_document", "arguments": {"document_name": "Agents of Chaos.pdf"}, "result_summary": "Saved summary"}],
             ),
         ):
             await _run_websocket_message(
@@ -1464,6 +1479,119 @@ async def test_websocket_emits_live_state_events_for_tool_backed_turn(client):
         assert state_payloads[1]["tool_names"] == ["summarize_document"]
         done_payload = next(payload for payload in payloads if payload["type"] == "done")
         assert done_payload["metadata"]["evidence"]["source_kinds"] == ["library"]
+        assert done_payload["metadata"]["evidence"]["tool_details"] == [
+            {
+                "tool_name": "summarize_document",
+                "detail_kind": "document",
+                "label": "Document",
+                "value": "Agents of Chaos.pdf",
+            }
+        ]
+
+
+def test_build_assistant_tool_details_includes_web_query_and_page_url():
+    from app.api.chat import _build_assistant_tool_details
+
+    details = _build_assistant_tool_details(
+        [
+            {"tool": "web_search", "arguments": {"query": "NASA Swift reboot"}, "result_summary": "result"},
+            {
+                "tool": "fetch_page",
+                "arguments": {"url": "https://www.nasa.gov/swift"},
+                "result_summary": "Title: Swift Mission Overview\nPage content from https://www.nasa.gov/swift:\n\n...",
+            },
+        ]
+    )
+
+    assert details == [
+        {
+            "tool_name": "web_search",
+            "detail_kind": "query",
+            "label": "Query",
+            "value": "NASA Swift reboot",
+        },
+        {
+            "tool_name": "fetch_page",
+            "detail_kind": "url",
+            "label": "Page",
+            "value": "https://www.nasa.gov/swift",
+            "source_kind": "web",
+            "source_title": "Swift Mission Overview",
+        },
+    ]
+
+
+def test_build_assistant_tool_details_fetch_page_kind_heuristics():
+    from app.api.chat import _build_assistant_tool_details
+
+    details = _build_assistant_tool_details(
+        [
+            {"tool": "fetch_page", "arguments": {"url": "https://en.wikipedia.org/wiki/Swift"}, "result_summary": "no title line"},
+            {"tool": "fetch_page", "arguments": {"url": "https://example.com/whitepaper.pdf"}, "result_summary": "no title line"},
+        ]
+    )
+
+    assert [d["source_kind"] for d in details] == ["wiki", "pdf"]
+    assert all("source_title" not in d for d in details)
+
+
+def test_build_assistant_evidence_metadata_counts_repeated_web_sources():
+    from app.api.chat import _build_assistant_evidence_metadata
+
+    evidence = _build_assistant_evidence_metadata(
+        [
+            {"tool": "web_search", "arguments": {"query": "swift observatory reboot"}, "result_summary": "search"},
+            {
+                "tool": "fetch_page",
+                "arguments": {"url": "https://www.nasa.gov/swift"},
+                "result_summary": "Title: Swift Mission Overview\nPage content from https://www.nasa.gov/swift:\n\n...",
+            },
+            {
+                "tool": "fetch_page",
+                "arguments": {"url": "https://en.wikipedia.org/wiki/Neil_Gehrels_Swift_Observatory"},
+                "result_summary": "Title: Neil Gehrels Swift Observatory\nPage content from https://en.wikipedia.org/wiki/Neil_Gehrels_Swift_Observatory:\n\n...",
+            },
+        ]
+    )
+
+    assert evidence is not None
+    assert evidence["tool_names"] == ["web_search", "fetch_page"]
+    assert evidence["source_kinds"] == ["web"]
+    assert evidence["source_counts"] == {"web": 3}
+
+
+def test_normalize_assistant_metadata_payload_passes_through_source_title_and_kind():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    normalized = _normalize_assistant_metadata_payload(
+        {
+            "tool_calls": ["fetch_page"],
+            "evidence": {
+                "grounded": True,
+                "tool_details": [
+                    {
+                        "tool_name": "fetch_page",
+                        "detail_kind": "url",
+                        "label": "Page",
+                        "value": "https://www.nasa.gov/swift",
+                        "source_kind": "web",
+                        "source_title": "Swift Mission Overview",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert normalized["evidence"]["tool_details"] == [
+        {
+            "tool_name": "fetch_page",
+            "detail_kind": "url",
+            "label": "Page",
+            "value": "https://www.nasa.gov/swift",
+            "source_kind": "web",
+            "source_title": "Swift Mission Overview",
+        }
+    ]
 
 
 @pytest.mark.asyncio

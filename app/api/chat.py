@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -2247,6 +2248,33 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
                     cleaned_counts[name] = count
             if cleaned_counts:
                 normalized_evidence["source_counts"] = cleaned_counts
+        tool_details = evidence.get("tool_details")
+        if isinstance(tool_details, list):
+            cleaned_details = []
+            for item in tool_details[:8]:
+                if not isinstance(item, dict):
+                    continue
+                tool_name = str(item.get("tool_name") or "").strip()
+                detail_kind = str(item.get("detail_kind") or "").strip()
+                label = str(item.get("label") or "").strip()
+                value = str(item.get("value") or "").strip()
+                if not (tool_name and detail_kind and label and value):
+                    continue
+                cleaned_item = {
+                    "tool_name": tool_name,
+                    "detail_kind": detail_kind,
+                    "label": label,
+                    "value": value[:500],
+                }
+                source_title = str(item.get("source_title") or "").strip()
+                if source_title:
+                    cleaned_item["source_title"] = source_title[:200]
+                source_kind = str(item.get("source_kind") or "").strip()
+                if source_kind:
+                    cleaned_item["source_kind"] = source_kind[:32]
+                cleaned_details.append(cleaned_item)
+            if cleaned_details:
+                normalized_evidence["tool_details"] = cleaned_details
         if normalized_evidence:
             normalized["evidence"] = normalized_evidence
 
@@ -2275,6 +2303,21 @@ def _evidence_kind_for_tool_name(tool_name: str) -> str | None:
     return None
 
 
+def _build_assistant_source_counts(
+    executed_tools: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    source_counts: Dict[str, int] = {}
+    for record in executed_tools or []:
+        if not isinstance(record, dict):
+            continue
+        tool_name = str(record.get("tool") or "").strip()
+        kind = _evidence_kind_for_tool_name(tool_name)
+        if kind is None:
+            continue
+        source_counts[kind] = source_counts.get(kind, 0) + 1
+    return source_counts
+
+
 def _build_assistant_evidence_metadata(
     executed_tools: List[Dict[str, Any]],
 ) -> Dict[str, Any] | None:
@@ -2282,12 +2325,7 @@ def _build_assistant_evidence_metadata(
     if not tool_names:
         return None
 
-    source_counts: Dict[str, int] = {}
-    for tool_name in tool_names:
-        kind = _evidence_kind_for_tool_name(tool_name)
-        if kind is None:
-            continue
-        source_counts[kind] = source_counts.get(kind, 0) + 1
+    source_counts = _build_assistant_source_counts(executed_tools)
 
     evidence: Dict[str, Any] = {
         "grounded": True,
@@ -2296,7 +2334,80 @@ def _build_assistant_evidence_metadata(
     if source_counts:
         evidence["source_kinds"] = list(source_counts.keys())
         evidence["source_counts"] = source_counts
+    tool_details = _build_assistant_tool_details(executed_tools)
+    if tool_details:
+        evidence["tool_details"] = tool_details
     return evidence
+
+
+def _source_kind_for_url(url: str) -> str:
+    """Cheap URL-only heuristic for per-source iconography — no extra fetch."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    if path.endswith(".pdf"):
+        return "pdf"
+    if host.endswith("wikipedia.org"):
+        return "wiki"
+    return "web"
+
+
+def _extract_fetch_page_title(result_summary: str) -> str:
+    """fetch_page prefixes its result with `Title: ...` when one was found."""
+    first_line = (result_summary or "").split("\n", 1)[0]
+    prefix = "Title: "
+    if first_line.startswith(prefix):
+        return first_line[len(prefix):].strip()
+    return ""
+
+
+def _build_assistant_tool_details(executed_tools: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    details: List[Dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for record in executed_tools or []:
+        if not isinstance(record, dict):
+            continue
+        tool_name = str(record.get("tool") or "").strip()
+        arguments = record.get("arguments") or {}
+        if not tool_name or not isinstance(arguments, dict):
+            continue
+
+        candidates: list[tuple[str, str, str]] = []
+        if tool_name in {"web_search", "search_library", "search_my_feeds", "search_feeds"}:
+            query = str(arguments.get("query") or "").strip()
+            if query:
+                candidates.append(("query", "Query", query))
+        if tool_name == "fetch_page":
+            url = str(arguments.get("url") or "").strip()
+            if url:
+                candidates.append(("url", "Page", url))
+        if tool_name == "summarize_document":
+            document_name = str(arguments.get("document_name") or "").strip()
+            if document_name:
+                candidates.append(("document", "Document", document_name))
+
+        for detail_kind, label, value in candidates:
+            key = (tool_name, detail_kind, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            detail: Dict[str, str] = {
+                "tool_name": tool_name,
+                "detail_kind": detail_kind,
+                "label": label,
+                "value": value,
+            }
+            if tool_name == "fetch_page" and detail_kind == "url":
+                detail["source_kind"] = _source_kind_for_url(value)
+                source_title = _extract_fetch_page_title(str(record.get("result_summary") or ""))
+                if source_title:
+                    detail["source_title"] = source_title
+            details.append(detail)
+            if len(details) >= 8:
+                return details
+
+    return details
 
 
 def _build_assistant_message_metadata(

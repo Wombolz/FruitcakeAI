@@ -450,7 +450,9 @@ async def _fetch_page(arguments: Dict[str, Any], user_context: Any = None) -> st
             + f"\n\n[... content truncated at {_MAX_PAGE_CHARS} characters ...]"
         )
 
-    result = f"Page content from {url}:\n\n{text}"
+    title = _extract_title(response.text)
+    title_line = f"Title: {title}\n" if title else ""
+    result = f"{title_line}Page content from {url}:\n\n{text}"
     _PAGE_CACHE.set(cache_key, result)
 
     elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
@@ -514,6 +516,23 @@ async def _blocked_target_reason(parsed_url) -> Optional[str]:
         if _is_private_or_local_ip(ip_text):
             return f"resolved to private/local IP ({ip_text})"
     return None
+
+
+def _extract_title(html: str) -> str:
+    """Best-effort <title> extraction for source attribution in evidence rows."""
+    title = ""
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html, "html.parser")
+        tag = soup.find("title")
+        if tag:
+            title = tag.get_text()
+    except ImportError:
+        match = re.search(r"(?is)<title[^>]*>(.*?)</title>", html)
+        if match:
+            title = html_lib.unescape(match.group(1))
+    return _clean_text_inline(title)[:200]
 
 
 def _extract_text(html: str) -> str:
