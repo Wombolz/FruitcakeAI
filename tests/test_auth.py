@@ -1588,10 +1588,10 @@ def test_normalize_assistant_metadata_payload_passes_through_source_title_and_ki
             "detail_kind": "url",
             "label": "Page",
             "value": "https://www.nasa.gov/swift",
-            "source_kind": "web",
-            "source_title": "Swift Mission Overview",
-        }
-    ]
+                "source_kind": "web",
+                "source_title": "Swift Mission Overview",
+            }
+        ]
 
 
 @pytest.mark.asyncio

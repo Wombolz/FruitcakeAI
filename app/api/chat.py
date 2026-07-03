@@ -2233,7 +2233,6 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
                 continue
         if cleaned_ids:
             normalized["recalled_memory_ids"] = cleaned_ids
-
     evidence = metadata.get("evidence")
     if isinstance(evidence, dict):
         normalized_evidence: Dict[str, Any] = {}
@@ -2333,8 +2332,6 @@ def _build_assistant_source_counts(
             continue
         source_counts[kind] = source_counts.get(kind, 0) + 1
     return source_counts
-
-
 def _build_assistant_evidence_metadata(
     executed_tools: List[Dict[str, Any]],
 ) -> Dict[str, Any] | None:
@@ -2425,8 +2422,6 @@ def _build_assistant_tool_details(executed_tools: List[Dict[str, Any]]) -> List[
                 return details
 
     return details
-
-
 def _build_assistant_message_metadata(
     *,
     handoff_metadata: Dict[str, Any],
