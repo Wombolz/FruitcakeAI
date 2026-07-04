@@ -188,6 +188,110 @@ async def test_maintenance_plan_uses_single_deterministic_step(client):
     assert all(row["requires_approval"] is False for row in rows)
 
 
+@pytest.mark.asyncio
+async def test_system_job_task_runs_without_llm_agent_loop(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "systemjobowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Nightly Memory Extraction",
+            "instruction": "Run nightly memory extraction.",
+            "task_type": "recurring",
+            "schedule": "0 3 * * *",
+            "deliver": False,
+            "requires_approval": False,
+            "recipe_family": "system_job",
+            "recipe_params": {
+                "job_name": "nightly_memory_extraction",
+                "since_hours": 24,
+            },
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    runner = TaskRunner()
+    with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+        with patch(
+            "app.memory.extraction.run_nightly_memory_extraction",
+            new=AsyncMock(
+                return_value={
+                    "users": 1,
+                    "candidates": 4,
+                    "queued": 2,
+                    "auto_approved": 1,
+                    "skipped_duplicates": 1,
+                }
+            ),
+        ):
+            with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=AssertionError("run_agent should not be called"))):
+                await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "pending"
+        assert task.result is not None
+        assert "Nightly memory extraction completed" in task.result
+        assert task.next_run_at is not None
+
+
+@pytest.mark.asyncio
+async def test_refresh_rss_cache_system_job_runs_without_llm_agent_loop(client):
+    from app.autonomy.runner import TaskRunner
+
+    headers = await _headers(client, "rsssystemjobowner")
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Refresh RSS Cache",
+            "instruction": "Refresh the RSS cache.",
+            "task_type": "recurring",
+            "schedule": "every:1h",
+            "deliver": False,
+            "requires_approval": False,
+            "recipe_family": "system_job",
+            "recipe_params": {
+                "job_name": "refresh_rss_cache",
+                "max_items_per_source": 20,
+            },
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    runner = TaskRunner()
+    with patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+        with patch(
+            "app.autonomy.profiles.system_job.rss_sources.refresh_active_sources_cache",
+            new=AsyncMock(return_value={"sources": 178, "items": 2263}),
+        ):
+            with patch("app.agent.core.run_agent", new=AsyncMock(side_effect=AssertionError("run_agent should not be called"))):
+                await runner.execute(type("TaskRef", (), {"id": task_id})())
+
+    async with TestSessionLocal() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.status == "pending"
+        assert task.result is not None
+        assert "RSS_REFRESH_OK" in task.result
+        assert task.next_run_at is not None
+
+        run = (
+            await db.execute(
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.id.desc())
+            )
+        ).scalars().first()
+        assert run is not None
+        assert run.status == "completed"
+
+
 def test_normalize_steps_drops_redundant_task_setup_steps():
     rows = _normalize_steps(
         [

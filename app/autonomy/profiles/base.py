@@ -10,6 +10,10 @@ DefaultPlannerFn = Callable[..., Awaitable[List[Dict[str, Any]]]]
 class TaskExecutionProfile(ABC):
     name = "default"
 
+    def execution_backend(self, *, run_context: Dict[str, Any]) -> str:
+        del run_context
+        return "agent"
+
     def _build_run_diagnostics(
         self,
         *,
@@ -139,3 +143,14 @@ class TaskExecutionProfile(ABC):
         run_debug: Dict[str, Any],
     ) -> None:
         return None
+
+    async def execute_non_agent(
+        self,
+        *,
+        db,
+        task,
+        user,
+        run_context: Dict[str, Any],
+        task_run_id: Optional[int],
+    ) -> Tuple[str, Dict[str, Any]]:
+        raise NotImplementedError("This profile does not support non-agent execution.")

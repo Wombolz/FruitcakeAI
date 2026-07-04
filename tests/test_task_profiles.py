@@ -13,6 +13,7 @@ from app.autonomy.profiles.maintenance import (
     _parse_maintenance_instruction,
 )
 from app.autonomy.profiles.morning_briefing import MorningBriefingExecutionProfile
+from app.autonomy.profiles.system_job import SystemJobExecutionProfile
 from app.autonomy.profiles.iss_pass_watcher import ISSPassWatcherExecutionProfile
 from app.autonomy.profiles.weather_conditions import WeatherConditionsExecutionProfile
 from app.autonomy.profiles.base import TaskExecutionProfile
@@ -58,6 +59,113 @@ def test_parse_maintenance_instruction_rejects_malformed_args():
     assert parsed["tool"] == "refresh_rss_cache"
     assert parsed["errors"]
     assert "Malformed maintenance args JSON" in parsed["errors"][0]
+
+
+@pytest.mark.asyncio
+async def test_system_job_profile_runs_nightly_memory_extraction_directly():
+    profile = SystemJobExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Nightly Memory Extraction",
+            instruction="Run nightly memory extraction.",
+            profile="system_job",
+            task_recipe={
+                "family": "system_job",
+                "params": {
+                    "job_name": "nightly_memory_extraction",
+                    "since_hours": 24,
+                },
+            },
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        user = SimpleNamespace(id=1)
+
+        run_context = await profile.prepare_run_context(
+            db=db,
+            user_id=1,
+            task_id=task.id,
+            task_run_id=501,
+        )
+
+        with patch(
+            "app.memory.extraction.run_nightly_memory_extraction",
+            new=AsyncMock(
+                return_value={
+                    "users": 2,
+                    "candidates": 5,
+                    "queued": 3,
+                    "auto_approved": 1,
+                    "skipped_duplicates": 1,
+                }
+            ),
+        ):
+            result, run_debug = await profile.execute_non_agent(
+                db=db,
+                task=task,
+                user=user,
+                run_context=run_context,
+                task_run_id=501,
+            )
+
+    assert "Nightly memory extraction completed" in result
+    assert "- Users scanned: 2" in result
+    assert run_debug["profile"] == "system_job"
+    assert run_debug["system_job"]["job_name"] == "nightly_memory_extraction"
+    assert run_debug["grounding_report"]["deterministic"] is True
+
+
+@pytest.mark.asyncio
+async def test_system_job_profile_runs_refresh_rss_cache_directly():
+    profile = SystemJobExecutionProfile()
+
+    async with TestSessionLocal() as db:
+        task = Task(
+            user_id=1,
+            title="Refresh RSS Cache",
+            instruction="Run rss cache refresh.",
+            profile="system_job",
+            task_recipe={
+                "family": "system_job",
+                "params": {
+                    "job_name": "refresh_rss_cache",
+                    "max_items_per_source": 20,
+                },
+            },
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        user = SimpleNamespace(id=1)
+
+        run_context = await profile.prepare_run_context(
+            db=db,
+            user_id=1,
+            task_id=task.id,
+            task_run_id=777,
+        )
+
+        with patch(
+            "app.autonomy.profiles.system_job.rss_sources.refresh_active_sources_cache",
+            new=AsyncMock(return_value={"sources": 178, "items": 2263}),
+        ):
+            result, run_debug = await profile.execute_non_agent(
+                db=db,
+                task=task,
+                user=user,
+                run_context=run_context,
+                task_run_id=777,
+            )
+
+    assert "RSS_REFRESH_OK" in result
+    assert "sources_refreshed: 178" in result
+    assert run_debug["profile"] == "system_job"
+    assert run_debug["system_job"]["job_name"] == "refresh_rss_cache"
+    assert run_debug["system_job"]["max_items_per_source"] == 20
+    assert run_debug["grounding_report"]["deterministic"] is True
 
 
 @pytest.mark.asyncio

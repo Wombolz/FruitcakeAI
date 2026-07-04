@@ -6,6 +6,7 @@ from app.autonomy.profiles.maintenance import MaintenanceExecutionProfile
 from app.autonomy.profiles.morning_briefing import BriefingExecutionProfile, MorningBriefingExecutionProfile
 from app.autonomy.profiles.news_magazine import NewsMagazineExecutionProfile
 from app.autonomy.profiles.repo_map import RepoMapExecutionProfile
+from app.autonomy.profiles.system_job import SystemJobExecutionProfile
 from app.autonomy.profiles.weather_conditions import WeatherConditionsExecutionProfile
 from app.autonomy.profiles.topic_watcher import TopicWatcherExecutionProfile
 
@@ -20,6 +21,7 @@ ALLOWED_TASK_PROFILES = {
     "weather_conditions",
     "topic_watcher",
     "iss_pass_watcher",
+    "system_job",
 }
 
 
@@ -32,6 +34,8 @@ def resolve_task_profile(task, user=None):
         agent_role = str(params.get("agent_role") or "").strip().lower()
         if family == "agent" and agent_role == "repo_map_manager":
             return RepoMapExecutionProfile()
+        if family == "system_job":
+            return SystemJobExecutionProfile()
     value = (getattr(task, "profile", None) or "").strip().lower()
     return resolve_task_profile_by_name(value)
 
@@ -50,6 +54,8 @@ def resolve_task_profile_by_name(value: str | None):
         return ISSPassWatcherExecutionProfile()
     if value == "maintenance":
         return MaintenanceExecutionProfile()
+    if value == "system_job":
+        return SystemJobExecutionProfile()
     return DefaultTaskExecutionProfile()
 
 
@@ -63,7 +69,7 @@ def normalize_task_profile(value: str | None) -> str | None:
         raise ValueError(
             "Unknown profile "
             f"'{value}'. Allowed: default, rss_newspaper, news_magazine, maintenance, "
-            "briefing, morning_briefing, weather_conditions, topic_watcher, iss_pass_watcher"
+            "briefing, morning_briefing, weather_conditions, topic_watcher, iss_pass_watcher, system_job"
         )
     if v in _RSS_NEWSPAPER_ALIASES:
         return "rss_newspaper"

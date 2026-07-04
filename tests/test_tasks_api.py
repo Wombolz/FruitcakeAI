@@ -254,6 +254,88 @@ async def test_create_task_accepts_explicit_recipe_family_from_editor(client):
 
 
 @pytest.mark.asyncio
+async def test_create_task_accepts_explicit_system_job_recipe_family(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "systemjobuser",
+            "email": "systemjob@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "systemjobuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Nightly Memory Extraction",
+            "instruction": "Run nightly memory extraction.",
+            "task_type": "recurring",
+            "schedule": "0 3 * * *",
+            "deliver": False,
+            "requires_approval": False,
+            "recipe_family": "system_job",
+            "recipe_params": {
+                "job_name": "nightly_memory_extraction",
+                "since_hours": 24,
+            },
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["profile"] == "system_job"
+    assert payload["task_recipe"]["family"] == "system_job"
+    assert payload["task_recipe"]["params"]["job_name"] == "nightly_memory_extraction"
+    assert payload["task_recipe"]["selected_executor_kind"] == "deterministic_job"
+
+
+@pytest.mark.asyncio
+async def test_create_task_accepts_refresh_rss_cache_as_system_job(client):
+    await client.post(
+        "/auth/register",
+        json={
+            "username": "rsssystemjobuser",
+            "email": "rsssystemjob@example.com",
+            "password": "pass123",
+        },
+    )
+    login = await client.post(
+        "/auth/login",
+        json={"username": "rsssystemjobuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = await client.post(
+        "/tasks",
+        json={
+            "title": "Refresh RSS Cache",
+            "instruction": "Refresh the RSS cache.",
+            "task_type": "recurring",
+            "schedule": "every:1h",
+            "deliver": False,
+            "requires_approval": False,
+        },
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["profile"] == "system_job"
+    assert payload["task_recipe"]["family"] == "system_job"
+    assert payload["task_recipe"]["params"]["job_name"] == "refresh_rss_cache"
+    assert payload["task_recipe"]["params"]["max_items_per_source"] == 20
+    assert payload["task_recipe"]["selected_executor_kind"] == "deterministic_job"
+
+
+@pytest.mark.asyncio
 async def test_create_task_accepts_briefing_market_symbol_from_editor(client):
     await client.post(
         "/auth/register",

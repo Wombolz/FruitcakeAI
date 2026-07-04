@@ -2388,7 +2388,7 @@ async def test_update_task_can_switch_from_watcher_to_daily_briefing_recipe():
 
 
 @pytest.mark.asyncio
-async def test_create_task_tool_normalizes_maintenance_recipe():
+async def test_create_task_tool_normalizes_refresh_rss_cache_to_system_job():
     import app.agent.tools as tools_module
     from app.db.models import Task
 
@@ -2407,16 +2407,16 @@ async def test_create_task_tool_normalizes_maintenance_recipe():
 
     payload = json.loads(result)
     assert payload["created"] is True
-    assert payload["profile"] == "maintenance"
-    assert payload["task_recipe"]["family"] == "maintenance"
-    assert "maintenance task" in payload["task_confirmation"].lower()
+    assert payload["profile"] == "system_job"
+    assert payload["task_recipe"]["family"] == "system_job"
+    assert "system job task" in payload["task_confirmation"].lower()
 
     async with TestSessionLocal() as db:
         task = await db.get(Task, payload["task_id"])
         assert task is not None
-        assert task.profile == "maintenance"
-        assert task.instruction.startswith("tool: refresh_rss_cache")
-        assert task.task_recipe["family"] == "maintenance"
+        assert task.profile == "system_job"
+        assert task.instruction.startswith("job_name: refresh_rss_cache")
+        assert task.task_recipe["family"] == "system_job"
 
 
 @pytest.mark.asyncio

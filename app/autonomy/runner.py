@@ -649,6 +649,16 @@ class TaskRunner:
         user_context.session_id = session_id
         user_context.task_id = task_id
 
+        if task_profile and task_profile.execution_backend(run_context=run_context) != "agent":
+            return await self._execute_non_agent_task(
+                task_id=task_id,
+                task_user_id=task_user_id,
+                session_id=session_id,
+                task_run_id=task_run_id,
+                task_profile=task_profile,
+                run_context=run_context,
+            )
+
         # Planned mode: execute TaskStep graph.
         if has_plan:
             async with AsyncSessionLocal() as db:
@@ -791,9 +801,47 @@ class TaskRunner:
 
     @staticmethod
     def _should_auto_plan(task: Task) -> bool:
+        recipe = task.task_recipe if isinstance(task.task_recipe, dict) else {}
+        if str(recipe.get("family") or "").strip().lower() == "system_job":
+            return False
         if _is_agent_recipe_task(task):
             return False
         return bool(task.schedule) or task.task_type == "recurring"
+
+    async def _execute_non_agent_task(
+        self,
+        *,
+        task_id: int,
+        task_user_id: int,
+        session_id: int,
+        task_run_id: int | None,
+        task_profile,
+        run_context: dict[str, object],
+    ) -> tuple[str, dict[str, object]]:
+        from app.db.session import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            task = await db.get(Task, task_id)
+            user = await db.get(User, task_user_id)
+            if task is None:
+                raise ValueError(f"Task {task_id} not found")
+            if user is None:
+                raise ValueError(f"User {task_user_id} not found for task {task_id}")
+            result, run_debug = await task_profile.execute_non_agent(
+                db=db,
+                task=task,
+                user=user,
+                run_context=run_context,
+                task_run_id=task_run_id,
+            )
+            await db.commit()
+
+        run_debug = dict(run_debug or {})
+        run_debug.setdefault("profile", getattr(task_profile, "name", "default"))
+        run_debug.setdefault("active_skills", [])
+        run_debug.setdefault("skill_selection_mode", "disabled_for_non_agent")
+        run_debug.setdefault("skill_injection_events", [])
+        return result, run_debug
 
     async def _execute_planned_steps(
         self,

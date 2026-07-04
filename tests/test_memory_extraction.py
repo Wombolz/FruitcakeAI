@@ -12,13 +12,14 @@ Nightly memory-extraction tests (memory v2 Day 4).
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
 
 from app.db.models import ChatMessage, ChatSession, Memory, MemoryProposal, User
-from app.memory.extraction import run_memory_extraction_for_user, run_nightly_memory_extraction
+from app.memory.extraction import _recent_transcript, run_memory_extraction_for_user, run_nightly_memory_extraction
 from tests.conftest import TestSessionLocal
 
 
@@ -35,6 +36,11 @@ def _fake_llm(candidates):
         choices = [_Choice()]
 
     return AsyncMock(return_value=_Resp())
+
+
+def _fake_llm_sequence(*candidate_groups):
+    responses = [_fake_llm(candidates).return_value for candidates in candidate_groups]
+    return AsyncMock(side_effect=responses)
 
 
 async def _headers(client, username: str, *, admin: bool = False) -> dict[str, str]:
@@ -77,11 +83,29 @@ CANDIDATES = [
      "attribute": "school", "importance": 0.7, "confidence": 0.4},
 ]
 
+PROJECT_CANDIDATES = [
+    {
+        "kind": "fact",
+        "content": "The Fruitcake repo root is /Users/jwomble/Development/fruitcake_v5.",
+        "subject": "Fruitcake repo",
+        "attribute": "root",
+        "importance": 0.9,
+        "confidence": 0.92,
+    },
+    {
+        "kind": "directive",
+        "content": "Use Docs/_internal for local planning notes and keep them out of git.",
+        "importance": 0.82,
+        "confidence": 0.88,
+    },
+]
+
 
 @pytest.mark.asyncio
 async def test_extraction_queues_and_auto_approves_narrowly():
     user_id = await _seed_user_with_chat("extractuser")
-    with patch("app.memory.extraction.litellm.acompletion", new=_fake_llm(CANDIDATES)):
+    fake = _fake_llm_sequence(CANDIDATES, [])
+    with patch("app.memory.extraction.litellm.acompletion", new=fake):
         async with TestSessionLocal() as db:
             stats = await run_memory_extraction_for_user(db, user_id)
             await db.commit()
@@ -102,13 +126,17 @@ async def test_extraction_queues_and_auto_approves_narrowly():
         assert memory.kind == "fact"
         assert memory.source == "extraction"
         assert memory.subject_key == "joey:allergy"
+        assert "lane:household" in memory.tags_list
+        assert "lane:household" in approved.proposal_payload["tags"]
 
         directive = by_content["Always avoid tree nuts in meal plans."]
         assert directive.status == "pending"
         assert "review" in (directive.reason or "").lower()
+        assert "lane:household" in directive.proposal_payload["tags"]
 
         low_confidence = by_content["Emma attends Lincoln Elementary now."]
         assert low_confidence.status == "pending"
+    assert fake.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -123,7 +151,7 @@ async def test_extraction_marks_would_supersede_for_review():
         ))
         await db.commit()
 
-    with patch("app.memory.extraction.litellm.acompletion", new=_fake_llm([CANDIDATES[0]])):
+    with patch("app.memory.extraction.litellm.acompletion", new=_fake_llm_sequence([CANDIDATES[0]], [])):
         async with TestSessionLocal() as db:
             stats = await run_memory_extraction_for_user(db, user_id)
             await db.commit()
@@ -158,7 +186,10 @@ async def test_extraction_never_reads_incognito_sessions():
 @pytest.mark.asyncio
 async def test_rerun_does_not_duplicate_proposals():
     user_id = await _seed_user_with_chat("extractrerun")
-    with patch("app.memory.extraction.litellm.acompletion", new=_fake_llm([CANDIDATES[1]])):
+    with patch(
+        "app.memory.extraction.litellm.acompletion",
+        new=_fake_llm_sequence([CANDIDATES[1]], [], [CANDIDATES[1]], []),
+    ):
         async with TestSessionLocal() as db:
             await run_memory_extraction_for_user(db, user_id)
             await db.commit()
@@ -187,6 +218,78 @@ async def test_admin_endpoint_requires_admin_and_runs(client):
     pheaders = await _headers(client, "extractparent")
     denied = await client.post("/admin/memory-extraction/run", headers=pheaders)
     assert denied.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_recent_transcript_ignores_empty_assistant_rows():
+    async with TestSessionLocal() as db:
+        user = User(username="extractempty", email="extractempty@example.com", hashed_password="x", role="parent")
+        db.add(user)
+        await db.flush()
+        session = ChatSession(user_id=user.id, title="t", is_incognito=False)
+        db.add(session)
+        await db.flush()
+        db.add_all([
+            ChatMessage(session_id=session.id, role="user", content="Remember that the repo root is fruitcake_v5."),
+            ChatMessage(session_id=session.id, role="assistant", content=""),
+            ChatMessage(session_id=session.id, role="assistant", content="Confirmed."),
+        ])
+        await db.commit()
+        transcript = await _recent_transcript(
+            db,
+            user.id,
+            datetime.now(timezone.utc) - timedelta(hours=24),
+        )
+
+    assert "assistant: \n" not in transcript
+    assert "assistant: Confirmed." in transcript
+
+
+@pytest.mark.asyncio
+async def test_extraction_project_lane_persists_project_memory_tags():
+    async with TestSessionLocal() as db:
+        user = User(username="extractproject", email="extractproject@example.com", hashed_password="x", role="parent")
+        db.add(user)
+        await db.flush()
+        session = ChatSession(user_id=user.id, title="t", is_incognito=False)
+        db.add(session)
+        await db.flush()
+        db.add_all([
+            ChatMessage(
+                session_id=session.id,
+                role="user",
+                content="Our Fruitcake repo lives at /Users/jwomble/Development/fruitcake_v5 and Docs/_internal is for local planning only.",
+            ),
+            ChatMessage(
+                session_id=session.id,
+                role="assistant",
+                content="Understood. I'll treat that repo root and Docs/_internal convention as part of the project setup.",
+            ),
+        ])
+        await db.commit()
+        user_id = user.id
+
+    fake = _fake_llm_sequence([], PROJECT_CANDIDATES)
+    with patch("app.memory.extraction.litellm.acompletion", new=fake):
+        async with TestSessionLocal() as db:
+            stats = await run_memory_extraction_for_user(db, user_id)
+            await db.commit()
+
+    assert stats["candidates"] == 2
+    assert stats["auto_approved"] == 1
+    assert stats["queued"] == 1
+    async with TestSessionLocal() as db:
+        proposals = (await db.execute(
+            select(MemoryProposal).where(MemoryProposal.user_id == user_id)
+        )).scalars().all()
+        by_content = {p.content: p for p in proposals}
+        repo_root = by_content["The Fruitcake repo root is /Users/jwomble/Development/fruitcake_v5."]
+        directive = by_content["Use Docs/_internal for local planning notes and keep them out of git."]
+        assert "lane:project" in repo_root.proposal_payload["tags"]
+        assert "lane:project" in directive.proposal_payload["tags"]
+        memory = await db.get(Memory, repo_root.approved_memory_id)
+        assert memory is not None
+        assert "lane:project" in memory.tags_list
 
 
 @pytest.mark.asyncio

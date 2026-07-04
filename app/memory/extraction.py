@@ -40,7 +40,8 @@ AUTO_APPROVE_CONFIDENCE = 0.75
 MAX_CANDIDATES_PER_USER = 12
 MAX_TRANSCRIPT_CHARS = 24_000
 
-_EXTRACTION_PROMPT = """You review one day of a household assistant's chat \
+_EXTRACTION_PROMPTS: dict[str, str] = {
+    "household": """You review one day of a household assistant's chat \
 transcripts and extract durable memories worth keeping about the user and \
 their household.
 
@@ -54,12 +55,37 @@ Extract only:
 - standing behavioral instructions the user clearly stated (kind=directive)
 - meaningful near-term events (kind=journal)
 
-Never extract: task/work state, one-off chatter, anything the assistant said
+Never extract: project/work state, one-off chatter, anything the assistant said
 without user confirmation, implementation details, or secrets/credentials.
 Return [] when nothing qualifies.
 
 Transcript:
-"""
+""",
+    "project": """You review one day of a technical assistant's chat \
+transcripts and extract durable project or workflow memories worth keeping.
+
+Return ONLY a JSON array (no prose). Each item:
+{"kind": "fact|journal|directive", "content": "<self-contained statement>", \
+"subject": "<who/what, for facts>", "attribute": "<which property, for facts>", \
+"importance": 0.0-1.0, "confidence": 0.0-1.0}
+
+Extract only:
+- durable project facts or environment constraints the user clearly confirmed
+- stable workflow preferences, operating rules, or standing instructions \
+  (kind=directive)
+- meaningful project events that are likely to matter in the near term \
+  (kind=journal)
+
+Never extract: ordinary question/answer chatter, speculative assistant advice, \
+one-off execution details, secrets/credentials, or web/news content unless the \
+user clearly confirmed it as part of their enduring workflow or project state.
+Use self-contained wording like "The Fruitcake repo root is ..." or \
+"Use Docs/_internal for local planning notes."
+Return [] when nothing qualifies.
+
+Transcript:
+""",
+}
 
 
 def _extraction_model() -> str:
@@ -96,6 +122,66 @@ def _parse_candidates(raw: str) -> list[dict[str, Any]]:
             }
         )
     return out[:MAX_CANDIDATES_PER_USER]
+
+
+async def _extract_candidates_for_lane(transcript: str, lane: str) -> list[dict[str, Any]]:
+    prompt = _EXTRACTION_PROMPTS.get(lane)
+    if not prompt:
+        return []
+    response = await litellm.acompletion(
+        model=_extraction_model(),
+        messages=[{"role": "user", "content": prompt + transcript}],
+        max_tokens=1200,
+    )
+    return _parse_candidates(response.choices[0].message.content or "")
+
+
+def _merge_lane_candidates(lane_results: list[tuple[str, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for lane, candidates in lane_results:
+        for candidate in candidates:
+            content = str(candidate.get("content") or "").strip()
+            if not content:
+                continue
+            key = content.lower()
+            if key not in merged:
+                merged[key] = dict(candidate)
+                merged[key]["lanes"] = {lane}
+                order.append(key)
+                continue
+            existing = merged[key]
+            existing["lanes"].add(lane)
+            if candidate.get("subject") and not existing.get("subject"):
+                existing["subject"] = candidate["subject"]
+            if candidate.get("attribute") and not existing.get("attribute"):
+                existing["attribute"] = candidate["attribute"]
+            existing_confidence = float(existing.get("confidence") or 0.0)
+            candidate_confidence = float(candidate.get("confidence") or 0.0)
+            existing["importance"] = max(
+                float(existing.get("importance") or 0.0),
+                float(candidate.get("importance") or 0.0),
+            )
+            existing["confidence"] = max(existing_confidence, candidate_confidence)
+            if candidate_confidence > existing_confidence:
+                existing["kind"] = candidate.get("kind") or existing.get("kind")
+
+    ordered = [merged[key] for key in order]
+    ordered.sort(
+        key=lambda item: (
+            float(item.get("importance") or 0.0),
+            float(item.get("confidence") or 0.0),
+        ),
+        reverse=True,
+    )
+    return ordered[:MAX_CANDIDATES_PER_USER]
+
+
+def _candidate_tags(candidate: dict[str, Any]) -> list[str]:
+    tags = ["nightly_extraction"]
+    for lane in sorted(str(lane).strip() for lane in (candidate.get("lanes") or set()) if str(lane).strip()):
+        tags.append(f"lane:{lane}")
+    return tags
 
 
 async def _recent_transcript(db: AsyncSession, user_id: int, since: datetime) -> str:
@@ -162,12 +248,10 @@ async def run_memory_extraction_for_user(
     if not transcript.strip():
         return stats
 
-    response = await litellm.acompletion(
-        model=_extraction_model(),
-        messages=[{"role": "user", "content": _EXTRACTION_PROMPT + transcript}],
-        max_tokens=1200,
-    )
-    candidates = _parse_candidates(response.choices[0].message.content or "")
+    lane_results: list[tuple[str, list[dict[str, Any]]]] = []
+    for lane in ("household", "project"):
+        lane_results.append((lane, await _extract_candidates_for_lane(transcript, lane)))
+    candidates = _merge_lane_candidates(lane_results)
     stats["candidates"] = len(candidates)
     if not candidates:
         return stats
@@ -187,6 +271,7 @@ async def run_memory_extraction_for_user(
             and candidate["kind"] in {"fact", "journal"}
             and not would_supersede
         )
+        tags = _candidate_tags(candidate)
 
         proposal = MemoryProposal(
             proposal_key=key,
@@ -208,7 +293,8 @@ async def run_memory_extraction_for_user(
                     "subject": candidate["subject"],
                     "attribute": candidate["attribute"],
                     "importance": candidate["importance"],
-                    "tags": ["nightly_extraction"],
+                    "tags": tags,
+                    "lanes": sorted(candidate.get("lanes") or []),
                 }
             ),
         )
@@ -224,7 +310,7 @@ async def run_memory_extraction_for_user(
                 subject=candidate["subject"],
                 attribute=candidate["attribute"],
                 importance=candidate["importance"],
-                tags=["nightly_extraction"],
+                tags=tags,
                 source="extraction",
                 confidence=candidate["confidence"],
             )

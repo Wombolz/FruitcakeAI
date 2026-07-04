@@ -17,6 +17,7 @@ _RECIPE_FAMILIES = {
     "iss_pass_watcher",
     "weather_conditions",
     "maintenance",
+    "system_job",
 }
 
 
@@ -72,6 +73,8 @@ def normalize_task_recipe(
         return _build_weather_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
     if family == "maintenance":
         return _build_maintenance_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
+    if family == "system_job":
+        return _build_system_job_recipe(title=title, instruction=instruction, task_type=task_type, params=params)
     return None
 
 
@@ -91,7 +94,10 @@ def build_task_recipe_metadata(
         "params": recipe.params,
         "assumptions": recipe.assumptions,
         "selected_profile": selected_profile,
-        "selected_executor_kind": str((executor_config or {}).get("kind") or "") or None,
+        "selected_executor_kind": (
+            str((executor_config or {}).get("kind") or "")
+            or ("deterministic_job" if recipe.family == "system_job" else None)
+        ),
         "instruction_style": "recipe_v1",
     }
 
@@ -193,6 +199,14 @@ def build_task_confirmation_text(
             + _schedule_suffix(schedule)
         )
 
+    if family == "system_job":
+        job_name = str(params.get("job_name") or "system job").strip()
+        return (
+            f"Created a {cadence} system job task, '{title}', for {job_name}."
+            " It will run directly in the backend task system without an LLM execution loop."
+            + _schedule_suffix(schedule)
+        )
+
     summary = build_task_recipe_summary(
         title=title,
         task_type=task_type,
@@ -266,7 +280,9 @@ def _resolve_recipe_family(
     ):
         return "weather_conditions"
     if "refresh_rss_cache" in lowered or ("refresh" in lowered and "rss" in lowered and "cache" in lowered):
-        return "maintenance"
+        return "system_job"
+    if "memory extraction" in lowered or "memory consolidation" in lowered:
+        return "system_job"
     inferred = infer_configured_executor(
         title=title,
         instruction=instruction,
@@ -573,6 +589,85 @@ def _build_maintenance_recipe(
         profile="maintenance",
         params={"tool": "refresh_rss_cache", "args": args},
         assumptions=["defaulted refresh_rss_cache max_items_per_source to 20"] if "max_items_per_source" not in params else [],
+    )
+
+
+def _build_system_job_recipe(
+    *,
+    title: str,
+    instruction: str,
+    task_type: str,
+    params: dict[str, Any],
+) -> NormalizedTaskRecipe | None:
+    requested_job_name = _string_param(params, "job_name")
+    lowered = f"{title}\n{instruction}".lower()
+    job_name = requested_job_name or (
+        "refresh_rss_cache"
+        if ("refresh_rss_cache" in lowered or ("refresh" in lowered and "rss" in lowered and "cache" in lowered))
+        else (
+            "nightly_memory_extraction"
+            if ("memory extraction" in lowered or "memory consolidation" in lowered)
+            else None
+        )
+    )
+    if not job_name:
+        return None
+    job_name = job_name.strip().lower()
+    if job_name not in {"nightly_memory_extraction", "refresh_rss_cache"}:
+        return None
+    assumptions: list[str] = []
+
+    if job_name == "nightly_memory_extraction":
+        since_hours = _int_param(params, "since_hours") or 24
+        since_hours = max(1, min(168, since_hours))
+        if _int_param(params, "since_hours") is None:
+            assumptions.append("defaulted nightly_memory_extraction since_hours to 24")
+        return NormalizedTaskRecipe(
+            family="system_job",
+            confidence="high",
+            title=_string_param(params, "title") or "Nightly Memory Extraction",
+            instruction=(
+                "job_name: nightly_memory_extraction\n"
+                f"since_hours: {since_hours}\n\n"
+                "Run the nightly memory extraction pipeline directly in the backend task system."
+            ),
+            task_type=task_type,
+            profile="system_job",
+            params={"job_name": "nightly_memory_extraction", "since_hours": since_hours},
+            assumptions=assumptions,
+        )
+
+    max_items = _int_param(params, "max_items_per_source") or _extract_refresh_rss_cache_max_items(instruction) or 20
+    max_items = max(1, min(50, max_items))
+    category = _string_param(params, "category")
+    if _int_param(params, "max_items_per_source") is None:
+        assumptions.append("defaulted refresh_rss_cache max_items_per_source to 20")
+    recipe_params: dict[str, Any] = {
+        "job_name": "refresh_rss_cache",
+        "max_items_per_source": max_items,
+    }
+    instruction_lines = [
+        "job_name: refresh_rss_cache",
+        f"max_items_per_source: {max_items}",
+    ]
+    if category:
+        recipe_params["category"] = category
+        instruction_lines.append(f"category: {category}")
+    instruction_lines.extend(
+        [
+            "",
+            "Run the RSS cache refresh directly in the backend task system.",
+        ]
+    )
+    return NormalizedTaskRecipe(
+        family="system_job",
+        confidence="high",
+        title=_string_param(params, "title") or "Refresh RSS Cache",
+        instruction="\n".join(instruction_lines),
+        task_type=task_type,
+        profile="system_job",
+        params=recipe_params,
+        assumptions=assumptions,
     )
 
 
