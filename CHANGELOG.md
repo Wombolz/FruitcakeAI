@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.30
+
+- Added deterministic `system_job` task execution for non-LLM maintenance workflows, allowing trusted internal jobs to run directly through profiles instead of being routed through the generic agent loop.
+- Added built-in system-job handlers for nightly memory extraction and RSS cache refresh, preserving task scheduling, run records, and inspection behavior while avoiding unnecessary model calls.
+- Extended task recipe normalization so explicit `system_job` tasks and refresh-RSS task creation paths resolve to the deterministic maintenance profile.
+- Added focused coverage for system-job profile resolution, direct execution, task API creation, memory extraction review-queue behavior, and RSS refresh execution without LLM agent churn.
+
 ## v0.7.29
 
 - Added admin-only incognito chat sessions with blocked side effects, ephemeral transcript cleanup on session delete, and minimal non-content retention aligned with the documented trust boundary.
