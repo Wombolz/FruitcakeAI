@@ -69,6 +69,22 @@ mcp_servers:
       shell_execution: false
       writes_disk: false
 
+  # FruitcakeImageLab companion app (~/Development/FruitcakeImageLab).
+  # Long timeout: generation is synchronous and the first run after ComfyUI
+  # starts includes checkpoint load. See Docs/_internal/comfyui_image_lab_mcp_v1_plan.md.
+  comfyui_image_lab:
+    type: http
+    url: http://localhost:47835
+    enabled: true
+    timeout: 300
+    classification: first_class_mcp
+    shipping_default: false
+    trust_boundary:
+      first_party: true
+      uses_network: true   # localhost HTTP to ComfyUI at 127.0.0.1:8188
+      shell_execution: false
+      writes_disk: true
+
   # ── Docker stdio servers ─────────────────────────────────────────────────────
   # These require Docker + the image to be available locally.
   # Alpha default: disabled unless intentionally enabled by the operator.

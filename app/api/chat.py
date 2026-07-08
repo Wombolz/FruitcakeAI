@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import re
 import time
+import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -114,6 +115,7 @@ _WEB_EVIDENCE_TOOL_NAMES = {
     "get_intraday_market_data",
     "search_places",
 }
+_IMAGE_EVIDENCE_TOOL_NAMES = {"generate_image"}
 _WORKSPACE_EXPLICIT_HINTS = (
     "workspace",
     "working on",
@@ -2291,6 +2293,36 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
                 cleaned_details.append(cleaned_item)
             if cleaned_details:
                 normalized_evidence["tool_details"] = cleaned_details
+        image_artifacts = evidence.get("image_artifacts")
+        if isinstance(image_artifacts, list):
+            cleaned_images = []
+            for item in image_artifacts[:6]:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or item.get("image_path") or "").strip()
+                if not path:
+                    continue
+                cleaned_item: Dict[str, Any] = {"path": path[:500]}
+                for source_key, target_key, max_len in (
+                    ("title", "title", 160),
+                    ("prompt", "prompt", 500),
+                    ("workflow", "workflow", 80),
+                    ("source_tool", "source_tool", 80),
+                ):
+                    value = str(item.get(source_key) or "").strip()
+                    if value:
+                        cleaned_item[target_key] = value[:max_len]
+                for key in ("seed", "width", "height"):
+                    value = item.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        cleaned_item[key] = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                cleaned_images.append(cleaned_item)
+            if cleaned_images:
+                normalized_evidence["image_artifacts"] = cleaned_images
         if normalized_evidence:
             normalized["evidence"] = normalized_evidence
 
@@ -2316,6 +2348,8 @@ def _evidence_kind_for_tool_name(tool_name: str) -> str | None:
         return "rss"
     if normalized in _WEB_EVIDENCE_TOOL_NAMES:
         return "web"
+    if normalized in _IMAGE_EVIDENCE_TOOL_NAMES:
+        return "image"
     return None
 
 
@@ -2351,6 +2385,9 @@ def _build_assistant_evidence_metadata(
     tool_details = _build_assistant_tool_details(executed_tools)
     if tool_details:
         evidence["tool_details"] = tool_details
+    image_artifacts = _build_assistant_image_artifacts(executed_tools)
+    if image_artifacts:
+        evidence["image_artifacts"] = image_artifacts
     return evidence
 
 
@@ -2422,6 +2459,86 @@ def _build_assistant_tool_details(executed_tools: List[Dict[str, Any]]) -> List[
                 return details
 
     return details
+
+
+def _build_assistant_image_artifacts(executed_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    artifacts: List[Dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    for record in executed_tools or []:
+        if not isinstance(record, dict):
+            continue
+        tool_name = str(record.get("tool") or "").strip()
+        if tool_name not in _IMAGE_EVIDENCE_TOOL_NAMES:
+            continue
+        payload = _parse_image_tool_result(record.get("result_summary"))
+        if not payload:
+            continue
+        image_path = str(payload.get("image_path") or payload.get("path") or "").strip()
+        if not image_path or image_path in seen_paths:
+            continue
+        seen_paths.add(image_path)
+
+        item: Dict[str, Any] = {
+            "path": image_path,
+            "source_tool": tool_name,
+        }
+        prompt = str(payload.get("prompt") or (record.get("arguments") or {}).get("prompt") or "").strip()
+        if prompt:
+            item["prompt"] = prompt
+            item["title"] = _image_artifact_title(prompt)
+        workflow = str(payload.get("workflow") or (record.get("arguments") or {}).get("workflow") or "").strip()
+        if workflow:
+            item["workflow"] = workflow
+        for key in ("seed", "width", "height"):
+            value = payload.get(key)
+            if value is None and isinstance(record.get("arguments"), dict):
+                value = record["arguments"].get(key)
+            if value is None:
+                continue
+            try:
+                item[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+        artifacts.append(item)
+        if len(artifacts) >= 6:
+            break
+    return artifacts
+
+
+def _parse_image_tool_result(raw: Any) -> Dict[str, Any] | None:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text or "image_path" not in text:
+        return None
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            value = parser(text)
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            return value
+    match = re.search(r"(\{.*?image_path.*?\})", text, flags=re.DOTALL)
+    if match:
+        snippet = match.group(1)
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                value = parser(snippet)
+            except Exception:
+                continue
+            if isinstance(value, dict):
+                return value
+    return None
+
+
+def _image_artifact_title(prompt: str) -> str:
+    compact = " ".join(str(prompt or "").split())
+    if len(compact) <= 72:
+        return compact
+    return compact[:69].rstrip() + "..."
 def _build_assistant_message_metadata(
     *,
     handoff_metadata: Dict[str, Any],

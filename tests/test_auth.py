@@ -6,6 +6,7 @@ Uses an in-memory SQLite database so no real postgres is needed.
 import asyncio
 import contextlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -17,6 +18,7 @@ from unittest.mock import AsyncMock, patch
 from app.api.chat import _execute_chat_turn, _run_websocket_message, chat_websocket
 from app.agent.context import UserContext
 from app.chat_runtime import get_chat_run_manager
+from app.config import settings
 from app.db.session import Base, get_db
 from app.db.models import ChatMessage, ChatSession, User
 from app.main import app
@@ -1560,6 +1562,45 @@ def test_build_assistant_evidence_metadata_counts_repeated_web_sources():
     assert evidence["source_counts"] == {"web": 3}
 
 
+def test_build_assistant_evidence_metadata_includes_generated_image_artifact():
+    from app.api.chat import _build_assistant_evidence_metadata
+
+    evidence = _build_assistant_evidence_metadata(
+        [
+            {
+                "tool": "generate_image",
+                "arguments": {"prompt": "A tiny robot baking a cake", "workflow": "sdxl_basic"},
+                "result_summary": json.dumps(
+                    {
+                        "image_path": "generated_images/robot.png",
+                        "prompt": "A tiny robot baking a cake",
+                        "workflow": "sdxl_basic",
+                        "seed": 123,
+                        "width": 1024,
+                        "height": 1024,
+                    }
+                ),
+            }
+        ]
+    )
+
+    assert evidence is not None
+    assert evidence["source_kinds"] == ["image"]
+    assert evidence["source_counts"] == {"image": 1}
+    assert evidence["image_artifacts"] == [
+        {
+            "path": "generated_images/robot.png",
+            "source_tool": "generate_image",
+            "prompt": "A tiny robot baking a cake",
+            "title": "A tiny robot baking a cake",
+            "workflow": "sdxl_basic",
+            "seed": 123,
+            "width": 1024,
+            "height": 1024,
+        }
+    ]
+
+
 def test_normalize_assistant_metadata_payload_passes_through_source_title_and_kind():
     from app.api.chat import _normalize_assistant_metadata_payload
 
@@ -1592,6 +1633,104 @@ def test_normalize_assistant_metadata_payload_passes_through_source_title_and_ki
                 "source_title": "Swift Mission Overview",
             }
         ]
+
+
+def test_normalize_assistant_metadata_payload_passes_through_image_artifacts():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    normalized = _normalize_assistant_metadata_payload(
+        {
+            "tool_calls": ["generate_image"],
+            "evidence": {
+                "grounded": True,
+                "image_artifacts": [
+                    {
+                        "path": "generated_images/robot.png",
+                        "title": "Robot cake",
+                        "prompt": "A tiny robot baking a cake",
+                        "workflow": "sdxl_basic",
+                        "seed": "123",
+                        "width": 1024,
+                        "height": 1024,
+                        "source_tool": "generate_image",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert normalized["evidence"]["image_artifacts"] == [
+        {
+            "path": "generated_images/robot.png",
+            "title": "Robot cake",
+            "prompt": "A tiny robot baking a cake",
+            "workflow": "sdxl_basic",
+            "seed": 123,
+            "width": 1024,
+            "height": 1024,
+            "source_tool": "generate_image",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_workspace_image_endpoint_serves_owned_workspace_image(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    await client.post("/auth/register", json={
+        "username": "imageuser",
+        "email": "imageuser@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "imageuser", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    image_path = Path(tmp_path) / "1" / "generated_images" / "robot.png"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+        b"\x1f\x15\xc4\x89\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    response = await client.get(
+        "/workspace/images",
+        params={"path": "generated_images/robot.png"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/png")
+    assert response.content.startswith(b"\x89PNG")
+
+
+@pytest.mark.asyncio
+async def test_workspace_image_endpoint_rejects_non_images_and_path_escape(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    await client.post("/auth/register", json={
+        "username": "imagenoaccess",
+        "email": "imagenoaccess@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "imagenoaccess", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    note_path = Path(tmp_path) / "1" / "generated_images" / "note.txt"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text("not an image", encoding="utf-8")
+
+    non_image = await client.get(
+        "/workspace/images",
+        params={"path": "generated_images/note.txt"},
+        headers=headers,
+    )
+    escaped = await client.get(
+        "/workspace/images",
+        params={"path": "../2/generated_images/other.png"},
+        headers=headers,
+    )
+
+    assert non_image.status_code == 400
+    assert escaped.status_code == 400
 
 
 @pytest.mark.asyncio
