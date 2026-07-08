@@ -10,10 +10,14 @@ Sprint 2.1: MCP tools added here automatically via registry.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
+import io
 import json
 import logging
+import mimetypes
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import structlog
@@ -317,6 +321,31 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "limit": {"type": "integer", "description": "Maximum number of results to return (default 5, max 8).", "default": 5},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "describe_image",
+            "description": (
+                "Inspect an image file in the current user's workspace using the configured vision model and return a grounded text description. "
+                "Use this when the user asks what is visible in an image, whether a generated image matches a prompt, or for OCR-like visual inspection. "
+                "This reads workspace images only; it cannot access arbitrary host paths."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative image path, for example 'generated_images/example.png'.",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "Optional focused visual question. Defaults to a concise description request.",
+                    },
+                },
+                "required": ["path"],
             },
         },
     },
@@ -1115,6 +1144,9 @@ async def _call_tool(
     if name == "summarize_document":
         return await _summarize_document(arguments, user_context)
 
+    if name == "describe_image":
+        return await _describe_image(arguments, user_context)
+
     if name == "list_library_documents":
         return await _list_library_documents(arguments, user_context)
 
@@ -1474,6 +1506,114 @@ async def _list_library_documents(
         for d in rows
     ]
     return json.dumps({"count": len(docs), "documents": docs}, ensure_ascii=False)
+
+
+_DESCRIBE_IMAGE_ALLOWED_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+async def _describe_image(arguments: Dict[str, Any], user_context: UserContext) -> str:
+    """Describe a workspace image using a configured vision-capable model."""
+    import litellm
+    from app.agent.core import _litellm_kwargs
+    from app.config import settings
+    from app.llm_usage import record_llm_usage_event
+    from app.mcp.servers.filesystem import resolve_workspace_path_for_user
+
+    model = str(settings.image_vision_model or "").strip()
+    if not model:
+        return (
+            "Image description is not configured. Set IMAGE_VISION_MODEL to a vision-capable model "
+            "(for example a local Qwen-VL, LLaVA, or MiniCPM-V model) and retry."
+        )
+
+    raw_path = str(arguments.get("path") or "").strip()
+    if not raw_path:
+        return "No image path provided."
+    question = str(arguments.get("question") or "").strip()
+    if not question:
+        question = "Describe the visible contents of this image. Distinguish observed details from uncertainty."
+
+    try:
+        _, image_path = resolve_workspace_path_for_user(user_context.user_id, raw_path)
+    except ValueError as exc:
+        return f"Image path is not allowed: {exc}"
+
+    if not image_path.exists() or not image_path.is_file():
+        return f"Image not found: {raw_path}"
+    if image_path.suffix.lower() not in _DESCRIBE_IMAGE_ALLOWED_SUFFIXES:
+        return "Unsupported image type. Supported formats: png, jpg, jpeg, webp, gif."
+    if image_path.stat().st_size > settings.image_vision_max_bytes:
+        return (
+            f"Image is too large to inspect safely ({image_path.stat().st_size} bytes). "
+            f"Limit is {settings.image_vision_max_bytes} bytes."
+        )
+
+    try:
+        data_url = _workspace_image_data_url(
+            image_path,
+            max_dimension=int(settings.image_vision_max_dimension),
+        )
+    except Exception as exc:
+        log.error("Image preparation failed", path=raw_path, error=str(exc))
+        return f"Image could not be prepared for inspection: {exc}"
+
+    prompt = (
+        "You are inspecting a user-provided workspace image. "
+        "Answer only from visible image evidence. If uncertain, say so. "
+        "Do not infer hidden context from the filename or prompt metadata.\n\n"
+        f"Question: {question}"
+    )
+    response = await litellm.acompletion(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        **_litellm_kwargs(model),
+    )
+    await record_llm_usage_event(
+        response,
+        user_id=user_context.user_id,
+        source="tool_image_description",
+        stage="tool_image_description",
+        model=model,
+    )
+    description = str(response.choices[0].message.content or "").strip()
+    if not description:
+        return f"No visual description was returned for {raw_path}."
+    return (
+        f"Image inspected: {raw_path}\n"
+        f"Question: {question}\n\n"
+        f"{description}"
+    )
+
+
+def _workspace_image_data_url(image_path: Path, *, max_dimension: int) -> str:
+    from PIL import Image
+
+    mime_type = mimetypes.guess_type(str(image_path))[0] or "image/png"
+    max_dimension = max(256, int(max_dimension or 2048))
+    with Image.open(image_path) as image:
+        image.load()
+        if max(image.size) <= max_dimension:
+            payload = image_path.read_bytes()
+            return f"data:{mime_type};base64,{base64.b64encode(payload).decode('ascii')}"
+
+        image.thumbnail((max_dimension, max_dimension))
+        output = io.BytesIO()
+        output_format = "JPEG" if image.mode in {"RGB", "L"} else "PNG"
+        if output_format == "JPEG":
+            image.save(output, format=output_format, quality=90)
+            out_mime = "image/jpeg"
+        else:
+            image.save(output, format=output_format)
+            out_mime = "image/png"
+        return f"data:{out_mime};base64,{base64.b64encode(output.getvalue()).decode('ascii')}"
 
 
 async def _summarize_document(

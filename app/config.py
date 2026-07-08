@@ -140,6 +140,9 @@ class Settings(BaseSettings):
     filesystem_mcp_max_read_bytes: int = 250_000
     filesystem_mcp_max_write_bytes: int = 240_000
     filesystem_mcp_max_search_results: int = 50
+    image_vision_model: str = ""
+    image_vision_max_bytes: int = 8_000_000
+    image_vision_max_dimension: int = 2048
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:5173"]

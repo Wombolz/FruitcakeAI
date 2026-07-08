@@ -115,7 +115,7 @@ _WEB_EVIDENCE_TOOL_NAMES = {
     "get_intraday_market_data",
     "search_places",
 }
-_IMAGE_EVIDENCE_TOOL_NAMES = {"generate_image"}
+_IMAGE_EVIDENCE_TOOL_NAMES = {"generate_image", "describe_image"}
 _WORKSPACE_EXPLICIT_HINTS = (
     "workspace",
     "working on",
@@ -2437,6 +2437,13 @@ def _build_assistant_tool_details(executed_tools: List[Dict[str, Any]]) -> List[
             document_name = str(arguments.get("document_name") or "").strip()
             if document_name:
                 candidates.append(("document", "Document", document_name))
+        if tool_name == "describe_image":
+            image_path = str(arguments.get("path") or "").strip()
+            if image_path:
+                candidates.append(("image", "Image", image_path))
+            question = str(arguments.get("question") or "").strip()
+            if question:
+                candidates.append(("question", "Question", question))
 
         for detail_kind, label, value in candidates:
             key = (tool_name, detail_kind, value)

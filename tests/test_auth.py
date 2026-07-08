@@ -1601,6 +1601,41 @@ def test_build_assistant_evidence_metadata_includes_generated_image_artifact():
     ]
 
 
+def test_build_assistant_evidence_metadata_includes_described_image_detail():
+    from app.api.chat import _build_assistant_evidence_metadata
+
+    evidence = _build_assistant_evidence_metadata(
+        [
+            {
+                "tool": "describe_image",
+                "arguments": {
+                    "path": "generated_images/robot.png",
+                    "question": "What is visible?",
+                },
+                "result_summary": "Image inspected: generated_images/robot.png\n\nA tiny robot is baking.",
+            }
+        ]
+    )
+
+    assert evidence is not None
+    assert evidence["source_kinds"] == ["image"]
+    assert evidence["source_counts"] == {"image": 1}
+    assert evidence["tool_details"] == [
+        {
+            "tool_name": "describe_image",
+            "detail_kind": "image",
+            "label": "Image",
+            "value": "generated_images/robot.png",
+        },
+        {
+            "tool_name": "describe_image",
+            "detail_kind": "question",
+            "label": "Question",
+            "value": "What is visible?",
+        },
+    ]
+
+
 def test_normalize_assistant_metadata_payload_passes_through_source_title_and_kind():
     from app.api.chat import _normalize_assistant_metadata_payload
 
@@ -1731,6 +1766,57 @@ async def test_workspace_image_endpoint_rejects_non_images_and_path_escape(clien
 
     assert non_image.status_code == 400
     assert escaped.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_describe_image_requires_configured_vision_model(monkeypatch):
+    from app.agent.tools import _describe_image
+
+    monkeypatch.setattr(settings, "image_vision_model", "")
+    result = await _describe_image(
+        {"path": "generated_images/robot.png"},
+        UserContext(user_id=1, username="imageuser", role="parent"),
+    )
+
+    assert "Image description is not configured" in result
+
+
+@pytest.mark.asyncio
+async def test_describe_image_calls_configured_vision_model(tmp_path, monkeypatch):
+    from PIL import Image
+    from app.agent.tools import _describe_image
+
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "image_vision_model", "ollama_chat/qwen-vl:test")
+    image_path = Path(tmp_path) / "1" / "generated_images" / "robot.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (4, 4), color=(20, 30, 40)).save(image_path)
+
+    fake_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="A small dark square is visible."))]
+    )
+
+    async def fake_acompletion(**kwargs):
+        message = kwargs["messages"][0]
+        content = message["content"]
+        assert kwargs["model"] == "ollama_chat/qwen-vl:test"
+        assert content[0]["type"] == "text"
+        assert "What is visible?" in content[0]["text"]
+        assert content[1]["type"] == "image_url"
+        assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        return fake_response
+
+    with (
+        patch("litellm.acompletion", new=AsyncMock(side_effect=fake_acompletion)),
+        patch("app.llm_usage.record_llm_usage_event", new=AsyncMock()),
+    ):
+        result = await _describe_image(
+            {"path": "generated_images/robot.png", "question": "What is visible?"},
+            UserContext(user_id=1, username="imageuser", role="parent"),
+        )
+
+    assert "Image inspected: generated_images/robot.png" in result
+    assert "A small dark square is visible." in result
 
 
 @pytest.mark.asyncio
