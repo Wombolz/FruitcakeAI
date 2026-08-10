@@ -38,6 +38,7 @@ FruitcakeAI is not a chat UI wrapper. It's an agent platform with a full working
 - The **agent** reasons over your memory, documents, and tools — not just the current message
 - The **task engine** plans and executes multi-step work autonomously, on a schedule, or triggered by webhooks
 - The **chat layer** can now create, inspect, and update real persistent tasks instead of only acting as a one-shot Q&A surface
+- The **visual chat path** can upload and serve workspace images, inspect them with an optional local vision model, and retain generated-image artifacts in conversation history
 - The **memory system** persists what matters across sessions, with 3-tier retrieval and semantic search
 - The **RAG pipeline** ingests your documents and makes them queryable with hybrid BM25 + vector retrieval
 - The **MCP layer** lets you drop in any tool server via a config file — no code changes required
@@ -125,6 +126,8 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - Per-persona tool scoping, content filtering, and tone configuration
 - Streaming chat via WebSocket; REST fallback
 - WebSocket chat no longer replays stale completed sends from reused server-side message state
+- Live image-generation turns expose bounded prompt, model, workflow, step, seed, and dimension context for first-class progress rendering
+- Generated images remain attached to assistant history as authenticated workspace artifacts and ordered Markdown references
 
 **Memory**
 - Persistent per-user memory written by the agent via `create_memory` tool
@@ -142,6 +145,11 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - Linked-folder ingestion is restricted to operator-approved roots via `LINKED_SOURCE_ALLOWED_ROOTS`
 - Hybrid BM25 + vector + RRF retrieval with source citations
 - Per-user library scoping — personal, shared, team
+
+**Workspace images**
+- Authenticated user-scoped upload and image-serving endpoints with path traversal and size protections
+- Optional `describe_image` tool backed by a separately configured vision-capable model
+- Inline image evidence metadata survives reloads and session switches instead of existing only during the live turn
 
 **Knowledge skills**
 - Admin-managed skills stored in the database as frozen prompt extensions
@@ -179,6 +187,7 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - RSS — feed management, discovery, and search
 - Webhooks — inbound triggers from GitHub, Zapier, IFTTT, or any HTTP client
 - Docker stdio MCP — drop in any MCP-compatible server via config
+- FruitcakeImageLab — optional first-party MCP companion for long-running local ComfyUI image generation
 
 **Mobile**
 - Native Swift app for iPhone and Mac
@@ -384,6 +393,7 @@ FruitcakeAI/
 | [Adding MCP Tools](Docs/ADDING_MCP_TOOLS.md) | How to extend the system with new tools |
 | [Persona System](Docs/PERSONA_SYSTEM.md) | Configuring users, roles, and personas |
 | [LLM Backends](Docs/LLM_BACKENDS.md) | Switching between Ollama, Claude, OpenAI |
+| [Local Model Cards](Docs/LOCAL_MODEL_CARDS.md) | Current local chat, vision, and image-workflow model inventory |
 | [RSS Newspaper Example](Docs/RSS_Newspaper_Example.md) | Example of a structured built-in task profile |
 | [Pre-Alpha Troubleshooting](Docs/PreAlpha_Troubleshooting.md) | Common install and recovery fixes |
 

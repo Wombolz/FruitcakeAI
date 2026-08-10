@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.31
+
+- Added authenticated, user-scoped workspace image upload and serving so chat clients can attach, retrieve, and persist image artifacts without broadening host-filesystem access.
+- Added an optional `describe_image` tool that sends bounded workspace images to a separately configured vision-capable model and records grounded image evidence in assistant metadata.
+- Integrated the FruitcakeImageLab MCP companion with a generation-aware timeout and live `image_rendering` state carrying bounded prompt, workflow, model, seed, step, and dimension context.
+- Preserved generated images across reloads and session switches through structured assistant evidence metadata and normalized inline Markdown references, including ordered placement guidance for final synthesis.
+- Added a maintained local-model inventory covering configured chat, vision, and ComfyUI workflow models, with operator notes on capabilities, quantization, and verification status.
+- Added focused regression coverage for workspace path isolation, upload limits, image serving and description, image evidence persistence, live generation state, and inline generated-image placement.
+
 ## v0.7.30
 
 - Added deterministic `system_job` task execution for non-LLM maintenance workflows, allowing trusted internal jobs to run directly through profiles instead of being routed through the generic agent loop.

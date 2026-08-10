@@ -2263,6 +2263,39 @@ def _parse_tool_json_result(content: str) -> Dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+_IMAGE_PLACEMENT_INSTRUCTION = (
+    "Final response presentation: include this generated image exactly once using Markdown "
+    "`![concise alt text](IMAGE_PATH)`, replacing IMAGE_PATH with the exact image_path above. "
+    "Place the reference immediately after the paragraph or section it illustrates instead of collecting images at the end."
+)
+_IMAGE_PLACEMENT_INSTRUCTION_MARKER = "Final response presentation:"
+
+
+def _apply_generated_image_response_contract(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add presentation guidance to generated-image tool results used for synthesis."""
+    tool_lookup = _tool_name_lookup(history)
+    updated = list(history)
+    changed = False
+
+    for index, message in enumerate(history):
+        if str(message.get("role") or "") != "tool":
+            continue
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        if tool_lookup.get(tool_call_id) != "generate_image":
+            continue
+        content = str(message.get("content") or "")
+        payload = _parse_tool_json_result(content)
+        image_path = str((payload or {}).get("image_path") or (payload or {}).get("path") or "").strip()
+        if not image_path or _IMAGE_PLACEMENT_INSTRUCTION_MARKER in content:
+            continue
+        augmented = dict(message)
+        augmented["content"] = f"{content.rstrip()}\n\n{_IMAGE_PLACEMENT_INSTRUCTION.replace('IMAGE_PATH', image_path)}"
+        updated[index] = augmented
+        changed = True
+
+    return updated if changed else history
+
+
 def reset_task_handoff_payload() -> contextvars.Token:
     return _task_handoff_payload.set(None)
 
@@ -2451,6 +2484,7 @@ async def run_agent(
     model_override: str | None = None,
     stage: str | None = None,
     runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> str:
     """
     Run the agent loop (non-streaming).
@@ -2524,6 +2558,7 @@ async def run_agent(
             stage=stage,
             user_context=user_context,
         )
+        turn_history = _apply_generated_image_response_contract(turn_history)
         _log_agent_turn_start(
             turn=turn_number,
             max_turns=max_turns,
@@ -2599,6 +2634,8 @@ async def run_agent(
             )
             normalized_message["tool_calls"] = normalized_tool_calls
             history[-1] = normalized_message
+            if pre_tool_callback is not None:
+                await pre_tool_callback(normalized_tool_calls)
             # Execute all tool calls, append results, then loop
             tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
             history.extend(tool_results)
@@ -2862,6 +2899,7 @@ async def stream_agent(
     model_override: str | None = None,
     stage: str | None = None,
     runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Run the agent loop with streaming.
@@ -2928,6 +2966,7 @@ async def stream_agent(
             stage=stage,
             user_context=user_context,
         )
+        turn_history = _apply_generated_image_response_contract(turn_history)
         _log_agent_turn_start(
             turn=turn_number,
             max_turns=max_turns,
@@ -3010,6 +3049,8 @@ async def stream_agent(
             )
             normalized_message["tool_calls"] = normalized_tool_calls
             history[-1] = normalized_message
+            if pre_tool_callback is not None:
+                await pre_tool_callback(normalized_tool_calls)
             tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
             history.extend(tool_results)
             runtime_messages = [normalized_message, *tool_results]

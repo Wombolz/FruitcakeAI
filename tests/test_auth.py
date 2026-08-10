@@ -6,6 +6,7 @@ Uses an in-memory SQLite database so no real postgres is needed.
 import asyncio
 import contextlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -17,6 +18,7 @@ from unittest.mock import AsyncMock, patch
 from app.api.chat import _execute_chat_turn, _run_websocket_message, chat_websocket
 from app.agent.context import UserContext
 from app.chat_runtime import get_chat_run_manager
+from app.config import settings
 from app.db.session import Base, get_db
 from app.db.models import ChatMessage, ChatSession, User
 from app.main import app
@@ -1535,6 +1537,87 @@ def test_build_assistant_tool_details_fetch_page_kind_heuristics():
     assert all("source_title" not in d for d in details)
 
 
+def test_build_chat_state_event_includes_image_render_details():
+    from app.api.chat import _build_chat_state_event, _build_live_tool_details
+
+    tool_calls = [
+        {
+            "function": {
+                "name": "generate_image",
+                "arguments": json.dumps(
+                    {
+                        "prompt": "A tiny robot baking a cake",
+                        "model": "sd3.5-large",
+                        "workflow": "fruitcake_lab",
+                        "steps": 40,
+                        "seed": "123",
+                        "width": 1024,
+                        "height": 1024,
+                        "negative_prompt": "not shown in live state",
+                    }
+                ),
+            }
+        }
+    ]
+
+    details = _build_live_tool_details(tool_calls)
+    payload = _build_chat_state_event(
+        "image_rendering",
+        tool_names=["generate_image"],
+        tool_details=details,
+    )
+
+    assert payload["state"] == "image_rendering"
+    assert payload["tool_names"] == ["generate_image"]
+    assert payload["tool_details"] == [
+        {
+            "tool_name": "generate_image",
+            "arguments": {
+                "prompt": "A tiny robot baking a cake",
+                "model": "sd3.5-large",
+                "workflow": "fruitcake_lab",
+                "steps": 40,
+                "seed": 123,
+                "width": 1024,
+                "height": 1024,
+            },
+        }
+    ]
+
+
+def test_build_live_tool_details_exposes_only_safe_operator_context():
+    from app.api.chat import _build_live_tool_details
+
+    tool_calls = [
+        {
+            "function": {
+                "name": "web_search",
+                "arguments": json.dumps({"query": "reflecting pool Washington DC", "api_key": "secret"}),
+            }
+        },
+        {
+            "function": {
+                "name": "fetch_page",
+                "arguments": json.dumps(
+                    {"url": "https://example.com/article?token=secret#private", "headers": {"Authorization": "secret"}}
+                ),
+            }
+        },
+        {
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"path": "reports/repo_map.md", "token": "secret"}),
+            }
+        },
+    ]
+
+    assert _build_live_tool_details(tool_calls) == [
+        {"tool_name": "web_search", "arguments": {"query": "reflecting pool Washington DC"}},
+        {"tool_name": "fetch_page", "arguments": {"url": "https://example.com/article"}},
+        {"tool_name": "read_file", "arguments": {"path": "reports/repo_map.md"}},
+    ]
+
+
 def test_build_assistant_evidence_metadata_counts_repeated_web_sources():
     from app.api.chat import _build_assistant_evidence_metadata
 
@@ -1558,6 +1641,118 @@ def test_build_assistant_evidence_metadata_counts_repeated_web_sources():
     assert evidence["tool_names"] == ["web_search", "fetch_page"]
     assert evidence["source_kinds"] == ["web"]
     assert evidence["source_counts"] == {"web": 3}
+
+
+def test_build_assistant_evidence_metadata_includes_generated_image_artifact():
+    from app.api.chat import _build_assistant_evidence_metadata
+
+    evidence = _build_assistant_evidence_metadata(
+        [
+            {
+                "tool": "generate_image",
+                "arguments": {"prompt": "A tiny robot baking a cake", "workflow": "sdxl_basic"},
+                "result_summary": json.dumps(
+                    {
+                        "image_path": "generated_images/robot.png",
+                        "prompt": "A tiny robot baking a cake",
+                        "workflow": "sdxl_basic",
+                        "seed": 123,
+                        "width": 1024,
+                        "height": 1024,
+                    }
+                ),
+            }
+        ]
+    )
+
+    assert evidence is not None
+    assert evidence["source_kinds"] == ["image"]
+    assert evidence["source_counts"] == {"image": 1}
+    assert evidence["image_artifacts"] == [
+        {
+            "path": "generated_images/robot.png",
+            "source_tool": "generate_image",
+            "prompt": "A tiny robot baking a cake",
+            "title": "A tiny robot baking a cake",
+            "workflow": "sdxl_basic",
+            "seed": 123,
+            "width": 1024,
+            "height": 1024,
+        }
+    ]
+
+
+def test_generated_image_reference_normalization_preserves_inline_placement():
+    from app.api.chat import _ensure_generated_image_markdown_references
+
+    records = [
+        {
+            "tool": "generate_image",
+            "arguments": {"prompt": "A layered diagram"},
+            "result_summary": json.dumps({"image_path": "generated_images/layers.png"}),
+        }
+    ]
+    content = "First concept.\n\n![Layered diagram](generated_images/layers.png)\n\nSecond concept."
+
+    assert _ensure_generated_image_markdown_references(content, records) == content
+
+
+def test_generated_image_reference_normalization_appends_only_missing_artifacts():
+    from app.api.chat import _ensure_generated_image_markdown_references
+
+    records = [
+        {
+            "tool": "generate_image",
+            "arguments": {"prompt": "First diagram"},
+            "result_summary": json.dumps({"image_path": "generated_images/first.png"}),
+        },
+        {
+            "tool": "generate_image",
+            "arguments": {"prompt": "Second diagram"},
+            "result_summary": json.dumps({"image_path": "generated_images/second.png"}),
+        },
+    ]
+    content = "First concept.\n\n![First diagram](/workspace/images?path=generated_images%2Ffirst.png)"
+
+    normalized = _ensure_generated_image_markdown_references(content, records)
+
+    assert normalized.count("first.png") == 1
+    assert normalized.endswith("![Second diagram](generated_images/second.png)")
+
+
+def test_build_assistant_evidence_metadata_includes_described_image_detail():
+    from app.api.chat import _build_assistant_evidence_metadata
+
+    evidence = _build_assistant_evidence_metadata(
+        [
+            {
+                "tool": "describe_image",
+                "arguments": {
+                    "path": "generated_images/robot.png",
+                    "question": "What is visible?",
+                },
+                "result_summary": "Image inspected: generated_images/robot.png\n\nA tiny robot is baking.",
+            }
+        ]
+    )
+
+    assert evidence is not None
+    assert evidence["source_kinds"] == ["image"]
+    assert evidence["source_counts"] == {"image": 1}
+    assert evidence["tool_details"] == [
+        {
+            "tool_name": "describe_image",
+            "detail_kind": "image",
+            "label": "Image",
+            "value": "generated_images/robot.png",
+        },
+        {
+            "tool_name": "describe_image",
+            "detail_kind": "question",
+            "label": "Question",
+            "value": "What is visible?",
+        },
+    ]
 
 
 def test_normalize_assistant_metadata_payload_passes_through_source_title_and_kind():
@@ -1592,6 +1787,215 @@ def test_normalize_assistant_metadata_payload_passes_through_source_title_and_ki
                 "source_title": "Swift Mission Overview",
             }
         ]
+
+
+def test_normalize_assistant_metadata_payload_passes_through_image_artifacts():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    normalized = _normalize_assistant_metadata_payload(
+        {
+            "tool_calls": ["generate_image"],
+            "evidence": {
+                "grounded": True,
+                "image_artifacts": [
+                    {
+                        "path": "generated_images/robot.png",
+                        "title": "Robot cake",
+                        "prompt": "A tiny robot baking a cake",
+                        "workflow": "sdxl_basic",
+                        "seed": "123",
+                        "width": 1024,
+                        "height": 1024,
+                        "source_tool": "generate_image",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert normalized["evidence"]["image_artifacts"] == [
+        {
+            "path": "generated_images/robot.png",
+            "title": "Robot cake",
+            "prompt": "A tiny robot baking a cake",
+            "workflow": "sdxl_basic",
+            "seed": 123,
+            "width": 1024,
+            "height": 1024,
+            "source_tool": "generate_image",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_workspace_image_endpoint_serves_owned_workspace_image(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    await client.post("/auth/register", json={
+        "username": "imageuser",
+        "email": "imageuser@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "imageuser", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    image_path = Path(tmp_path) / "1" / "generated_images" / "robot.png"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+        b"\x1f\x15\xc4\x89\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    response = await client.get(
+        "/workspace/images",
+        params={"path": "generated_images/robot.png"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/png")
+    assert response.content.startswith(b"\x89PNG")
+
+
+@pytest.mark.asyncio
+async def test_workspace_image_endpoint_rejects_non_images_and_path_escape(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    await client.post("/auth/register", json={
+        "username": "imagenoaccess",
+        "email": "imagenoaccess@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "imagenoaccess", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    note_path = Path(tmp_path) / "1" / "generated_images" / "note.txt"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text("not an image", encoding="utf-8")
+
+    non_image = await client.get(
+        "/workspace/images",
+        params={"path": "generated_images/note.txt"},
+        headers=headers,
+    )
+    escaped = await client.get(
+        "/workspace/images",
+        params={"path": "../2/generated_images/other.png"},
+        headers=headers,
+    )
+
+    assert non_image.status_code == 400
+    assert escaped.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_workspace_upload_endpoint_stores_user_file(client, tmp_path, monkeypatch):
+    relative_workspace = tmp_path / "relative-workspace"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "workspace_dir", "relative-workspace")
+    await client.post("/auth/register", json={
+        "username": "uploaduser",
+        "email": "uploaduser@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "uploaduser", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    response = await client.post(
+        "/workspace/uploads",
+        headers=headers,
+        data={"target_dir": "uploads/chat"},
+        files={"file": ("robot cake?.png", b"fake image bytes", "image/png")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["filename"] == "robot cake?.png"
+    assert payload["media_type"] == "image/png"
+    assert payload["size_bytes"] == len(b"fake image bytes")
+    assert payload["is_image"] is True
+    assert payload["path"].startswith("uploads/chat/")
+    assert "?" not in payload["stored_filename"]
+    assert (relative_workspace / "1" / payload["path"]).read_bytes() == b"fake image bytes"
+
+
+@pytest.mark.asyncio
+async def test_workspace_upload_endpoint_rejects_escape_and_oversize(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "upload_max_size_mb", 1)
+    await client.post("/auth/register", json={
+        "username": "uploadblocked",
+        "email": "uploadblocked@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "uploadblocked", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    escaped = await client.post(
+        "/workspace/uploads",
+        headers=headers,
+        data={"target_dir": "../other"},
+        files={"file": ("note.txt", b"hello", "text/plain")},
+    )
+    oversized = await client.post(
+        "/workspace/uploads",
+        headers=headers,
+        data={"target_dir": "uploads"},
+        files={"file": ("big.bin", b"x" * (1024 * 1024 + 1), "application/octet-stream")},
+    )
+
+    assert escaped.status_code == 400
+    assert oversized.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_describe_image_requires_configured_vision_model(monkeypatch):
+    from app.agent.tools import _describe_image
+
+    monkeypatch.setattr(settings, "image_vision_model", "")
+    result = await _describe_image(
+        {"path": "generated_images/robot.png"},
+        UserContext(user_id=1, username="imageuser", role="parent"),
+    )
+
+    assert "Image description is not configured" in result
+
+
+@pytest.mark.asyncio
+async def test_describe_image_calls_configured_vision_model(tmp_path, monkeypatch):
+    from PIL import Image
+    from app.agent.tools import _describe_image
+
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "image_vision_model", "ollama_chat/qwen-vl:test")
+    image_path = Path(tmp_path) / "1" / "generated_images" / "robot.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (4, 4), color=(20, 30, 40)).save(image_path)
+
+    fake_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="A small dark square is visible."))]
+    )
+
+    async def fake_acompletion(**kwargs):
+        message = kwargs["messages"][0]
+        content = message["content"]
+        assert kwargs["model"] == "ollama_chat/qwen-vl:test"
+        assert content[0]["type"] == "text"
+        assert "What is visible?" in content[0]["text"]
+        assert content[1]["type"] == "image_url"
+        assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        return fake_response
+
+    with (
+        patch("litellm.acompletion", new=AsyncMock(side_effect=fake_acompletion)),
+        patch("app.llm_usage.record_llm_usage_event", new=AsyncMock()),
+    ):
+        result = await _describe_image(
+            {"path": "generated_images/robot.png", "question": "What is visible?"},
+            UserContext(user_id=1, username="imageuser", role="parent"),
+        )
+
+    assert "Image inspected: generated_images/robot.png" in result
+    assert "A small dark square is visible." in result
 
 
 @pytest.mark.asyncio
