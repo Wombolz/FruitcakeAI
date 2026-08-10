@@ -76,7 +76,7 @@ mcp_servers:
     type: http
     url: http://localhost:47835
     enabled: true
-    timeout: 300
+    timeout: 600
     classification: first_class_mcp
     shipping_default: false
     trust_boundary:

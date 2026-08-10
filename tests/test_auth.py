@@ -1537,6 +1537,87 @@ def test_build_assistant_tool_details_fetch_page_kind_heuristics():
     assert all("source_title" not in d for d in details)
 
 
+def test_build_chat_state_event_includes_image_render_details():
+    from app.api.chat import _build_chat_state_event, _build_live_tool_details
+
+    tool_calls = [
+        {
+            "function": {
+                "name": "generate_image",
+                "arguments": json.dumps(
+                    {
+                        "prompt": "A tiny robot baking a cake",
+                        "model": "sd3.5-large",
+                        "workflow": "fruitcake_lab",
+                        "steps": 40,
+                        "seed": "123",
+                        "width": 1024,
+                        "height": 1024,
+                        "negative_prompt": "not shown in live state",
+                    }
+                ),
+            }
+        }
+    ]
+
+    details = _build_live_tool_details(tool_calls)
+    payload = _build_chat_state_event(
+        "image_rendering",
+        tool_names=["generate_image"],
+        tool_details=details,
+    )
+
+    assert payload["state"] == "image_rendering"
+    assert payload["tool_names"] == ["generate_image"]
+    assert payload["tool_details"] == [
+        {
+            "tool_name": "generate_image",
+            "arguments": {
+                "prompt": "A tiny robot baking a cake",
+                "model": "sd3.5-large",
+                "workflow": "fruitcake_lab",
+                "steps": 40,
+                "seed": 123,
+                "width": 1024,
+                "height": 1024,
+            },
+        }
+    ]
+
+
+def test_build_live_tool_details_exposes_only_safe_operator_context():
+    from app.api.chat import _build_live_tool_details
+
+    tool_calls = [
+        {
+            "function": {
+                "name": "web_search",
+                "arguments": json.dumps({"query": "reflecting pool Washington DC", "api_key": "secret"}),
+            }
+        },
+        {
+            "function": {
+                "name": "fetch_page",
+                "arguments": json.dumps(
+                    {"url": "https://example.com/article?token=secret#private", "headers": {"Authorization": "secret"}}
+                ),
+            }
+        },
+        {
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"path": "reports/repo_map.md", "token": "secret"}),
+            }
+        },
+    ]
+
+    assert _build_live_tool_details(tool_calls) == [
+        {"tool_name": "web_search", "arguments": {"query": "reflecting pool Washington DC"}},
+        {"tool_name": "fetch_page", "arguments": {"url": "https://example.com/article"}},
+        {"tool_name": "read_file", "arguments": {"path": "reports/repo_map.md"}},
+    ]
+
+
 def test_build_assistant_evidence_metadata_counts_repeated_web_sources():
     from app.api.chat import _build_assistant_evidence_metadata
 
@@ -1599,6 +1680,44 @@ def test_build_assistant_evidence_metadata_includes_generated_image_artifact():
             "height": 1024,
         }
     ]
+
+
+def test_generated_image_reference_normalization_preserves_inline_placement():
+    from app.api.chat import _ensure_generated_image_markdown_references
+
+    records = [
+        {
+            "tool": "generate_image",
+            "arguments": {"prompt": "A layered diagram"},
+            "result_summary": json.dumps({"image_path": "generated_images/layers.png"}),
+        }
+    ]
+    content = "First concept.\n\n![Layered diagram](generated_images/layers.png)\n\nSecond concept."
+
+    assert _ensure_generated_image_markdown_references(content, records) == content
+
+
+def test_generated_image_reference_normalization_appends_only_missing_artifacts():
+    from app.api.chat import _ensure_generated_image_markdown_references
+
+    records = [
+        {
+            "tool": "generate_image",
+            "arguments": {"prompt": "First diagram"},
+            "result_summary": json.dumps({"image_path": "generated_images/first.png"}),
+        },
+        {
+            "tool": "generate_image",
+            "arguments": {"prompt": "Second diagram"},
+            "result_summary": json.dumps({"image_path": "generated_images/second.png"}),
+        },
+    ]
+    content = "First concept.\n\n![First diagram](/workspace/images?path=generated_images%2Ffirst.png)"
+
+    normalized = _ensure_generated_image_markdown_references(content, records)
+
+    assert normalized.count("first.png") == 1
+    assert normalized.endswith("![Second diagram](generated_images/second.png)")
 
 
 def test_build_assistant_evidence_metadata_includes_described_image_detail():
@@ -1766,6 +1885,66 @@ async def test_workspace_image_endpoint_rejects_non_images_and_path_escape(clien
 
     assert non_image.status_code == 400
     assert escaped.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_workspace_upload_endpoint_stores_user_file(client, tmp_path, monkeypatch):
+    relative_workspace = tmp_path / "relative-workspace"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "workspace_dir", "relative-workspace")
+    await client.post("/auth/register", json={
+        "username": "uploaduser",
+        "email": "uploaduser@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "uploaduser", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    response = await client.post(
+        "/workspace/uploads",
+        headers=headers,
+        data={"target_dir": "uploads/chat"},
+        files={"file": ("robot cake?.png", b"fake image bytes", "image/png")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["filename"] == "robot cake?.png"
+    assert payload["media_type"] == "image/png"
+    assert payload["size_bytes"] == len(b"fake image bytes")
+    assert payload["is_image"] is True
+    assert payload["path"].startswith("uploads/chat/")
+    assert "?" not in payload["stored_filename"]
+    assert (relative_workspace / "1" / payload["path"]).read_bytes() == b"fake image bytes"
+
+
+@pytest.mark.asyncio
+async def test_workspace_upload_endpoint_rejects_escape_and_oversize(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "upload_max_size_mb", 1)
+    await client.post("/auth/register", json={
+        "username": "uploadblocked",
+        "email": "uploadblocked@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "uploadblocked", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    escaped = await client.post(
+        "/workspace/uploads",
+        headers=headers,
+        data={"target_dir": "../other"},
+        files={"file": ("note.txt", b"hello", "text/plain")},
+    )
+    oversized = await client.post(
+        "/workspace/uploads",
+        headers=headers,
+        data={"target_dir": "uploads"},
+        files={"file": ("big.bin", b"x" * (1024 * 1024 + 1), "application/octet-stream")},
+    )
+
+    assert escaped.status_code == 400
+    assert oversized.status_code == 413
 
 
 @pytest.mark.asyncio

@@ -19,7 +19,7 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -92,6 +92,7 @@ _ASSISTANT_MESSAGE_METADATA_KIND = "assistant_message_metadata"
 _CHAT_LIVE_STATE_VALUES = {
     "thinking",
     "tool_active",
+    "image_rendering",
     "waiting_approval",
     "validating",
     "retrying",
@@ -888,6 +889,7 @@ async def send_message(
             reply,
             get_tool_execution_records(),
         )
+        reply = _ensure_generated_image_markdown_references(reply, get_tool_execution_records())
         runtime_history_messages = await _flush_pending_runtime_history()
         handoff_metadata = get_task_handoff_payload() or {}
         assistant_metadata = _build_assistant_message_metadata(
@@ -1019,6 +1021,7 @@ async def _run_websocket_message(
         state: str,
         *,
         tool_names: List[str] | None = None,
+        tool_details: List[Dict[str, Any]] | None = None,
         retry_reason: str | None = None,
         attempt: int | None = None,
     ) -> None:
@@ -1026,6 +1029,7 @@ async def _run_websocket_message(
             _build_chat_state_event(
                 state,
                 tool_names=tool_names,
+                tool_details=tool_details,
                 retry_reason=retry_reason,
                 attempt=attempt,
             )
@@ -1223,6 +1227,12 @@ async def _run_websocket_message(
             if tool_names:
                 await _emit_state("tool_active", tool_names=tool_names)
 
+        async def _emit_pre_tool_state(tool_calls: List[Dict[str, Any]]) -> None:
+            tool_names = _tool_call_names_from_calls(tool_calls)
+            tool_details = _build_live_tool_details(tool_calls)
+            state = "image_rendering" if any(name == "generate_image" for name in tool_names) else "tool_active"
+            await _emit_state(state, tool_names=tool_names, tool_details=tool_details)
+
         await _emit_state("thinking")
 
         if should_validate:
@@ -1237,6 +1247,7 @@ async def _run_websocket_message(
                     stage="chat_complex" if effective_complex else "chat_simple",
                     enable_validation=True,
                     runtime_message_callback=_flush_runtime_messages_with_state,
+                    pre_tool_callback=_emit_pre_tool_state,
                     state_callback=_emit_state,
                 )
             except Exception as e:
@@ -1267,6 +1278,7 @@ async def _run_websocket_message(
                 complete,
                 get_tool_execution_records(),
             )
+            complete = _ensure_generated_image_markdown_references(complete, get_tool_execution_records())
             for token_chunk in _chunk_text(complete):
                 full_response.append(token_chunk)
                 await _send_json_if_open({"type": "token", "content": token_chunk})
@@ -1281,6 +1293,7 @@ async def _run_websocket_message(
                     model_override=session.llm_model,
                     stage="chat_simple",
                     runtime_message_callback=_flush_runtime_messages_with_state,
+                    pre_tool_callback=_emit_pre_tool_state,
                 ):
                     full_response.append(token_chunk)
                     await _send_json_if_open({"type": "token", "content": token_chunk})
@@ -1323,6 +1336,7 @@ async def _run_websocket_message(
                     "".join(full_response),
                     get_tool_execution_records(),
                 )
+                complete = _ensure_generated_image_markdown_references(complete, get_tool_execution_records())
         runtime_history_messages = await _flush_pending_runtime_history()
         handoff_metadata = get_task_handoff_payload() or {}
         assistant_metadata = _build_assistant_message_metadata(
@@ -1792,10 +1806,145 @@ def _runtime_messages_tool_names(runtime_messages: List[Dict[str, Any]]) -> list
     return names
 
 
+def _tool_call_names_from_calls(tool_calls: List[Dict[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    names: list[str] = []
+    for call in tool_calls or []:
+        function = (call or {}).get("function") or {}
+        tool_name = str(function.get("name") or "").strip()
+        if tool_name and tool_name not in seen:
+            seen.add(tool_name)
+            names.append(tool_name)
+    return names
+
+
+def _tool_call_arguments(call: Dict[str, Any]) -> Dict[str, Any]:
+    function = (call or {}).get("function") or {}
+    raw_args = function.get("arguments") or {}
+    if isinstance(raw_args, dict):
+        return dict(raw_args)
+    if isinstance(raw_args, str) and raw_args.strip():
+        try:
+            parsed = json.loads(raw_args)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _build_live_tool_details(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    details: List[Dict[str, Any]] = []
+    for call in tool_calls or []:
+        function = (call or {}).get("function") or {}
+        tool_name = str(function.get("name") or "").strip()
+        if not tool_name:
+            continue
+        arguments = _tool_call_arguments(call)
+        if tool_name == "generate_image":
+            sanitized_args = _sanitize_image_render_arguments(arguments)
+        else:
+            sanitized_args = _sanitize_live_tool_arguments(tool_name, arguments)
+        if sanitized_args:
+            details.append({"tool_name": tool_name, "arguments": sanitized_args})
+    return details
+
+
+_LIVE_TOOL_ARGUMENT_FIELDS: Dict[str, Dict[str, tuple[str, ...]]] = {
+    "web_search": {"query": ("query", "q")},
+    "fetch_page": {"url": ("url",)},
+    "search_library": {"query": ("query",), "document": ("document_name", "filename")},
+    "summarize_document": {
+        "document": ("document_name", "filename"),
+        "section": ("section", "section_query", "query"),
+    },
+    "search_my_feeds": {"query": ("query",), "category": ("category",)},
+    "search_my_feeds_timeline": {
+        "query": ("query",),
+        "start": ("start_date",),
+        "end": ("end_date",),
+    },
+    "search_feeds": {"query": ("query",), "category": ("category",)},
+    "get_feed_items": {"source": ("source_id", "source"), "category": ("category",)},
+    "read_file": {"path": ("path",)},
+    "write_file": {"path": ("path",)},
+    "append_file": {"path": ("path",)},
+    "stat_file": {"path": ("path",)},
+    "list_directory": {"path": ("path",)},
+    "make_directory": {"path": ("path",)},
+    "find_files": {"path": ("path", "root"), "pattern": ("pattern", "query")},
+    "describe_image": {"path": ("path",), "question": ("question",)},
+    "search_places": {"query": ("query",), "location": ("location",)},
+    "get_daily_market_data": {"symbol": ("symbol",)},
+    "get_intraday_market_data": {"symbol": ("symbol",), "interval": ("interval",)},
+    "api_request": {"method": ("method",), "url": ("url",)},
+    "get_task": {"task": ("task_id",)},
+    "run_task_now": {"task": ("task_id",)},
+    "update_task": {"task": ("task_id",), "title": ("title",)},
+    "create_task": {"title": ("title",)},
+    "propose_task_draft": {"title": ("title",)},
+    "search_memory_graph": {"query": ("query",)},
+}
+
+
+def _sanitize_live_tool_arguments(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose only bounded, non-sensitive arguments useful for live operator feedback."""
+    fields = _LIVE_TOOL_ARGUMENT_FIELDS.get(tool_name) or {}
+    sanitized: Dict[str, Any] = {}
+    for label, candidates in fields.items():
+        value = next((arguments.get(key) for key in candidates if arguments.get(key) not in (None, "")), None)
+        if value is None or isinstance(value, dict):
+            continue
+        if isinstance(value, list):
+            value = ", ".join(str(item) for item in value[:5])
+        if isinstance(value, (int, float, bool)):
+            sanitized[label] = value
+            continue
+        compact = " ".join(str(value).split())
+        if label == "url":
+            parsed = urlparse(compact)
+            if parsed.scheme and parsed.netloc:
+                compact = parsed._replace(query="", fragment="").geturl()
+        if compact:
+            sanitized[label] = compact[:300]
+    return sanitized
+
+
+def _sanitize_image_render_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    aliases = {
+        "prompt": ("prompt", "positive_prompt", "description"),
+        "model": ("model", "model_name", "checkpoint", "ckpt_name"),
+        "workflow": ("workflow", "workflow_name", "template"),
+        "steps": ("steps", "num_steps"),
+        "seed": ("seed",),
+        "width": ("width",),
+        "height": ("height",),
+        "cfg_scale": ("cfg_scale", "guidance", "guidance_scale"),
+    }
+    sanitized: Dict[str, Any] = {}
+    for canonical, candidates in aliases.items():
+        value = next((arguments.get(key) for key in candidates if arguments.get(key) not in (None, "")), None)
+        if value is None:
+            continue
+        if canonical in {"steps", "seed", "width", "height"}:
+            try:
+                sanitized[canonical] = int(value)
+            except (TypeError, ValueError):
+                sanitized[canonical] = str(value).strip()[:80]
+        elif canonical == "cfg_scale":
+            try:
+                sanitized[canonical] = float(value)
+            except (TypeError, ValueError):
+                sanitized[canonical] = str(value).strip()[:80]
+        else:
+            sanitized[canonical] = str(value).strip()[:500]
+    return sanitized
+
+
 def _build_chat_state_event(
     state: str,
     *,
     tool_names: List[str] | None = None,
+    tool_details: List[Dict[str, Any]] | None = None,
     retry_reason: str | None = None,
     attempt: int | None = None,
 ) -> Dict[str, Any]:
@@ -1811,6 +1960,14 @@ def _build_chat_state_event(
         cleaned_tool_names = [str(item).strip() for item in tool_names if str(item).strip()]
         if cleaned_tool_names:
             payload["tool_names"] = cleaned_tool_names
+    if isinstance(tool_details, list):
+        cleaned_details = [
+            detail
+            for detail in tool_details
+            if isinstance(detail, dict) and str(detail.get("tool_name") or "").strip()
+        ]
+        if cleaned_details:
+            payload["tool_details"] = cleaned_details
     if retry_reason:
         payload["retry_reason"] = str(retry_reason).strip()
     if attempt is not None:
@@ -1853,6 +2010,7 @@ async def _execute_chat_turn(
     stage: str,
     enable_validation: bool,
     runtime_message_callback=None,
+    pre_tool_callback=None,
     state_callback: Callable[..., Awaitable[None]] | None = None,
 ) -> str:
     started = time.perf_counter()
@@ -1863,6 +2021,7 @@ async def _execute_chat_turn(
         model_override=model_override,
         stage=stage,
         runtime_message_callback=runtime_message_callback,
+        pre_tool_callback=pre_tool_callback,
     )
     executed_tools = get_tool_execution_records()
     should_run_validation = settings.chat_validation_enabled and (enable_validation or bool(executed_tools))
@@ -1922,6 +2081,7 @@ async def _execute_chat_turn(
             model_override=model_override,
             stage=f"{stage}_retry",
             runtime_message_callback=runtime_message_callback,
+            pre_tool_callback=pre_tool_callback,
         )
 
 
@@ -2546,6 +2706,60 @@ def _image_artifact_title(prompt: str) -> str:
     if len(compact) <= 72:
         return compact
     return compact[:69].rstrip() + "..."
+
+
+def _markdown_image_reference_keys(content: str) -> set[str]:
+    keys: set[str] = set()
+    for match in re.finditer(r"!\[[^\]]*\]\(\s*<?([^\s)>]+)>?(?:\s+[^)]*)?\)", str(content or "")):
+        target = unquote(str(match.group(1) or "").strip())
+        parsed = urlparse(target)
+        query_path = (parse_qs(parsed.query).get("path") or [""])[0]
+        path = unquote(query_path or parsed.path or target).lstrip("./")
+        if not path:
+            continue
+        keys.add(path)
+        keys.add(Path(path).name)
+    return keys
+
+
+def _ensure_generated_image_markdown_references(
+    content: str,
+    executed_tools: List[Dict[str, Any]],
+) -> str:
+    """Guarantee generated images remain addressable by ordered chat renderers."""
+    generated_records = [
+        record
+        for record in executed_tools or []
+        if isinstance(record, dict) and str(record.get("tool") or "").strip() == "generate_image"
+    ]
+    artifacts = _build_assistant_image_artifacts(generated_records)
+    if not artifacts:
+        return content
+
+    referenced = _markdown_image_reference_keys(content)
+    missing: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        path = str(artifact.get("path") or "").strip()
+        normalized_path = unquote(path).lstrip("./")
+        if not path or normalized_path in referenced or Path(normalized_path).name in referenced:
+            continue
+        missing.append(artifact)
+    if not missing:
+        return content
+
+    references = []
+    for artifact in missing:
+        path = str(artifact.get("path") or "").strip()
+        alt = str(artifact.get("title") or artifact.get("prompt") or "Generated image")
+        alt = " ".join(alt.replace("[", "").replace("]", "").split())[:120] or "Generated image"
+        references.append(f"![{alt}]({path})")
+
+    base = str(content or "").rstrip()
+    separator = "\n\n" if base else ""
+    joined_references = "\n\n".join(references)
+    return f"{base}{separator}{joined_references}"
+
+
 def _build_assistant_message_metadata(
     *,
     handoff_metadata: Dict[str, Any],

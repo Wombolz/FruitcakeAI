@@ -486,6 +486,92 @@ async def test_stream_agent_keeps_tool_turns_internal_before_streaming_final(mon
 
 
 @pytest.mark.asyncio
+async def test_run_agent_emits_pre_tool_callback_before_dispatch():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    events: list[str] = []
+    tool_calls = [
+        SimpleNamespace(
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(
+                name="generate_image",
+                arguments='{"prompt":"A tiny robot baking a cake","model":"sd3.5-large","steps":40}',
+            ),
+        )
+    ]
+
+    async def _acompletion(**kwargs):
+        if _acompletion.calls == 0:
+            _acompletion.calls += 1
+            return _fake_response(tool_calls=tool_calls)
+        return _fake_response(content="Rendered.")
+
+    async def _dispatch(tool_calls, user_context):
+        events.append("dispatch")
+        return [{"role": "tool", "tool_call_id": "call_1", "content": '{"image_path":"generated_images/robot.png"}'}]
+
+    async def _pre_tool(tool_calls):
+        events.append("pre")
+
+    _acompletion.calls = 0
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[{"function": {"name": "generate_image"}}]),
+        patch("app.agent.core.dispatch_tool_calls", side_effect=_dispatch),
+        patch("app.agent.core.litellm.acompletion", side_effect=_acompletion),
+    ):
+        result = await run_agent(
+            [{"role": "user", "content": "render a robot"}],
+            user_context,
+            pre_tool_callback=_pre_tool,
+        )
+
+    assert result == "Rendered."
+    assert events == ["pre", "dispatch"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_adds_inline_image_contract_after_generation():
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    tool_calls = [
+        SimpleNamespace(
+            id="call_image",
+            type="function",
+            function=SimpleNamespace(name="generate_image", arguments='{"prompt":"A layered diagram"}'),
+        )
+    ]
+    requests = []
+
+    async def _acompletion(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            return _fake_response(tool_calls=tool_calls)
+        return _fake_response(content="Explanation.\n\n![Layered diagram](generated_images/layers.png)")
+
+    tool_result = {
+        "role": "tool",
+        "tool_call_id": "call_image",
+        "content": '{"image_path":"generated_images/layers.png"}',
+    }
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[{"function": {"name": "generate_image"}}]),
+        patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(return_value=[tool_result])),
+        patch("app.agent.core.litellm.acompletion", side_effect=_acompletion),
+    ):
+        result = await run_agent([{"role": "user", "content": "Explain this with a diagram"}], user_context)
+
+    assert result.endswith("![Layered diagram](generated_images/layers.png)")
+    synthesis_tool_result = next(
+        message
+        for message in requests[1]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "call_image"
+    )
+    assert "generated_images/layers.png" in synthesis_tool_result["content"]
+    assert "immediately after the paragraph or section it illustrates" in synthesis_tool_result["content"]
+    assert tool_result["content"] == '{"image_path":"generated_images/layers.png"}'
+
+
+@pytest.mark.asyncio
 async def test_stream_agent_stops_after_failed_delete_event_tool_result():
     user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
     tool_calls = [
