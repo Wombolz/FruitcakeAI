@@ -39,6 +39,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from app.agent.tools import TOOL_SCHEMAS  # noqa: E402
+from app.agent.model_stream import (  # noqa: E402
+    ModelTurnAccumulator,
+    close_provider_stream,
+    iter_model_stream_events,
+)
 
 OLLAMA_BASE = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3.6:35b"
@@ -281,6 +286,69 @@ async def _run_litellm(
         }
 
 
+async def _run_litellm_stream(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Capture sanitized normalized stream shape without recording raw content."""
+    import litellm
+
+    started = time.perf_counter()
+    provider_stream = None
+    accumulator = ModelTurnAccumulator(request_id="diagnostic")
+    event_counts: dict[str, int] = {}
+    tool_shapes: list[dict[str, Any]] = []
+    try:
+        provider_stream = await litellm.acompletion(
+            model=f"ollama_chat/{model}",
+            messages=messages,
+            tools=tools,
+            stream=True,
+            reasoning_effort="high",
+            api_base=OLLAMA_BASE,
+            max_tokens=2400,
+            timeout=300,
+        )
+        try:
+            async for event in iter_model_stream_events(provider_stream):
+                accumulator.add(event)
+                event_counts[event.kind] = event_counts.get(event.kind, 0) + 1
+                if event.kind == "tool_call_delta":
+                    tool_shapes.append(
+                        {
+                            "has_index": event.tool_call_index is not None,
+                            "position": event.tool_call_position,
+                            "has_id": bool(event.tool_call_id),
+                            "name": event.tool_name or "",
+                            "arguments_type": type(event.arguments_payload).__name__,
+                            "complete": event.tool_call_complete,
+                        }
+                    )
+        finally:
+            await close_provider_stream(provider_stream)
+        turn = accumulator.finish()
+        return {
+            "outcome": "tool_call" if turn.tool_calls else ("text_answer" if turn.content.strip() else "empty_answer"),
+            "event_counts": event_counts,
+            "tool_shapes": tool_shapes[:8],
+            "tool_names": [call["function"]["name"] for call in turn.tool_calls],
+            "content_chars": len(turn.content),
+            "reasoning_chars": len(turn.reasoning_content),
+            "finish_reason": turn.finish_reason or "",
+            "usage_present": bool(turn.usage),
+            "elapsed_s": round(time.perf_counter() - started, 1),
+        }
+    except Exception as exc:  # noqa: BLE001 — harness records bounded error previews
+        return {
+            "outcome": _classify_error(str(exc)),
+            "error_preview": str(exc)[:400],
+            "events_before_error": accumulator.event_count,
+            "elapsed_s": round(time.perf_counter() - started, 1),
+        }
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -288,8 +356,8 @@ async def main() -> None:
     parser.add_argument(
         "--legs",
         nargs="+",
-        default=["native_correct", "native_litellm_shape", "litellm_e2e"],
-        choices=["native_correct", "native_litellm_shape", "litellm_e2e"],
+        default=["native_correct", "native_litellm_shape", "litellm_e2e", "litellm_stream"],
+        choices=["native_correct", "native_litellm_shape", "litellm_e2e", "litellm_stream"],
     )
     parser.add_argument("--scenarios", nargs="+", default=list(SCENARIOS.keys()), choices=list(SCENARIOS.keys()))
     parser.add_argument("--max-tools", type=int, default=0, help="cap the tool surface (0 = full app surface)")
@@ -322,8 +390,14 @@ async def main() -> None:
                             messages=_native_history(scenario, correct=False),
                             tools=tools,
                         )
-                    else:
+                    elif leg == "litellm_e2e":
                         outcome = await _run_litellm(
+                            model=args.model,
+                            messages=_openai_history(scenario),
+                            tools=tools,
+                        )
+                    else:
+                        outcome = await _run_litellm_stream(
                             model=args.model,
                             messages=_openai_history(scenario),
                             tools=tools,

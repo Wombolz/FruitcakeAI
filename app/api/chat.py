@@ -37,7 +37,7 @@ from app.agent.chat_intents import (
     is_library_summary_intent,
 )
 from app.agent.chat_orchestration import build_orchestrated_chat_history
-from app.agent.chat_routing import classify_chat_complexity
+from app.agent.chat_routing import ChatComplexityDecision, classify_chat_complexity
 from app.agent.chat_validation import (
     build_chat_retry_instruction,
     should_validate_chat_response,
@@ -92,6 +92,7 @@ _ASSISTANT_MESSAGE_METADATA_KIND = "assistant_message_metadata"
 _CHAT_LIVE_STATE_VALUES = {
     "thinking",
     "tool_active",
+    "tool_completed",
     "image_rendering",
     "waiting_approval",
     "validating",
@@ -803,6 +804,15 @@ async def send_message(
         auto_complex=(decision.is_complex or library_intent),
         preference=getattr(current_user, "chat_routing_preference", None),
     )
+    _log_chat_routing_decision(
+        decision=decision,
+        preference=getattr(current_user, "chat_routing_preference", None),
+        execution_mode=execution_mode,
+        effective_complex=effective_complex,
+        library_intent=library_intent,
+        session_id=session_id,
+        transport="rest",
+    )
     should_validate = should_validate_chat_response(
         user_prompt=body.content,
         effective_complex=effective_complex,
@@ -1176,6 +1186,7 @@ async def _run_websocket_message(
         )
         _record_chat_stage_timing(stage_timings_ms, "library_grounding", stage_started)
         full_response: List[str] = []
+        provisional_draft_committed = False
         decision = classify_chat_complexity(
             user_message,
             threshold=settings.chat_complexity_threshold,
@@ -1184,6 +1195,15 @@ async def _run_websocket_message(
         execution_mode, effective_complex = _resolve_chat_execution(
             auto_complex=(decision.is_complex or library_intent),
             preference=getattr(current_user, "chat_routing_preference", None),
+        )
+        _log_chat_routing_decision(
+            decision=decision,
+            preference=getattr(current_user, "chat_routing_preference", None),
+            execution_mode=execution_mode,
+            effective_complex=effective_complex,
+            library_intent=library_intent,
+            session_id=session_id,
+            transport="websocket",
         )
         should_validate = should_validate_chat_response(
             user_prompt=user_message,
@@ -1225,13 +1245,28 @@ async def _run_websocket_message(
             await _flush_runtime_messages(new_messages)
             tool_names = _runtime_messages_tool_names(new_messages)
             if tool_names:
-                await _emit_state("tool_active", tool_names=tool_names)
+                await _emit_state("tool_completed", tool_names=tool_names)
 
         async def _emit_pre_tool_state(tool_calls: List[Dict[str, Any]]) -> None:
             tool_names = _tool_call_names_from_calls(tool_calls)
             tool_details = _build_live_tool_details(tool_calls)
             state = "image_rendering" if any(name == "generate_image" for name in tool_names) else "tool_active"
             await _emit_state(state, tool_names=tool_names, tool_details=tool_details)
+
+        async def _emit_provisional_text(action: str, content: str) -> None:
+            nonlocal provisional_draft_committed
+            event_type = {
+                "delta": "draft_token",
+                "reset": "draft_reset",
+                "commit": "draft_commit",
+            }.get(action)
+            if event_type is None:
+                raise ValueError(f"Unsupported provisional text action: {action}")
+            provisional_draft_committed = action == "commit"
+            payload: Dict[str, Any] = {"type": event_type}
+            if content:
+                payload["content"] = content
+            await _send_json_if_open(payload)
 
         await _emit_state("thinking")
 
@@ -1286,7 +1321,7 @@ async def _run_websocket_message(
         else:
             started = time.perf_counter()
             try:
-                async for token_chunk in stream_agent(
+                agent_stream = stream_agent(
                     execution_history,
                     user_context,
                     mode=execution_mode,
@@ -1294,9 +1329,13 @@ async def _run_websocket_message(
                     stage="chat_simple",
                     runtime_message_callback=_flush_runtime_messages_with_state,
                     pre_tool_callback=_emit_pre_tool_state,
-                ):
-                    full_response.append(token_chunk)
-                    await _send_json_if_open({"type": "token", "content": token_chunk})
+                    provisional_text_callback=_emit_provisional_text,
+                )
+                async with contextlib.aclosing(agent_stream):
+                    async for token_chunk in agent_stream:
+                        full_response.append(token_chunk)
+                        if not provisional_draft_committed:
+                            await _send_json_if_open({"type": "token", "content": token_chunk})
             except Exception as e:
                 runtime_history_messages = await _flush_pending_runtime_history()
                 handoff_metadata = get_task_handoff_payload() or {}
@@ -1437,7 +1476,10 @@ async def chat_websocket(
     Auth path 2 — web/legacy client (backward compatible):
       First WS message:    {"content": "user message", "token": "Bearer <token>"}
 
-    Server sends:  {"type": "token",   "content": "..."}  (one per chunk)
+    Server sends:  {"type": "draft_token", "content": "..."} (provisional)
+                   {"type": "draft_reset"}                   (tool superseded draft)
+                   {"type": "draft_commit"}                  (promote provisional text)
+                   {"type": "token",   "content": "..."}   (committed chunk)
                    {"type": "done",    "content": "full response"}
                    {"type": "persona", "content": "...", "persona": "name"}
                    {"type": "error",   "content": "error message"}
@@ -1570,6 +1612,9 @@ async def chat_websocket(
                     }
                 )
                 return
+            # The socket can outlive preference updates made through the HTTP API.
+            # Refresh the narrow mutable field instead of forcing a reconnect.
+            await db.refresh(current_user, attribute_names=["chat_routing_preference"])
             sr = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
             session = sr.scalar_one_or_none() or session
             active_message_task = asyncio.create_task(
@@ -1983,6 +2028,30 @@ def _normalize_chat_routing_preference(value: str | None) -> str:
     if lowered in {"auto", "fast", "deep"}:
         return lowered
     return "auto"
+
+
+def _log_chat_routing_decision(
+    *,
+    decision: ChatComplexityDecision,
+    preference: str | None,
+    execution_mode: str,
+    effective_complex: bool,
+    library_intent: bool,
+    session_id: int,
+    transport: str,
+) -> None:
+    log.info(
+        "chat.routing_decision",
+        session_id=session_id,
+        transport=transport,
+        preference=_normalize_chat_routing_preference(preference),
+        classifier_score=getattr(decision, "score", None),
+        classifier_reasons=list(getattr(decision, "reasons", []) or []),
+        classifier_complex=decision.is_complex,
+        library_intent=library_intent,
+        execution_mode=execution_mode,
+        effective_complex=effective_complex,
+    )
 
 
 def _resolve_chat_execution(

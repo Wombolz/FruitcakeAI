@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     local_tool_investigation_enabled: bool = False
     local_tool_investigation_drop_browser_tools: bool = False
     local_tool_investigation_max_tools: int = 0
+    fruitcake_native_agent_streaming_enabled: bool = False
+    fruitcake_native_agent_streaming_models: str = "ollama_chat/muse-glimmer:30b-mlx"
+    fruitcake_native_agent_streaming_reasoning_effort: str = "high"
+    fruitcake_local_reasoning_tap: bool = False
     local_tool_text_only_models: str = ""
     # Sprint 5.6.5 knowledge skills
     skills_preview_allowed_domains: List[str] = [
