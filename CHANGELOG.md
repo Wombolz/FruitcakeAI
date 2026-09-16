@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.32
+
+- Added opt-in, model-allowlisted native streaming for non-validation-gated chat turns, using one provider request per turn and accumulating complete tool calls before dispatch.
+- Added reversible WebSocket draft events and a `tool_completed` state, while preserving the authoritative final answer in the `done` event and saved history.
+- Preserved tagged and explicit Ollama reasoning separately from visible answers and assigned tool-call indexes across the full stream to prevent separate calls from being merged.
+- Added an optional local reasoning diagnostic that redacts complete buffered output when the stream ends and stays disabled for incognito sessions.
+- Closed provider streams on cancellation and limited compatibility fallback to failures before the first normalized event.
+- Refreshed chat routing preferences on each WebSocket message and added routing and native-stream timing diagnostics.
+- Extended the local-model diagnosis harness and regression coverage for real LiteLLM chunk conversion, tool accumulation, draft promotion, cleanup, and credential redaction.
+
 ## v0.7.31
 
 - Added authenticated, user-scoped workspace image upload and serving so chat clients can attach, retrieve, and persist image artifacts without broadening host-filesystem access.
