@@ -52,6 +52,9 @@ FRUITCAKE_LOCAL_REASONING_TAP=true
 The reasoning tap is never persisted by the streaming transport and is
 automatically disabled for incognito sessions. It is diagnostic model output,
 not an audit log or a literal representation of model inference.
+Reasoning is buffered until the provider stream ends (including interruption),
+then redacted and written to stderr so credentials split across deltas are
+redacted together.
 
 Before enabling a new model in normal chat, run its streamed fixture matrix:
 

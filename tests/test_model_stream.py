@@ -9,6 +9,24 @@ from app.agent.model_stream import (
     close_provider_stream,
     iter_model_stream_events,
 )
+from app.agent.litellm_ollama_patch import apply_litellm_ollama_stream_patch
+
+
+def _ollama_parser():
+    from litellm.llms.ollama.chat.transformation import OllamaChatCompletionResponseIterator
+
+    apply_litellm_ollama_stream_patch()
+    return OllamaChatCompletionResponseIterator(streaming_response=iter([]), sync_stream=True)
+
+
+def _ollama_chunk(message, *, done=False):
+    return {
+        "model": "test",
+        "message": {"role": "assistant", "content": "", **message},
+        "done": done,
+        "prompt_eval_count": 12 if done else 0,
+        "eval_count": 4 if done else 0,
+    }
 
 
 async def _chunks(*items):
@@ -172,3 +190,71 @@ async def test_close_provider_stream_awaits_aclose():
     stream = _ProviderStream()
     await close_provider_stream(stream)
     assert stream.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("messages, reasoning, content", [
+    ([{"content": "<think>private analysis</think>Visible answer"}], "private analysis", "Visible answer"),
+    ([{"content": part} for part in ["<think>private ", "analysis", "</think>Visible answer"]],
+     "private analysis", "Visible answer"),
+    ([{"content": part} for part in "<think>private analysis</think>Visible answer"],
+     "private analysis", "Visible answer"),
+    ([{"thinking": "private analysis", "content": "Visible answer"}], "private analysis", "Visible answer"),
+    ([{"thinking": "private "}, {"thinking": "analysis"}, {"content": "Visible answer"}],
+     "private analysis", "Visible answer"),
+    ([{"content": "<think>unfinished private analysis"}], "unfinished private analysis", ""),
+    ([{"content": "Visible answer<"}], "", "Visible answer<"),
+])
+async def test_real_ollama_parser_preserves_reasoning_boundaries(messages, reasoning, content):
+    parser = _ollama_parser()
+    chunks = [
+        parser.chunk_parser(_ollama_chunk(message, done=index == len(messages) - 1))
+        for index, message in enumerate(messages)
+    ]
+    result = await _accumulate(*chunks)
+
+    assert result.reasoning_content == reasoning
+    assert result.content == content
+    assert result.usage == {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16}
+
+
+@pytest.mark.asyncio
+async def test_real_ollama_parser_keeps_complete_calls_separate_across_chunks():
+    parser = _ollama_parser()
+    first = _ollama_chunk({"tool_calls": [
+        {"function": {"name": "read_file", "arguments": {"path": "notes/a.md"}}},
+        {"function": {"name": "list_tasks", "arguments": {}}},
+    ]})
+    second = _ollama_chunk({"tool_calls": [
+        {"function": {"name": "read_file", "arguments": {"path": "notes/b.md"}}},
+        {"function": {"name": "list_tasks", "arguments": {}}},
+    ]}, done=True)
+    snapshot = json.dumps([first, second])
+    result = await _accumulate(parser.chunk_parser(first), parser.chunk_parser(second))
+
+    assert json.dumps([first, second]) == snapshot
+    assert [call["function"]["name"] for call in result.tool_calls] == [
+        "read_file", "list_tasks", "read_file", "list_tasks",
+    ]
+    assert [json.loads(call["function"]["arguments"]) for call in result.tool_calls] == [
+        {"path": "notes/a.md"}, {}, {"path": "notes/b.md"}, {},
+    ]
+    assert len({call["id"] for call in result.tool_calls}) == 4
+
+
+@pytest.mark.asyncio
+async def test_real_ollama_parser_keeps_reasoning_state_per_stream():
+    first, second = _ollama_parser(), _ollama_parser()
+    private = first.chunk_parser(_ollama_chunk({"content": "<think>private"}))
+    public = second.chunk_parser(_ollama_chunk({"content": "Visible answer"}, done=True))
+    closed = first.chunk_parser(_ollama_chunk({"content": "</think>First answer"}, done=True))
+
+    assert (await _accumulate(public)).content == "Visible answer"
+    result = await _accumulate(private, closed)
+    assert result.reasoning_content == "private"
+    assert result.content == "First answer"
+
+
+def test_ollama_stream_patch_is_idempotent():
+    _ollama_parser()
+    assert apply_litellm_ollama_stream_patch() is False

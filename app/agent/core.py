@@ -18,7 +18,10 @@ import litellm
 import structlog
 
 from app.agent.context import UserContext
-from app.agent.litellm_ollama_patch import apply_litellm_ollama_tool_history_patch
+from app.agent.litellm_ollama_patch import (
+    apply_litellm_ollama_stream_patch,
+    apply_litellm_ollama_tool_history_patch,
+)
 from app.agent.model_stream import (
     ModelStreamError,
     ModelTurnAccumulator,
@@ -52,6 +55,7 @@ litellm.suppress_debug_info = True
 # tool_name from conversation history, corrupting every multi-turn tool
 # transcript sent to local models — see app/agent/litellm_ollama_patch.py.
 apply_litellm_ollama_tool_history_patch()
+apply_litellm_ollama_stream_patch()
 
 # Phase 4: task sessions get more turns for multi-step autonomous work
 TURN_LIMITS: Dict[str, int] = {
@@ -487,22 +491,19 @@ def _write_reasoning_tap(
     model: str,
     stage: str | None,
     turn: int,
-    started: bool,
-) -> bool:
+) -> None:
+    """Redact a complete turn's reasoning, never individual provider deltas."""
     if not text or not _reasoning_tap_enabled(user_context, model):
-        return started
+        return
     cleaned = text
     for pattern, replacement in _REASONING_SECRET_PATTERNS:
         cleaned = pattern.sub(replacement, cleaned)
-    if not started:
-        prefix = (
-            f"\n[fruitcake reasoning session={user_context.session_id or '-'} "
-            f"model={model} stage={stage or '-'} turn={turn}]\n"
-        )
-        sys.stderr.write(prefix)
-    sys.stderr.write(cleaned)
+    prefix = (
+        f"\n[fruitcake reasoning session={user_context.session_id or '-'} "
+        f"model={model} stage={stage or '-'} turn={turn}]\n"
+    )
+    sys.stderr.write(prefix + cleaned + "\n")
     sys.stderr.flush()
-    return True
 
 
 def _drop_stale_reasoning_content(history: List[Dict[str, Any]]) -> None:
@@ -3068,7 +3069,6 @@ async def stream_agent(
         if native_streaming_enabled:
             accumulator = ModelTurnAccumulator()
             provider_stream = None
-            tap_started = False
             event_counts: dict[str, int] = {}
             stream_started = time.perf_counter()
             first_event_ms: float | None = None
@@ -3098,16 +3098,7 @@ async def stream_agent(
                             first_event_ms = (time.perf_counter() - stream_started) * 1000.0
                         event_counts[event.kind] = event_counts.get(event.kind, 0) + 1
                         accumulator.add(event)
-                        if event.kind == "reasoning_delta" and event.text:
-                            tap_started = _write_reasoning_tap(
-                                event.text,
-                                user_context=user_context,
-                                model=selected_model,
-                                stage=stage,
-                                turn=turn_number,
-                                started=tap_started,
-                            )
-                        elif event.kind == "text_delta" and event.text:
+                        if event.kind == "text_delta" and event.text:
                             if turn_tools and provisional_text_callback is not None:
                                 provisional_text_active = True
                                 await provisional_text_callback("delta", event.text)
@@ -3115,10 +3106,16 @@ async def stream_agent(
                                 native_text_emitted = True
                                 yield event.text
                 finally:
-                    await close_provider_stream(provider_stream)
-                if tap_started:
-                    sys.stderr.write("\n")
-                    sys.stderr.flush()
+                    try:
+                        await close_provider_stream(provider_stream)
+                    finally:
+                        _write_reasoning_tap(
+                            "".join(accumulator.reasoning_parts),
+                            user_context=user_context,
+                            model=selected_model,
+                            stage=stage,
+                            turn=turn_number,
+                        )
                 native_turn = accumulator.finish()
                 if native_turn.usage:
                     await record_llm_usage_event(

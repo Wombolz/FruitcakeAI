@@ -35,6 +35,7 @@ with lenient templates are unaffected.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any, Dict, List
 
 import structlog
@@ -42,6 +43,62 @@ import structlog
 log = structlog.get_logger()
 
 _PATCH_FLAG = "_fruitcake_tool_history_patch"
+_STREAM_PATCH_FLAG = "_fruitcake_stream_patch"
+
+
+def apply_litellm_ollama_stream_patch() -> bool:
+    """Preserve reasoning and complete-call identity before LiteLLM translation.
+
+    Ollama emits complete argument objects. LiteLLM serializes them and assigns
+    indexes starting at zero in each chunk, making separate calls look like
+    fragments of one call. Its tag handling also removes reasoning boundaries
+    before the provider-neutral normalizer can inspect them.
+    """
+    from litellm.llms.ollama.chat.transformation import OllamaChatCompletionResponseIterator
+
+    from app.agent.model_stream import ModelStreamNormalizer
+
+    iterator_class = OllamaChatCompletionResponseIterator
+    if getattr(iterator_class, _STREAM_PATCH_FLAG, False):
+        return False
+    original_parser = iterator_class.chunk_parser
+
+    def chunk_parser_with_stream_boundaries(self, chunk):
+        # The upstream parser mutates tool dictionaries. Preserve the caller's
+        # raw chunk, including reasoning, while retaining its usage/error logic.
+        translated_chunk = deepcopy(chunk)
+        message = translated_chunk["message"]
+        raw_content = message.get("content")
+        raw_reasoning = message.pop("thinking", None)
+        message["content"] = ""
+
+        next_index = getattr(self, "_fruitcake_next_tool_index", 0)
+        for call in message.get("tool_calls") or []:
+            if isinstance((call.get("function") or {}).get("arguments"), dict):
+                call["index"] = next_index
+                next_index += 1
+        self._fruitcake_next_tool_index = next_index
+
+        response = original_parser(self, translated_chunk)
+        normalizer = getattr(self, "_fruitcake_reasoning_normalizer", None)
+        if normalizer is None:
+            normalizer = ModelStreamNormalizer()
+            self._fruitcake_reasoning_normalizer = normalizer
+        events = normalizer.feed({"choices": [{
+            "delta": {"content": raw_content, "reasoning_content": raw_reasoning},
+            "finish_reason": "stop" if chunk.get("done") else None,
+        }]})
+        delta = response.choices[0].delta
+        delta.content = "".join(event.text or "" for event in events if event.kind == "text_delta") or None
+        delta.reasoning_content = "".join(
+            event.text or "" for event in events if event.kind == "reasoning_delta"
+        ) or None
+        return response
+
+    iterator_class.chunk_parser = chunk_parser_with_stream_boundaries
+    setattr(iterator_class, _STREAM_PATCH_FLAG, True)
+    log.info("litellm_ollama_stream_patch_installed")
+    return True
 
 
 def _coerce_arguments(raw: Any) -> Dict[str, Any]:

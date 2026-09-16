@@ -39,6 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from app.agent.tools import TOOL_SCHEMAS  # noqa: E402
+from app.agent.litellm_ollama_patch import apply_litellm_ollama_stream_patch  # noqa: E402
 from app.agent.model_stream import (  # noqa: E402
     ModelTurnAccumulator,
     close_provider_stream,
@@ -294,6 +295,8 @@ async def _run_litellm_stream(
 ) -> dict[str, Any]:
     """Capture sanitized normalized stream shape without recording raw content."""
     import litellm
+
+    apply_litellm_ollama_stream_patch()
 
     started = time.perf_counter()
     provider_stream = None

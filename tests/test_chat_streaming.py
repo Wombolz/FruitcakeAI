@@ -13,6 +13,14 @@ from app.agent.tools import _soften_unsupported_summary_totals
 from app.config import settings
 
 
+@pytest.fixture(autouse=True)
+def _streaming_settings(monkeypatch):
+    # Individual native-stream tests opt in; compatibility tests must not read
+    # a developer's native-stream or diagnostic settings from .env.
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", False)
+    monkeypatch.setattr(settings, "fruitcake_local_reasoning_tap", False)
+
+
 class _FakeMessage:
     def __init__(self, *, content: str = "", tool_calls=None):
         self.content = content
@@ -143,6 +151,7 @@ async def test_native_streaming_plain_turn_uses_one_provider_request(monkeypatch
     model = "ollama_chat/muse-glimmer:30b-mlx"
     monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
     monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_models", model)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_reasoning_effort", "high")
     user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
     provider_stream = _ClosableStream(
         [
@@ -412,6 +421,52 @@ async def test_native_reasoning_tap_is_suppressed_for_incognito(monkeypatch):
 
     assert result == "Visible answer"
     stderr_write.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["complete", "error", "close"])
+async def test_reasoning_tap_redacts_across_deltas_when_stream_ends(monkeypatch, ending):
+    model = "ollama_chat/test"
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_models", model)
+    monkeypatch.setattr(settings, "fruitcake_local_reasoning_tap", True)
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    reasoning = "api_key=EXAMPLE_FAKE_CREDENTIAL Bearer EXAMPLE_FAKE_TOKEN sk-EXAMPLE_FAKE_KEY"
+
+    class _ReasoningStream(_ClosableStream):
+        async def __anext__(self):
+            stderr_write.assert_not_called()
+            if self._index == len(self._chunks) and ending == "error":
+                raise RuntimeError("synthetic stream failure")
+            return await super().__anext__()
+
+    # Character-sized chunks exercise every split, including inside prefixes.
+    provider_stream = _ReasoningStream([
+        *[_stream_chunk(reasoning=character) for character in reasoning],
+        _stream_chunk(content="Visible answer", finish_reason="stop" if ending == "complete" else None),
+    ])
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(return_value=provider_stream)),
+        patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
+        patch("app.agent.core.sys.stderr.write") as stderr_write,
+    ):
+        stream = stream_agent([{"role": "user", "content": "hi"}], user_context, model_override=model)
+        assert await anext(stream) == "Visible answer"
+        stderr_write.assert_not_called()
+        if ending == "close":
+            await stream.aclose()
+        elif ending == "error":
+            with pytest.raises(core.ModelStreamError, match="partial progress"):
+                await anext(stream)
+        else:
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+
+    output = "".join(call.args[0] for call in stderr_write.call_args_list)
+    assert "EXAMPLE_FAKE" not in output
+    assert "api_key=[REDACTED] Bearer [REDACTED] sk-[REDACTED]" in output
+    assert provider_stream.closed is True
 
 
 @pytest.mark.asyncio
