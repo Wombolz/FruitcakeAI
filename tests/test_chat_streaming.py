@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.agent import core
 from app.agent.context import UserContext
 from app.agent.core import build_local_document_summary_digest, run_agent, stream_agent
 from app.agent.tools import _soften_unsupported_summary_totals
 from app.config import settings
+
+
+@pytest.fixture(autouse=True)
+def _streaming_settings(monkeypatch):
+    # Individual native-stream tests opt in; compatibility tests must not read
+    # a developer's native-stream or diagnostic settings from .env.
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", False)
+    monkeypatch.setattr(settings, "fruitcake_local_reasoning_tap", False)
 
 
 class _FakeMessage:
@@ -54,6 +64,409 @@ async def _fake_stream(*parts: str):
                 )
             ]
         )
+
+
+class _ClosableStream:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self._index = 0
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._index >= len(self._chunks):
+            raise StopAsyncIteration
+        chunk = self._chunks[self._index]
+        self._index += 1
+        return chunk
+
+    async def aclose(self):
+        self.closed = True
+
+
+def _stream_chunk(*, content=None, reasoning=None, tool_calls=None, finish_reason=None, usage=None):
+    delta = SimpleNamespace(
+        content=content,
+        reasoning_content=reasoning,
+        tool_calls=tool_calls or [],
+    )
+    return SimpleNamespace(
+        choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)],
+        usage=usage,
+    )
+
+
+def test_native_streaming_policy_requires_feature_flag_and_exact_model_match(monkeypatch):
+    model = "ollama_chat/muse-glimmer:30b-mlx"
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_models", model)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", False)
+
+    assert core._native_agent_streaming_enabled(model) is False
+
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
+    assert core._native_agent_streaming_enabled(model) is True
+    assert core._native_agent_streaming_enabled("ollama_chat/muse-glimmer:30b") is False
+    assert core._native_agent_streaming_enabled("ollama_chat/qwen3.6:35b") is False
+
+
+@pytest.mark.asyncio
+async def test_unlisted_local_model_keeps_compatibility_path(monkeypatch):
+    selected_model = "ollama_chat/qwen3.6:35b"
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
+    monkeypatch.setattr(
+        settings,
+        "fruitcake_native_agent_streaming_models",
+        "ollama_chat/muse-glimmer:30b-mlx",
+    )
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch(
+            "app.agent.core.litellm.acompletion",
+            new=AsyncMock(return_value=_fake_response(content="Compatibility answer")),
+        ) as completion,
+        patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
+    ):
+        result = "".join(
+            [
+                chunk
+                async for chunk in stream_agent(
+                    [{"role": "user", "content": "hi"}],
+                    user_context,
+                    model_override=selected_model,
+                )
+            ]
+        )
+
+    assert result == "Compatibility answer"
+    assert completion.await_count == 1
+    assert completion.await_args.kwargs["stream"] is False
+
+
+@pytest.mark.asyncio
+async def test_native_streaming_plain_turn_uses_one_provider_request(monkeypatch):
+    model = "ollama_chat/muse-glimmer:30b-mlx"
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_models", model)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_reasoning_effort", "high")
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    provider_stream = _ClosableStream(
+        [
+            _stream_chunk(reasoning="Check the request. "),
+            _stream_chunk(content="Hello"),
+            _stream_chunk(
+                content=" world",
+                finish_reason="stop",
+                usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4, total_tokens=16),
+            ),
+        ]
+    )
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(return_value=provider_stream)) as completion,
+        patch("app.agent.core.record_llm_usage_event", new=AsyncMock()) as usage_recorder,
+    ):
+        chunks = [
+            chunk
+            async for chunk in stream_agent(
+                [{"role": "user", "content": "hi"}],
+                user_context,
+                model_override=model,
+            )
+        ]
+
+    assert "".join(chunks) == "Hello world"
+    assert completion.await_count == 1
+    assert completion.await_args.kwargs["stream"] is True
+    assert completion.await_args.kwargs["reasoning_effort"] == "high"
+    assert provider_stream.closed is True
+    usage_recorder.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_native_streaming_tool_turn_is_canonical_before_dispatch(monkeypatch):
+    model = "ollama_chat/muse-glimmer:30b-mlx"
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_models", model)
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    tool_stream = _ClosableStream(
+        [
+            _stream_chunk(
+                reasoning="I should inspect the file.",
+                content="I'll read it now.",
+                tool_calls=[
+                    {
+                        "function": {"name": "read_file", "arguments": {"path": "notes/a.md"}}
+                    }
+                ],
+                finish_reason="tool_calls",
+            )
+        ]
+    )
+    answer_stream = _ClosableStream(
+        [_stream_chunk(content="The file says hello.", finish_reason="stop")]
+    )
+    completion = AsyncMock(side_effect=[tool_stream, answer_stream])
+    pre_tool_calls = []
+    runtime_messages = []
+    provisional_events = []
+
+    async def _pre_tool(calls):
+        pre_tool_calls.extend(calls)
+
+    async def _runtime(messages):
+        runtime_messages.extend(messages)
+
+    async def _provisional(action, content):
+        provisional_events.append((action, content))
+
+    async def _dispatch(calls, _user_context):
+        return [
+            {"role": "tool", "tool_call_id": calls[0]["id"], "content": "hello"}
+        ]
+
+    with (
+        patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[{"type": "function", "function": {"name": "read_file"}}],
+        ),
+        patch("app.agent.core.litellm.acompletion", completion),
+        patch(
+            "app.agent.core.dispatch_tool_calls",
+            new=AsyncMock(side_effect=_dispatch),
+        ) as dispatcher,
+        patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
+    ):
+        chunks = [
+            chunk
+            async for chunk in stream_agent(
+                [{"role": "user", "content": "read the file"}],
+                user_context,
+                model_override=model,
+                pre_tool_callback=_pre_tool,
+                runtime_message_callback=_runtime,
+                provisional_text_callback=_provisional,
+            )
+        ]
+
+    assert "".join(chunks) == "The file says hello."
+    assert completion.await_count == 2
+    dispatched = dispatcher.await_args.args[0]
+    assert dispatched == pre_tool_calls
+    assert dispatched[0]["id"].startswith("call_stream_")
+    assert dispatched[0]["type"] == "function"
+    assert json.loads(dispatched[0]["function"]["arguments"]) == {"path": "notes/a.md"}
+    assert runtime_messages[0]["content"] == ""
+    assert runtime_messages[0]["reasoning_content"] == "I should inspect the file."
+    assert "I'll read it now" not in "".join(chunks)
+    assert provisional_events == [
+        ("delta", "I'll read it now."),
+        ("reset", ""),
+        ("delta", "The file says hello."),
+        ("commit", ""),
+    ]
+    assert tool_stream.closed is True
+    assert answer_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_native_streaming_generator_close_closes_provider(monkeypatch):
+    model = "ollama_chat/muse-glimmer:30b-mlx"
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_models", model)
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    provider_stream = _ClosableStream(
+        [
+            _stream_chunk(content="first"),
+            _stream_chunk(content="second", finish_reason="stop"),
+        ]
+    )
+
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(return_value=provider_stream)),
+        patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
+    ):
+        agent_stream = stream_agent(
+            [{"role": "user", "content": "hi"}],
+            user_context,
+            model_override=model,
+        )
+        assert await agent_stream.__anext__() == "first"
+        await agent_stream.aclose()
+
+    assert provider_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_native_streaming_falls_back_only_before_first_event(monkeypatch):
+    model = "ollama_chat/muse-glimmer:30b-mlx"
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_models", model)
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+
+    class _FailsBeforeEvent(_ClosableStream):
+        async def __anext__(self):
+            raise RuntimeError("provider stream failed before first event")
+
+    failed_stream = _FailsBeforeEvent([])
+    completion = AsyncMock(
+        side_effect=[failed_stream, _fake_response(content="Compatibility answer")]
+    )
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", completion),
+        patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
+    ):
+        chunks = [
+            chunk
+            async for chunk in stream_agent(
+                [{"role": "user", "content": "hi"}],
+                user_context,
+                model_override=model,
+            )
+        ]
+
+    assert "".join(chunks) == "Compatibility answer"
+    assert completion.await_count == 2
+    assert completion.await_args_list[0].kwargs["stream"] is True
+    assert completion.await_args_list[1].kwargs["stream"] is False
+    assert failed_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_native_streaming_does_not_replay_after_partial_stream_failure(monkeypatch):
+    model = "ollama_chat/muse-glimmer:30b-mlx"
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_models", model)
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+
+    class _FailsAfterEvent(_ClosableStream):
+        async def __anext__(self):
+            if self._index == 0:
+                self._index += 1
+                return _stream_chunk(content="partial")
+            raise RuntimeError("provider stream failed after output")
+
+    failed_stream = _FailsAfterEvent([])
+    completion = AsyncMock(return_value=failed_stream)
+    provisional_events = []
+
+    async def _provisional(action, content):
+        provisional_events.append((action, content))
+
+    with (
+        patch(
+            "app.agent.core.get_tools_for_user",
+            return_value=[{"type": "function", "function": {"name": "read_file"}}],
+        ),
+        patch("app.agent.core.litellm.acompletion", completion),
+        patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
+    ):
+        with pytest.raises(RuntimeError, match="failed after partial progress"):
+            _ = [
+                chunk
+                async for chunk in stream_agent(
+                    [{"role": "user", "content": "hi"}],
+                    user_context,
+                    model_override=model,
+                    provisional_text_callback=_provisional,
+                )
+            ]
+
+    assert completion.await_count == 1
+    assert failed_stream.closed is True
+    assert provisional_events == [("delta", "partial"), ("reset", "")]
+
+
+@pytest.mark.asyncio
+async def test_native_reasoning_tap_is_suppressed_for_incognito(monkeypatch):
+    model = "ollama_chat/muse-glimmer:30b-mlx"
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_models", model)
+    monkeypatch.setattr(settings, "fruitcake_local_reasoning_tap", True)
+    user_context = UserContext(
+        user_id=1,
+        username="tester",
+        role="admin",
+        persona="family_assistant",
+        is_incognito=True,
+    )
+    provider_stream = _ClosableStream(
+        [
+            _stream_chunk(reasoning="private reasoning"),
+            _stream_chunk(content="Visible answer", finish_reason="stop"),
+        ]
+    )
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(return_value=provider_stream)),
+        patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
+        patch("app.agent.core.sys.stderr.write") as stderr_write,
+    ):
+        result = "".join(
+            [
+                chunk
+                async for chunk in stream_agent(
+                    [{"role": "user", "content": "hi"}],
+                    user_context,
+                    model_override=model,
+                )
+            ]
+        )
+
+    assert result == "Visible answer"
+    stderr_write.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["complete", "error", "close"])
+async def test_reasoning_tap_redacts_across_deltas_when_stream_ends(monkeypatch, ending):
+    model = "ollama_chat/test"
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_enabled", True)
+    monkeypatch.setattr(settings, "fruitcake_native_agent_streaming_models", model)
+    monkeypatch.setattr(settings, "fruitcake_local_reasoning_tap", True)
+    user_context = UserContext(user_id=1, username="tester", role="parent", persona="family_assistant")
+    reasoning = "api_key=EXAMPLE_FAKE_CREDENTIAL Bearer EXAMPLE_FAKE_TOKEN sk-EXAMPLE_FAKE_KEY"
+
+    class _ReasoningStream(_ClosableStream):
+        async def __anext__(self):
+            stderr_write.assert_not_called()
+            if self._index == len(self._chunks) and ending == "error":
+                raise RuntimeError("synthetic stream failure")
+            return await super().__anext__()
+
+    # Character-sized chunks exercise every split, including inside prefixes.
+    provider_stream = _ReasoningStream([
+        *[_stream_chunk(reasoning=character) for character in reasoning],
+        _stream_chunk(content="Visible answer", finish_reason="stop" if ending == "complete" else None),
+    ])
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[]),
+        patch("app.agent.core.litellm.acompletion", new=AsyncMock(return_value=provider_stream)),
+        patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
+        patch("app.agent.core.sys.stderr.write") as stderr_write,
+    ):
+        stream = stream_agent([{"role": "user", "content": "hi"}], user_context, model_override=model)
+        assert await anext(stream) == "Visible answer"
+        stderr_write.assert_not_called()
+        if ending == "close":
+            await stream.aclose()
+        elif ending == "error":
+            with pytest.raises(core.ModelStreamError, match="partial progress"):
+                await anext(stream)
+        else:
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+
+    output = "".join(call.args[0] for call in stderr_write.call_args_list)
+    assert "EXAMPLE_FAKE" not in output
+    assert "api_key=[REDACTED] Bearer [REDACTED] sk-[REDACTED]" in output
+    assert provider_stream.closed is True
 
 
 @pytest.mark.asyncio

@@ -29,6 +29,52 @@ ollama serve
 
 > **Important**: Use the `ollama_chat/` prefix, not `ollama/`. The `ollama/` prefix routes to the generate API which does not support tool/function calling — tools will be silently ignored.
 
+### Experimental native agent streaming
+
+Fruitcake can opt selected models into one provider stream per agent turn. This
+removes the compatibility path's non-streaming probe and duplicate final-text
+request while preserving complete tool-call accumulation before dispatch.
+
+The feature is disabled by default and model allowlisted:
+
+```env
+FRUITCAKE_NATIVE_AGENT_STREAMING_ENABLED=true
+FRUITCAKE_NATIVE_AGENT_STREAMING_MODELS=ollama_chat/muse-glimmer:30b-mlx
+FRUITCAKE_NATIVE_AGENT_STREAMING_REASONING_EFFORT=high
+```
+
+Optional developer-only reasoning output can be sent to stderr:
+
+```env
+FRUITCAKE_LOCAL_REASONING_TAP=true
+```
+
+The reasoning tap is never persisted by the streaming transport and is
+automatically disabled for incognito sessions. It is diagnostic model output,
+not an audit log or a literal representation of model inference.
+Reasoning is buffered until the provider stream ends (including interruption),
+then redacted and written to stderr so credentials split across deltas are
+redacted together.
+
+Before enabling a new model in normal chat, run its streamed fixture matrix:
+
+```bash
+.venv/bin/python scripts/diagnose_local_tool_calls.py \
+  --model muse-glimmer:30b-mlx \
+  --legs litellm_stream \
+  --trials 1
+```
+
+Models not present in `FRUITCAKE_NATIVE_AGENT_STREAMING_MODELS` continue using
+the established compatibility path. A native stream may fall back only if it
+fails before producing its first event; partial turns are never replayed.
+
+For tool-enabled native turns, the WebSocket uses reversible `draft_token`,
+`draft_reset`, and `draft_commit` events. This lets clients display model text
+immediately while still removing intermediate narration if the completed turn
+selects a tool. The terminal `done` event remains authoritative and contains the
+complete persisted answer for backward compatibility.
+
 ---
 
 ### Anthropic Claude — cloud, best quality

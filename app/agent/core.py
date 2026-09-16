@@ -10,13 +10,25 @@ import contextvars
 import hashlib
 import json
 import re
+import sys
+import time
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List
 
 import litellm
 import structlog
 
 from app.agent.context import UserContext
-from app.agent.litellm_ollama_patch import apply_litellm_ollama_tool_history_patch
+from app.agent.litellm_ollama_patch import (
+    apply_litellm_ollama_stream_patch,
+    apply_litellm_ollama_tool_history_patch,
+)
+from app.agent.model_stream import (
+    ModelStreamError,
+    ModelTurnAccumulator,
+    ModelTurnResult,
+    close_provider_stream,
+    iter_model_stream_events,
+)
 from app.agent.tools import dispatch_tool_calls, get_tools_for_user
 from app.config import settings
 from app.llm_usage import record_llm_usage_event, stream_usage_enabled
@@ -43,6 +55,7 @@ litellm.suppress_debug_info = True
 # tool_name from conversation history, corrupting every multi-turn tool
 # transcript sent to local models — see app/agent/litellm_ollama_patch.py.
 apply_litellm_ollama_tool_history_patch()
+apply_litellm_ollama_stream_patch()
 
 # Phase 4: task sessions get more turns for multi-step autonomous work
 TURN_LIMITS: Dict[str, int] = {
@@ -437,6 +450,69 @@ def _should_skip_final_stream_pass(model: str) -> bool:
 def _is_local_model(model: str | None) -> bool:
     selected = str(model or "").strip()
     return selected.startswith(("ollama/", "ollama_chat/"))
+
+
+def _configured_native_streaming_models() -> set[str]:
+    return {
+        str(part).strip()
+        for part in str(settings.fruitcake_native_agent_streaming_models or "").split(",")
+        if str(part).strip()
+    }
+
+
+def _native_agent_streaming_enabled(model: str | None) -> bool:
+    selected = str(model or "").strip()
+    return bool(
+        settings.fruitcake_native_agent_streaming_enabled
+        and selected
+        and selected in _configured_native_streaming_models()
+    )
+
+
+_REASONING_SECRET_PATTERNS = (
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}"), "Bearer [REDACTED]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"), "sk-[REDACTED]"),
+    (re.compile(r"(?i)(api[_ -]?key\s*[:=]\s*)\S+"), r"\1[REDACTED]"),
+)
+
+
+def _reasoning_tap_enabled(user_context: UserContext, model: str | None) -> bool:
+    return bool(
+        settings.fruitcake_local_reasoning_tap
+        and _is_local_model(model)
+        and not user_context.is_incognito
+    )
+
+
+def _write_reasoning_tap(
+    text: str,
+    *,
+    user_context: UserContext,
+    model: str,
+    stage: str | None,
+    turn: int,
+) -> None:
+    """Redact a complete turn's reasoning, never individual provider deltas."""
+    if not text or not _reasoning_tap_enabled(user_context, model):
+        return
+    cleaned = text
+    for pattern, replacement in _REASONING_SECRET_PATTERNS:
+        cleaned = pattern.sub(replacement, cleaned)
+    prefix = (
+        f"\n[fruitcake reasoning session={user_context.session_id or '-'} "
+        f"model={model} stage={stage or '-'} turn={turn}]\n"
+    )
+    sys.stderr.write(prefix + cleaned + "\n")
+    sys.stderr.flush()
+
+
+def _drop_stale_reasoning_content(history: List[Dict[str, Any]]) -> None:
+    """Retain streamed reasoning for one immediate replay turn only."""
+    for index, message in enumerate(history):
+        if str(message.get("role") or "") == "assistant":
+            updated = dict(message)
+            updated.pop("reasoning_content", None)
+            history[index] = updated
 
 
 def _is_local_tool_json_parse_error(exc: Exception, model: str | None) -> bool:
@@ -2900,6 +2976,7 @@ async def stream_agent(
     stage: str | None = None,
     runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    provisional_text_callback: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Run the agent loop with streaming.
@@ -2953,6 +3030,16 @@ async def stream_agent(
         user_context=user_context,
     )
     prior_recent_feed_fetches = 0
+    native_streaming_enabled = _native_agent_streaming_enabled(selected_model)
+    log.info(
+        "agent.native_streaming_policy",
+        selected=native_streaming_enabled,
+        model=selected_model,
+        mode=mode,
+        stage=stage,
+        session_id=user_context.session_id,
+        task_id=user_context.task_id,
+    )
 
     for turn in range(max_turns):
         turn_number = turn + 1
@@ -2976,66 +3063,185 @@ async def stream_agent(
             user_context=user_context,
             history=history,
         )
-        # Probe turn non-streaming so intermediate tool turns stay internal.
-        try:
-            response = await _acompletion_with_budget(
-                history=turn_history,
-                user_context=user_context,
-                model=selected_model,
-                mode=mode,
-                stage=stage,
-                stream=False,
-                tools=turn_tools,
-                tool_choice="auto",
-                extra_kwargs=extra,
-            )
-        except Exception as e:
-            if turn_tools and (
-                _is_local_tool_json_parse_error(e, selected_model)
-                or _is_local_tool_unsupported_error(e, selected_model)
-            ):
-                _log_local_tool_event(
-                    event=(
-                        "LLM local_tool_unsupported_fallback"
-                        if _is_local_tool_unsupported_error(e, selected_model)
-                        else "LLM local_tool_json_parse_fallback"
-                    ),
-                    history=history,
-                    tools=tools,
+        native_turn: ModelTurnResult | None = None
+        native_text_emitted = False
+        provisional_text_active = False
+        if native_streaming_enabled:
+            accumulator = ModelTurnAccumulator()
+            provider_stream = None
+            event_counts: dict[str, int] = {}
+            stream_started = time.perf_counter()
+            first_event_ms: float | None = None
+            native_extra = dict(extra)
+            reasoning_effort = str(settings.fruitcake_native_agent_streaming_reasoning_effort or "").strip()
+            if reasoning_effort:
+                native_extra["reasoning_effort"] = reasoning_effort
+            stream_kwargs: dict[str, Any] = {}
+            if stream_usage_enabled():
+                stream_kwargs["stream_options"] = {"include_usage": True}
+            try:
+                provider_stream = await _acompletion_with_budget(
+                    history=turn_history,
+                    user_context=user_context,
                     model=selected_model,
                     mode=mode,
                     stage=stage,
-                    user_context=user_context,
-                    error=e,
+                    stream=True,
+                    tools=turn_tools,
+                    tool_choice="auto",
+                    extra_kwargs=native_extra,
+                    stream_kwargs=stream_kwargs,
                 )
-                fallback_history = _build_tool_parse_fallback_history(history)
+                try:
+                    async for event in iter_model_stream_events(provider_stream):
+                        if first_event_ms is None:
+                            first_event_ms = (time.perf_counter() - stream_started) * 1000.0
+                        event_counts[event.kind] = event_counts.get(event.kind, 0) + 1
+                        accumulator.add(event)
+                        if event.kind == "text_delta" and event.text:
+                            if turn_tools and provisional_text_callback is not None:
+                                provisional_text_active = True
+                                await provisional_text_callback("delta", event.text)
+                            elif not turn_tools:
+                                native_text_emitted = True
+                                yield event.text
+                finally:
+                    try:
+                        await close_provider_stream(provider_stream)
+                    finally:
+                        _write_reasoning_tap(
+                            "".join(accumulator.reasoning_parts),
+                            user_context=user_context,
+                            model=selected_model,
+                            stage=stage,
+                            turn=turn_number,
+                        )
+                native_turn = accumulator.finish()
+                if native_turn.usage:
+                    await record_llm_usage_event(
+                        {"usage": native_turn.usage},
+                        stage=f"{stage}_native_stream" if stage else "native_stream",
+                        model=selected_model,
+                    )
+                log.info(
+                    "agent.native_streaming_turn_finished",
+                    model=selected_model,
+                    mode=mode,
+                    stage=stage,
+                    session_id=user_context.session_id,
+                    task_id=user_context.task_id,
+                    turn=turn_number,
+                    first_event_ms=round(first_event_ms or 0.0, 2),
+                    elapsed_ms=round((time.perf_counter() - stream_started) * 1000.0, 2),
+                    event_counts=event_counts,
+                    finish_reason=native_turn.finish_reason,
+                    tool_call_count=len(native_turn.tool_calls),
+                    duplicate_final_pass_avoided=True,
+                )
+            except Exception as e:
+                if provisional_text_active and provisional_text_callback is not None:
+                    await provisional_text_callback("reset", "")
+                    provisional_text_active = False
+                if accumulator.event_count > 0:
+                    log.error(
+                        "agent.native_streaming_partial_failure",
+                        error_type=type(e).__name__,
+                        model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        session_id=user_context.session_id,
+                        task_id=user_context.task_id,
+                        turn=turn_number,
+                        event_count=accumulator.event_count,
+                    )
+                    raise ModelStreamError(
+                        "Native model stream failed after partial progress"
+                    ) from None
+                log.warning(
+                    "agent.native_streaming_fallback",
+                    error_type=type(e).__name__,
+                    model=selected_model,
+                    mode=mode,
+                    stage=stage,
+                    session_id=user_context.session_id,
+                    task_id=user_context.task_id,
+                    turn=turn_number,
+                    failure_phase="before_first_event",
+                )
+
+        if native_turn is None:
+            # Compatibility path: non-streaming probe followed by optional final stream.
+            try:
                 response = await _acompletion_with_budget(
-                    history=fallback_history,
+                    history=turn_history,
                     user_context=user_context,
                     model=selected_model,
                     mode=mode,
-                    stage=f"{stage}_local_tool_fallback" if stage else "local_tool_fallback",
+                    stage=stage,
+                    stream=False,
+                    tools=turn_tools,
+                    tool_choice="auto",
                     extra_kwargs=extra,
                 )
-            else:
-                log.error(
-                    "LLM call failed (streaming turn)",
-                    error=str(e),
-                    model=selected_model,
-                    mode=mode,
-                    stage=stage,
-                )
-                raise
-        await record_llm_usage_event(
-            response,
-            stage=f"{stage}_probe" if stage else "stream_probe",
-            model=selected_model,
-        )
-
-        message = response.choices[0].message
+            except Exception as e:
+                if turn_tools and (
+                    _is_local_tool_json_parse_error(e, selected_model)
+                    or _is_local_tool_unsupported_error(e, selected_model)
+                ):
+                    _log_local_tool_event(
+                        event=(
+                            "LLM local_tool_unsupported_fallback"
+                            if _is_local_tool_unsupported_error(e, selected_model)
+                            else "LLM local_tool_json_parse_fallback"
+                        ),
+                        history=history,
+                        tools=tools,
+                        model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        user_context=user_context,
+                        error=e,
+                    )
+                    fallback_history = _build_tool_parse_fallback_history(history)
+                    response = await _acompletion_with_budget(
+                        history=fallback_history,
+                        user_context=user_context,
+                        model=selected_model,
+                        mode=mode,
+                        stage=f"{stage}_local_tool_fallback" if stage else "local_tool_fallback",
+                        extra_kwargs=extra,
+                    )
+                else:
+                    log.error(
+                        "LLM call failed (streaming turn)",
+                        error=str(e),
+                        model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                    )
+                    raise
+            await record_llm_usage_event(
+                response,
+                stage=f"{stage}_probe" if stage else "stream_probe",
+                model=selected_model,
+            )
+            message: Any = response.choices[0].message
+        else:
+            message = native_turn
 
         if message.tool_calls:
-            normalized_message = _normalize_tool_calls(message.model_dump(exclude_none=True))
+            if provisional_text_active and provisional_text_callback is not None:
+                await provisional_text_callback("reset", "")
+                provisional_text_active = False
+            normalized_message = (
+                message.assistant_message()
+                if isinstance(message, ModelTurnResult)
+                else _normalize_tool_calls(message.model_dump(exclude_none=True))
+            )
+            # Narration preceding a tool call is working state, not a final answer.
+            normalized_message["content"] = ""
+            if native_turn is not None:
+                _drop_stale_reasoning_content(history)
             history.append(normalized_message)
             normalized_tool_calls = list(normalized_message.get("tool_calls") or [])
             normalized_tool_calls, prior_recent_feed_fetches = _rewrite_headline_rss_tool_calls(
@@ -3306,6 +3512,13 @@ async def stream_agent(
                 user_context=user_context,
                 content=message.content or "",
             )
+            if native_turn is not None:
+                if provisional_text_active and provisional_text_callback is not None:
+                    await provisional_text_callback("commit", "")
+                if not native_text_emitted:
+                    for token in _chunk_plain_text(message.content or ""):
+                        yield token
+                return
             if _should_skip_final_stream_pass(selected_model):
                 for token in _chunk_plain_text(message.content or ""):
                     yield token

@@ -149,6 +149,69 @@ async def test_update_my_chat_routing_preference(client):
 
 
 @pytest.mark.asyncio
+async def test_websocket_refreshes_routing_preference_without_reconnect(client):
+    await client.post("/auth/register", json={
+        "username": "liveprefuser",
+        "email": "livepref@example.com",
+        "password": "pass123",
+    })
+    login = await client.post(
+        "/auth/login",
+        json={"username": "liveprefuser", "password": "pass123"},
+    )
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    create = await client.post("/chat/sessions", json={"title": "Live preference"}, headers=headers)
+    session_id = create.json()["id"]
+
+    captured_preferences = []
+
+    async def fake_run_message(**kwargs):
+        captured_preferences.append(kwargs["current_user"].chat_routing_preference)
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.headers = {"authorization": f"Bearer {token}"}
+            self._first = True
+
+        async def accept(self):
+            return None
+
+        async def receive_text(self):
+            if self._first:
+                self._first = False
+                return '{"content":"hello","client_send_id":"live-pref-1"}'
+            raise RuntimeError("socket closed")
+
+        async def send_json(self, _payload):
+            return None
+
+        async def close(self):
+            return None
+
+    async with TestSessionLocal() as db:
+        # Prime this long-lived session's identity map with the old value.
+        stale_user = (
+            await db.execute(select(User).where(User.username == "liveprefuser"))
+        ).scalar_one()
+        assert stale_user.chat_routing_preference == "auto"
+        await db.commit()
+
+        async with TestSessionLocal() as update_db:
+            updated_user = (
+                await update_db.execute(select(User).where(User.username == "liveprefuser"))
+            ).scalar_one()
+            updated_user.chat_routing_preference = "fast"
+            await update_db.commit()
+
+        assert stale_user.chat_routing_preference == "auto"
+        with patch("app.api.chat._run_websocket_message", new=AsyncMock(side_effect=fake_run_message)):
+            await chat_websocket(session_id, FakeWebSocket(), db)
+
+    assert captured_preferences == ["fast"]
+
+
+@pytest.mark.asyncio
 async def test_me_unauthenticated(client):
     resp = await client.get("/auth/me")
     assert resp.status_code == 403
@@ -1276,6 +1339,64 @@ async def test_websocket_disconnect_does_not_rollback_completed_response(client)
 
 
 @pytest.mark.asyncio
+async def test_websocket_promotes_native_draft_without_retransmitting_tokens(client):
+    await client.post("/auth/register", json={
+        "username": "chatdraftstreamuser",
+        "email": "chatdraftstream@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "chatdraftstreamuser", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    create = await client.post("/chat/sessions", json={"title": "Draft Stream"}, headers=headers)
+    session_id = create.json()["id"]
+
+    async def fake_stream_agent(*args, **kwargs):
+        callback = kwargs["provisional_text_callback"]
+        await callback("delta", "Visible ")
+        await callback("delta", "answer")
+        await callback("commit", "")
+        yield "Visible "
+        yield "answer"
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.username == "chatdraftstreamuser"))
+        ).scalar_one()
+        session = (
+            await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        ).scalar_one()
+
+        manager = get_chat_run_manager()
+        await manager.clear(session_id)
+        manager._recent_prompts.pop(session_id, None)
+        manager._recent_send_ids.pop(session_id, None)
+        websocket = AsyncMock()
+
+        with (
+            patch("app.api.chat.stream_agent", new=fake_stream_agent),
+            patch("app.api.chat.classify_chat_complexity", return_value=SimpleNamespace(is_complex=False)),
+        ):
+            await _run_websocket_message(
+                session_id=session_id,
+                websocket=websocket,
+                db=db,
+                current_user=user,
+                session=session,
+                user_message="tell me something simple",
+                client_send_id="draft-stream-1",
+                allowed_tools=None,
+                blocked_tools=None,
+            )
+
+        payloads = [call.args[0] for call in websocket.send_json.await_args_list]
+        assert [payload["type"] for payload in payloads].count("draft_token") == 2
+        assert any(payload["type"] == "draft_commit" for payload in payloads)
+        assert not any(payload["type"] == "token" for payload in payloads)
+        done_payload = next(payload for payload in payloads if payload["type"] == "done")
+        assert done_payload["content"] == "Visible answer"
+
+
+@pytest.mark.asyncio
 async def test_websocket_done_payload_includes_message_id_for_task_drafts(client):
     await client.post("/auth/register", json={
         "username": "chatdraftwsuser",
@@ -1420,6 +1541,7 @@ async def test_websocket_emits_live_state_events_for_tool_backed_turn(client):
         {
             "role": "assistant",
             "content": "",
+            "reasoning_content": "private streamed reasoning must not persist",
             "tool_calls": [
                 {
                     "id": "call_lib_1",
@@ -1436,7 +1558,9 @@ async def test_websocket_emits_live_state_events_for_tool_backed_turn(client):
     ]
 
     async def _tool_backed_execute(*args, **kwargs):
+        pre_tool_callback = kwargs["pre_tool_callback"]
         callback = kwargs["runtime_message_callback"]
+        await pre_tool_callback(runtime_messages[0]["tool_calls"])
         await callback(runtime_messages)
         return "Grounded answer from tool output."
 
@@ -1477,7 +1601,12 @@ async def test_websocket_emits_live_state_events_for_tool_backed_turn(client):
 
         payloads = [call.args[0] for call in websocket.send_json.await_args_list]
         state_payloads = [payload for payload in payloads if payload["type"] == "state"]
-        assert [payload["state"] for payload in state_payloads] == ["thinking", "tool_active", "completed"]
+        assert [payload["state"] for payload in state_payloads] == [
+            "thinking",
+            "tool_active",
+            "tool_completed",
+            "completed",
+        ]
         assert state_payloads[1]["tool_names"] == ["summarize_document"]
         done_payload = next(payload for payload in payloads if payload["type"] == "done")
         assert done_payload["metadata"]["evidence"]["source_kinds"] == ["library"]
@@ -2065,6 +2194,7 @@ async def test_rest_local_post_tool_synthesis_recovery_persists_tool_turns(clien
         {
             "role": "assistant",
             "content": "",
+            "reasoning_content": "private streamed reasoning must not persist",
             "tool_calls": [
                 {
                     "id": "call_sum_1",
@@ -2223,6 +2353,7 @@ async def test_runtime_history_flush_skips_non_persistable_messages_without_dupl
         {
             "role": "assistant",
             "content": "",
+            "reasoning_content": "private streamed reasoning must not persist",
             "tool_calls": [
                 {
                     "id": "call_sum_1",
@@ -2299,6 +2430,8 @@ async def test_runtime_history_flush_skips_non_persistable_messages_without_dupl
     assert len(tool_call_payloads) == 2
     assert sum("call_sum_1" in str(payload or "") for payload in tool_call_payloads) == 1
     assert sum("call_sum_2" in str(payload or "") for payload in tool_call_payloads) == 1
+    assert all("private streamed reasoning" not in str(row.content or "") for row in rows)
+    assert all("private streamed reasoning" not in str(row.tool_calls or "") for row in rows)
 
 
 @pytest.mark.asyncio
