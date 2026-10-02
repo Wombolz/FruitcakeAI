@@ -265,8 +265,7 @@ def read_message(stdin: Any) -> Optional[Dict[str, Any]]:
 
 def write_message(stdout: Any, message: Dict[str, Any]) -> None:
     payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
-    stdout.write(f"Content-Length: {len(payload)}\r\n\r\n".encode("utf-8"))
-    stdout.write(payload)
+    stdout.write(payload + b"\n")
     stdout.flush()
 
 

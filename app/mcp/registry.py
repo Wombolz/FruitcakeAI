@@ -2,10 +2,12 @@
 FruitcakeAI v5 — MCP Server Registry
 Auto-discovery from config/mcp_config.yaml.
 
-Supports three server types:
+Supported server types:
   internal_python  — Python modules that run in-process (calendar, web, rss)
   docker_stdio     — Docker containers invoked via stdio (python_refactoring, playwright, etc.)
-  http             — External MCP servers over HTTP JSON-RPC (first-class companion apps, etc.)
+  stdio            — Local subprocesses managed by the official MCP SDK
+  streamable_http  — Standard MCP HTTP endpoints managed by the SDK
+  http             — Legacy POST-only companion-app compatibility
 
 Tool schemas are converted from MCP format → LiteLLM function-calling format at startup.
 Adding a new server requires only a config entry — no code changes.
@@ -14,6 +16,7 @@ Adding a new server requires only a config entry — no code changes.
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -88,7 +91,7 @@ class MCPRegistry:
     """
 
     def __init__(self):
-        # docker_stdio/http: persistent clients
+        # SDK transports and legacy HTTP: persistent clients
         self._clients: Dict[str, MCPClient] = {}
         # internal_python: imported modules
         self._modules: Dict[str, Any] = {}
@@ -103,6 +106,7 @@ class MCPRegistry:
         # Duplicate tool name conflicts (deterministic first-wins policy)
         self._duplicate_tools: List[Dict[str, Any]] = []
         self._is_ready = False
+        self._server_tools: Dict[str, Tuple[str, List[Dict[str, Any]]]] = {}
 
     def _register_tool(self, tool: Dict[str, Any], server_name: str, server_type: str) -> None:
         """
@@ -127,6 +131,30 @@ class MCPRegistry:
         self._tool_map[name] = (server_name, server_type)
         self._litellm_schemas.append(_to_litellm_schema(tool))
 
+    def _set_server_tools(self, name: str, kind: str, tools: List[Dict[str, Any]]) -> None:
+        # Rebuild atomically in config order so live changes preserve first-wins
+        # collision handling and removed tools disappear from future turns.
+        self._server_tools[name] = (kind, list(tools))
+        self._tool_map.clear()
+        self._litellm_schemas.clear()
+        self._duplicate_tools.clear()
+        order = dict.fromkeys([*self._server_configs, *self._server_tools])
+        for server in order:
+            server_kind, entries = self._server_tools.get(server, ("", []))
+            for tool in entries:
+                self._register_tool(tool, server, server_kind)
+
+    @staticmethod
+    def _config_values(config: Dict[str, Any], key: str) -> Dict[str, str]:
+        values = dict(config.get(key, {}) or {})
+        for name, variable in (config.get("env_from" if key == "env" else f"{key}_from_env", {}) or {}).items():
+            if variable not in os.environ:
+                raise ValueError(f"Missing environment variable for MCP {key}: {variable}")
+            values[name] = os.environ[variable]
+        if any(not isinstance(k, str) or not isinstance(v, str) for k, v in values.items()):
+            raise ValueError(f"MCP {key} must contain string keys and values")
+        return values
+
     async def startup(self, config_path: Optional[Path] = None) -> None:
         """Load config/mcp_config.yaml and initialize all enabled servers."""
         path = config_path or _CONFIG_PATH
@@ -150,8 +178,8 @@ class MCPRegistry:
                 await self._init_internal(server_name, config)
             elif server_type == "docker_stdio":
                 await self._init_docker(server_name, config)
-            elif server_type == "http":
-                await self._init_http(server_name, config)
+            elif server_type in {"stdio", "streamable_http", "http"}:
+                await self._init_external(server_name, config, server_type)
             else:
                 log.warning("Unknown MCP server type", server=server_name, type=server_type)
 
@@ -172,8 +200,7 @@ class MCPRegistry:
             module = importlib.import_module(module_path)
             tools = module.get_tools()  # expected: List[MCP tool schema dicts]
             self._modules[server_name] = module
-            for tool in tools:
-                self._register_tool(tool, server_name, "internal_python")
+            self._set_server_tools(server_name, "internal_python", tools)
             log.info(
                 "Internal MCP server loaded",
                 server=server_name,
@@ -183,76 +210,46 @@ class MCPRegistry:
             log.error("Failed to load internal MCP server", server=server_name, error=str(e))
 
     async def _init_docker(self, server_name: str, config: Dict[str, Any]) -> None:
-        """
-        Connect to a Docker stdio MCP server.
-        Failures are non-fatal — the server is simply omitted from the tool list.
-        """
         image = config.get("image")
         if not image:
             log.error("No image specified for docker_stdio server", server=server_name)
             return
-
-        docker_run_args = list(config.get("docker_run_args", []) or [])
-        server_args = list(config.get("server_args", []) or [])
-
-        client = MCPClient(
-            server_name=server_name,
-            command="docker",
-            args=["run", "-i", "--rm", *docker_run_args, image, *server_args],
-            timeout=config.get("timeout", 60),
-        )
-        ok = await client.connect()
-        if ok:
-            self._clients[server_name] = client
-            for tool in client.get_tools():
-                self._register_tool(tool, server_name, "docker_stdio")
-            log.info(
-                "Docker MCP server connected",
-                server=server_name,
-                image=image,
-                tools=[t["name"] for t in client.get_tools()],
-            )
-        else:
-            log.warning(
-                "Docker MCP server unavailable (Docker may not be running or image not pulled)",
-                server=server_name,
-                image=image,
-                hint=f"docker pull {image}",
-            )
+        await self._init_external(server_name, {
+            **config,
+            "command": "docker",
+            "args": ["run", "-i", "--rm", *list(config.get("docker_run_args", []) or []),
+                     image, *list(config.get("server_args", []) or [])],
+        }, "docker_stdio")
 
     async def _init_http(self, server_name: str, config: Dict[str, Any]) -> None:
-        """
-        Connect to an external HTTP MCP server that speaks JSON-RPC over POST.
-        Failures are non-fatal — the server is simply omitted from the tool list.
-        """
-        server_url = config.get("url")
-        if not server_url:
-            log.error("No url specified for http MCP server", server=server_name)
-            return
+        await self._init_external(server_name, config, "http")
 
-        client = MCPClient(
-            server_name=server_name,
-            server_url=server_url,
-            timeout=config.get("timeout", 30),
-        )
-        ok = await client.connect()
-        if ok:
+    async def _init_external(self, server_name: str, config: Dict[str, Any], kind: str) -> None:
+        client = None
+        try:
+            transport = "stdio" if kind == "docker_stdio" else kind
+            if not config.get("command" if transport == "stdio" else "url"):
+                raise ValueError("MCP server requires command for stdio or url for HTTP")
+            client = MCPClient(
+                server_name=server_name,
+                command=config.get("command"), args=list(config.get("args", []) or []),
+                server_url=config.get("url"), transport=transport,
+                timeout=config.get("timeout", 60 if transport == "stdio" else 30),
+                cwd=config.get("cwd"), env=self._config_values(config, "env"),
+                headers=self._config_values(config, "headers"),
+                on_tools_changed=lambda tools: self._set_server_tools(server_name, kind, tools),
+            )
             self._clients[server_name] = client
-            for tool in client.get_tools():
-                self._register_tool(tool, server_name, "http")
-            log.info(
-                "HTTP MCP server connected",
-                server=server_name,
-                url=server_url,
-                tools=[t["name"] for t in client.get_tools()],
-            )
-        else:
-            log.warning(
-                "HTTP MCP server unavailable",
-                server=server_name,
-                url=server_url,
-                error=client.get_status().get("last_error"),
-            )
+            if await client.connect():
+                self._set_server_tools(server_name, kind, client.get_tools())
+                log.info("MCP server connected", server=server_name, transport=transport)
+            else:
+                log.warning("MCP server unavailable", server=server_name,
+                            error=client.get_status().get("last_error"))
+        except Exception as exc:
+            if client is not None:
+                await client.disconnect()
+            log.warning("MCP server configuration failed", server=server_name, error_type=type(exc).__name__)
 
     # ── Tool access ───────────────────────────────────────────────────────────
 
@@ -292,9 +289,9 @@ class MCPRegistry:
                 log.error("Internal MCP tool failed", tool=tool_name, error=str(e))
                 return f"Tool {tool_name} failed: {e}"
 
-        if server_type in {"docker_stdio", "http"}:
+        if server_type in {"docker_stdio", "stdio", "streamable_http", "http"}:
             client = self._clients.get(server_name)
-            if not client or not client.is_connected():
+            if not client:
                 return f"MCP server '{server_name}' is not available"
             effective_args = dict(arguments)
             config = self._server_configs.get(server_name, {})
@@ -373,7 +370,7 @@ class MCPRegistry:
                 servers.append(entry)
                 continue
 
-            if server_type in {"docker_stdio", "http"}:
+            if server_type in {"docker_stdio", "stdio", "streamable_http", "http"}:
                 client = self._clients.get(server_name)
                 if client is None:
                     entry["status"] = "not_connected"
@@ -407,7 +404,7 @@ class MCPRegistry:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def shutdown(self) -> None:
-        """Disconnect all Docker stdio servers."""
+        """Disconnect all external servers and clear their tool catalogs."""
         for client in self._clients.values():
             await client.disconnect()
         self._clients.clear()

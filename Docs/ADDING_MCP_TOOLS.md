@@ -12,12 +12,15 @@ Alpha shipping policy:
 ## How the MCP registry works
 
 At startup, `app/mcp/registry.py` reads `config/mcp_config.yaml` and initializes
-each enabled server. Two transport types are supported:
+each enabled server. The official MCP Python SDK handles standard transports:
 
 | Type | How it runs | When to use |
 |------|-------------|-------------|
 | `internal_python` | Imported in-process | Fast; for tools written as Python modules |
-| `docker_stdio` | Subprocess via Docker | Isolates dependencies; for third-party MCP servers |
+| `stdio` | Local subprocess through the SDK | Node, Python, or other local MCP executables |
+| `docker_stdio` | Docker subprocess through the SDK | Isolates dependencies; existing Docker configurations still work |
+| `streamable_http` | Standard MCP endpoint through the SDK | HTTP servers with JSON or SSE responses and negotiated session handling |
+| `http` | Legacy POST-only JSON-RPC adapter | Existing FieldKit and FruitcakeImageLab companion servers |
 
 All tools are registered in LiteLLM function-calling format and injected into
 the agent's tool schema. The LLM chooses which tool to call.
@@ -26,6 +29,92 @@ That does not mean every configured MCP is appropriate to ship enabled. Before e
 - `core` — first-party, required for the shipped product
 - `optional` — useful but not required
 - `developer-only` — local/admin tooling that should stay off in the default alpha config
+
+---
+
+## Adding a local stdio server
+
+Fruitcake launches the executable directly, with no shell command interpolation.
+`command`, `args`, `cwd`, and `timeout` configure the process. The SDK inherits
+its standard minimal environment; use `env` for literal variables and `env_from`
+to copy named variables from the backend environment.
+
+```yaml
+mcp_servers:
+  local_service:
+    type: stdio
+    command: /absolute/path/to/python
+    args: ["-m", "my_mcp_server"]
+    cwd: /absolute/path/to/project
+    env:
+      SERVICE_MODE: local
+    env_from:
+      SERVICE_TOKEN: MY_SERVICE_TOKEN
+    enabled: true
+    timeout: 60
+```
+
+Missing referenced environment variables prevent the connection. Keep secrets
+in the backend environment rather than committing them to YAML.
+
+### Elgato Stream Deck
+
+The configured `elgato` entry launches `npx --yes @elgato/mcp-server@0.1.7`.
+This version was verified with read-only tool discovery. The first launch may
+need network access to download the package; later launches use npm's cache.
+Node.js 18+ and `npx` must be available on the backend's PATH. For a service with
+a restricted PATH, use the absolute path to `npx` and include Node's directory
+in the configured process environment.
+
+Run Stream Deck 7.4+ on the same Mac or Windows machine, enable **MCP Deck** in
+Preferences, and place the actions you want exposed in the **MCP Actions**
+profile. Provide descriptions for those actions. The bridge uses local IPC,
+so running it inside a Linux Docker container is not equivalent to running it
+alongside Stream Deck.
+
+Elgato is explicitly enabled in this operator configuration, but marked
+`shipping_default: false`. Other deployments should disable it unless needed.
+The trust metadata reflects what exposed actions may do; it does not itself
+enforce permissions. Existing persona restrictions and approval rules still
+apply to the discovered tool names.
+
+## Adding a Streamable HTTP server
+
+```yaml
+mcp_servers:
+  remote_service:
+    type: streamable_http
+    url: https://mcp.example.com/mcp
+    headers_from_env:
+      Authorization: MY_MCP_AUTHORIZATION
+    enabled: true
+    timeout: 60
+```
+
+`MY_MCP_AUTHORIZATION` contains the full header value, such as `Bearer ...`.
+Literal non-secret headers can be supplied through `headers`. The URL is the
+exact MCP endpoint, including its path. The SDK handles protocol negotiation,
+JSON/SSE responses, session headers where required, and session termination.
+Interactive OAuth onboarding is not provided by this configuration; use an
+existing token/header or a server that does not require it.
+
+Keep FieldKit and FruitcakeImageLab on `type: http` until those companion servers
+implement standard MCP HTTP transport. That compatibility adapter continues to
+send their existing POST-only JSON-RPC requests.
+
+## Lifecycle and tool changes
+
+- SDK sessions have one owner task, allowing chat and scheduled tasks to call
+  them concurrently and allowing shutdown from another task.
+- Tool-list notifications refresh the registry, including additions and removals.
+  Paginated tool lists are collected before replacing the visible catalog.
+- Failed calls are never automatically repeated: a timed-out action may already
+  have executed. A later independent call can reconnect to the server.
+- A server unavailable at initial startup has no discovered tools; fix its setup
+  and restart Fruitcake. Legacy HTTP companions require restart for tool changes.
+- Use `/admin/tools` and `/admin/mcp/diagnostics` to inspect connection state,
+  connection errors, and the bounded subprocess stderr tail. Configuration
+  validation failures are also logged during backend startup.
 
 ---
 
@@ -48,7 +137,14 @@ mcp_servers:
     timeout: 60
 ```
 
-Then pull the image and restart the backend:
+The bundled shell server now emits standard newline-delimited MCP JSON. Rebuild
+existing `fruitcake/mcp-shell` images after this upgrade:
+
+```bash
+docker build -t fruitcake/mcp-shell -f mcp_shell_server/Dockerfile .
+```
+
+For other servers, pull the image and restart the backend:
 
 ```bash
 docker pull mcp/mcp-filesystem
