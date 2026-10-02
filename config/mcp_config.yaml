@@ -85,6 +85,22 @@ mcp_servers:
       shell_execution: false
       writes_disk: true
 
+  # Explicitly enabled local integration. Requires Node and Stream Deck's MCP
+  # Actions profile. Pin the bridge version used for compatibility verification.
+  elgato:
+    type: stdio
+    command: npx
+    args: ["--yes", "@elgato/mcp-server@0.1.7"]
+    enabled: true
+    timeout: 60
+    classification: optional
+    shipping_default: false
+    trust_boundary:
+      first_party: false
+      uses_network: true
+      shell_execution: true
+      writes_disk: true
+
   # ── Docker stdio servers ─────────────────────────────────────────────────────
   # These require Docker + the image to be available locally.
   # Alpha default: disabled unless intentionally enabled by the operator.

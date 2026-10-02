@@ -94,15 +94,7 @@ def test_stdio_server_smoke(tmp_path):
     assert proc.stdout is not None
 
     def read_message() -> dict:
-        header = b""
-        while not header.endswith(b"\r\n\r\n"):
-            chunk = proc.stdout.read(1)
-            assert chunk
-            header += chunk
-        length_line = header.decode().split("\r\n", 1)[0]
-        length = int(length_line.split(":", 1)[1].strip())
-        payload = proc.stdout.read(length)
-        return json.loads(payload.decode())
+        return json.loads(proc.stdout.readline())
 
     def send_message(payload: dict) -> None:
         encoded = json.dumps(payload).encode()

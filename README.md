@@ -322,7 +322,7 @@ If bootstrap or verification fails, see [Pre-Alpha Troubleshooting](Docs/PreAlph
 
 ## Adding Capabilities
 
-New tools and data sources are added via `config/mcp_config.yaml` — no code changes required. The agent discovers them at startup and starts using them.
+New tools and data sources are added via `config/mcp_config.yaml` — no code changes required. The official MCP SDK supports local stdio processes, Docker stdio servers, and Streamable HTTP endpoints. Existing companion apps retain their legacy HTTP adapter. The agent discovers tools at startup and refreshes SDK tool catalogs when servers announce changes.
 
 ```yaml
 mcp_servers:

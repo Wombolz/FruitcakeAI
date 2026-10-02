@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.33
+
+- Migrated standard MCP stdio and Streamable HTTP connections to the official MCP Python SDK while retaining a dedicated compatibility adapter for existing POST-only companion apps.
+- Added local stdio server configuration, authenticated Streamable HTTP support, paginated tool discovery, and live tool-catalog refresh when servers announce changes.
+- Hardened external tool execution so timed-out or cancelled mutations are not replayed automatically, SDK transport lifecycles remain task-safe, and subprocess diagnostics stay bounded and redact configured credentials.
+- Added an optional pinned Elgato Stream Deck MCP integration and expanded operator documentation for transport setup, trust boundaries, diagnostics, and compatibility behavior.
+- Updated the bundled shell MCP server to standard newline-delimited MCP framing and expanded transport regression coverage across stdio, Streamable HTTP, legacy HTTP, cancellation, timeout, and catalog-change behavior.
+
 ## v0.7.32
 
 - Added opt-in, model-allowlisted native streaming for non-validation-gated chat turns, using one provider request per turn and accumulating complete tool calls before dispatch.

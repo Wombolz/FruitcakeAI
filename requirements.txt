@@ -42,9 +42,8 @@ email-validator>=2.0
 
 # ── HTTP / MCP ────────────────────────────────────────────────────────────────
 httpx[http2]>=0.23.0,<0.28.0
-# Phase 2 (MCP) — requires Python 3.10+. Uncomment when implementing Sprint 2.1:
-# mcp>=1.0.0
-# sse-starlette>=1.6.5
+mcp==2.2.0
+httpx2>=2.5,<3
 
 # ── Web research + RSS (Sprint 2.2) ──────────────────────────────────────────
 beautifulsoup4>=4.12.0

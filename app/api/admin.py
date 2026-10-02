@@ -373,7 +373,7 @@ def _check_mcp() -> Dict[str, Any]:
     optional_unavailable = [
         server["server"]
         for server in enabled_servers
-        if server.get("type") == "docker_stdio"
+        if server.get("type") in {"docker_stdio", "stdio", "streamable_http", "http"}
         and server.get("status") not in ("connected",)
     ]
 

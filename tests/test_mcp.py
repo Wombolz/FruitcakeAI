@@ -272,41 +272,6 @@ def test_admin_check_mcp_reports_internal_server_failures_as_error():
 
 
 @pytest.mark.asyncio
-async def test_stdio_reader_waits_for_matching_response_id():
-    client = MCPClient(server_name="test", command="docker", args=["run", "fake"])
-    client._read = AsyncMock(side_effect=[
-        {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"message": "working"}},
-        {"jsonrpc": "2.0", "id": 999, "result": {"ignored": True}},
-        {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}},
-    ])
-
-    msg = await client._read_response(request_id=2, timeout=1.0)
-    assert msg is not None
-    assert msg.get("id") == 2
-    assert msg["result"]["ok"] is True
-
-
-@pytest.mark.asyncio
-async def test_stdio_call_retries_once_after_timeout():
-    client = MCPClient(server_name="test", command="docker", args=["run", "fake"], timeout=1)
-    client._connected = True
-    client._process = MagicMock()
-    client._write = AsyncMock()
-    client._read_response = AsyncMock(
-        side_effect=[
-            asyncio.TimeoutError(),
-            {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}},
-        ]
-    )
-    client._reconnect_for_retry = AsyncMock(return_value=True)
-
-    result = await client._call_stdio("search", {"query": "x"})
-    assert result["success"] is True
-    assert result["result"]["ok"] is True
-    client._reconnect_for_retry.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_registry_duplicate_tool_name_first_wins(tmp_path: Path):
     cfg = {
         "mcp_servers": {
@@ -481,7 +446,7 @@ def test_default_mcp_config_defines_shell_server_contract():
     shell = cfg["mcp_servers"]["shell"]
 
     assert shell["type"] == "docker_stdio"
-    assert shell["enabled"] is True
+    assert shell["enabled"] is False
     assert shell["timeout"] == 30
     assert shell["pass_user_context"] is True
     assert shell["docker_run_args"] == ["--network", "none", "-v", "./workspace:/workspace"]
