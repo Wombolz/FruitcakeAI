@@ -205,7 +205,10 @@ class ModelStreamNormalizer:
                     )
                 )
 
-        usage = _normalized_usage(_value(chunk, "usage", None))
+        usage = _normalized_usage(
+            _value(chunk, "usage", None),
+            _value(chunk, "provider_specific_fields", None),
+        )
         if usage and sum(usage.values()) > 0:
             events.append(ModelStreamEvent(kind="usage", usage=usage))
 
@@ -306,7 +309,7 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
-def _normalized_usage(usage: Any) -> dict[str, int] | None:
+def _normalized_usage(usage: Any, provider_specific_fields: Any = None) -> dict[str, int] | None:
     if usage is None:
         return None
     values = {
@@ -322,6 +325,23 @@ def _normalized_usage(usage: Any) -> dict[str, int] | None:
             normalized[key] = 0
     if normalized["total_tokens"] <= 0:
         normalized["total_tokens"] = normalized["prompt_tokens"] + normalized["completion_tokens"]
+    prompt_details = _value(usage, "prompt_tokens_details", None)
+    cached_prompt_tokens = _value(usage, "cached_prompt_tokens", None)
+    if prompt_details is not None or cached_prompt_tokens is not None:
+        normalized["cached_prompt_tokens"] = max(
+            0,
+            _optional_int(_value(prompt_details, "cached_tokens", cached_prompt_tokens)) or 0,
+        )
+    provider_fields = provider_specific_fields if isinstance(provider_specific_fields, dict) else {}
+    ollama_metrics = provider_fields.get("ollama_metrics")
+    if isinstance(ollama_metrics, dict):
+        for source, target in (
+            ("total_duration", "total_duration_ns"),
+            ("load_duration", "load_duration_ns"),
+            ("prompt_eval_duration", "prompt_eval_duration_ns"),
+            ("eval_duration", "eval_duration_ns"),
+        ):
+            normalized[target] = max(0, _optional_int(ollama_metrics.get(source)) or 0)
     return normalized
 
 

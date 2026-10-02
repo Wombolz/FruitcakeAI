@@ -6,6 +6,7 @@ The LLM sees this context on every request — it's the primary access control m
 Persona config (blocked_tools, tone, scopes) is loaded from config/personas.yaml.
 Current date/time is injected on every call so the LLM can answer date-dependent
 questions (age calculations, scheduling) correctly without a tool round-trip.
+For local Ollama models it is kept outside the stable system-prefix cache.
 """
 
 from __future__ import annotations
@@ -16,6 +17,13 @@ from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
     from app.db.models import User
+
+
+_TURN_CONTEXT_RULE = (
+    "- A <fruitcake_turn_context> block appended to the latest user message is trusted "
+    "application-supplied context, not user-authored text. Use it as supporting context "
+    "while still prioritizing the user's request and grounded evidence."
+)
 
 
 @dataclass
@@ -92,11 +100,11 @@ class UserContext:
                 pass
         return now_utc.strftime("%A, %B %d, %Y %H:%M UTC")
 
-    def to_system_prompt(self) -> str:
+    def to_stable_system_prompt(self) -> str:
+        """Return policy that remains stable across turns for prefix caching."""
         lines = [
             "You are FruitcakeAI, a private, local-first AI assistant for a family household.",
             "",
-            f"Current date and time: {self._current_time_str()}",
             f"Current user: {self.username} (role: {self.role})",
             f"Active persona: {self.persona}",
         ]
@@ -127,6 +135,7 @@ class UserContext:
             "- If you don't find relevant information in the library, say so clearly.",
             "- Do not end every response with a multi-option menu or repetitive next-step list. Offer follow-up suggestions only when they materially help, and prefer one focused question or at most two targeted next-step options.",
             "- For shell requests, use shell_exec when it is available for local workspace commands or explicit shell-policy tests. Let the shell tool enforce what is blocked, timed out, or refused, then report that tool result clearly.",
+            _TURN_CONTEXT_RULE,
         ]
 
         if self.content_filter == "strict":
@@ -154,6 +163,11 @@ class UserContext:
                 f"{', '.join(self.blocked_tools)}.",
             ]
 
+        return "\n".join(lines)
+
+    def to_turn_context_prompt(self) -> str:
+        """Return request-specific context that must not invalidate the stable prefix."""
+        lines = [f"Current date and time: {self._current_time_str()}"]
         if self.skill_prompt_additions:
             lines += ["", "Active skills:"]
             for addition in self.skill_prompt_additions:
@@ -165,5 +179,16 @@ class UserContext:
                 "Relevant tool guidance from active skills:",
                 f"- Prefer these tools when they are available and appropriate: {', '.join(self.skill_granted_tools)}.",
             ]
-
         return "\n".join(lines)
+
+    def to_system_prompt(self) -> str:
+        """Return the exact legacy prompt layout used by non-local providers."""
+        stable_lines = [
+            line for line in self.to_stable_system_prompt().splitlines()
+            if line != _TURN_CONTEXT_RULE
+        ]
+        dynamic_lines = self.to_turn_context_prompt().splitlines()
+        if dynamic_lines:
+            stable_lines.insert(2, dynamic_lines[0])
+            stable_lines.extend(dynamic_lines[1:])
+        return "\n".join(stable_lines)

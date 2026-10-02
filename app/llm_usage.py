@@ -49,6 +49,72 @@ def _extract_usage_counts(response: Any) -> tuple[int, int, int] | None:
     return prompt_tokens, completion_tokens, total_tokens
 
 
+def _value(value: Any, key: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _extract_local_inference_metrics(response: Any) -> dict[str, int]:
+    usage = _value(response, "usage", None)
+    if usage is None:
+        return {}
+    details = _value(usage, "prompt_tokens_details", None)
+    metrics = {
+        "cached_prompt_tokens": int(
+            _value(details, "cached_tokens", _value(usage, "cached_prompt_tokens", 0)) or 0
+        )
+    }
+    provider_fields = _value(response, "provider_specific_fields", {})
+    ollama_metrics = provider_fields.get("ollama_metrics", {}) if isinstance(provider_fields, dict) else {}
+    for source, target in (
+        ("total_duration", "total_duration_ns"),
+        ("load_duration", "load_duration_ns"),
+        ("prompt_eval_duration", "prompt_eval_duration_ns"),
+        ("eval_duration", "eval_duration_ns"),
+    ):
+        metrics[target] = int(
+            (ollama_metrics.get(source) if isinstance(ollama_metrics, dict) else 0)
+            or _value(usage, target, 0)
+            or 0
+        )
+    return {key: max(0, value) for key, value in metrics.items()}
+
+
+def _log_local_inference_metrics(
+    response: Any,
+    *,
+    model: str,
+    source: str,
+    stage: str | None,
+    context: dict[str, Any],
+) -> None:
+    if not model.lower().startswith(("ollama/", "ollama_chat/")):
+        return
+    metrics = _extract_local_inference_metrics(response)
+    counts = _extract_usage_counts(response)
+    if counts is None:
+        return
+    prompt_tokens = counts[0]
+    cached_tokens = metrics.get("cached_prompt_tokens", 0)
+    log.info(
+        "llm.local_inference_timing",
+        model=model,
+        source=source,
+        stage=stage,
+        session_id=context.get("session_id"),
+        task_id=context.get("task_id"),
+        task_run_id=context.get("task_run_id"),
+        prompt_tokens=prompt_tokens,
+        cached_prompt_tokens=cached_tokens,
+        prompt_cache_percent=round((cached_tokens / prompt_tokens) * 100.0, 2) if prompt_tokens else 0.0,
+        total_duration_ms=round(metrics.get("total_duration_ns", 0) / 1_000_000, 2),
+        load_duration_ms=round(metrics.get("load_duration_ns", 0) / 1_000_000, 2),
+        prompt_eval_duration_ms=round(metrics.get("prompt_eval_duration_ns", 0) / 1_000_000, 2),
+        eval_duration_ms=round(metrics.get("eval_duration_ns", 0) / 1_000_000, 2),
+    )
+
+
 def _estimate_cost_usd(response: Any, *, fallback_model: str | None) -> float | None:
     try:
         return float(litellm.completion_cost(completion_response=response))
@@ -93,6 +159,19 @@ async def record_llm_usage_event(
         return
 
     prompt_tokens, completion_tokens, total_tokens = counts
+    log_context = {
+        **context,
+        "session_id": session_id if session_id is not None else context.get("session_id"),
+        "task_id": task_id if task_id is not None else context.get("task_id"),
+        "task_run_id": task_run_id if task_run_id is not None else context.get("task_run_id"),
+    }
+    _log_local_inference_metrics(
+        response,
+        model=resolved_model,
+        source=str(source or context.get("source") or "llm_call"),
+        stage=stage if stage is not None else context.get("stage"),
+        context=log_context,
+    )
     event = LLMUsageEvent(
         user_id=resolved_user_id,
         session_id=session_id if session_id is not None else context.get("session_id"),

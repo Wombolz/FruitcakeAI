@@ -124,7 +124,7 @@ async def _generate_plan_steps(
             messages=[{"role": "user", "content": prompt}],
             tools=None,
             tool_choice=None,
-            **_litellm_kwargs(),
+            **_litellm_kwargs(selected_model),
         )
         await record_llm_usage_event(
             resp,

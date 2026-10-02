@@ -1574,7 +1574,7 @@ async def _describe_image(arguments: Dict[str, Any], user_context: UserContext) 
                 ],
             }
         ],
-        **_litellm_kwargs(model),
+        **_litellm_kwargs(model, is_incognito=user_context.is_incognito),
     )
     await record_llm_usage_event(
         response,
@@ -1736,7 +1736,7 @@ async def _summarize_document(
         resp = await litellm.acompletion(
             model=summary_model,
             messages=[{"role": "user", "content": prompt}],
-            **_litellm_kwargs(summary_model),
+            **_litellm_kwargs(summary_model, is_incognito=user_context.is_incognito),
         )
         await record_llm_usage_event(
             resp,

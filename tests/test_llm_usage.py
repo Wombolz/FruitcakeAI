@@ -11,7 +11,11 @@ from app.agent.core import run_agent, stream_agent
 from app.config import settings
 from app.autonomy.planner import _generate_plan_steps
 from app.db.models import ChatSession, LLMUsageEvent, Task, User
-from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
+from app.llm_usage import (
+    _extract_local_inference_metrics,
+    bind_llm_usage_context,
+    reset_llm_usage_context,
+)
 from tests.conftest import TestSessionLocal
 
 
@@ -74,6 +78,30 @@ def _fake_tool_response(
             )
         ],
     )
+
+
+def test_extract_local_inference_metrics_reads_litellm_ollama_fields():
+    response = SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens_details=SimpleNamespace(cached_tokens=75),
+        ),
+        provider_specific_fields={
+            "ollama_metrics": {
+                "total_duration": 900_000_000,
+                "load_duration": 100_000_000,
+                "prompt_eval_duration": 200_000_000,
+                "eval_duration": 500_000_000,
+            }
+        },
+    )
+
+    assert _extract_local_inference_metrics(response) == {
+        "cached_prompt_tokens": 75,
+        "total_duration_ns": 900_000_000,
+        "load_duration_ns": 100_000_000,
+        "prompt_eval_duration_ns": 200_000_000,
+        "eval_duration_ns": 500_000_000,
+    }
 
 
 async def _fake_stream_with_usage(*parts: str):
