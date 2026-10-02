@@ -19,14 +19,16 @@ def _ollama_parser():
     return OllamaChatCompletionResponseIterator(streaming_response=iter([]), sync_stream=True)
 
 
-def _ollama_chunk(message, *, done=False):
-    return {
+def _ollama_chunk(message, *, done=False, metrics=None):
+    chunk = {
         "model": "test",
         "message": {"role": "assistant", "content": "", **message},
         "done": done,
         "prompt_eval_count": 12 if done else 0,
         "eval_count": 4 if done else 0,
     }
+    chunk.update(metrics or {})
+    return chunk
 
 
 async def _chunks(*items):
@@ -215,7 +217,40 @@ async def test_real_ollama_parser_preserves_reasoning_boundaries(messages, reaso
 
     assert result.reasoning_content == reasoning
     assert result.content == content
-    assert result.usage == {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16}
+    assert result.usage is not None
+    assert result.usage["prompt_tokens"] == 12
+    assert result.usage["completion_tokens"] == 4
+    assert result.usage["total_tokens"] == 16
+    assert result.usage["cached_prompt_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_real_ollama_parser_preserves_prompt_cache_and_timing_metrics():
+    parser = _ollama_parser()
+    chunk = parser.chunk_parser(_ollama_chunk(
+        {"content": "Cached answer"},
+        done=True,
+        metrics={
+            "prompt_eval_cached_count": 9,
+            "total_duration": 100_000_000,
+            "load_duration": 10_000_000,
+            "prompt_eval_duration": 20_000_000,
+            "eval_duration": 60_000_000,
+        },
+    ))
+
+    result = await _accumulate(chunk)
+
+    assert result.usage == {
+        "prompt_tokens": 12,
+        "completion_tokens": 4,
+        "total_tokens": 16,
+        "cached_prompt_tokens": 9,
+        "total_duration_ns": 100_000_000,
+        "load_duration_ns": 10_000_000,
+        "prompt_eval_duration_ns": 20_000_000,
+        "eval_duration_ns": 60_000_000,
+    }
 
 
 @pytest.mark.asyncio

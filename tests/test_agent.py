@@ -15,6 +15,7 @@ tool-registry level using mock UserContext objects.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -1296,6 +1297,49 @@ def test_build_messages_adds_immediate_action_followup_hint_for_yes_after_run_no
 
     assert any("approval to execute the concrete action proposed" in msg for msg in system_messages)
     assert any("do not use propose_task_draft or create_task" in msg for msg in system_messages)
+
+
+def test_build_messages_keeps_local_system_prefix_stable_and_moves_turn_context_to_user():
+    ctx = UserContext(
+        user_id=1,
+        username="tester",
+        role="parent",
+        persona="family_assistant",
+        skill_prompt_additions=["Use the document-summary skill for this turn."],
+        skill_granted_tools=["summarize_document"],
+    )
+    history = [
+        {"role": "system", "content": "Grounding note: report.md is authoritative."},
+        {"role": "user", "content": "Summarize the report."},
+    ]
+    snapshot = deepcopy(history)
+
+    messages = _build_messages(history, ctx, model="ollama_chat/qwen3.6:35b")
+
+    assert history == snapshot
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert "Current date and time:" not in messages[0]["content"]
+    assert "document-summary skill" not in messages[0]["content"]
+    assert "<fruitcake_turn_context>" in messages[1]["content"]
+    assert "Current date and time:" in messages[1]["content"]
+    assert "document-summary skill" in messages[1]["content"]
+    assert "Grounding note: report.md is authoritative." in messages[1]["content"]
+
+
+def test_build_messages_keeps_cloud_message_shape_unchanged():
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    history = [
+        {"role": "system", "content": "Grounding note."},
+        {"role": "user", "content": "Hello"},
+    ]
+
+    messages = _build_messages(history, ctx, model="gpt-5-mini")
+
+    assert messages[0]["role"] == "system"
+    prompt_lines = messages[0]["content"].splitlines()
+    assert prompt_lines[2].startswith("Current date and time:")
+    assert "<fruitcake_turn_context>" not in messages[0]["content"]
+    assert messages[1:] == history
 
 
 def test_system_prompt_includes_persona_behavior_instructions():

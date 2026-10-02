@@ -238,19 +238,107 @@ def restore_agent_runtime_history(token: contextvars.Token) -> None:
     _agent_runtime_history.reset(token)
 
 
+def _is_local_ollama_model(model: str | None) -> bool:
+    return str(model or "").strip().lower().startswith(("ollama/", "ollama_chat/"))
+
+
 def _build_messages(
     history: List[Dict[str, Any]],
     user_context: UserContext,
+    *,
+    model: str | None = None,
 ) -> List[Dict[str, Any]]:
-    """Prepend the system prompt to the conversation history."""
-    messages = [{"role": "system", "content": user_context.to_system_prompt()}]
+    """Build provider-safe messages while preserving a stable local prefix."""
     followup_hint = _recent_task_followup_hint(history)
-    if followup_hint:
-        messages.append({"role": "system", "content": followup_hint})
     immediate_action_hint = _recent_immediate_action_followup_hint(history)
+
+    if not _is_local_ollama_model(model):
+        messages = [{"role": "system", "content": user_context.to_system_prompt()}]
+        if followup_hint:
+            messages.append({"role": "system", "content": followup_hint})
+        if immediate_action_hint:
+            messages.append({"role": "system", "content": immediate_action_hint})
+        return messages + history
+
+    dynamic_parts = [user_context.to_turn_context_prompt()]
+    if followup_hint:
+        dynamic_parts.append(followup_hint)
     if immediate_action_hint:
-        messages.append({"role": "system", "content": immediate_action_hint})
-    return messages + history
+        dynamic_parts.append(immediate_action_hint)
+
+    provider_history: List[Dict[str, Any]] = []
+    for message in history:
+        if str(message.get("role") or "") == "system":
+            content = str(message.get("content") or "").strip()
+            if content:
+                dynamic_parts.append(content)
+            continue
+        provider_history.append(dict(message))
+
+    turn_context = "\n\n".join(part.strip() for part in dynamic_parts if part and part.strip())
+    if turn_context:
+        for index in range(len(provider_history) - 1, -1, -1):
+            if str(provider_history[index].get("role") or "") != "user":
+                continue
+            current = dict(provider_history[index])
+            content = current.get("content")
+            envelope = f"<fruitcake_turn_context>\n{turn_context}\n</fruitcake_turn_context>"
+            if isinstance(content, list):
+                current["content"] = [*content, {"type": "text", "text": envelope}]
+            else:
+                base = str(content or "").rstrip()
+                current["content"] = f"{base}\n\n{envelope}" if base else envelope
+            provider_history[index] = current
+            break
+
+    return [
+        {"role": "system", "content": user_context.to_stable_system_prompt()},
+        *provider_history,
+    ]
+
+
+def _request_shape_fingerprints(
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None,
+) -> tuple[str, str]:
+    """Fingerprint cache-relevant request structure without logging content."""
+    stable_prefix = ""
+    if messages and str(messages[0].get("role") or "") == "system":
+        stable_prefix = str(messages[0].get("content") or "")
+    tools_payload = json.dumps(tools or [], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return (
+        hashlib.sha256(stable_prefix.encode("utf-8")).hexdigest()[:16],
+        hashlib.sha256(tools_payload.encode("utf-8")).hexdigest()[:16],
+    )
+
+
+def _log_prompt_cache_shape(
+    *,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None,
+    model: str,
+    mode: str,
+    stage: str | None,
+    user_context: UserContext,
+    aggressive: bool = False,
+) -> None:
+    if not _is_local_ollama_model(model):
+        return
+    stable_prefix_fingerprint, tool_schema_fingerprint = _request_shape_fingerprints(messages, tools)
+    log.info(
+        "agent.prompt_cache_shape",
+        model=model,
+        mode=mode,
+        stage=stage,
+        session_id=user_context.session_id,
+        task_id=user_context.task_id,
+        stable_prefix_fingerprint=stable_prefix_fingerprint,
+        tool_schema_fingerprint=tool_schema_fingerprint,
+        tool_count=len(tools or []),
+        message_count=len(messages),
+        recent_roles=[str(message.get("role") or "") for message in messages[-6:]],
+        aggressive=aggressive,
+    )
 
 
 def _sanitize_history_tool_chains(
@@ -319,11 +407,20 @@ async def _acompletion_with_budget(
             task_id=user_context.task_id,
         )
     _record_budget_event(report, stage=stage, mode=mode, model=model)
+    request_messages = _build_messages(projected_history, user_context, model=model)
+    _log_prompt_cache_shape(
+        messages=request_messages,
+        tools=tools,
+        model=model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+    )
 
     try:
         return await litellm.acompletion(
             model=model,
-            messages=_build_messages(projected_history, user_context),
+            messages=request_messages,
             stream=stream,
             tools=tools or None,
             tool_choice=tool_choice if tools else None,
@@ -347,10 +444,20 @@ async def _acompletion_with_budget(
                 aggressive=True,
             )
         _record_budget_event(aggressive_report, stage=stage, mode=mode, model=model)
+        aggressive_messages = _build_messages(aggressive_history, user_context, model=model)
+        _log_prompt_cache_shape(
+            messages=aggressive_messages,
+            tools=tools,
+            model=model,
+            mode=mode,
+            stage=stage,
+            user_context=user_context,
+            aggressive=True,
+        )
         try:
             response = await litellm.acompletion(
                 model=model,
-                messages=_build_messages(aggressive_history, user_context),
+                messages=aggressive_messages,
                 stream=stream,
                 tools=tools or None,
                 tool_choice=tool_choice if tools else None,
@@ -403,12 +510,15 @@ def _normalized_local_api_base() -> str:
     return base
 
 
-def _litellm_kwargs(model: str | None = None) -> Dict[str, Any]:
+def _litellm_kwargs(model: str | None = None, *, is_incognito: bool = False) -> Dict[str, Any]:
     """Build extra kwargs for litellm based on the selected model/provider."""
     kwargs: Dict[str, Any] = {}
     selected_model = str(model or settings.llm_model or "")
-    if selected_model.startswith(("ollama/", "ollama_chat/")):
+    if _is_local_ollama_model(selected_model):
         kwargs["api_base"] = _normalized_local_api_base()
+        keep_alive = str(settings.local_model_keep_alive or "").strip()
+        if keep_alive and not is_incognito:
+            kwargs["keep_alive"] = keep_alive
         return kwargs
     if settings.llm_backend in ("ollama", "openai_compat"):
         kwargs["api_base"] = _normalized_local_api_base()
@@ -1760,7 +1870,7 @@ async def _synthesize_from_rss_evidence(
             ),
         }
     )
-    extra = _litellm_kwargs(selected_model)
+    extra = _litellm_kwargs(selected_model, is_incognito=user_context.is_incognito)
     response = await _acompletion_with_budget(
         history=synthesis_history,
         user_context=user_context,
@@ -1864,7 +1974,7 @@ async def _synthesize_from_document_evidence(
             ),
         }
     )
-    extra = _litellm_kwargs(selected_model)
+    extra = _litellm_kwargs(selected_model, is_incognito=user_context.is_incognito)
     response = await _acompletion_with_budget(
         history=synthesis_history,
         user_context=user_context,
@@ -2490,7 +2600,7 @@ async def _stream_final_response(
     loop after the non-streaming probe determined the turn is a plain text
     response.
     """
-    extra = _litellm_kwargs(selected_model)
+    extra = _litellm_kwargs(selected_model, is_incognito=user_context.is_incognito)
     emitted = False
 
     try:
@@ -2592,7 +2702,7 @@ async def run_agent(
         user_context=user_context,
         history=history,
     )
-    extra = _litellm_kwargs(selected_model)
+    extra = _litellm_kwargs(selected_model, is_incognito=user_context.is_incognito)
     consecutive_failed_search_turns = 0
     previous_tool_signature = ""
     repeated_tool_signature_count = 0
@@ -3001,7 +3111,7 @@ async def stream_agent(
         user_context=user_context,
         history=history,
     )
-    extra = _litellm_kwargs(selected_model)
+    extra = _litellm_kwargs(selected_model, is_incognito=user_context.is_incognito)
     consecutive_failed_search_turns = 0
     previous_tool_signature = ""
     repeated_tool_signature_count = 0

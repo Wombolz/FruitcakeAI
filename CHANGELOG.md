@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.34
+
+- Improved Ollama prompt-cache reuse by keeping the local system-policy prefix stable and moving volatile time, grounding, skill, and guardrail context into a trusted per-turn context block.
+- Preserved the existing cloud-provider prompt layout while retaining strict single-leading-system-message compatibility for local model templates.
+- Added configurable local model residency through `LOCAL_MODEL_KEEP_ALIVE`, defaulting to 15 minutes while leaving incognito sessions on Ollama's default lifecycle policy.
+- Preserved Ollama prompt-cache and inference timing metrics through LiteLLM and added bounded diagnostics for cache hit rate, model load, prompt evaluation, generation time, stable-prefix identity, and tool-schema identity.
+- Added a standalone Ollama prompt-cache benchmark and expanded regression coverage for local/cloud message construction, model routing, incognito behavior, stream metrics, and usage accounting.
+
 ## v0.7.33
 
 - Migrated standard MCP stdio and Streamable HTTP connections to the official MCP Python SDK while retaining a dedicated compatibility adapter for existing POST-only companion apps.

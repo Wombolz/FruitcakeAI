@@ -44,6 +44,34 @@ log = structlog.get_logger()
 
 _PATCH_FLAG = "_fruitcake_tool_history_patch"
 _STREAM_PATCH_FLAG = "_fruitcake_stream_patch"
+_OLLAMA_TIMING_FIELDS = (
+    "total_duration",
+    "load_duration",
+    "prompt_eval_duration",
+    "eval_duration",
+)
+
+
+def _attach_ollama_metrics(response: Any, payload: Dict[str, Any]) -> Any:
+    """Retain metrics that LiteLLM 1.82 drops from Ollama responses."""
+    cached = int(payload.get("prompt_eval_cached_count", 0) or 0)
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        from litellm.types.utils import PromptTokensDetailsWrapper
+
+        usage.prompt_tokens_details = PromptTokensDetailsWrapper(cached_tokens=max(0, cached))
+
+    metrics = {
+        key: max(0, int(payload.get(key, 0) or 0))
+        for key in _OLLAMA_TIMING_FIELDS
+        if payload.get(key) is not None
+    }
+    metrics["prompt_eval_cached_count"] = max(0, cached)
+    existing = getattr(response, "provider_specific_fields", None)
+    provider_fields = dict(existing) if isinstance(existing, dict) else {}
+    provider_fields["ollama_metrics"] = metrics
+    response.provider_specific_fields = provider_fields
+    return response
 
 
 def apply_litellm_ollama_stream_patch() -> bool:
@@ -79,7 +107,7 @@ def apply_litellm_ollama_stream_patch() -> bool:
                 next_index += 1
         self._fruitcake_next_tool_index = next_index
 
-        response = original_parser(self, translated_chunk)
+        response = _attach_ollama_metrics(original_parser(self, translated_chunk), chunk)
         normalizer = getattr(self, "_fruitcake_reasoning_normalizer", None)
         if normalizer is None:
             normalizer = ModelStreamNormalizer()
@@ -166,6 +194,7 @@ def apply_litellm_ollama_tool_history_patch() -> bool:
         return False
 
     original_transform = OllamaChatConfig.transform_request
+    original_transform_response = OllamaChatConfig.transform_response
 
     def transform_request_with_tool_history(
         self: OllamaChatConfig,
@@ -227,7 +256,19 @@ def apply_litellm_ollama_tool_history_patch() -> bool:
         data["messages"] = _coalesce_system_messages(outgoing)
         return data
 
+    def transform_response_with_metrics(self, *args, **kwargs):
+        raw_response = kwargs.get("raw_response")
+        if raw_response is None and len(args) >= 2:
+            raw_response = args[1]
+        response = original_transform_response(self, *args, **kwargs)
+        try:
+            payload = raw_response.json() if raw_response is not None else {}
+        except Exception:
+            payload = {}
+        return _attach_ollama_metrics(response, payload if isinstance(payload, dict) else {})
+
     OllamaChatConfig.transform_request = transform_request_with_tool_history  # type: ignore[method-assign]
+    OllamaChatConfig.transform_response = transform_response_with_metrics  # type: ignore[method-assign]
     setattr(OllamaChatConfig, _PATCH_FLAG, True)
     log.info("litellm_ollama_tool_history_patch_installed")
     return True

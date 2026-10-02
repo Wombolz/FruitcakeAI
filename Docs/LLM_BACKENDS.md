@@ -1,6 +1,6 @@
 # LLM Backends
 
-Switch the underlying model by changing two lines in `.env`. No code changes required.
+Switch the underlying model with `.env` settings. No code changes required.
 
 ---
 
@@ -11,6 +11,7 @@ Switch the underlying model by changing two lines in `.env`. No code changes req
 ```env
 LLM_MODEL=ollama_chat/qwen2.5:14b
 LOCAL_API_BASE=http://localhost:11434/v1
+LOCAL_MODEL_KEEP_ALIVE=15m
 ```
 
 ```bash
@@ -28,6 +29,35 @@ ollama serve
 | `llama3.3:70b` | ~43GB | ❌ Crashes with pgvector + embedding in RAM |
 
 > **Important**: Use the `ollama_chat/` prefix, not `ollama/`. The `ollama/` prefix routes to the generate API which does not support tool/function calling — tools will be silently ignored.
+
+### Ollama prompt-cache behavior
+
+Fruitcake keeps the leading local-model system prompt stable and moves
+turn-specific time, grounding, skill, and guardrail context to the latest user
+turn. This gives Ollama a reusable prompt prefix while preserving the full
+request context. Cloud-provider message construction is unchanged.
+
+`LOCAL_MODEL_KEEP_ALIVE` controls how long Ollama should keep a local chat model
+resident after a request. The default is `15m`; set it to an empty value to use
+Ollama's own default. Incognito sessions do not override Ollama's keep-alive
+policy.
+
+When Ollama returns native timing data, the backend logs:
+
+- `agent.prompt_cache_shape`: stable-prefix and tool-schema fingerprints only
+- `llm.local_inference_timing`: prompt tokens, cached prompt tokens, cache hit
+  percentage, model-load time, prompt-evaluation time, and generation time
+
+These diagnostics do not log prompt text. This optimization uses Ollama's
+in-memory model and prompt cache only; Fruitcake does not persist a prompt cache
+to disk.
+
+For a direct local benchmark:
+
+```bash
+.venv/bin/python scripts/benchmark_ollama_prompt_cache.py \
+  --model qwen3.6:35b
+```
 
 ### Experimental native agent streaming
 
