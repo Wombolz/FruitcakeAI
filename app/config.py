@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     # ── Application ──────────────────────────────────────────────────────────
     app_name: str = "FruitcakeAI"
-    app_version: str = "0.7.34"
+    app_version: str = "0.7.35"
     debug: bool = False
     log_level: str = "INFO"
     app_port: int = 30417
@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     gemini_api_key: str = ""
     openai_models: str = ""
+    openai_prompt_cache_enabled: bool = True
+    # Empty preserves the provider/organization default. Support varies by model.
+    openai_prompt_cache_retention: str = ""
     anthropic_models: str = ""
     gemini_models: str = ""
     local_models: str = ""

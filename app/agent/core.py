@@ -18,6 +18,7 @@ import litellm
 import structlog
 
 from app.agent.context import UserContext
+from app.agent.model_provider import is_local_ollama_model, is_native_openai_model
 from app.agent.litellm_ollama_patch import (
     apply_litellm_ollama_stream_patch,
     apply_litellm_ollama_tool_history_patch,
@@ -239,7 +240,7 @@ def restore_agent_runtime_history(token: contextvars.Token) -> None:
 
 
 def _is_local_ollama_model(model: str | None) -> bool:
-    return str(model or "").strip().lower().startswith(("ollama/", "ollama_chat/"))
+    return is_local_ollama_model(model)
 
 
 def _build_messages(
@@ -252,7 +253,7 @@ def _build_messages(
     followup_hint = _recent_task_followup_hint(history)
     immediate_action_hint = _recent_immediate_action_followup_hint(history)
 
-    if not _is_local_ollama_model(model):
+    if not (_is_local_ollama_model(model) or is_native_openai_model(model)):
         messages = [{"role": "system", "content": user_context.to_system_prompt()}]
         if followup_hint:
             messages.append({"role": "system", "content": followup_hint})
@@ -265,6 +266,13 @@ def _build_messages(
         dynamic_parts.append(followup_hint)
     if immediate_action_hint:
         dynamic_parts.append(immediate_action_hint)
+
+    if is_native_openai_model(model):
+        messages = [{"role": "system", "content": user_context.to_stable_system_prompt()}]
+        turn_context = "\n\n".join(part.strip() for part in dynamic_parts if part and part.strip())
+        if turn_context:
+            messages.append({"role": "system", "content": turn_context})
+        return [*messages, *history]
 
     provider_history: List[Dict[str, Any]] = []
     for message in history:
@@ -322,7 +330,7 @@ def _log_prompt_cache_shape(
     user_context: UserContext,
     aggressive: bool = False,
 ) -> None:
-    if not _is_local_ollama_model(model):
+    if not (_is_local_ollama_model(model) or is_native_openai_model(model)):
         return
     stable_prefix_fingerprint, tool_schema_fingerprint = _request_shape_fingerprints(messages, tools)
     log.info(
@@ -339,6 +347,33 @@ def _log_prompt_cache_shape(
         recent_roles=[str(message.get("role") or "") for message in messages[-6:]],
         aggressive=aggressive,
     )
+
+
+def _apply_provider_prompt_cache_kwargs(
+    kwargs: Dict[str, Any],
+    *,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None,
+    model: str,
+    user_context: UserContext,
+) -> Dict[str, Any]:
+    if (
+        not settings.openai_prompt_cache_enabled
+        or user_context.is_incognito
+        or not is_native_openai_model(model)
+    ):
+        return kwargs
+    stable_prefix_fingerprint, tool_schema_fingerprint = _request_shape_fingerprints(messages, tools)
+    cache_identity = f"{model}|{stable_prefix_fingerprint}|{tool_schema_fingerprint}"
+    updated = dict(kwargs)
+    updated.setdefault(
+        "prompt_cache_key",
+        f"fruitcake-{hashlib.sha256(cache_identity.encode('utf-8')).hexdigest()[:32]}",
+    )
+    retention = str(settings.openai_prompt_cache_retention or "").strip()
+    if retention:
+        updated.setdefault("prompt_cache_retention", retention)
+    return updated
 
 
 def _sanitize_history_tool_chains(
@@ -408,6 +443,13 @@ async def _acompletion_with_budget(
         )
     _record_budget_event(report, stage=stage, mode=mode, model=model)
     request_messages = _build_messages(projected_history, user_context, model=model)
+    extra_kwargs = _apply_provider_prompt_cache_kwargs(
+        extra_kwargs,
+        messages=request_messages,
+        tools=tools,
+        model=model,
+        user_context=user_context,
+    )
     _log_prompt_cache_shape(
         messages=request_messages,
         tools=tools,

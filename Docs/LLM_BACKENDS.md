@@ -132,6 +132,25 @@ OPENAI_API_KEY=sk-...
 LOCAL_API_BASE=
 ```
 
+OpenAI prompt caching is automatic for matching request prefixes. Fruitcake
+keeps the persona and policy system prefix stable, places volatile turn context
+in a following system message, and sends a hashed `prompt_cache_key` derived
+from the stable prompt and tool-schema shape. Prompt content is not included in
+the key or cache diagnostics.
+
+```env
+OPENAI_PROMPT_CACHE_ENABLED=true
+# Optional; empty preserves the provider/organization default.
+OPENAI_PROMPT_CACHE_RETENTION=
+```
+
+Set an explicit retention value only after checking that it is supported by the
+selected model and appropriate for the deployment's privacy policy. Fruitcake
+does not send cache-routing or retention hints for incognito sessions, but
+OpenAI's automatic caching and organization-level retention policy still apply.
+Cached input usage is logged through `llm.prompt_cache_usage` when OpenAI
+returns `prompt_tokens_details.cached_tokens`.
+
 ---
 
 ### Any OpenAI-compatible local server

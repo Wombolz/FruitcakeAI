@@ -24,6 +24,8 @@ from sqlalchemy import select
 
 from app.agent.context import UserContext
 from app.agent.core import (
+    _acompletion_with_budget,
+    _apply_provider_prompt_cache_kwargs,
     _build_messages,
     _filter_tools_for_prompt,
     _is_rss_owned_headline_prompt,
@@ -1333,13 +1335,106 @@ def test_build_messages_keeps_cloud_message_shape_unchanged():
         {"role": "user", "content": "Hello"},
     ]
 
-    messages = _build_messages(history, ctx, model="gpt-5-mini")
+    messages = _build_messages(history, ctx, model="claude-sonnet-4-6")
 
     assert messages[0]["role"] == "system"
     prompt_lines = messages[0]["content"].splitlines()
     assert prompt_lines[2].startswith("Current date and time:")
     assert "<fruitcake_turn_context>" not in messages[0]["content"]
     assert messages[1:] == history
+
+
+def test_build_messages_keeps_openai_prefix_stable_with_system_turn_context():
+    ctx = UserContext(
+        user_id=1,
+        username="tester",
+        role="parent",
+        persona="family_assistant",
+        skill_prompt_additions=["Use current grounded evidence."],
+    )
+    history = [{"role": "user", "content": "What changed?"}]
+
+    messages = _build_messages(history, ctx, model="gpt-5-mini")
+
+    assert [message["role"] for message in messages] == ["system", "system", "user"]
+    assert "Current date and time:" not in messages[0]["content"]
+    assert "Use current grounded evidence." not in messages[0]["content"]
+    assert "Current date and time:" in messages[1]["content"]
+    assert "Use current grounded evidence." in messages[1]["content"]
+    assert messages[2] == history[0]
+
+
+def test_openai_prompt_cache_key_is_stable_and_tool_shape_aware(monkeypatch):
+    monkeypatch.setattr(settings, "openai_prompt_cache_enabled", True)
+    monkeypatch.setattr(settings, "openai_prompt_cache_retention", "")
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    messages = _build_messages([{"role": "user", "content": "Hello"}], ctx, model="gpt-5-mini")
+    tools = [{"type": "function", "function": {"name": "search_library", "parameters": {"type": "object"}}}]
+
+    first = _apply_provider_prompt_cache_kwargs(
+        {}, messages=messages, tools=tools, model="gpt-5-mini", user_context=ctx
+    )
+    second = _apply_provider_prompt_cache_kwargs(
+        {}, messages=messages, tools=tools, model="gpt-5-mini", user_context=ctx
+    )
+    changed = _apply_provider_prompt_cache_kwargs(
+        {}, messages=messages, tools=[], model="gpt-5-mini", user_context=ctx
+    )
+
+    assert first["prompt_cache_key"].startswith("fruitcake-")
+    assert first == second
+    assert first["prompt_cache_key"] != changed["prompt_cache_key"]
+    assert "prompt_cache_retention" not in first
+
+
+def test_openai_prompt_cache_hints_are_omitted_for_incognito(monkeypatch):
+    monkeypatch.setattr(settings, "openai_prompt_cache_enabled", True)
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    ctx.is_incognito = True
+    messages = _build_messages([{"role": "user", "content": "Hello"}], ctx, model="gpt-5")
+
+    kwargs = _apply_provider_prompt_cache_kwargs(
+        {}, messages=messages, tools=[], model="gpt-5", user_context=ctx
+    )
+
+    assert kwargs == {}
+
+
+def test_openai_extended_cache_retention_is_opt_in(monkeypatch):
+    monkeypatch.setattr(settings, "openai_prompt_cache_enabled", True)
+    monkeypatch.setattr(settings, "openai_prompt_cache_retention", "24h")
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    messages = _build_messages([{"role": "user", "content": "Hello"}], ctx, model="gpt-5")
+
+    kwargs = _apply_provider_prompt_cache_kwargs(
+        {}, messages=messages, tools=[], model="gpt-5", user_context=ctx
+    )
+
+    assert kwargs["prompt_cache_retention"] == "24h"
+
+
+@pytest.mark.asyncio
+async def test_openai_completion_receives_cache_key(monkeypatch):
+    monkeypatch.setattr(settings, "openai_prompt_cache_enabled", True)
+    monkeypatch.setattr(settings, "openai_prompt_cache_retention", "")
+    completion = AsyncMock(return_value=SimpleNamespace())
+    ctx = _make_context(persona="family_assistant", blocked=[])
+
+    with patch("app.agent.core.litellm.acompletion", new=completion):
+        await _acompletion_with_budget(
+            history=[{"role": "user", "content": "Hello"}],
+            user_context=ctx,
+            model="gpt-5-mini",
+            mode="chat",
+            stage="chat_simple",
+            tools=[],
+        )
+
+    kwargs = completion.await_args.kwargs
+    assert kwargs["prompt_cache_key"].startswith("fruitcake-")
+    assert "prompt_cache_retention" not in kwargs
+    assert kwargs["messages"][0]["role"] == "system"
+    assert "Current date and time:" not in kwargs["messages"][0]["content"]
 
 
 def test_system_prompt_includes_persona_behavior_instructions():
