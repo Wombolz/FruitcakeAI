@@ -10,11 +10,12 @@ from app.agent.context import UserContext
 from app.agent.core import run_agent, stream_agent
 from app.config import settings
 from app.autonomy.planner import _generate_plan_steps
-from app.db.models import ChatSession, LLMUsageEvent, Task, User
+from app.db.models import ChatMessage, ChatRun, ChatSession, LLMUsageEvent, Task, User
 from app.llm_usage import (
     _extract_local_inference_metrics,
     _log_prompt_cache_usage,
     bind_llm_usage_context,
+    record_llm_usage_event,
     reset_llm_usage_context,
 )
 from tests.conftest import TestSessionLocal
@@ -136,6 +137,7 @@ def test_log_prompt_cache_usage_supports_openai(monkeypatch):
                 "session_id": 42,
                 "task_id": None,
                 "task_run_id": None,
+                "chat_run_id": None,
                 "prompt_tokens": 200,
                 "cached_prompt_tokens": 150,
                 "prompt_cache_percent": 75.0,
@@ -218,6 +220,65 @@ async def test_run_agent_records_usage_event():
     assert rows[0].completion_tokens == 25
     assert rows[0].total_tokens == 125
     assert rows[0].estimated_cost_usd == 0.0025
+
+
+@pytest.mark.asyncio
+async def test_usage_event_persists_chat_run_cache_and_local_timing_metrics():
+    user_id, session_id = await _seed_user_and_session()
+    async with TestSessionLocal() as db:
+        message = ChatMessage(session_id=session_id, role="user", content="Trace this")
+        db.add(message)
+        await db.flush()
+        run = ChatRun(
+            id="chat_run_usage_metrics",
+            session_id=session_id,
+            user_id=user_id,
+            user_message_id=message.id,
+            status="running",
+            phase="model_active",
+            model="ollama_chat/qwen3.6:35b",
+        )
+        db.add(run)
+        await db.commit()
+
+    response = _fake_response(content="Hello", model="ollama_chat/qwen3.6:35b")
+    response.usage.prompt_tokens_details = SimpleNamespace(cached_tokens=60)
+    response.provider_specific_fields = {
+        "ollama_metrics": {
+            "total_duration": 900_000_000,
+            "load_duration": 100_000_000,
+            "prompt_eval_duration": 200_000_000,
+            "eval_duration": 500_000_000,
+        }
+    }
+    token = bind_llm_usage_context(
+        user_id=user_id,
+        session_id=session_id,
+        chat_run_id=run.id,
+        source="chat_websocket",
+    )
+    try:
+        with (
+            patch("app.llm_usage.AsyncSessionLocal", new=TestSessionLocal),
+            patch("app.llm_usage.litellm.completion_cost", return_value=0.0),
+        ):
+            await record_llm_usage_event(response, stage="chat_simple")
+    finally:
+        reset_llm_usage_context(token)
+
+    async with TestSessionLocal() as db:
+        row = (
+            await db.execute(
+                select(LLMUsageEvent).where(
+                    LLMUsageEvent.chat_run_id == "chat_run_usage_metrics"
+                )
+            )
+        ).scalar_one()
+    assert row.cached_prompt_tokens == 60
+    assert row.total_duration_ms == 900.0
+    assert row.load_duration_ms == 100.0
+    assert row.prompt_eval_duration_ms == 200.0
+    assert row.eval_duration_ms == 500.0
 
 
 @pytest.mark.asyncio

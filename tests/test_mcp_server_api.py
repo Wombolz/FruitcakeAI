@@ -75,6 +75,7 @@ async def test_mcp_tools_list_includes_task_and_library_tools(client):
     assert "fruitcake_get_task_run_artifacts" in names
     assert "fruitcake_get_memory_candidates" in names
     assert "fruitcake_inspect_task_run" in names
+    assert "fruitcake_inspect_chat_run" in names
     assert "fruitcake_get_task_health_rollup" in names
 
 

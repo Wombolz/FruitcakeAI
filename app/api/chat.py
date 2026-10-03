@@ -912,6 +912,7 @@ async def send_message(
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
             session_id=session_id,
+            chat_run_id=chat_run.id,
             source="chat_rest",
         )
 
@@ -1254,6 +1255,24 @@ async def decide_chat_run_approval(
     runtime_history_token = reset_agent_runtime_history()
     handoff_token = reset_task_handoff_payload()
     approval_token = None
+    usage_token = bind_llm_usage_context(
+        user_id=current_user.id,
+        session_id=run.session_id,
+        chat_run_id=run.id,
+        source="chat_approval_resume",
+    )
+
+    async def _record_run_event(event: AgentEvent) -> None:
+        await apply_chat_run_event(db, run, event)
+        if event.type != AgentEventType.TEXT_DELTA:
+            await db.commit()
+
+    event_emitter = AgentEventEmitter(
+        run_id=run.id,
+        session_id=run.session_id,
+        callback=_record_run_event,
+        starting_sequence=int(run.last_event_sequence or 0),
+    )
     try:
         user_context = UserContext.from_user(current_user, persona_name=session.persona)
         prompt_message = await db.get(ChatMessage, run.user_message_id) if run.user_message_id else None
@@ -1268,6 +1287,13 @@ async def decide_chat_run_approval(
         finally:
             _approval_armed.reset(replay_token)
         tool_call_id = str(payload.get("tool_call_id") or "").strip()
+        await event_emitter.emit(
+            AgentEventType.TOOL_COMPLETED,
+            tool_call_id=tool_call_id,
+            tool_name=str(payload.get("tool_name") or "unknown"),
+            content_chars=len(str(replay_result or "")),
+            resumed_after_approval=True,
+        )
         tool_message = ChatMessage(
             session_id=run.session_id,
             role="tool",
@@ -1289,17 +1315,6 @@ async def decide_chat_run_approval(
             pending_tool_calls.clear()
             pending_tool_calls.extend(tool_calls)
 
-        async def _record_run_event(event: AgentEvent) -> None:
-            await apply_chat_run_event(db, run, event)
-            if event.type != AgentEventType.TEXT_DELTA:
-                await db.commit()
-
-        event_emitter = AgentEventEmitter(
-            run_id=run.id,
-            session_id=run.session_id,
-            callback=_record_run_event,
-            starting_sequence=int(run.last_event_sequence or 0),
-        )
         _flush_runtime_messages, _flush_pending_runtime_history, _ = (
             _build_runtime_history_flush_helpers(
                 session_id=run.session_id,
@@ -1387,6 +1402,7 @@ async def decide_chat_run_approval(
         restore_tool_execution_records(record_token)
         restore_agent_runtime_history(runtime_history_token)
         restore_task_handoff_payload(handoff_token)
+        reset_llm_usage_context(usage_token)
         if current_task is not None:
             await manager.clear(run.session_id, current_task)
 
@@ -1666,6 +1682,7 @@ async def _run_websocket_message(
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
             session_id=session_id,
+            chat_run_id=chat_run.id,
             source="chat_websocket",
         )
         _flush_runtime_messages, _flush_pending_runtime_history, _get_consumed_runtime_message_count = (

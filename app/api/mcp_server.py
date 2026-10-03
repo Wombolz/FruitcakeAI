@@ -251,6 +251,17 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "fruitcake_inspect_chat_run",
+        "description": "Inspect one user-owned chat run with its lifecycle timeline, timings, tools, and usage.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
         "name": "fruitcake_get_task_health_rollup",
         "description": "Summarize task run health over a recent time window for one user-owned task.",
         "inputSchema": {
@@ -1136,6 +1147,23 @@ async def _tool_inspect_task_run(arguments: Dict[str, Any], user: User) -> Dict[
     )
 
 
+async def _tool_inspect_chat_run(arguments: Dict[str, Any], user: User) -> Dict[str, Any] | str:
+    from app.chat_runtime import build_chat_run_inspection, get_chat_run_manager, owned_chat_run
+    from app.db.session import AsyncSessionLocal
+
+    run_id = str(arguments.get("run_id") or "").strip()
+    if not run_id:
+        return "run_id is required."
+
+    async with AsyncSessionLocal() as db:
+        run = await owned_chat_run(db, run_id=run_id, user_id=user.id)
+        if run is None:
+            return {"found": False, "message": "Chat run not found."}
+        active_run_id = await get_chat_run_manager().active_run_id(run.session_id)
+        payload = await build_chat_run_inspection(db, run, active=active_run_id == run.id)
+    return {"found": True, **payload}
+
+
 async def _tool_get_task_health_rollup(arguments: Dict[str, Any], user: User) -> Dict[str, Any] | str:
     from collections import Counter
     from sqlalchemy import desc, select
@@ -1280,6 +1308,7 @@ _TOOL_HANDLERS: dict[str, Callable[[Dict[str, Any], User], Awaitable[str]]] = {
     "fruitcake_get_task_run_artifacts": _tool_get_task_run_artifacts,
     "fruitcake_get_memory_candidates": _tool_get_memory_candidates,
     "fruitcake_inspect_task_run": _tool_inspect_task_run,
+    "fruitcake_inspect_chat_run": _tool_inspect_chat_run,
     "fruitcake_get_task_health_rollup": _tool_get_task_health_rollup,
 }
 

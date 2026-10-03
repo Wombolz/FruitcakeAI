@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -12,7 +13,8 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.runtime import AgentEvent, AgentEventType
-from app.db.models import ChatRun
+from app.agent.model_provider import is_local_ollama_model, is_native_openai_model
+from app.db.models import ChatRun, ChatRunEvent, LLMUsageEvent
 
 
 _DURABLE_EVENT_PHASES: dict[AgentEventType, str] = {
@@ -31,6 +33,30 @@ _DURABLE_EVENT_PHASES: dict[AgentEventType, str] = {
     AgentEventType.RUN_COMPLETED: "finalizing",
     AgentEventType.RUN_FAILED: "failed",
     AgentEventType.RUN_CANCELLED: "cancelled",
+}
+
+_TRACE_PAYLOAD_KEYS = {
+    "approval_kind",
+    "argument_keys",
+    "artifact_count",
+    "citation_count",
+    "content_chars",
+    "error_type",
+    "failure_phase",
+    "has_structured_content",
+    "history_length",
+    "mode",
+    "model",
+    "phase",
+    "reason",
+    "resumed_after_approval",
+    "retry_reason",
+    "stage",
+    "tool_call_id",
+    "tool_count",
+    "tool_name",
+    "tools_enabled",
+    "turn",
 }
 
 
@@ -253,6 +279,20 @@ async def apply_chat_run_event(db: AsyncSession, run: ChatRun, event: AgentEvent
         phase = str(event.payload.get("phase") or "running").strip() or "running"
     if phase:
         run.phase = phase
+    if event.type in _DURABLE_EVENT_PHASES:
+        trace = ChatRunEvent(
+            run_id=run.id,
+            sequence=int(event.sequence),
+            event_type=event.type.value,
+            phase=phase,
+            occurred_at=event.timestamp,
+        )
+        trace.payload = {
+            key: value
+            for key, value in event.payload.items()
+            if key in _TRACE_PAYLOAD_KEYS
+        }
+        db.add(trace)
     run.updated_at = datetime.now(timezone.utc)
     await db.flush()
 
@@ -306,4 +346,173 @@ def serialize_chat_run(run: ChatRun, *, active: bool) -> dict[str, Any]:
         "finished_at": run.finished_at,
         "user_message_id": run.user_message_id,
         "assistant_message_id": run.assistant_message_id,
+    }
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _elapsed_ms(start: datetime | None, end: datetime | None) -> float | None:
+    aware_start = _aware(start)
+    aware_end = _aware(end)
+    if aware_start is None or aware_end is None:
+        return None
+    return round(max(0.0, (aware_end - aware_start).total_seconds() * 1000.0), 2)
+
+
+def _provider_family(model: str | None) -> str:
+    if is_local_ollama_model(model):
+        return "ollama"
+    if is_native_openai_model(model):
+        return "openai"
+    return "other"
+
+
+def _grounding_outcome(event_counts: Counter[str], evidence_count: int) -> str:
+    completed = event_counts[AgentEventType.TOOL_COMPLETED.value]
+    failed = event_counts[AgentEventType.TOOL_FAILED.value]
+    requested = event_counts[AgentEventType.TOOL_REQUESTED.value]
+    if not requested:
+        return "not_requested"
+    if completed and failed:
+        return "partial"
+    if failed and not completed:
+        return "failed"
+    if completed and evidence_count:
+        return "grounded"
+    if completed:
+        return "tool_supported"
+    return "incomplete"
+
+
+async def build_chat_run_inspection(
+    db: AsyncSession,
+    run: ChatRun,
+    *,
+    active: bool,
+) -> dict[str, Any]:
+    """Build an operator-safe timeline and outcome summary for one chat run."""
+    event_rows = list(
+        (
+            await db.execute(
+                select(ChatRunEvent)
+                .where(ChatRunEvent.run_id == run.id)
+                .order_by(ChatRunEvent.sequence, ChatRunEvent.id)
+            )
+        ).scalars().all()
+    )
+    usage_rows = list(
+        (
+            await db.execute(
+                select(LLMUsageEvent)
+                .where(LLMUsageEvent.chat_run_id == run.id)
+                .order_by(LLMUsageEvent.created_at, LLMUsageEvent.id)
+            )
+        ).scalars().all()
+    )
+
+    event_counts: Counter[str] = Counter(row.event_type for row in event_rows)
+    phase_timings: defaultdict[str, float] = defaultdict(float)
+    timeline: list[dict[str, Any]] = []
+    terminal_time = run.finished_at or run.updated_at or datetime.now(timezone.utc)
+    for index, row in enumerate(event_rows):
+        next_time = event_rows[index + 1].occurred_at if index + 1 < len(event_rows) else terminal_time
+        elapsed = _elapsed_ms(row.occurred_at, next_time)
+        if row.phase and elapsed is not None:
+            phase_timings[row.phase] += elapsed
+        timeline.append(
+            {
+                "sequence": row.sequence,
+                "event_type": row.event_type,
+                "phase": row.phase,
+                "occurred_at": row.occurred_at,
+                "elapsed_to_next_ms": elapsed,
+                "details": row.payload,
+            }
+        )
+
+    prompt_tokens = sum(int(row.prompt_tokens or 0) for row in usage_rows)
+    completion_tokens = sum(int(row.completion_tokens or 0) for row in usage_rows)
+    cached_tokens = sum(int(row.cached_prompt_tokens or 0) for row in usage_rows)
+    evidence_count = sum(
+        int(row.payload.get("citation_count") or 0)
+        + int(row.payload.get("artifact_count") or 0)
+        + int(bool(row.payload.get("has_structured_content")))
+        for row in event_rows
+        if row.event_type == AgentEventType.TOOL_COMPLETED.value
+    )
+    tool_names = sorted(
+        {
+            str(row.payload.get("tool_name") or "").strip()
+            for row in event_rows
+            if row.event_type == AgentEventType.TOOL_REQUESTED.value
+            and str(row.payload.get("tool_name") or "").strip()
+        }
+    )
+    provider_family = _provider_family(run.model)
+    tool_requested = event_counts[AgentEventType.TOOL_REQUESTED.value]
+    cache_percent = round((cached_tokens / prompt_tokens) * 100.0, 2) if prompt_tokens else 0.0
+
+    run_payload = serialize_chat_run(run, active=active)
+    for timestamp_key in ("started_at", "updated_at", "finished_at"):
+        timestamp = run_payload.get(timestamp_key)
+        if isinstance(timestamp, datetime):
+            run_payload[timestamp_key] = timestamp.isoformat()
+    for item in timeline:
+        timestamp = item.get("occurred_at")
+        if isinstance(timestamp, datetime):
+            item["occurred_at"] = timestamp.isoformat()
+
+    return {
+        "run": run_payload,
+        "scenario": {
+            "provider_family": provider_family,
+            "mode": run.mode,
+            "stage": run.stage,
+            "interaction": "tool_augmented" if tool_requested else "text_only",
+        },
+        "outcome": {
+            "completed": run.status == "completed",
+            "status": run.status,
+            "error_classification": run.error_classification,
+            "grounding": _grounding_outcome(event_counts, evidence_count),
+        },
+        "metrics": {
+            "latency_ms": _elapsed_ms(run.started_at, run.finished_at or run.updated_at),
+            "model_turns": event_counts[AgentEventType.MODEL_TURN_STARTED.value],
+            "tool_requests": tool_requested,
+            "tool_completions": event_counts[AgentEventType.TOOL_COMPLETED.value],
+            "tool_failures": event_counts[AgentEventType.TOOL_FAILED.value],
+            "validation_retries": event_counts[AgentEventType.VALIDATION_RETRY.value],
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "cached_prompt_tokens": cached_tokens,
+            "prompt_cache_percent": cache_percent,
+            "llm_calls": len(usage_rows),
+        },
+        "phase_timings_ms": {
+            phase: round(duration, 2)
+            for phase, duration in sorted(phase_timings.items())
+        },
+        "tools": tool_names,
+        "timeline": timeline,
+        "usage": [
+            {
+                "source": row.source,
+                "stage": row.stage,
+                "model": row.model,
+                "provider": row.provider,
+                "prompt_tokens": row.prompt_tokens,
+                "completion_tokens": row.completion_tokens,
+                "cached_prompt_tokens": row.cached_prompt_tokens,
+                "total_duration_ms": row.total_duration_ms,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in usage_rows
+        ],
     }

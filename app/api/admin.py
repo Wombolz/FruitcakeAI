@@ -35,6 +35,7 @@ from app.autonomy.push import get_apns_pusher
 from app.config import settings
 from app.db.models import (
     AuditLog,
+    ChatRun,
     DeviceToken,
     MemoryEntity,
     MemoryObservation,
@@ -50,6 +51,7 @@ from app.db.models import (
 )
 from app.db.models import TaskRunArtifact
 from app.db.session import get_db
+from app.chat_runtime import build_chat_run_inspection, get_chat_run_manager
 from app.metrics import metrics
 from app.memory.graph_service import get_graph_memory_service
 from app.mcp.servers.filesystem import resolve_workspace_path_for_user, write_workspace_text
@@ -1592,6 +1594,19 @@ async def inspect_task_run(
     _: User = Depends(require_admin),
 ):
     return await _build_task_run_inspect_payload(db, run_id)
+
+
+@router.get("/chat-runs/{run_id}/inspect", tags=["admin"])
+async def inspect_chat_run(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    run = await db.get(ChatRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat run not found")
+    active_run_id = await get_chat_run_manager().active_run_id(run.session_id)
+    return await build_chat_run_inspection(db, run, active=active_run_id == run.id)
 
 
 @router.get("/task-runs/{run_id}/edition.pdf", tags=["admin"])

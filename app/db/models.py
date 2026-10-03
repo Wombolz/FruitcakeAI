@@ -437,6 +437,12 @@ class ChatRun(Base):
 
     session = relationship("ChatSession", back_populates="runs")
     user = relationship("User", back_populates="chat_runs")
+    events = relationship(
+        "ChatRunEvent",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        order_by="ChatRunEvent.sequence",
+    )
 
     @property
     def approval_payload(self):
@@ -456,6 +462,42 @@ class ChatRun(Base):
 
     def __repr__(self):
         return f"<ChatRun(id='{self.id}', status='{self.status}')>"
+
+
+class ChatRunEvent(Base):
+    """Sanitized lifecycle event retained for operator inspection."""
+
+    __tablename__ = "chat_run_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_chat_run_events_run_sequence"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(
+        String(64),
+        ForeignKey("chat_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sequence = Column(Integer, nullable=False)
+    event_type = Column(String(50), nullable=False, index=True)
+    phase = Column(String(50), nullable=True)
+    payload_json = Column(Text, nullable=False, default="{}")
+    occurred_at = Column(DateTime(timezone=True), nullable=False)
+
+    run = relationship("ChatRun", back_populates="events")
+
+    @property
+    def payload(self):
+        try:
+            value = json.loads(self.payload_json or "{}")
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @payload.setter
+    def payload(self, value):
+        self.payload_json = json.dumps(value if isinstance(value, dict) else {})
 
 
 class AuditLog(Base):
@@ -487,6 +529,7 @@ class LLMUsageEvent(Base):
     session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="SET NULL"), index=True)
     task_id = Column(Integer, ForeignKey("tasks.id", ondelete="SET NULL"), index=True)
     task_run_id = Column(Integer, ForeignKey("task_runs.id", ondelete="SET NULL"), index=True)
+    chat_run_id = Column(String(64), ForeignKey("chat_runs.id", ondelete="SET NULL"), index=True)
 
     source = Column(String(50), nullable=False, index=True)
     stage = Column(String(80), nullable=True, index=True)
@@ -496,7 +539,12 @@ class LLMUsageEvent(Base):
     prompt_tokens = Column(Integer, nullable=False, default=0)
     completion_tokens = Column(Integer, nullable=False, default=0)
     total_tokens = Column(Integer, nullable=False, default=0)
+    cached_prompt_tokens = Column(Integer, nullable=False, default=0)
     estimated_cost_usd = Column(Float, nullable=True)
+    total_duration_ms = Column(Float, nullable=True)
+    load_duration_ms = Column(Float, nullable=True)
+    prompt_eval_duration_ms = Column(Float, nullable=True)
+    eval_duration_ms = Column(Float, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
