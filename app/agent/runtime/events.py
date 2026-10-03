@@ -123,12 +123,13 @@ class AgentEventEmitter:
         session_id: int | None = None,
         task_id: int | None = None,
         callback: AgentEventCallback | None = None,
+        starting_sequence: int = 0,
     ) -> None:
         self.run_id = run_id or f"run_{uuid4().hex}"
         self.session_id = session_id
         self.task_id = task_id
         self.callback = callback
-        self._sequence = 0
+        self._sequence = max(0, int(starting_sequence))
         self._lock = asyncio.Lock()
         self._started = False
         self._terminal = False

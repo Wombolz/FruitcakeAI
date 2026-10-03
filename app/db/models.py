@@ -68,6 +68,7 @@ class User(Base):
     # Relationships
     documents = relationship("Document", back_populates="owner", cascade="all, delete-orphan")
     chat_sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
+    chat_runs = relationship("ChatRun", back_populates="user", cascade="all, delete-orphan")
     audit_logs = relationship("AuditLog", back_populates="user", cascade="all, delete-orphan")
     tasks = relationship("Task", back_populates="user", cascade="all, delete-orphan")
     managed_agent_presets = relationship("ManagedAgentPreset", back_populates="user", cascade="all, delete-orphan")
@@ -367,6 +368,7 @@ class ChatSession(Base):
 
     user = relationship("User", back_populates="chat_sessions")
     messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
+    runs = relationship("ChatRun", back_populates="session", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<ChatSession(id={self.id})>"
@@ -389,6 +391,71 @@ class ChatMessage(Base):
 
     def __repr__(self):
         return f"<ChatMessage(session_id={self.session_id}, role='{self.role}')>"
+
+
+class ChatRun(Base):
+    """Durable lifecycle state for one user-initiated chat turn."""
+
+    __tablename__ = "chat_runs"
+
+    id = Column(String(64), primary_key=True)
+    session_id = Column(
+        Integer,
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_message_id = Column(
+        Integer,
+        ForeignKey("chat_messages.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    assistant_message_id = Column(
+        Integer,
+        ForeignKey("chat_messages.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    client_send_id = Column(String(100), nullable=True, index=True)
+    status = Column(String(30), nullable=False, default="running", index=True)
+    phase = Column(String(50), nullable=False, default="starting")
+    mode = Column(String(50), nullable=True)
+    stage = Column(String(100), nullable=True)
+    model = Column(String(200), nullable=True)
+    last_event_sequence = Column(Integer, nullable=False, default=0)
+    approval_kind = Column(String(50), nullable=True)
+    approval_payload_json = Column(Text, nullable=True)
+    error_classification = Column(String(100), nullable=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+    session = relationship("ChatSession", back_populates="runs")
+    user = relationship("User", back_populates="chat_runs")
+
+    @property
+    def approval_payload(self):
+        if not self.approval_payload_json:
+            return None
+        try:
+            return json.loads(self.approval_payload_json)
+        except Exception:
+            return None
+
+    @approval_payload.setter
+    def approval_payload(self, value):
+        if value is None:
+            self.approval_payload_json = None
+            return
+        self.approval_payload_json = json.dumps(value)
+
+    def __repr__(self):
+        return f"<ChatRun(id='{self.id}', status='{self.status}')>"
 
 
 class AuditLog(Base):

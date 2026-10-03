@@ -42,6 +42,7 @@ from app.agent.runtime import (
     wrap_provisional_text_callback,
 )
 from app.agent.tools import dispatch_tool_calls, get_tools_for_user
+from app.autonomy.approval import ApprovalRequired
 from app.config import settings
 from app.llm_usage import record_llm_usage_event, stream_usage_enabled
 from app.metrics import metrics
@@ -3499,6 +3500,14 @@ async def run_agent(
     except asyncio.CancelledError:
         await emitter.terminal_once(AgentEventType.RUN_CANCELLED)
         raise
+    except ApprovalRequired as exc:
+        await emitter.emit(
+            AgentEventType.APPROVAL_REQUIRED,
+            tool_name=exc.tool_name,
+            approval_kind=exc.approval_kind,
+            reason=exc.reason,
+        )
+        raise
     except Exception as exc:
         await emitter.terminal_once(
             AgentEventType.RUN_FAILED,
@@ -3565,6 +3574,14 @@ async def stream_agent(
             yield chunk
     except asyncio.CancelledError:
         await emitter.terminal_once(AgentEventType.RUN_CANCELLED)
+        raise
+    except ApprovalRequired as exc:
+        await emitter.emit(
+            AgentEventType.APPROVAL_REQUIRED,
+            tool_name=exc.tool_name,
+            approval_kind=exc.approval_kind,
+            reason=exc.reason,
+        )
         raise
     except GeneratorExit:
         await emitter.terminal_once(

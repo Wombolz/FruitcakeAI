@@ -14,6 +14,7 @@ from app.agent.runtime import (
     build_tool_call_result,
     emit_tool_completed_events,
 )
+from app.autonomy.approval import ApprovalRequired
 from app.config import settings
 
 
@@ -246,6 +247,44 @@ async def test_run_agent_emits_tool_sequence_and_preserves_legacy_callbacks():
     requested = events[2]
     assert requested.payload["tool_name"] == "read_file"
     assert requested.payload["argument_keys"] == ["path"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_emits_approval_required_without_misclassifying_failure():
+    events = []
+    call = SimpleNamespace(
+        id="call_write",
+        type="function",
+        function=SimpleNamespace(name="write_file", arguments='{"path":"notes/a.md","content":"x"}'),
+    )
+
+    async def _collect(event):
+        events.append(event)
+
+    emitter = AgentEventEmitter(callback=_collect, session_id=42)
+    with (
+        patch("app.agent.core.get_tools_for_user", return_value=[{"function": {"name": "write_file"}}]),
+        patch(
+            "app.agent.core.litellm.acompletion",
+            new=AsyncMock(return_value=_response(tool_calls=[call])),
+        ),
+        patch(
+            "app.agent.core.dispatch_tool_calls",
+            new=AsyncMock(side_effect=ApprovalRequired("write_file")),
+        ),
+        patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
+    ):
+        with pytest.raises(ApprovalRequired):
+            await run_agent(
+                [{"role": "user", "content": "write the note"}],
+                _context(),
+                event_emitter=emitter,
+            )
+
+    event_types = [event.type for event in events]
+    assert event_types[-1] == AgentEventType.APPROVAL_REQUIRED
+    assert AgentEventType.RUN_FAILED not in event_types
+    assert events[-1].payload["tool_name"] == "write_file"
 
 
 @pytest.mark.asyncio
