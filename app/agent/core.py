@@ -37,6 +37,7 @@ from app.agent.runtime import (
     ProviderCapabilities,
     emit_tool_completed_events,
     emit_tool_requested_events,
+    normalize_tool_call_results,
     resolve_provider_capabilities,
     wrap_provisional_text_callback,
 )
@@ -2861,11 +2862,13 @@ async def _execute_agent_tool_turn(
     if pre_tool_callback is not None:
         await pre_tool_callback(normalized_tool_calls)
 
-    tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
+    raw_tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
+    structured_tool_results = normalize_tool_call_results(normalized_tool_calls, raw_tool_results)
+    tool_results = [result.to_message() for result in structured_tool_results]
     await emit_tool_completed_events(
         event_emitter,
         normalized_tool_calls,
-        tool_results,
+        structured_tool_results,
         turn=turn_number,
     )
     history.extend(tool_results)

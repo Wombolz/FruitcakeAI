@@ -2552,6 +2552,28 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
                 cleaned_images.append(cleaned_item)
             if cleaned_images:
                 normalized_evidence["image_artifacts"] = cleaned_images
+        citations = evidence.get("citations")
+        if isinstance(citations, list):
+            cleaned_citations = []
+            for item in citations[:12]:
+                if not isinstance(item, dict):
+                    continue
+                cleaned_item = {}
+                for key, max_len in (
+                    ("url", 500),
+                    ("title", 200),
+                    ("label", 200),
+                    ("source", 120),
+                    ("document", 300),
+                    ("path", 500),
+                ):
+                    value = str(item.get(key) or "").strip()
+                    if value:
+                        cleaned_item[key] = value[:max_len]
+                if cleaned_item:
+                    cleaned_citations.append(cleaned_item)
+            if cleaned_citations:
+                normalized_evidence["citations"] = cleaned_citations
         if normalized_evidence:
             normalized["evidence"] = normalized_evidence
 
@@ -2617,7 +2639,35 @@ def _build_assistant_evidence_metadata(
     image_artifacts = _build_assistant_image_artifacts(executed_tools)
     if image_artifacts:
         evidence["image_artifacts"] = image_artifacts
+    citations = _build_assistant_citations(executed_tools)
+    if citations:
+        evidence["citations"] = citations
     return evidence
+
+
+def _build_assistant_citations(executed_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    citations: List[Dict[str, Any]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for record in executed_tools or []:
+        if not isinstance(record, dict) or not isinstance(record.get("citations"), list):
+            continue
+        for item in record["citations"]:
+            if not isinstance(item, dict):
+                continue
+            cleaned = {
+                str(key): value
+                for key, value in item.items()
+                if str(key) in {"url", "title", "label", "source", "document", "path"}
+                and value not in (None, "")
+            }
+            key = tuple(sorted((name, str(value)) for name, value in cleaned.items()))
+            if not cleaned or key in seen:
+                continue
+            seen.add(key)
+            citations.append(cleaned)
+            if len(citations) >= 12:
+                return citations
+    return citations
 
 
 def _source_kind_for_url(url: str) -> str:
@@ -2687,7 +2737,12 @@ def _build_assistant_tool_details(executed_tools: List[Dict[str, Any]]) -> List[
             }
             if tool_name == "fetch_page" and detail_kind == "url":
                 detail["source_kind"] = _source_kind_for_url(value)
-                source_title = _extract_fetch_page_title(str(record.get("result_summary") or ""))
+                structured = record.get("structured_content")
+                source_title = (
+                    str(structured.get("title") or "").strip()
+                    if isinstance(structured, dict)
+                    else ""
+                ) or _extract_fetch_page_title(str(record.get("result_summary") or ""))
                 if source_title:
                     detail["source_title"] = source_title
             details.append(detail)
@@ -2707,7 +2762,22 @@ def _build_assistant_image_artifacts(executed_tools: List[Dict[str, Any]]) -> Li
         tool_name = str(record.get("tool") or "").strip()
         if tool_name not in _IMAGE_EVIDENCE_TOOL_NAMES:
             continue
-        payload = _parse_image_tool_result(record.get("result_summary"))
+        normalized_artifacts = record.get("artifacts")
+        payload = (
+            next(
+                (
+                    dict(item)
+                    for item in normalized_artifacts
+                    if isinstance(item, dict)
+                    and str(item.get("path") or item.get("image_path") or "").strip()
+                ),
+                None,
+            )
+            if isinstance(normalized_artifacts, list)
+            else None
+        )
+        if payload is None:
+            payload = _parse_image_tool_result(record.get("result_summary"))
         if not payload:
             continue
         image_path = str(payload.get("image_path") or payload.get("path") or "").strip()

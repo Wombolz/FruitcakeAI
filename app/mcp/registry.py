@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import structlog
 import yaml
 
+from app.agent.runtime.models import ToolOutputText
 from app.mcp.client import MCPClient
 
 log = structlog.get_logger(__name__)
@@ -63,6 +64,13 @@ def _extract_text(result: Any) -> str:
             )
         return str(content)
     return str(result)
+
+
+def _extract_structured_content(result: Any) -> Dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    structured = result.get("structuredContent") or result.get("structured_content")
+    return dict(structured) if isinstance(structured, dict) else None
 
 
 def _serialize_user_context(user_context: Any) -> Dict[str, Any]:
@@ -284,7 +292,10 @@ class MCPRegistry:
                 return f"Internal module {server_name} is not loaded"
             try:
                 result = await module.call_tool(tool_name, arguments, user_context)
-                return str(result)
+                return ToolOutputText(
+                    str(result),
+                    structured_content=_extract_structured_content(result),
+                )
             except Exception as e:
                 log.error("Internal MCP tool failed", tool=tool_name, error=str(e))
                 return f"Tool {tool_name} failed: {e}"
@@ -299,7 +310,10 @@ class MCPRegistry:
                 effective_args["_fruitcake_user_context"] = _serialize_user_context(user_context)
             raw = await client.call_tool(tool_name, effective_args)
             if raw["success"]:
-                return _extract_text(raw["result"])
+                return ToolOutputText(
+                    _extract_text(raw["result"]),
+                    structured_content=_extract_structured_content(raw["result"]),
+                )
             return f"Tool {tool_name} failed: {raw.get('error', 'unknown error')}"
 
         return f"Unsupported server type for tool: {tool_name}"

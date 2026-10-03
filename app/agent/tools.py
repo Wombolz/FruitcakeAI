@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 import structlog
 
 from app.agent.context import UserContext
+from app.agent.runtime.models import build_tool_call_result
 from app.autonomy.approval import ApprovalRequired, build_blocked_tool_approval_payload
 
 log = structlog.get_logger(__name__)
@@ -1056,7 +1057,12 @@ async def _execute_tool_call(
     )
 
     records = list(_tool_execution_records.get())
-    records.append({"tool": tool_name, "arguments": arguments, "result_summary": str(result_content)})
+    normalized_result = build_tool_call_result(
+        tool_call_id="",
+        name=tool_name,
+        content=result_content,
+    )
+    records.append(normalized_result.to_execution_record(arguments=arguments))
     _tool_execution_records.set(records)
     return result_content
 

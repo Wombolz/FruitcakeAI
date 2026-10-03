@@ -11,6 +11,8 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 from uuid import uuid4
 
+from app.agent.runtime.models import ToolCallResult
+
 
 class AgentEventType(str, Enum):
     RUN_STARTED = "run_started"
@@ -209,7 +211,7 @@ async def emit_tool_requested_events(
 async def emit_tool_completed_events(
     emitter: AgentEventEmitter | None,
     tool_calls: Sequence[Mapping[str, Any]],
-    tool_results: Sequence[Mapping[str, Any]],
+    tool_results: Sequence[Mapping[str, Any] | ToolCallResult],
     *,
     turn: int,
 ) -> None:
@@ -220,18 +222,34 @@ async def emit_tool_completed_events(
         for call_id, name, _ in (_tool_call_parts(call) for call in tool_calls)
     }
     for result in tool_results:
-        call_id = str(result.get("tool_call_id") or "")
-        content = str(result.get("content") or "")
-        lowered = content.casefold().lstrip()
-        is_error = bool(result.get("is_error")) or lowered.startswith(("error", "tool ")) and "failed" in lowered[:120]
+        if isinstance(result, ToolCallResult):
+            call_id = result.tool_call_id
+            content = result.content
+            is_error = result.is_error
+            tool_name = result.name
+            artifact_count = len(result.artifacts)
+            citation_count = len(result.citations)
+            has_structured_content = result.structured_content is not None
+        else:
+            call_id = str(result.get("tool_call_id") or "")
+            content = str(result.get("content") or "")
+            lowered = content.casefold().lstrip()
+            is_error = bool(result.get("is_error")) or lowered.startswith(("error", "tool ")) and "failed" in lowered[:120]
+            tool_name = names_by_id.get(call_id, "unknown")
+            artifact_count = len(result.get("artifacts") or [])
+            citation_count = len(result.get("citations") or [])
+            has_structured_content = isinstance(result.get("structured_content"), Mapping)
         event_type = AgentEventType.TOOL_FAILED if is_error else AgentEventType.TOOL_COMPLETED
         await emitter.emit(
             event_type,
             turn=turn,
             tool_call_id=call_id,
-            tool_name=names_by_id.get(call_id, "unknown"),
+            tool_name=tool_name,
             content_chars=len(content),
             result_fingerprint=content_fingerprint(content),
+            has_structured_content=has_structured_content,
+            artifact_count=artifact_count,
+            citation_count=citation_count,
         )
 
 

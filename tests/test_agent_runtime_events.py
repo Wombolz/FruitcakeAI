@@ -7,7 +7,13 @@ import pytest
 
 from app.agent.context import UserContext
 from app.agent.core import run_agent, stream_agent
-from app.agent.runtime import AgentEventEmitter, AgentEventType
+from app.agent.runtime import (
+    AgentEventEmitter,
+    AgentEventType,
+    ToolOutputText,
+    build_tool_call_result,
+    emit_tool_completed_events,
+)
 from app.config import settings
 
 
@@ -51,6 +57,68 @@ def _context() -> UserContext:
         role="parent",
         session_id=42,
     )
+
+
+def test_structured_tool_result_preserves_plain_model_message():
+    output = ToolOutputText(
+        "Image generated.",
+        structured_content={
+            "image_path": "generated_images/map.png",
+            "prompt": "A system map",
+            "sources": [{"url": "https://example.com/source", "title": "Source"}],
+        },
+    )
+
+    result = build_tool_call_result(
+        tool_call_id="call_image",
+        name="generate_image",
+        content=output,
+    )
+
+    assert result.to_message() == {
+        "role": "tool",
+        "tool_call_id": "call_image",
+        "content": "Image generated.",
+    }
+    assert result.artifacts == [
+        {
+            "kind": "image",
+            "path": "generated_images/map.png",
+            "prompt": "A system map",
+            "source_tool": "generate_image",
+        }
+    ]
+    assert result.citations == [
+        {"url": "https://example.com/source", "title": "Source"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_completion_event_reports_structured_metadata_without_content():
+    events = []
+
+    async def _collect(event):
+        events.append(event)
+
+    emitter = AgentEventEmitter(callback=_collect, session_id=42)
+    result = build_tool_call_result(
+        tool_call_id="call_image",
+        name="generate_image",
+        content='{"image_path":"generated_images/map.png"}',
+    )
+    await emit_tool_completed_events(
+        emitter,
+        [{"id": "call_image", "function": {"name": "generate_image", "arguments": "{}"}}],
+        [result],
+        turn=1,
+    )
+
+    assert len(events) == 1
+    assert events[0].type == AgentEventType.TOOL_COMPLETED
+    assert events[0].payload["has_structured_content"] is True
+    assert events[0].payload["artifact_count"] == 1
+    assert events[0].payload["citation_count"] == 0
+    assert "content" not in events[0].payload
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,9 @@ from app.agent.runtime.models import (
     RunOutcome,
     ToolCallRequest,
     ToolCallResult,
+    ToolOutputText,
+    build_tool_call_result,
+    normalize_tool_call_results,
 )
 from app.agent.runtime.provider import ProviderCapabilities, resolve_provider_capabilities
 
@@ -29,8 +32,11 @@ __all__ = [
     "RunOutcome",
     "ToolCallRequest",
     "ToolCallResult",
+    "ToolOutputText",
+    "build_tool_call_result",
     "emit_tool_completed_events",
     "emit_tool_requested_events",
+    "normalize_tool_call_results",
     "resolve_provider_capabilities",
     "wrap_provisional_text_callback",
 ]
