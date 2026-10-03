@@ -8,6 +8,7 @@ import pytest
 from app.agent.context import UserContext
 from app.agent.core import run_agent, stream_agent
 from app.agent.runtime import AgentEventEmitter, AgentEventType
+from app.config import settings
 
 
 class _FakeMessage:
@@ -269,3 +270,56 @@ async def test_run_agent_emits_failure_without_swallowing_exception():
 
     assert events[-1].type == AgentEventType.RUN_FAILED
     assert events[-1].payload["error_type"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_streaming_and_non_streaming_share_repeated_tool_convergence(monkeypatch):
+    monkeypatch.setattr(settings, "agent_repeated_tool_signature_threshold", 1)
+    tool_call = SimpleNamespace(
+        id="call_repeat",
+        type="function",
+        function=SimpleNamespace(name="find_files", arguments="{}"),
+    )
+    tool_result = [
+        {"role": "tool", "tool_call_id": "call_repeat", "content": "same result"}
+    ]
+
+    async def _exercise(*, streaming: bool) -> tuple[str, int, int]:
+        completion = AsyncMock(return_value=_response(tool_calls=[tool_call]))
+        dispatch = AsyncMock(return_value=tool_result)
+        with (
+            patch(
+                "app.agent.core.get_tools_for_user",
+                return_value=[{"type": "function", "function": {"name": "find_files"}}],
+            ),
+            patch("app.agent.core.litellm.acompletion", new=completion),
+            patch("app.agent.core.dispatch_tool_calls", new=dispatch),
+            patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
+            patch("app.agent.core._native_agent_streaming_enabled", return_value=False),
+        ):
+            if streaming:
+                result = "".join(
+                    [
+                        chunk
+                        async for chunk in stream_agent(
+                            [{"role": "user", "content": "Keep searching."}],
+                            _context(),
+                            mode="task",
+                        )
+                    ]
+                )
+            else:
+                result = await run_agent(
+                    [{"role": "user", "content": "Keep searching."}],
+                    _context(),
+                    mode="task",
+                )
+        return result, completion.await_count, dispatch.await_count
+
+    plain_result, plain_model_turns, plain_tool_turns = await _exercise(streaming=False)
+    stream_result, stream_model_turns, stream_tool_turns = await _exercise(streaming=True)
+
+    assert stream_result == plain_result
+    assert "repeating the same tool cycle" in plain_result.lower()
+    assert (plain_model_turns, plain_tool_turns) == (2, 2)
+    assert (stream_model_turns, stream_tool_turns) == (2, 2)
