@@ -16,6 +16,7 @@ from app.agent.runtime.models import (
     ToolCallRequest,
     ToolCallResult,
 )
+from app.agent.runtime.provider import ProviderCapabilities, resolve_provider_capabilities
 
 __all__ = [
     "AgentEvent",
@@ -24,10 +25,12 @@ __all__ = [
     "AgentRunState",
     "ChatRunContext",
     "ModelTurn",
+    "ProviderCapabilities",
     "RunOutcome",
     "ToolCallRequest",
     "ToolCallResult",
     "emit_tool_completed_events",
     "emit_tool_requested_events",
+    "resolve_provider_capabilities",
     "wrap_provisional_text_callback",
 ]

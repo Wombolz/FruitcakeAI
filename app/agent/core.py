@@ -20,7 +20,6 @@ import litellm
 import structlog
 
 from app.agent.context import UserContext
-from app.agent.model_provider import is_local_ollama_model, is_native_openai_model
 from app.agent.litellm_ollama_patch import (
     apply_litellm_ollama_stream_patch,
     apply_litellm_ollama_tool_history_patch,
@@ -35,8 +34,10 @@ from app.agent.model_stream import (
 from app.agent.runtime import (
     AgentEventEmitter,
     AgentEventType,
+    ProviderCapabilities,
     emit_tool_completed_events,
     emit_tool_requested_events,
+    resolve_provider_capabilities,
     wrap_provisional_text_callback,
 )
 from app.agent.tools import dispatch_tool_calls, get_tools_for_user
@@ -248,10 +249,6 @@ def restore_agent_runtime_history(token: contextvars.Token) -> None:
     _agent_runtime_history.reset(token)
 
 
-def _is_local_ollama_model(model: str | None) -> bool:
-    return is_local_ollama_model(model)
-
-
 def _build_messages(
     history: List[Dict[str, Any]],
     user_context: UserContext,
@@ -259,10 +256,11 @@ def _build_messages(
     model: str | None = None,
 ) -> List[Dict[str, Any]]:
     """Build provider-safe messages while preserving a stable local prefix."""
+    capabilities = resolve_provider_capabilities(model)
     followup_hint = _recent_task_followup_hint(history)
     immediate_action_hint = _recent_immediate_action_followup_hint(history)
 
-    if not (_is_local_ollama_model(model) or is_native_openai_model(model)):
+    if not capabilities.prompt_cache_shape:
         messages = [{"role": "system", "content": user_context.to_system_prompt()}]
         if followup_hint:
             messages.append({"role": "system", "content": followup_hint})
@@ -276,7 +274,7 @@ def _build_messages(
     if immediate_action_hint:
         dynamic_parts.append(immediate_action_hint)
 
-    if is_native_openai_model(model):
+    if capabilities.family == "openai":
         messages = [{"role": "system", "content": user_context.to_stable_system_prompt()}]
         turn_context = "\n\n".join(part.strip() for part in dynamic_parts if part and part.strip())
         if turn_context:
@@ -339,7 +337,7 @@ def _log_prompt_cache_shape(
     user_context: UserContext,
     aggressive: bool = False,
 ) -> None:
-    if not (_is_local_ollama_model(model) or is_native_openai_model(model)):
+    if not resolve_provider_capabilities(model).prompt_cache_shape:
         return
     stable_prefix_fingerprint, tool_schema_fingerprint = _request_shape_fingerprints(messages, tools)
     log.info(
@@ -369,7 +367,7 @@ def _apply_provider_prompt_cache_kwargs(
     if (
         not settings.openai_prompt_cache_enabled
         or user_context.is_incognito
-        or not is_native_openai_model(model)
+        or not resolve_provider_capabilities(model).prompt_cache_api
     ):
         return kwargs
     stable_prefix_fingerprint, tool_schema_fingerprint = _request_shape_fingerprints(messages, tools)
@@ -565,13 +563,14 @@ def _litellm_kwargs(model: str | None = None, *, is_incognito: bool = False) -> 
     """Build extra kwargs for litellm based on the selected model/provider."""
     kwargs: Dict[str, Any] = {}
     selected_model = str(model or settings.llm_model or "")
-    if _is_local_ollama_model(selected_model):
+    provider = resolve_provider_capabilities(selected_model)
+    if provider.is_local:
         kwargs["api_base"] = _normalized_local_api_base()
         keep_alive = str(settings.local_model_keep_alive or "").strip()
         if keep_alive and not is_incognito:
             kwargs["keep_alive"] = keep_alive
         return kwargs
-    if settings.llm_backend in ("ollama", "openai_compat"):
+    if provider.uses_local_api_base:
         kwargs["api_base"] = _normalized_local_api_base()
     return kwargs
 
@@ -604,30 +603,15 @@ def _chunk_plain_text(content: str, chunk_size: int = 64) -> List[str]:
 
 
 def _should_skip_final_stream_pass(model: str) -> bool:
-    selected = str(model or "").strip()
-    return selected.startswith(("ollama/", "ollama_chat/"))
+    return resolve_provider_capabilities(model).skip_duplicate_final_stream
 
 
 def _is_local_model(model: str | None) -> bool:
-    selected = str(model or "").strip()
-    return selected.startswith(("ollama/", "ollama_chat/"))
-
-
-def _configured_native_streaming_models() -> set[str]:
-    return {
-        str(part).strip()
-        for part in str(settings.fruitcake_native_agent_streaming_models or "").split(",")
-        if str(part).strip()
-    }
+    return resolve_provider_capabilities(model).is_local
 
 
 def _native_agent_streaming_enabled(model: str | None) -> bool:
-    selected = str(model or "").strip()
-    return bool(
-        settings.fruitcake_native_agent_streaming_enabled
-        and selected
-        and selected in _configured_native_streaming_models()
-    )
+    return resolve_provider_capabilities(model).native_streaming
 
 
 _REASONING_SECRET_PATTERNS = (
@@ -690,21 +674,12 @@ def _is_local_tool_unsupported_error(exc: Exception, model: str | None) -> bool:
     return "does not support tools" in lowered and "ollama" in lowered
 
 
-def _configured_local_text_only_models() -> set[str]:
-    return {
-        str(part).strip()
-        for part in str(settings.local_tool_text_only_models or "").split(",")
-        if str(part).strip()
-    }
-
-
 def _is_configured_local_text_only_model(model: str | None) -> bool:
-    selected = str(model or "").strip()
-    return bool(selected) and selected in _configured_local_text_only_models()
+    return resolve_provider_capabilities(model).configured_text_only
 
 
 def _is_qwen_local_tool_guardrail_model(model: str | None) -> bool:
-    return str(model or "").strip() == "ollama_chat/qwen3.6:35b"
+    return resolve_provider_capabilities(model).targeted_local_tool_guardrails
 
 
 def _recent_role_sequence(history: List[Dict[str, Any]], *, limit: int = 5) -> List[str]:
@@ -2731,6 +2706,7 @@ class _AgentLoopSetup:
     history: List[Dict[str, Any]]
     max_turns: int
     selected_model: str
+    provider: ProviderCapabilities
     tools: List[Dict[str, Any]] | None
     extra: Dict[str, Any]
     state: _AgentLoopState
@@ -2787,6 +2763,7 @@ def _initialize_agent_loop(
         history=history,
         max_turns=max_turns,
         selected_model=selected_model,
+        provider=resolve_provider_capabilities(selected_model),
         tools=tools,
         extra=_litellm_kwargs(selected_model, is_incognito=user_context.is_incognito),
         state=_AgentLoopState(),
@@ -3245,7 +3222,7 @@ async def _run_agent_chunks(
     extra = setup.extra
     loop_state = setup.state
     rss_owned_headline_prompt = setup.rss_owned_headline_prompt
-    native_streaming_enabled = streaming and _native_agent_streaming_enabled(selected_model)
+    native_streaming_enabled = streaming and setup.provider.native_streaming
     if streaming:
         log.info(
             "agent.native_streaming_policy",
@@ -3280,7 +3257,7 @@ async def _run_agent_chunks(
             stream_started = time.perf_counter()
             first_event_ms: float | None = None
             native_extra = dict(extra)
-            reasoning_effort = str(settings.fruitcake_native_agent_streaming_reasoning_effort or "").strip()
+            reasoning_effort = setup.provider.native_reasoning_effort
             if reasoning_effort:
                 native_extra["reasoning_effort"] = reasoning_effort
             stream_kwargs: dict[str, Any] = {}
@@ -3459,7 +3436,7 @@ async def _run_agent_chunks(
             if not streaming:
                 yield message.content or ""
                 return
-            if _should_skip_final_stream_pass(selected_model):
+            if setup.provider.skip_duplicate_final_stream:
                 for token in _chunk_plain_text(message.content or ""):
                     yield token
                 return
