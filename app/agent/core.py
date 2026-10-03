@@ -6,6 +6,7 @@ it decides when to call tools and how to synthesize results.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import hashlib
 import json
@@ -29,6 +30,13 @@ from app.agent.model_stream import (
     ModelTurnResult,
     close_provider_stream,
     iter_model_stream_events,
+)
+from app.agent.runtime import (
+    AgentEventEmitter,
+    AgentEventType,
+    emit_tool_completed_events,
+    emit_tool_requested_events,
+    wrap_provisional_text_callback,
 )
 from app.agent.tools import dispatch_tool_calls, get_tools_for_user
 from app.config import settings
@@ -2705,7 +2713,7 @@ async def _stream_final_response(
         )
 
 
-async def run_agent(
+async def _run_agent_impl(
     messages: List[Dict[str, Any]],
     user_context: UserContext,
     mode: str = "chat",
@@ -2713,6 +2721,7 @@ async def run_agent(
     stage: str | None = None,
     runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    event_emitter: AgentEventEmitter | None = None,
 ) -> str:
     """
     Run the agent loop (non-streaming).
@@ -2796,6 +2805,22 @@ async def run_agent(
             user_context=user_context,
             history=history,
         )
+        if event_emitter is not None:
+            if history and history[-1].get("role") == "tool":
+                await event_emitter.emit(
+                    AgentEventType.SYNTHESIS_STARTED,
+                    turn=turn_number,
+                )
+            await event_emitter.emit(
+                AgentEventType.MODEL_TURN_STARTED,
+                turn=turn_number,
+                model=selected_model,
+                mode=mode,
+                stage=stage,
+                history_length=len(turn_history),
+                tools_enabled=bool(turn_tools),
+                tool_count=len(turn_tools or []),
+            )
         try:
             response = await _acompletion_with_budget(
                 history=turn_history,
@@ -2862,10 +2887,21 @@ async def run_agent(
             )
             normalized_message["tool_calls"] = normalized_tool_calls
             history[-1] = normalized_message
+            await emit_tool_requested_events(
+                event_emitter,
+                normalized_tool_calls,
+                turn=turn_number,
+            )
             if pre_tool_callback is not None:
                 await pre_tool_callback(normalized_tool_calls)
             # Execute all tool calls, append results, then loop
             tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
+            await emit_tool_completed_events(
+                event_emitter,
+                normalized_tool_calls,
+                tool_results,
+                turn=turn_number,
+            )
             history.extend(tool_results)
             runtime_messages = [normalized_message, *tool_results]
             _record_agent_runtime_messages(runtime_messages)
@@ -3120,7 +3156,7 @@ async def run_agent(
     return _max_turns_message(history)
 
 
-async def stream_agent(
+async def _stream_agent_impl(
     messages: List[Dict[str, Any]],
     user_context: UserContext,
     mode: str = "chat",
@@ -3129,6 +3165,7 @@ async def stream_agent(
     runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     provisional_text_callback: Callable[[str, str], Awaitable[None]] | None = None,
+    event_emitter: AgentEventEmitter | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Run the agent loop with streaming.
@@ -3215,9 +3252,26 @@ async def stream_agent(
             user_context=user_context,
             history=history,
         )
+        if event_emitter is not None:
+            if history and history[-1].get("role") == "tool":
+                await event_emitter.emit(
+                    AgentEventType.SYNTHESIS_STARTED,
+                    turn=turn_number,
+                )
+            await event_emitter.emit(
+                AgentEventType.MODEL_TURN_STARTED,
+                turn=turn_number,
+                model=selected_model,
+                mode=mode,
+                stage=stage,
+                history_length=len(turn_history),
+                tools_enabled=bool(turn_tools),
+                tool_count=len(turn_tools or []),
+            )
         native_turn: ModelTurnResult | None = None
         native_text_emitted = False
         provisional_text_active = False
+        reasoning_event_emitted = False
         if native_streaming_enabled:
             accumulator = ModelTurnAccumulator()
             provider_stream = None
@@ -3250,6 +3304,17 @@ async def stream_agent(
                             first_event_ms = (time.perf_counter() - stream_started) * 1000.0
                         event_counts[event.kind] = event_counts.get(event.kind, 0) + 1
                         accumulator.add(event)
+                        if (
+                            event.kind == "reasoning_delta"
+                            and event.text
+                            and not reasoning_event_emitted
+                            and event_emitter is not None
+                        ):
+                            reasoning_event_emitted = True
+                            await event_emitter.emit(
+                                AgentEventType.REASONING_STARTED,
+                                turn=turn_number,
+                            )
                         if event.kind == "text_delta" and event.text:
                             if turn_tools and provisional_text_callback is not None:
                                 provisional_text_active = True
@@ -3407,9 +3472,20 @@ async def stream_agent(
             )
             normalized_message["tool_calls"] = normalized_tool_calls
             history[-1] = normalized_message
+            await emit_tool_requested_events(
+                event_emitter,
+                normalized_tool_calls,
+                turn=turn_number,
+            )
             if pre_tool_callback is not None:
                 await pre_tool_callback(normalized_tool_calls)
             tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
+            await emit_tool_completed_events(
+                event_emitter,
+                normalized_tool_calls,
+                tool_results,
+                turn=turn_number,
+            )
             history.extend(tool_results)
             runtime_messages = [normalized_message, *tool_results]
             _record_agent_runtime_messages(runtime_messages)
@@ -3685,3 +3761,126 @@ async def stream_agent(
             return
 
     yield _max_turns_message(history)
+
+
+async def run_agent(
+    messages: List[Dict[str, Any]],
+    user_context: UserContext,
+    mode: str = "chat",
+    model_override: str | None = None,
+    stage: str | None = None,
+    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    event_emitter: AgentEventEmitter | None = None,
+) -> str:
+    """Run the non-streaming loop and emit one ordered lifecycle stream."""
+    selected_model = model_override or settings.llm_model
+    emitter = event_emitter or AgentEventEmitter(
+        session_id=user_context.session_id,
+        task_id=user_context.task_id,
+    )
+    await emitter.start_once(
+        mode=mode,
+        model=selected_model,
+        stage=stage,
+        streaming=False,
+    )
+    try:
+        result = await _run_agent_impl(
+            messages,
+            user_context,
+            mode=mode,
+            model_override=model_override,
+            stage=stage,
+            runtime_message_callback=runtime_message_callback,
+            pre_tool_callback=pre_tool_callback,
+            event_emitter=emitter,
+        )
+    except asyncio.CancelledError:
+        await emitter.terminal_once(AgentEventType.RUN_CANCELLED)
+        raise
+    except Exception as exc:
+        await emitter.terminal_once(
+            AgentEventType.RUN_FAILED,
+            error_type=type(exc).__name__,
+            failure_phase="agent_loop",
+        )
+        raise
+    await emitter.terminal_once(
+        AgentEventType.RUN_COMPLETED,
+        content_chars=len(result),
+    )
+    return result
+
+
+async def stream_agent(
+    messages: List[Dict[str, Any]],
+    user_context: UserContext,
+    mode: str = "chat",
+    model_override: str | None = None,
+    stage: str | None = None,
+    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    provisional_text_callback: Callable[[str, str], Awaitable[None]] | None = None,
+    event_emitter: AgentEventEmitter | None = None,
+) -> AsyncGenerator[str, None]:
+    """Run the streaming loop and emit one ordered lifecycle stream."""
+    selected_model = model_override or settings.llm_model
+    emitter = event_emitter or AgentEventEmitter(
+        session_id=user_context.session_id,
+        task_id=user_context.task_id,
+    )
+    await emitter.start_once(
+        mode=mode,
+        model=selected_model,
+        stage=stage,
+        streaming=True,
+    )
+    wrapped_provisional_callback = wrap_provisional_text_callback(
+        emitter,
+        provisional_text_callback,
+    )
+    content_chars = 0
+    inner_stream = _stream_agent_impl(
+        messages,
+        user_context,
+        mode=mode,
+        model_override=model_override,
+        stage=stage,
+        runtime_message_callback=runtime_message_callback,
+        pre_tool_callback=pre_tool_callback,
+        provisional_text_callback=wrapped_provisional_callback,
+        event_emitter=emitter,
+    )
+    try:
+        async for chunk in inner_stream:
+            content_chars += len(chunk)
+            if emitter.is_observed:
+                await emitter.emit(
+                    AgentEventType.TEXT_DELTA,
+                    content=chunk,
+                    provisional=False,
+                )
+            yield chunk
+    except asyncio.CancelledError:
+        await emitter.terminal_once(AgentEventType.RUN_CANCELLED)
+        raise
+    except GeneratorExit:
+        await emitter.terminal_once(
+            AgentEventType.RUN_CANCELLED,
+            reason="consumer_closed_stream",
+        )
+        raise
+    except Exception as exc:
+        await emitter.terminal_once(
+            AgentEventType.RUN_FAILED,
+            error_type=type(exc).__name__,
+            failure_phase="agent_loop",
+        )
+        raise
+    finally:
+        await inner_stream.aclose()
+    await emitter.terminal_once(
+        AgentEventType.RUN_COMPLETED,
+        content_chars=content_chars,
+    )
