@@ -3213,118 +3213,7 @@ async def _complete_agent_turn(
     return response
 
 
-async def _run_agent_impl(
-    messages: List[Dict[str, Any]],
-    user_context: UserContext,
-    mode: str = "chat",
-    model_override: str | None = None,
-    stage: str | None = None,
-    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
-    pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
-    event_emitter: AgentEventEmitter | None = None,
-) -> str:
-    """
-    Run the agent loop (non-streaming).
-
-    Continues calling the LLM until it produces a final text response
-    with no pending tool calls.
-
-    Args:
-        messages: Conversation history (user/assistant turns, no system message).
-        user_context: User identity, persona, and access controls.
-        mode: "chat" (default, 8 turns) or "task" (16 turns for autonomous work).
-
-    Returns the assistant's final response as a plain string.
-    """
-    if mode == "chat":
-        unsupported_api_message = _unsupported_alphavantage_request_message(messages)
-        if unsupported_api_message:
-            return unsupported_api_message
-
-    setup = _initialize_agent_loop(
-        messages=messages,
-        user_context=user_context,
-        mode=mode,
-        model_override=model_override,
-        stage=stage,
-    )
-    history = setup.history
-    max_turns = setup.max_turns
-    selected_model = setup.selected_model
-    extra = setup.extra
-    loop_state = setup.state
-    rss_owned_headline_prompt = setup.rss_owned_headline_prompt
-    for turn in range(max_turns):
-        turn_number = turn + 1
-        prepared_turn = await _prepare_agent_turn(
-            turn_number=turn_number,
-            setup=setup,
-            user_context=user_context,
-            mode=mode,
-            stage=stage,
-            event_emitter=event_emitter,
-        )
-        turn_history = prepared_turn.history
-        turn_tools = prepared_turn.tools
-        response = await _complete_agent_turn(
-            history=history,
-            turn_history=turn_history,
-            tools=turn_tools,
-            user_context=user_context,
-            selected_model=selected_model,
-            mode=mode,
-            stage=stage,
-            extra=extra,
-            usage_stage=stage,
-            error_message="LLM call failed",
-        )
-
-        message = response.choices[0].message
-        finish_reason = response.choices[0].finish_reason
-
-        # Append assistant turn to history (normalize tool_call args to str)
-        normalized_message = _normalize_tool_calls(message.model_dump(exclude_none=True))
-        history.append(normalized_message)
-
-        # Check tool_calls directly — some Ollama models return finish_reason="stop"
-        # even when tool calls are present, so we can't rely on finish_reason alone.
-        if message.tool_calls:
-            stop_response = await _execute_agent_tool_turn(
-                original_messages=messages,
-                history=history,
-                normalized_message=normalized_message,
-                state=loop_state,
-                turn_number=turn_number,
-                max_turns=max_turns,
-                rss_owned_headline_prompt=rss_owned_headline_prompt,
-                mode=mode,
-                stage=stage,
-                selected_model=selected_model,
-                user_context=user_context,
-                event_emitter=event_emitter,
-                pre_tool_callback=pre_tool_callback,
-                runtime_message_callback=runtime_message_callback,
-                streaming=False,
-            )
-            if stop_response is not None:
-                return stop_response
-        else:
-            # Final text response
-            _log_agent_final_turn(
-                turn=turn_number,
-                mode=mode,
-                stage=stage,
-                selected_model=selected_model,
-                user_context=user_context,
-                content=message.content or "",
-            )
-            return message.content or ""
-
-    log.warning("Agent hit max turns without a final response", max_turns=max_turns)
-    return _max_turns_message(history)
-
-
-async def _stream_agent_impl(
+async def _run_agent_chunks(
     messages: List[Dict[str, Any]],
     user_context: UserContext,
     mode: str = "chat",
@@ -3334,17 +3223,14 @@ async def _stream_agent_impl(
     pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     provisional_text_callback: Callable[[str, str], Awaitable[None]] | None = None,
     event_emitter: AgentEventEmitter | None = None,
+    streaming: bool = False,
 ) -> AsyncGenerator[str, None]:
-    """
-    Run the agent loop with streaming.
-
-    Yields text tokens as they arrive from the LLM.
-    Tool calls are resolved silently; the final response is streamed.
-    """
-    unsupported_api_message = _unsupported_alphavantage_request_message(messages)
-    if unsupported_api_message:
-        yield unsupported_api_message
-        return
+    """Run the canonical agent loop and yield final committed text chunks."""
+    if streaming or mode == "chat":
+        unsupported_api_message = _unsupported_alphavantage_request_message(messages)
+        if unsupported_api_message:
+            yield unsupported_api_message
+            return
 
     setup = _initialize_agent_loop(
         messages=messages,
@@ -3359,16 +3245,17 @@ async def _stream_agent_impl(
     extra = setup.extra
     loop_state = setup.state
     rss_owned_headline_prompt = setup.rss_owned_headline_prompt
-    native_streaming_enabled = _native_agent_streaming_enabled(selected_model)
-    log.info(
-        "agent.native_streaming_policy",
-        selected=native_streaming_enabled,
-        model=selected_model,
-        mode=mode,
-        stage=stage,
-        session_id=user_context.session_id,
-        task_id=user_context.task_id,
-    )
+    native_streaming_enabled = streaming and _native_agent_streaming_enabled(selected_model)
+    if streaming:
+        log.info(
+            "agent.native_streaming_policy",
+            selected=native_streaming_enabled,
+            model=selected_model,
+            mode=mode,
+            stage=stage,
+            session_id=user_context.session_id,
+            task_id=user_context.task_id,
+        )
 
     for turn in range(max_turns):
         turn_number = turn + 1
@@ -3511,8 +3398,8 @@ async def _stream_agent_impl(
                 mode=mode,
                 stage=stage,
                 extra=extra,
-                usage_stage=f"{stage}_probe" if stage else "stream_probe",
-                error_message="LLM call failed (streaming turn)",
+                usage_stage=(f"{stage}_probe" if stage else "stream_probe") if streaming else stage,
+                error_message="LLM call failed (streaming turn)" if streaming else "LLM call failed",
             )
             message: Any = response.choices[0].message
         else:
@@ -3527,8 +3414,9 @@ async def _stream_agent_impl(
                 if isinstance(message, ModelTurnResult)
                 else _normalize_tool_calls(message.model_dump(exclude_none=True))
             )
-            # Narration preceding a tool call is working state, not a final answer.
-            normalized_message["content"] = ""
+            # Streamed narration preceding a tool call is provisional working state.
+            if streaming:
+                normalized_message["content"] = ""
             if native_turn is not None:
                 _drop_stale_reasoning_content(history)
             history.append(normalized_message)
@@ -3547,7 +3435,7 @@ async def _stream_agent_impl(
                 event_emitter=event_emitter,
                 pre_tool_callback=pre_tool_callback,
                 runtime_message_callback=runtime_message_callback,
-                streaming=True,
+                streaming=streaming,
             )
             if stop_response is not None:
                 yield stop_response
@@ -3568,6 +3456,9 @@ async def _stream_agent_impl(
                     for token in _chunk_plain_text(message.content or ""):
                         yield token
                 return
+            if not streaming:
+                yield message.content or ""
+                return
             if _should_skip_final_stream_pass(selected_model):
                 for token in _chunk_plain_text(message.content or ""):
                     yield token
@@ -3581,6 +3472,8 @@ async def _stream_agent_impl(
                 yield token
             return
 
+    if not streaming:
+        log.warning("Agent hit max turns without a final response", max_turns=max_turns)
     yield _max_turns_message(history)
 
 
@@ -3607,15 +3500,21 @@ async def run_agent(
         streaming=False,
     )
     try:
-        result = await _run_agent_impl(
-            messages,
-            user_context,
-            mode=mode,
-            model_override=model_override,
-            stage=stage,
-            runtime_message_callback=runtime_message_callback,
-            pre_tool_callback=pre_tool_callback,
-            event_emitter=emitter,
+        result = "".join(
+            [
+                chunk
+                async for chunk in _run_agent_chunks(
+                    messages,
+                    user_context,
+                    mode=mode,
+                    model_override=model_override,
+                    stage=stage,
+                    runtime_message_callback=runtime_message_callback,
+                    pre_tool_callback=pre_tool_callback,
+                    event_emitter=emitter,
+                    streaming=False,
+                )
+            ]
         )
     except asyncio.CancelledError:
         await emitter.terminal_once(AgentEventType.RUN_CANCELLED)
@@ -3662,7 +3561,7 @@ async def stream_agent(
         provisional_text_callback,
     )
     content_chars = 0
-    inner_stream = _stream_agent_impl(
+    inner_stream = _run_agent_chunks(
         messages,
         user_context,
         mode=mode,
@@ -3672,6 +3571,7 @@ async def stream_agent(
         pre_tool_callback=pre_tool_callback,
         provisional_text_callback=wrapped_provisional_callback,
         event_emitter=emitter,
+        streaming=True,
     )
     try:
         async for chunk in inner_stream:
