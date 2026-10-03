@@ -13,6 +13,7 @@ from app.autonomy.planner import _generate_plan_steps
 from app.db.models import ChatSession, LLMUsageEvent, Task, User
 from app.llm_usage import (
     _extract_local_inference_metrics,
+    _log_prompt_cache_usage,
     bind_llm_usage_context,
     reset_llm_usage_context,
 )
@@ -102,6 +103,45 @@ def test_extract_local_inference_metrics_reads_litellm_ollama_fields():
         "prompt_eval_duration_ns": 200_000_000,
         "eval_duration_ns": 500_000_000,
     }
+
+
+def test_log_prompt_cache_usage_supports_openai(monkeypatch):
+    calls = []
+    monkeypatch.setattr("app.llm_usage.log.info", lambda event, **fields: calls.append((event, fields)))
+    response = SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens=200,
+            completion_tokens=20,
+            total_tokens=220,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=150),
+        )
+    )
+
+    _log_prompt_cache_usage(
+        response,
+        model="gpt-5-mini",
+        source="chat_rest",
+        stage="chat_simple",
+        context={"session_id": 42},
+    )
+
+    assert calls == [
+        (
+            "llm.prompt_cache_usage",
+            {
+                "provider": "openai",
+                "model": "gpt-5-mini",
+                "source": "chat_rest",
+                "stage": "chat_simple",
+                "session_id": 42,
+                "task_id": None,
+                "task_run_id": None,
+                "prompt_tokens": 200,
+                "cached_prompt_tokens": 150,
+                "prompt_cache_percent": 75.0,
+            },
+        )
+    ]
 
 
 async def _fake_stream_with_usage(*parts: str):

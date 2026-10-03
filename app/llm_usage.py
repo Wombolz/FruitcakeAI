@@ -7,6 +7,7 @@ import litellm
 import structlog
 
 from app.config import settings
+from app.agent.model_provider import is_local_ollama_model, is_native_openai_model
 from app.db.models import LLMUsageEvent
 from app.db.session import AsyncSessionLocal
 
@@ -89,7 +90,7 @@ def _log_local_inference_metrics(
     stage: str | None,
     context: dict[str, Any],
 ) -> None:
-    if not model.lower().startswith(("ollama/", "ollama_chat/")):
+    if not is_local_ollama_model(model):
         return
     metrics = _extract_local_inference_metrics(response)
     counts = _extract_usage_counts(response)
@@ -112,6 +113,41 @@ def _log_local_inference_metrics(
         load_duration_ms=round(metrics.get("load_duration_ns", 0) / 1_000_000, 2),
         prompt_eval_duration_ms=round(metrics.get("prompt_eval_duration_ns", 0) / 1_000_000, 2),
         eval_duration_ms=round(metrics.get("eval_duration_ns", 0) / 1_000_000, 2),
+    )
+
+
+def _log_prompt_cache_usage(
+    response: Any,
+    *,
+    model: str,
+    source: str,
+    stage: str | None,
+    context: dict[str, Any],
+) -> None:
+    if not (is_local_ollama_model(model) or is_native_openai_model(model)):
+        return
+    usage = _value(response, "usage", None)
+    details = _value(usage, "prompt_tokens_details", None)
+    flattened_cached = _value(usage, "cached_prompt_tokens", None)
+    if details is None and flattened_cached is None:
+        return
+    counts = _extract_usage_counts(response)
+    if counts is None:
+        return
+    prompt_tokens = counts[0]
+    cached_tokens = _extract_local_inference_metrics(response).get("cached_prompt_tokens", 0)
+    log.info(
+        "llm.prompt_cache_usage",
+        provider="ollama" if is_local_ollama_model(model) else "openai",
+        model=model,
+        source=source,
+        stage=stage,
+        session_id=context.get("session_id"),
+        task_id=context.get("task_id"),
+        task_run_id=context.get("task_run_id"),
+        prompt_tokens=prompt_tokens,
+        cached_prompt_tokens=cached_tokens,
+        prompt_cache_percent=round((cached_tokens / prompt_tokens) * 100.0, 2) if prompt_tokens else 0.0,
     )
 
 
@@ -165,11 +201,20 @@ async def record_llm_usage_event(
         "task_id": task_id if task_id is not None else context.get("task_id"),
         "task_run_id": task_run_id if task_run_id is not None else context.get("task_run_id"),
     }
+    resolved_source = str(source or context.get("source") or "llm_call")
+    resolved_stage = stage if stage is not None else context.get("stage")
+    _log_prompt_cache_usage(
+        response,
+        model=resolved_model,
+        source=resolved_source,
+        stage=resolved_stage,
+        context=log_context,
+    )
     _log_local_inference_metrics(
         response,
         model=resolved_model,
-        source=str(source or context.get("source") or "llm_call"),
-        stage=stage if stage is not None else context.get("stage"),
+        source=resolved_source,
+        stage=resolved_stage,
         context=log_context,
     )
     event = LLMUsageEvent(

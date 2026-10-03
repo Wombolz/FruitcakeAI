@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.35
+
+- Extended prompt-cache optimization to native OpenAI models by keeping stable persona and policy instructions ahead of volatile turn context.
+- Added privacy-conscious OpenAI cache routing keys derived from stable prompt and tool-schema fingerprints, with optional provider retention configuration and no Fruitcake cache hints in incognito sessions.
+- Added cached-input usage diagnostics for OpenAI responses while preserving existing Ollama metrics and leaving Anthropic and generic OpenAI-compatible endpoints unchanged.
+- Added provider-detection and request-construction regression coverage plus updated OpenAI backend configuration guidance.
+
 ## v0.7.34
 
 - Improved Ollama prompt-cache reuse by keeping the local system-policy prefix stable and moving volatile time, grounding, skill, and guardrail context into a trusted per-turn context block.
