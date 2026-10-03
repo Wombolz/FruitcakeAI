@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.36
+
+- Unified streaming and collected chat execution around one canonical agent loop with typed lifecycle events, shared convergence behavior, centralized provider capabilities, and normalized structured tool results.
+- Added durable chat-run identity and lifecycle state across REST and WebSocket transports, including additive run IDs, restart/interruption classification, and exact approval-gated tool replay.
+- Added bounded per-run trace persistence and shared admin/MCP inspection with ordered lifecycle events, phase timings, tool and retry counts, grounding outcome, latency, token usage, and prompt-cache metrics.
+- Added `GET /admin/chat-runs/{run_id}/inspect` and the user-scoped `fruitcake_inspect_chat_run` MCP operator tool without changing existing task-run inspection contracts.
+- Kept trace storage privacy-bounded by excluding prompts, search-query values, raw tool arguments/results, token deltas, and reasoning content.
+- Added migrations `043_chat_runs` and `044_chat_run_traces` plus deterministic local Ollama/OpenAI qualification coverage.
+
 ## v0.7.35
 
 - Extended prompt-cache optimization to native OpenAI models by keeping stable persona and policy instructions ahead of volatile turn context.
