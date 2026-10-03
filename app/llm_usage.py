@@ -106,6 +106,7 @@ def _log_local_inference_metrics(
         session_id=context.get("session_id"),
         task_id=context.get("task_id"),
         task_run_id=context.get("task_run_id"),
+        chat_run_id=context.get("chat_run_id"),
         prompt_tokens=prompt_tokens,
         cached_prompt_tokens=cached_tokens,
         prompt_cache_percent=round((cached_tokens / prompt_tokens) * 100.0, 2) if prompt_tokens else 0.0,
@@ -145,6 +146,7 @@ def _log_prompt_cache_usage(
         session_id=context.get("session_id"),
         task_id=context.get("task_id"),
         task_run_id=context.get("task_run_id"),
+        chat_run_id=context.get("chat_run_id"),
         prompt_tokens=prompt_tokens,
         cached_prompt_tokens=cached_tokens,
         prompt_cache_percent=round((cached_tokens / prompt_tokens) * 100.0, 2) if prompt_tokens else 0.0,
@@ -178,6 +180,7 @@ async def record_llm_usage_event(
     session_id: int | None = None,
     task_id: int | None = None,
     task_run_id: int | None = None,
+    chat_run_id: str | None = None,
     model: str | None = None,
     provider: str | None = None,
 ) -> None:
@@ -200,6 +203,7 @@ async def record_llm_usage_event(
         "session_id": session_id if session_id is not None else context.get("session_id"),
         "task_id": task_id if task_id is not None else context.get("task_id"),
         "task_run_id": task_run_id if task_run_id is not None else context.get("task_run_id"),
+        "chat_run_id": chat_run_id if chat_run_id is not None else context.get("chat_run_id"),
     }
     resolved_source = str(source or context.get("source") or "llm_call")
     resolved_stage = stage if stage is not None else context.get("stage")
@@ -217,11 +221,13 @@ async def record_llm_usage_event(
         stage=resolved_stage,
         context=log_context,
     )
+    inference_metrics = _extract_local_inference_metrics(response)
     event = LLMUsageEvent(
         user_id=resolved_user_id,
         session_id=session_id if session_id is not None else context.get("session_id"),
         task_id=task_id if task_id is not None else context.get("task_id"),
         task_run_id=task_run_id if task_run_id is not None else context.get("task_run_id"),
+        chat_run_id=chat_run_id if chat_run_id is not None else context.get("chat_run_id"),
         source=str(source or context.get("source") or "llm_call"),
         stage=stage if stage is not None else context.get("stage"),
         model=resolved_model,
@@ -229,7 +235,12 @@ async def record_llm_usage_event(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
+        cached_prompt_tokens=inference_metrics.get("cached_prompt_tokens", 0),
         estimated_cost_usd=_estimate_cost_usd(response, fallback_model=resolved_model),
+        total_duration_ms=(inference_metrics.get("total_duration_ns", 0) / 1_000_000) or None,
+        load_duration_ms=(inference_metrics.get("load_duration_ns", 0) / 1_000_000) or None,
+        prompt_eval_duration_ms=(inference_metrics.get("prompt_eval_duration_ns", 0) / 1_000_000) or None,
+        eval_duration_ms=(inference_metrics.get("eval_duration_ns", 0) / 1_000_000) or None,
     )
 
     try:

@@ -1794,6 +1794,42 @@ async def test_dispatch_returns_tool_role_messages():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_execution_record_keeps_structured_artifact_metadata():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import app.agent.tools as tools_module
+
+    ctx = _make_context()
+    mock_call = MagicMock()
+    mock_call.function.name = "generate_image"
+    mock_call.function.arguments = '{"prompt": "A system map"}'
+    mock_call.id = "call_image"
+    token = tools_module.reset_tool_execution_records()
+    try:
+        with patch.object(
+            tools_module,
+            "_call_tool",
+            new=AsyncMock(
+                return_value='{"image_path":"generated_images/map.png","seed":7}'
+            ),
+        ):
+            with patch.object(tools_module, "_write_audit_log", new_callable=AsyncMock):
+                results = await tools_module.dispatch_tool_calls([mock_call], ctx)
+        records = tools_module.get_tool_execution_records()
+    finally:
+        tools_module.restore_tool_execution_records(token)
+
+    assert results == [
+        {
+            "role": "tool",
+            "tool_call_id": "call_image",
+            "content": '{"image_path":"generated_images/map.png","seed":7}',
+        }
+    ]
+    assert records[0]["structured_content"]["seed"] == 7
+    assert records[0]["artifacts"][0]["path"] == "generated_images/map.png"
+
+
+@pytest.mark.asyncio
 async def test_dispatch_propagates_approval_required():
     """ApprovalRequired must bubble out of dispatch_tool_calls for TaskRunner to handle."""
     from unittest.mock import AsyncMock, MagicMock, patch

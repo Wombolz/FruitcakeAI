@@ -6,19 +6,20 @@ it decides when to call tools and how to synthesize results.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import hashlib
 import json
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List
 
 import litellm
 import structlog
 
 from app.agent.context import UserContext
-from app.agent.model_provider import is_local_ollama_model, is_native_openai_model
 from app.agent.litellm_ollama_patch import (
     apply_litellm_ollama_stream_patch,
     apply_litellm_ollama_tool_history_patch,
@@ -30,7 +31,18 @@ from app.agent.model_stream import (
     close_provider_stream,
     iter_model_stream_events,
 )
+from app.agent.runtime import (
+    AgentEventEmitter,
+    AgentEventType,
+    ProviderCapabilities,
+    emit_tool_completed_events,
+    emit_tool_requested_events,
+    normalize_tool_call_results,
+    resolve_provider_capabilities,
+    wrap_provisional_text_callback,
+)
 from app.agent.tools import dispatch_tool_calls, get_tools_for_user
+from app.autonomy.approval import ApprovalRequired
 from app.config import settings
 from app.llm_usage import record_llm_usage_event, stream_usage_enabled
 from app.metrics import metrics
@@ -239,10 +251,6 @@ def restore_agent_runtime_history(token: contextvars.Token) -> None:
     _agent_runtime_history.reset(token)
 
 
-def _is_local_ollama_model(model: str | None) -> bool:
-    return is_local_ollama_model(model)
-
-
 def _build_messages(
     history: List[Dict[str, Any]],
     user_context: UserContext,
@@ -250,10 +258,11 @@ def _build_messages(
     model: str | None = None,
 ) -> List[Dict[str, Any]]:
     """Build provider-safe messages while preserving a stable local prefix."""
+    capabilities = resolve_provider_capabilities(model)
     followup_hint = _recent_task_followup_hint(history)
     immediate_action_hint = _recent_immediate_action_followup_hint(history)
 
-    if not (_is_local_ollama_model(model) or is_native_openai_model(model)):
+    if not capabilities.prompt_cache_shape:
         messages = [{"role": "system", "content": user_context.to_system_prompt()}]
         if followup_hint:
             messages.append({"role": "system", "content": followup_hint})
@@ -267,7 +276,7 @@ def _build_messages(
     if immediate_action_hint:
         dynamic_parts.append(immediate_action_hint)
 
-    if is_native_openai_model(model):
+    if capabilities.family == "openai":
         messages = [{"role": "system", "content": user_context.to_stable_system_prompt()}]
         turn_context = "\n\n".join(part.strip() for part in dynamic_parts if part and part.strip())
         if turn_context:
@@ -330,7 +339,7 @@ def _log_prompt_cache_shape(
     user_context: UserContext,
     aggressive: bool = False,
 ) -> None:
-    if not (_is_local_ollama_model(model) or is_native_openai_model(model)):
+    if not resolve_provider_capabilities(model).prompt_cache_shape:
         return
     stable_prefix_fingerprint, tool_schema_fingerprint = _request_shape_fingerprints(messages, tools)
     log.info(
@@ -360,7 +369,7 @@ def _apply_provider_prompt_cache_kwargs(
     if (
         not settings.openai_prompt_cache_enabled
         or user_context.is_incognito
-        or not is_native_openai_model(model)
+        or not resolve_provider_capabilities(model).prompt_cache_api
     ):
         return kwargs
     stable_prefix_fingerprint, tool_schema_fingerprint = _request_shape_fingerprints(messages, tools)
@@ -556,13 +565,14 @@ def _litellm_kwargs(model: str | None = None, *, is_incognito: bool = False) -> 
     """Build extra kwargs for litellm based on the selected model/provider."""
     kwargs: Dict[str, Any] = {}
     selected_model = str(model or settings.llm_model or "")
-    if _is_local_ollama_model(selected_model):
+    provider = resolve_provider_capabilities(selected_model)
+    if provider.is_local:
         kwargs["api_base"] = _normalized_local_api_base()
         keep_alive = str(settings.local_model_keep_alive or "").strip()
         if keep_alive and not is_incognito:
             kwargs["keep_alive"] = keep_alive
         return kwargs
-    if settings.llm_backend in ("ollama", "openai_compat"):
+    if provider.uses_local_api_base:
         kwargs["api_base"] = _normalized_local_api_base()
     return kwargs
 
@@ -595,30 +605,15 @@ def _chunk_plain_text(content: str, chunk_size: int = 64) -> List[str]:
 
 
 def _should_skip_final_stream_pass(model: str) -> bool:
-    selected = str(model or "").strip()
-    return selected.startswith(("ollama/", "ollama_chat/"))
+    return resolve_provider_capabilities(model).skip_duplicate_final_stream
 
 
 def _is_local_model(model: str | None) -> bool:
-    selected = str(model or "").strip()
-    return selected.startswith(("ollama/", "ollama_chat/"))
-
-
-def _configured_native_streaming_models() -> set[str]:
-    return {
-        str(part).strip()
-        for part in str(settings.fruitcake_native_agent_streaming_models or "").split(",")
-        if str(part).strip()
-    }
+    return resolve_provider_capabilities(model).is_local
 
 
 def _native_agent_streaming_enabled(model: str | None) -> bool:
-    selected = str(model or "").strip()
-    return bool(
-        settings.fruitcake_native_agent_streaming_enabled
-        and selected
-        and selected in _configured_native_streaming_models()
-    )
+    return resolve_provider_capabilities(model).native_streaming
 
 
 _REASONING_SECRET_PATTERNS = (
@@ -681,21 +676,12 @@ def _is_local_tool_unsupported_error(exc: Exception, model: str | None) -> bool:
     return "does not support tools" in lowered and "ollama" in lowered
 
 
-def _configured_local_text_only_models() -> set[str]:
-    return {
-        str(part).strip()
-        for part in str(settings.local_tool_text_only_models or "").split(",")
-        if str(part).strip()
-    }
-
-
 def _is_configured_local_text_only_model(model: str | None) -> bool:
-    selected = str(model or "").strip()
-    return bool(selected) and selected in _configured_local_text_only_models()
+    return resolve_provider_capabilities(model).configured_text_only
 
 
 def _is_qwen_local_tool_guardrail_model(model: str | None) -> bool:
-    return str(model or "").strip() == "ollama_chat/qwen3.6:35b"
+    return resolve_provider_capabilities(model).targeted_local_tool_guardrails
 
 
 def _recent_role_sequence(history: List[Dict[str, Any]], *, limit: int = 5) -> List[str]:
@@ -2705,33 +2691,45 @@ async def _stream_final_response(
         )
 
 
-async def run_agent(
+@dataclass
+class _AgentLoopState:
+    consecutive_failed_search_turns: int = 0
+    previous_tool_signature: str = ""
+    repeated_tool_signature_count: int = 0
+    previous_semantic_tool_signature: str = ""
+    repeated_semantic_tool_signature_count: int = 0
+    recent_exploration_signatures: List[str] = field(default_factory=list)
+    recent_rss_query_family_signatures: List[str] = field(default_factory=list)
+    prior_recent_feed_fetches: int = 0
+
+
+@dataclass
+class _AgentLoopSetup:
+    history: List[Dict[str, Any]]
+    max_turns: int
+    selected_model: str
+    provider: ProviderCapabilities
+    tools: List[Dict[str, Any]] | None
+    extra: Dict[str, Any]
+    state: _AgentLoopState
+    rss_owned_headline_prompt: bool
+
+
+@dataclass(frozen=True)
+class _PreparedAgentTurn:
+    number: int
+    history: List[Dict[str, Any]]
+    tools: List[Dict[str, Any]] | None
+
+
+def _initialize_agent_loop(
+    *,
     messages: List[Dict[str, Any]],
     user_context: UserContext,
-    mode: str = "chat",
-    model_override: str | None = None,
-    stage: str | None = None,
-    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
-    pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
-) -> str:
-    """
-    Run the agent loop (non-streaming).
-
-    Continues calling the LLM until it produces a final text response
-    with no pending tool calls.
-
-    Args:
-        messages: Conversation history (user/assistant turns, no system message).
-        user_context: User identity, persona, and access controls.
-        mode: "chat" (default, 8 turns) or "task" (16 turns for autonomous work).
-
-    Returns the assistant's final response as a plain string.
-    """
-    if mode == "chat":
-        unsupported_api_message = _unsupported_alphavantage_request_message(messages)
-        if unsupported_api_message:
-            return unsupported_api_message
-
+    mode: str,
+    model_override: str | None,
+    stage: str | None,
+) -> _AgentLoopSetup:
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
     selected_model = model_override or settings.llm_model
@@ -2744,15 +2742,6 @@ async def run_agent(
         user_context=user_context,
         history=history,
     )
-    extra = _litellm_kwargs(selected_model, is_incognito=user_context.is_incognito)
-    consecutive_failed_search_turns = 0
-    previous_tool_signature = ""
-    repeated_tool_signature_count = 0
-    previous_semantic_tool_signature = ""
-    repeated_semantic_tool_signature_count = 0
-    recent_exploration_signatures: List[str] = []
-    recent_rss_query_family_signatures: List[str] = []
-    headline_roundup_prompt = _is_headline_roundup_prompt(messages)
     rss_owned_headline_prompt = _is_rss_owned_headline_prompt(messages)
     if rss_owned_headline_prompt:
         log.info(
@@ -2772,355 +2761,440 @@ async def run_agent(
         selected_model=selected_model,
         user_context=user_context,
     )
-    prior_recent_feed_fetches = 0
+    return _AgentLoopSetup(
+        history=history,
+        max_turns=max_turns,
+        selected_model=selected_model,
+        provider=resolve_provider_capabilities(selected_model),
+        tools=tools,
+        extra=_litellm_kwargs(selected_model, is_incognito=user_context.is_incognito),
+        state=_AgentLoopState(),
+        rss_owned_headline_prompt=rss_owned_headline_prompt,
+    )
 
-    for turn in range(max_turns):
-        turn_number = turn + 1
-        turn_tools = tools
-        turn_history = history
-        turn_history, turn_tools = _apply_local_tool_guardrail(
+
+async def _prepare_agent_turn(
+    *,
+    turn_number: int,
+    setup: _AgentLoopSetup,
+    user_context: UserContext,
+    mode: str,
+    stage: str | None,
+    event_emitter: AgentEventEmitter | None,
+) -> _PreparedAgentTurn:
+    turn_history, turn_tools = _apply_local_tool_guardrail(
+        history=setup.history,
+        tools=setup.tools,
+        model=setup.selected_model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+    )
+    turn_history = _apply_generated_image_response_contract(turn_history)
+    _log_agent_turn_start(
+        turn=turn_number,
+        max_turns=setup.max_turns,
+        mode=mode,
+        stage=stage,
+        selected_model=setup.selected_model,
+        user_context=user_context,
+        history=setup.history,
+    )
+    if event_emitter is not None:
+        if setup.history and setup.history[-1].get("role") == "tool":
+            await event_emitter.emit(
+                AgentEventType.SYNTHESIS_STARTED,
+                turn=turn_number,
+            )
+        await event_emitter.emit(
+            AgentEventType.MODEL_TURN_STARTED,
+            turn=turn_number,
+            model=setup.selected_model,
+            mode=mode,
+            stage=stage,
+            history_length=len(turn_history),
+            tools_enabled=bool(turn_tools),
+            tool_count=len(turn_tools or []),
+        )
+    return _PreparedAgentTurn(
+        number=turn_number,
+        history=turn_history,
+        tools=turn_tools,
+    )
+
+
+async def _execute_agent_tool_turn(
+    *,
+    original_messages: List[Dict[str, Any]],
+    history: List[Dict[str, Any]],
+    normalized_message: Dict[str, Any],
+    state: _AgentLoopState,
+    turn_number: int,
+    max_turns: int,
+    rss_owned_headline_prompt: bool,
+    mode: str,
+    stage: str | None,
+    selected_model: str,
+    user_context: UserContext,
+    event_emitter: AgentEventEmitter | None,
+    pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None,
+    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None,
+    streaming: bool,
+) -> str | None:
+    """Execute one tool turn and apply the shared convergence policy."""
+    normalized_tool_calls = list(normalized_message.get("tool_calls") or [])
+    normalized_tool_calls, state.prior_recent_feed_fetches = _rewrite_headline_rss_tool_calls(
+        normalized_tool_calls,
+        rss_owned_headline_prompt=rss_owned_headline_prompt,
+        prior_recent_feed_fetches=state.prior_recent_feed_fetches,
+        mode=mode,
+        stage=stage,
+        selected_model=selected_model,
+        user_context=user_context,
+    )
+    normalized_message["tool_calls"] = normalized_tool_calls
+    history[-1] = normalized_message
+
+    await emit_tool_requested_events(
+        event_emitter,
+        normalized_tool_calls,
+        turn=turn_number,
+    )
+    if pre_tool_callback is not None:
+        await pre_tool_callback(normalized_tool_calls)
+
+    raw_tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
+    structured_tool_results = normalize_tool_call_results(normalized_tool_calls, raw_tool_results)
+    tool_results = [result.to_message() for result in structured_tool_results]
+    await emit_tool_completed_events(
+        event_emitter,
+        normalized_tool_calls,
+        structured_tool_results,
+        turn=turn_number,
+    )
+    history.extend(tool_results)
+    runtime_messages = [normalized_message, *tool_results]
+    _record_agent_runtime_messages(runtime_messages)
+    if runtime_message_callback is not None:
+        await runtime_message_callback(runtime_messages)
+
+    current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
+    current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
+    current_is_document_signature = _is_document_tool_signature(current_semantic_tool_signature)
+    current_rss_query_family_signature = _rss_query_family_signature(normalized_tool_calls)
+
+    if current_tool_signature == state.previous_tool_signature:
+        state.repeated_tool_signature_count += 1
+    else:
+        state.repeated_tool_signature_count = 0
+        state.previous_tool_signature = current_tool_signature
+    if (
+        current_semantic_tool_signature
+        and current_semantic_tool_signature == state.previous_semantic_tool_signature
+    ):
+        state.repeated_semantic_tool_signature_count += 1
+    else:
+        state.repeated_semantic_tool_signature_count = 0
+        state.previous_semantic_tool_signature = current_semantic_tool_signature or ""
+    if _is_exploration_tool_turn(normalized_tool_calls):
+        state.recent_exploration_signatures.append(current_tool_signature)
+        state.recent_exploration_signatures = state.recent_exploration_signatures[
+            -max(2, int(settings.agent_exploration_churn_window)) :
+        ]
+    else:
+        state.recent_exploration_signatures = []
+    if current_rss_query_family_signature:
+        state.recent_rss_query_family_signatures.append(current_rss_query_family_signature)
+        state.recent_rss_query_family_signatures = state.recent_rss_query_family_signatures[-6:]
+
+    _log_agent_tool_turn(
+        turn=turn_number,
+        mode=mode,
+        stage=stage,
+        selected_model=selected_model,
+        user_context=user_context,
+        tool_calls=normalized_tool_calls,
+        tool_results=tool_results,
+        repeated_signature_count=state.repeated_tool_signature_count,
+    )
+    failed_delete = _failed_delete_message(normalized_tool_calls, tool_results)
+    if failed_delete:
+        return failed_delete
+    task_handoff = _task_handoff_message(original_messages, normalized_tool_calls, tool_results)
+    if task_handoff:
+        return task_handoff
+
+    metrics.inc_tool_calls(len(normalized_tool_calls))
+    if _is_failed_search_turn(normalized_tool_calls, tool_results):
+        state.consecutive_failed_search_turns += 1
+        if state.consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
+            _record_loop_event(
+                event_type="failed_search_loop",
+                stage=stage,
+                mode=mode,
+                model=selected_model,
+                details={"turn": turn_number, "threshold": REPEATED_FAILED_SEARCH_TURN_THRESHOLD},
+            )
+            log.info(
+                "Stopping repeated failed search loop",
+                turn=turn_number,
+                model=selected_model,
+                mode=mode,
+                stage=stage,
+            )
+            return _repeated_failed_search_message(history)
+    else:
+        state.consecutive_failed_search_turns = 0
+
+    if state.repeated_tool_signature_count >= int(settings.agent_repeated_tool_signature_threshold):
+        _record_loop_event(
+            event_type="repeated_tool_signature",
+            stage=stage,
+            mode=mode,
+            model=selected_model,
+            details={
+                "turn": turn_number,
+                "repeated_count": state.repeated_tool_signature_count,
+                "tool_signature": current_tool_signature,
+            },
+        )
+        return _repeated_tool_signature_message(
+            tool_calls=normalized_tool_calls,
+            repeated_count=state.repeated_tool_signature_count,
             history=history,
-            tools=tools,
+        )
+
+    if (
+        current_semantic_tool_signature
+        and state.repeated_semantic_tool_signature_count
+        >= int(settings.agent_repeated_semantic_tool_signature_threshold)
+    ):
+        _record_loop_event(
+            event_type="repeated_semantic_tool_signature",
+            stage=stage,
+            mode=mode,
+            model=selected_model,
+            details={
+                "turn": turn_number,
+                "repeated_count": state.repeated_semantic_tool_signature_count,
+                "tool_signature": current_semantic_tool_signature,
+            },
+        )
+        if current_is_document_signature:
+            synthesized = await _safe_synthesize_from_document_evidence(
+                history=history,
+                user_context=user_context,
+                selected_model=selected_model,
+                mode=mode,
+                stage=stage,
+                reason="document_query_family_churn",
+            )
+            if synthesized:
+                return synthesized
+            return _repeated_document_retrieval_message(
+                tool_calls=normalized_tool_calls,
+                history=history,
+            )
+        synthesized = await _safe_synthesize_from_rss_evidence(
+            history=history,
+            user_context=user_context,
+            selected_model=selected_model,
+            mode=mode,
+            stage=stage,
+            reason="repeated_semantic_tool_signature",
+        )
+        if synthesized:
+            return synthesized
+        return _repeated_semantic_research_message(
+            tool_calls=normalized_tool_calls,
+            history=history,
+        )
+
+    if current_rss_query_family_signature:
+        family_count = state.recent_rss_query_family_signatures.count(current_rss_query_family_signature)
+        if family_count >= int(settings.agent_repeated_rss_query_family_threshold):
+            _record_loop_event(
+                event_type="rss_query_family_churn",
+                stage=stage,
+                mode=mode,
+                model=selected_model,
+                details={
+                    "turn": turn_number,
+                    "family_signature": current_rss_query_family_signature,
+                    "family_count": family_count,
+                },
+            )
+            synthesized = await _safe_synthesize_from_rss_evidence(
+                history=history,
+                user_context=user_context,
+                selected_model=selected_model,
+                mode=mode,
+                stage=stage,
+                reason="rss_query_family_churn",
+            )
+            if synthesized:
+                return synthesized
+            return _repeated_semantic_research_message(
+                tool_calls=normalized_tool_calls,
+                history=history,
+            )
+        if (
+            rss_owned_headline_prompt
+            and len(state.recent_rss_query_family_signatures)
+            >= int(settings.agent_headline_roundup_rss_turn_cap)
+        ):
+            _record_loop_event(
+                event_type="headline_roundup_convergence",
+                stage=stage,
+                mode=mode,
+                model=selected_model,
+                details={
+                    "turn": turn_number,
+                    "family_signature": current_rss_query_family_signature,
+                    "rss_turns": len(state.recent_rss_query_family_signatures),
+                },
+            )
+            synthesized = await _safe_synthesize_from_rss_evidence(
+                history=history,
+                user_context=user_context,
+                selected_model=selected_model,
+                mode=mode,
+                stage=stage,
+                reason="headline_roundup_convergence",
+            )
+            if synthesized:
+                return synthesized
+
+    if current_is_document_signature and _has_nonempty_document_summary_evidence(history):
+        if any(_tool_call_name(call) == "search_library" for call in normalized_tool_calls):
+            _record_loop_event(
+                event_type="document_summary_followed_by_search",
+                stage=stage,
+                mode=mode,
+                model=selected_model,
+                details={
+                    "turn": turn_number,
+                    "tool_names": [_tool_call_name(call) for call in normalized_tool_calls],
+                },
+            )
+            synthesized = await _safe_synthesize_from_document_evidence(
+                history=history,
+                user_context=user_context,
+                selected_model=selected_model,
+                mode=mode,
+                stage=stage,
+                reason="document_summary_already_available",
+            )
+            if synthesized:
+                return synthesized
+    if current_is_document_signature and turn_number >= max_turns - 1:
+        synthesized = await _safe_synthesize_from_document_evidence(
+            history=history,
+            user_context=user_context,
+            selected_model=selected_model,
+            mode=mode,
+            stage=stage,
+            reason="turn_budget_near_exhaustion",
+        )
+        if synthesized:
+            return synthesized
+
+    if _exploration_churn_detected(state.recent_exploration_signatures):
+        _record_loop_event(
+            event_type="exploration_churn",
+            stage=stage,
+            mode=mode,
+            model=selected_model,
+            details={
+                "turn": turn_number,
+                "recent_signatures": list(state.recent_exploration_signatures),
+                "window": int(settings.agent_exploration_churn_window),
+                "max_unique_signatures": int(settings.agent_exploration_churn_max_unique_signatures),
+            },
+        )
+        return _exploration_churn_message(
+            tool_calls=normalized_tool_calls,
+            history=history,
+        )
+
+    log.info(
+        "Tool calls executed (streaming turn)" if streaming else "Tool calls executed",
+        turn=turn_number,
+        tools=[_tool_call_name(call) for call in normalized_tool_calls],
+        model=selected_model,
+        mode=mode,
+        stage=stage,
+    )
+    return None
+
+
+async def _complete_agent_turn(
+    *,
+    history: List[Dict[str, Any]],
+    turn_history: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None,
+    user_context: UserContext,
+    selected_model: str,
+    mode: str,
+    stage: str | None,
+    extra: Dict[str, Any],
+    usage_stage: str | None,
+    error_message: str,
+) -> Any:
+    """Invoke one compatibility completion with shared local-tool recovery."""
+    try:
+        response = await _acompletion_with_budget(
+            history=turn_history,
+            user_context=user_context,
             model=selected_model,
             mode=mode,
             stage=stage,
-            user_context=user_context,
+            tools=tools,
+            tool_choice="auto",
+            extra_kwargs=extra,
         )
-        turn_history = _apply_generated_image_response_contract(turn_history)
-        _log_agent_turn_start(
-            turn=turn_number,
-            max_turns=max_turns,
-            mode=mode,
-            stage=stage,
-            selected_model=selected_model,
-            user_context=user_context,
-            history=history,
-        )
-        try:
-            response = await _acompletion_with_budget(
-                history=turn_history,
-                user_context=user_context,
+    except Exception as exc:
+        if tools and (
+            _is_local_tool_json_parse_error(exc, selected_model)
+            or _is_local_tool_unsupported_error(exc, selected_model)
+        ):
+            _log_local_tool_event(
+                event=(
+                    "LLM local_tool_unsupported_fallback"
+                    if _is_local_tool_unsupported_error(exc, selected_model)
+                    else "LLM local_tool_json_parse_fallback"
+                ),
+                history=history,
+                tools=tools,
                 model=selected_model,
                 mode=mode,
                 stage=stage,
-                tools=turn_tools,
-                tool_choice="auto",
+                user_context=user_context,
+                error=exc,
+            )
+            fallback_history = _build_tool_parse_fallback_history(history)
+            response = await _acompletion_with_budget(
+                history=fallback_history,
+                user_context=user_context,
+                model=selected_model,
+                mode=mode,
+                stage=f"{stage}_local_tool_fallback" if stage else "local_tool_fallback",
                 extra_kwargs=extra,
             )
-        except Exception as e:
-            if turn_tools and (
-                _is_local_tool_json_parse_error(e, selected_model)
-                or _is_local_tool_unsupported_error(e, selected_model)
-            ):
-                _log_local_tool_event(
-                    event=(
-                        "LLM local_tool_unsupported_fallback"
-                        if _is_local_tool_unsupported_error(e, selected_model)
-                        else "LLM local_tool_json_parse_fallback"
-                    ),
-                    history=history,
-                    tools=tools,
-                    model=selected_model,
-                    mode=mode,
-                    stage=stage,
-                    user_context=user_context,
-                    error=e,
-                )
-                fallback_history = _build_tool_parse_fallback_history(history)
-                response = await _acompletion_with_budget(
-                    history=fallback_history,
-                    user_context=user_context,
-                    model=selected_model,
-                    mode=mode,
-                    stage=f"{stage}_local_tool_fallback" if stage else "local_tool_fallback",
-                    extra_kwargs=extra,
-                )
-            else:
-                log.error("LLM call failed", error=str(e), model=selected_model, mode=mode, stage=stage)
-                raise
-        await record_llm_usage_event(response, stage=stage, model=selected_model)
-
-        message = response.choices[0].message
-        finish_reason = response.choices[0].finish_reason
-
-        # Append assistant turn to history (normalize tool_call args to str)
-        normalized_message = _normalize_tool_calls(message.model_dump(exclude_none=True))
-        history.append(normalized_message)
-
-        # Check tool_calls directly — some Ollama models return finish_reason="stop"
-        # even when tool calls are present, so we can't rely on finish_reason alone.
-        if message.tool_calls:
-            normalized_tool_calls = list(normalized_message.get("tool_calls") or [])
-            normalized_tool_calls, prior_recent_feed_fetches = _rewrite_headline_rss_tool_calls(
-                normalized_tool_calls,
-                rss_owned_headline_prompt=rss_owned_headline_prompt,
-                prior_recent_feed_fetches=prior_recent_feed_fetches,
-                mode=mode,
-                stage=stage,
-                selected_model=selected_model,
-                user_context=user_context,
-            )
-            normalized_message["tool_calls"] = normalized_tool_calls
-            history[-1] = normalized_message
-            if pre_tool_callback is not None:
-                await pre_tool_callback(normalized_tool_calls)
-            # Execute all tool calls, append results, then loop
-            tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
-            history.extend(tool_results)
-            runtime_messages = [normalized_message, *tool_results]
-            _record_agent_runtime_messages(runtime_messages)
-            if runtime_message_callback is not None:
-                await runtime_message_callback(runtime_messages)
-            current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
-            current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
-            current_is_document_signature = _is_document_tool_signature(current_semantic_tool_signature)
-            current_rss_query_family_signature = _rss_query_family_signature(normalized_tool_calls)
-            if current_tool_signature == previous_tool_signature:
-                repeated_tool_signature_count += 1
-            else:
-                repeated_tool_signature_count = 0
-                previous_tool_signature = current_tool_signature
-            if current_semantic_tool_signature and current_semantic_tool_signature == previous_semantic_tool_signature:
-                repeated_semantic_tool_signature_count += 1
-            else:
-                repeated_semantic_tool_signature_count = 0
-                previous_semantic_tool_signature = current_semantic_tool_signature or ""
-            if _is_exploration_tool_turn(message.tool_calls):
-                recent_exploration_signatures.append(current_tool_signature)
-                recent_exploration_signatures = recent_exploration_signatures[
-                    -max(2, int(settings.agent_exploration_churn_window)) :
-                ]
-            else:
-                recent_exploration_signatures = []
-            if current_rss_query_family_signature:
-                recent_rss_query_family_signatures.append(current_rss_query_family_signature)
-                recent_rss_query_family_signatures = recent_rss_query_family_signatures[-6:]
-            _log_agent_tool_turn(
-                turn=turn_number,
-                mode=mode,
-                stage=stage,
-                selected_model=selected_model,
-                user_context=user_context,
-                tool_calls=normalized_tool_calls,
-                tool_results=tool_results,
-                repeated_signature_count=repeated_tool_signature_count,
-            )
-            failed_delete = _failed_delete_message(normalized_tool_calls, tool_results)
-            if failed_delete:
-                return failed_delete
-            task_handoff = _task_handoff_message(messages, normalized_tool_calls, tool_results)
-            if task_handoff:
-                return task_handoff
-            metrics.inc_tool_calls(len(normalized_tool_calls))
-            if _is_failed_search_turn(normalized_tool_calls, tool_results):
-                consecutive_failed_search_turns += 1
-                if consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
-                    _record_loop_event(
-                        event_type="failed_search_loop",
-                        stage=stage,
-                        mode=mode,
-                        model=selected_model,
-                        details={"turn": turn_number, "threshold": REPEATED_FAILED_SEARCH_TURN_THRESHOLD},
-                    )
-                    log.info(
-                        "Stopping repeated failed search loop",
-                        turn=turn_number,
-                        model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                    )
-                    return _repeated_failed_search_message(history)
-            else:
-                consecutive_failed_search_turns = 0
-            if repeated_tool_signature_count >= int(settings.agent_repeated_tool_signature_threshold):
-                _record_loop_event(
-                    event_type="repeated_tool_signature",
-                    stage=stage,
-                    mode=mode,
-                    model=selected_model,
-                    details={
-                        "turn": turn_number,
-                        "repeated_count": repeated_tool_signature_count,
-                        "tool_signature": current_tool_signature,
-                    },
-                )
-                return _repeated_tool_signature_message(
-                    tool_calls=normalized_tool_calls,
-                    repeated_count=repeated_tool_signature_count,
-                    history=history,
-                )
-            if (
-                current_semantic_tool_signature
-                and repeated_semantic_tool_signature_count >= int(settings.agent_repeated_semantic_tool_signature_threshold)
-            ):
-                _record_loop_event(
-                    event_type="repeated_semantic_tool_signature",
-                    stage=stage,
-                    mode=mode,
-                    model=selected_model,
-                    details={
-                        "turn": turn_number,
-                        "repeated_count": repeated_semantic_tool_signature_count,
-                        "tool_signature": current_semantic_tool_signature,
-                    },
-                )
-                if current_is_document_signature:
-                    synthesized = await _safe_synthesize_from_document_evidence(
-                        history=history,
-                        user_context=user_context,
-                        selected_model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                        reason="document_query_family_churn",
-                    )
-                    if synthesized:
-                        return synthesized
-                    return _repeated_document_retrieval_message(
-                        tool_calls=normalized_tool_calls,
-                        history=history,
-                    )
-                synthesized = await _safe_synthesize_from_rss_evidence(
-                    history=history,
-                    user_context=user_context,
-                    selected_model=selected_model,
-                    mode=mode,
-                    stage=stage,
-                    reason="repeated_semantic_tool_signature",
-                )
-                if synthesized:
-                    return synthesized
-                return _repeated_semantic_research_message(
-                    tool_calls=normalized_tool_calls,
-                    history=history,
-                )
-            if current_rss_query_family_signature:
-                family_count = recent_rss_query_family_signatures.count(current_rss_query_family_signature)
-                if family_count >= int(settings.agent_repeated_rss_query_family_threshold):
-                    _record_loop_event(
-                        event_type="rss_query_family_churn",
-                        stage=stage,
-                        mode=mode,
-                        model=selected_model,
-                        details={
-                            "turn": turn_number,
-                            "family_signature": current_rss_query_family_signature,
-                            "family_count": family_count,
-                        },
-                    )
-                    synthesized = await _safe_synthesize_from_rss_evidence(
-                        history=history,
-                        user_context=user_context,
-                        selected_model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                        reason="rss_query_family_churn",
-                    )
-                    if synthesized:
-                        return synthesized
-                    return _repeated_semantic_research_message(
-                        tool_calls=normalized_tool_calls,
-                        history=history,
-                    )
-                if (
-                    rss_owned_headline_prompt
-                    and len(recent_rss_query_family_signatures) >= int(settings.agent_headline_roundup_rss_turn_cap)
-                ):
-                    _record_loop_event(
-                        event_type="headline_roundup_convergence",
-                        stage=stage,
-                        mode=mode,
-                        model=selected_model,
-                        details={
-                            "turn": turn_number,
-                            "family_signature": current_rss_query_family_signature,
-                            "rss_turns": len(recent_rss_query_family_signatures),
-                        },
-                    )
-                    synthesized = await _safe_synthesize_from_rss_evidence(
-                        history=history,
-                        user_context=user_context,
-                        selected_model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                        reason="headline_roundup_convergence",
-                    )
-                    if synthesized:
-                        return synthesized
-            if current_is_document_signature and _has_nonempty_document_summary_evidence(history):
-                if any(_tool_call_name(call) == "search_library" for call in normalized_tool_calls):
-                    _record_loop_event(
-                        event_type="document_summary_followed_by_search",
-                        stage=stage,
-                        mode=mode,
-                        model=selected_model,
-                        details={
-                            "turn": turn_number,
-                            "tool_names": [_tool_call_name(call) for call in normalized_tool_calls],
-                        },
-                    )
-                    synthesized = await _safe_synthesize_from_document_evidence(
-                        history=history,
-                        user_context=user_context,
-                        selected_model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                        reason="document_summary_already_available",
-                    )
-                    if synthesized:
-                        return synthesized
-            if current_is_document_signature and turn_number >= max_turns - 1:
-                synthesized = await _safe_synthesize_from_document_evidence(
-                    history=history,
-                    user_context=user_context,
-                    selected_model=selected_model,
-                    mode=mode,
-                    stage=stage,
-                    reason="turn_budget_near_exhaustion",
-                )
-                if synthesized:
-                    return synthesized
-            if _exploration_churn_detected(recent_exploration_signatures):
-                _record_loop_event(
-                    event_type="exploration_churn",
-                    stage=stage,
-                    mode=mode,
-                    model=selected_model,
-                    details={
-                        "turn": turn_number,
-                        "recent_signatures": list(recent_exploration_signatures),
-                        "window": int(settings.agent_exploration_churn_window),
-                        "max_unique_signatures": int(settings.agent_exploration_churn_max_unique_signatures),
-                    },
-                )
-                return _exploration_churn_message(
-                    tool_calls=normalized_tool_calls,
-                    history=history,
-                )
-            log.info(
-                "Tool calls executed",
-                turn=turn + 1,
-                tools=[_tool_call_name(tc) for tc in normalized_tool_calls],
+        else:
+            log.error(
+                error_message,
+                error=str(exc),
                 model=selected_model,
                 mode=mode,
                 stage=stage,
             )
-        else:
-            # Final text response
-            _log_agent_final_turn(
-                turn=turn_number,
-                mode=mode,
-                stage=stage,
-                selected_model=selected_model,
-                user_context=user_context,
-                content=message.content or "",
-            )
-            return message.content or ""
-
-    log.warning("Agent hit max turns without a final response", max_turns=max_turns)
-    return _max_turns_message(history)
+            raise
+    await record_llm_usage_event(response, stage=usage_stage, model=selected_model)
+    return response
 
 
-async def stream_agent(
+async def _run_agent_chunks(
     messages: List[Dict[str, Any]],
     user_context: UserContext,
     mode: str = "chat",
@@ -3129,95 +3203,57 @@ async def stream_agent(
     runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     provisional_text_callback: Callable[[str, str], Awaitable[None]] | None = None,
+    event_emitter: AgentEventEmitter | None = None,
+    streaming: bool = False,
 ) -> AsyncGenerator[str, None]:
-    """
-    Run the agent loop with streaming.
+    """Run the canonical agent loop and yield final committed text chunks."""
+    if streaming or mode == "chat":
+        unsupported_api_message = _unsupported_alphavantage_request_message(messages)
+        if unsupported_api_message:
+            yield unsupported_api_message
+            return
 
-    Yields text tokens as they arrive from the LLM.
-    Tool calls are resolved silently; the final response is streamed.
-    """
-    unsupported_api_message = _unsupported_alphavantage_request_message(messages)
-    if unsupported_api_message:
-        yield unsupported_api_message
-        return
-
-    history = list(messages)
-    max_turns = TURN_LIMITS.get(mode, 8)
-    selected_model = model_override or settings.llm_model
-    tools = get_tools_for_user(user_context)
-    tools = _apply_local_tool_investigation_filters(
-        tools=tools,
-        model=selected_model,
-        mode=mode,
-        stage=stage,
+    setup = _initialize_agent_loop(
+        messages=messages,
         user_context=user_context,
-        history=history,
+        mode=mode,
+        model_override=model_override,
+        stage=stage,
     )
-    extra = _litellm_kwargs(selected_model, is_incognito=user_context.is_incognito)
-    consecutive_failed_search_turns = 0
-    previous_tool_signature = ""
-    repeated_tool_signature_count = 0
-    previous_semantic_tool_signature = ""
-    repeated_semantic_tool_signature_count = 0
-    recent_exploration_signatures: List[str] = []
-    recent_rss_query_family_signatures: List[str] = []
-    headline_roundup_prompt = _is_headline_roundup_prompt(messages)
-    rss_owned_headline_prompt = _is_rss_owned_headline_prompt(messages)
-    if rss_owned_headline_prompt:
+    history = setup.history
+    max_turns = setup.max_turns
+    selected_model = setup.selected_model
+    extra = setup.extra
+    loop_state = setup.state
+    rss_owned_headline_prompt = setup.rss_owned_headline_prompt
+    native_streaming_enabled = streaming and setup.provider.native_streaming
+    if streaming:
         log.info(
-            "agent.headline_roundup_classified",
-            rss_owned=True,
+            "agent.native_streaming_policy",
+            selected=native_streaming_enabled,
+            model=selected_model,
             mode=mode,
             stage=stage,
-            model=selected_model,
             session_id=user_context.session_id,
             task_id=user_context.task_id,
         )
-    tools = _filter_tools_for_prompt(
-        tools,
-        rss_owned_headline_prompt=rss_owned_headline_prompt,
-        mode=mode,
-        stage=stage,
-        selected_model=selected_model,
-        user_context=user_context,
-    )
-    prior_recent_feed_fetches = 0
-    native_streaming_enabled = _native_agent_streaming_enabled(selected_model)
-    log.info(
-        "agent.native_streaming_policy",
-        selected=native_streaming_enabled,
-        model=selected_model,
-        mode=mode,
-        stage=stage,
-        session_id=user_context.session_id,
-        task_id=user_context.task_id,
-    )
 
     for turn in range(max_turns):
         turn_number = turn + 1
-        turn_tools = tools
-        turn_history = history
-        turn_history, turn_tools = _apply_local_tool_guardrail(
-            history=history,
-            tools=tools,
-            model=selected_model,
+        prepared_turn = await _prepare_agent_turn(
+            turn_number=turn_number,
+            setup=setup,
+            user_context=user_context,
             mode=mode,
             stage=stage,
-            user_context=user_context,
+            event_emitter=event_emitter,
         )
-        turn_history = _apply_generated_image_response_contract(turn_history)
-        _log_agent_turn_start(
-            turn=turn_number,
-            max_turns=max_turns,
-            mode=mode,
-            stage=stage,
-            selected_model=selected_model,
-            user_context=user_context,
-            history=history,
-        )
+        turn_history = prepared_turn.history
+        turn_tools = prepared_turn.tools
         native_turn: ModelTurnResult | None = None
         native_text_emitted = False
         provisional_text_active = False
+        reasoning_event_emitted = False
         if native_streaming_enabled:
             accumulator = ModelTurnAccumulator()
             provider_stream = None
@@ -3225,7 +3261,7 @@ async def stream_agent(
             stream_started = time.perf_counter()
             first_event_ms: float | None = None
             native_extra = dict(extra)
-            reasoning_effort = str(settings.fruitcake_native_agent_streaming_reasoning_effort or "").strip()
+            reasoning_effort = setup.provider.native_reasoning_effort
             if reasoning_effort:
                 native_extra["reasoning_effort"] = reasoning_effort
             stream_kwargs: dict[str, Any] = {}
@@ -3250,6 +3286,17 @@ async def stream_agent(
                             first_event_ms = (time.perf_counter() - stream_started) * 1000.0
                         event_counts[event.kind] = event_counts.get(event.kind, 0) + 1
                         accumulator.add(event)
+                        if (
+                            event.kind == "reasoning_delta"
+                            and event.text
+                            and not reasoning_event_emitted
+                            and event_emitter is not None
+                        ):
+                            reasoning_event_emitted = True
+                            await event_emitter.emit(
+                                AgentEventType.REASONING_STARTED,
+                                turn=turn_number,
+                            )
                         if event.kind == "text_delta" and event.text:
                             if turn_tools and provisional_text_callback is not None:
                                 provisional_text_active = True
@@ -3323,59 +3370,17 @@ async def stream_agent(
 
         if native_turn is None:
             # Compatibility path: non-streaming probe followed by optional final stream.
-            try:
-                response = await _acompletion_with_budget(
-                    history=turn_history,
-                    user_context=user_context,
-                    model=selected_model,
-                    mode=mode,
-                    stage=stage,
-                    stream=False,
-                    tools=turn_tools,
-                    tool_choice="auto",
-                    extra_kwargs=extra,
-                )
-            except Exception as e:
-                if turn_tools and (
-                    _is_local_tool_json_parse_error(e, selected_model)
-                    or _is_local_tool_unsupported_error(e, selected_model)
-                ):
-                    _log_local_tool_event(
-                        event=(
-                            "LLM local_tool_unsupported_fallback"
-                            if _is_local_tool_unsupported_error(e, selected_model)
-                            else "LLM local_tool_json_parse_fallback"
-                        ),
-                        history=history,
-                        tools=tools,
-                        model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                        user_context=user_context,
-                        error=e,
-                    )
-                    fallback_history = _build_tool_parse_fallback_history(history)
-                    response = await _acompletion_with_budget(
-                        history=fallback_history,
-                        user_context=user_context,
-                        model=selected_model,
-                        mode=mode,
-                        stage=f"{stage}_local_tool_fallback" if stage else "local_tool_fallback",
-                        extra_kwargs=extra,
-                    )
-                else:
-                    log.error(
-                        "LLM call failed (streaming turn)",
-                        error=str(e),
-                        model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                    )
-                    raise
-            await record_llm_usage_event(
-                response,
-                stage=f"{stage}_probe" if stage else "stream_probe",
-                model=selected_model,
+            response = await _complete_agent_turn(
+                history=history,
+                turn_history=turn_history,
+                tools=turn_tools,
+                user_context=user_context,
+                selected_model=selected_model,
+                mode=mode,
+                stage=stage,
+                extra=extra,
+                usage_stage=(f"{stage}_probe" if stage else "stream_probe") if streaming else stage,
+                error_message="LLM call failed (streaming turn)" if streaming else "LLM call failed",
             )
             message: Any = response.choices[0].message
         else:
@@ -3390,271 +3395,32 @@ async def stream_agent(
                 if isinstance(message, ModelTurnResult)
                 else _normalize_tool_calls(message.model_dump(exclude_none=True))
             )
-            # Narration preceding a tool call is working state, not a final answer.
-            normalized_message["content"] = ""
+            # Streamed narration preceding a tool call is provisional working state.
+            if streaming:
+                normalized_message["content"] = ""
             if native_turn is not None:
                 _drop_stale_reasoning_content(history)
             history.append(normalized_message)
-            normalized_tool_calls = list(normalized_message.get("tool_calls") or [])
-            normalized_tool_calls, prior_recent_feed_fetches = _rewrite_headline_rss_tool_calls(
-                normalized_tool_calls,
+            stop_response = await _execute_agent_tool_turn(
+                original_messages=messages,
+                history=history,
+                normalized_message=normalized_message,
+                state=loop_state,
+                turn_number=turn_number,
+                max_turns=max_turns,
                 rss_owned_headline_prompt=rss_owned_headline_prompt,
-                prior_recent_feed_fetches=prior_recent_feed_fetches,
                 mode=mode,
                 stage=stage,
                 selected_model=selected_model,
                 user_context=user_context,
+                event_emitter=event_emitter,
+                pre_tool_callback=pre_tool_callback,
+                runtime_message_callback=runtime_message_callback,
+                streaming=streaming,
             )
-            normalized_message["tool_calls"] = normalized_tool_calls
-            history[-1] = normalized_message
-            if pre_tool_callback is not None:
-                await pre_tool_callback(normalized_tool_calls)
-            tool_results = await dispatch_tool_calls(normalized_tool_calls, user_context)
-            history.extend(tool_results)
-            runtime_messages = [normalized_message, *tool_results]
-            _record_agent_runtime_messages(runtime_messages)
-            if runtime_message_callback is not None:
-                await runtime_message_callback(runtime_messages)
-            current_tool_signature = _tool_call_signature(normalized_tool_calls, tool_results)
-            current_semantic_tool_signature = _semantic_tool_signature(normalized_tool_calls)
-            current_is_document_signature = _is_document_tool_signature(current_semantic_tool_signature)
-            current_rss_query_family_signature = _rss_query_family_signature(normalized_tool_calls)
-            if current_tool_signature == previous_tool_signature:
-                repeated_tool_signature_count += 1
-            else:
-                repeated_tool_signature_count = 0
-                previous_tool_signature = current_tool_signature
-            if current_semantic_tool_signature and current_semantic_tool_signature == previous_semantic_tool_signature:
-                repeated_semantic_tool_signature_count += 1
-            else:
-                repeated_semantic_tool_signature_count = 0
-                previous_semantic_tool_signature = current_semantic_tool_signature or ""
-            if _is_exploration_tool_turn(normalized_tool_calls):
-                recent_exploration_signatures.append(current_tool_signature)
-                recent_exploration_signatures = recent_exploration_signatures[
-                    -max(2, int(settings.agent_exploration_churn_window)) :
-                ]
-            else:
-                recent_exploration_signatures = []
-            if current_rss_query_family_signature:
-                recent_rss_query_family_signatures.append(current_rss_query_family_signature)
-                recent_rss_query_family_signatures = recent_rss_query_family_signatures[-6:]
-            _log_agent_tool_turn(
-                turn=turn_number,
-                mode=mode,
-                stage=stage,
-                selected_model=selected_model,
-                user_context=user_context,
-                tool_calls=normalized_tool_calls,
-                tool_results=tool_results,
-                repeated_signature_count=repeated_tool_signature_count,
-            )
-            failed_delete = _failed_delete_message(normalized_tool_calls, tool_results)
-            if failed_delete:
-                yield failed_delete
+            if stop_response is not None:
+                yield stop_response
                 return
-            task_handoff = _task_handoff_message(messages, normalized_tool_calls, tool_results)
-            if task_handoff:
-                yield task_handoff
-                return
-            metrics.inc_tool_calls(len(normalized_tool_calls))
-            if _is_failed_search_turn(normalized_tool_calls, tool_results):
-                consecutive_failed_search_turns += 1
-                if consecutive_failed_search_turns >= REPEATED_FAILED_SEARCH_TURN_THRESHOLD:
-                    _record_loop_event(
-                        event_type="failed_search_loop",
-                        stage=stage,
-                        mode=mode,
-                        model=selected_model,
-                        details={"turn": turn_number, "threshold": REPEATED_FAILED_SEARCH_TURN_THRESHOLD},
-                    )
-                    yield _repeated_failed_search_message(history)
-                    return
-            else:
-                consecutive_failed_search_turns = 0
-            if repeated_tool_signature_count >= int(settings.agent_repeated_tool_signature_threshold):
-                _record_loop_event(
-                    event_type="repeated_tool_signature",
-                    stage=stage,
-                    mode=mode,
-                    model=selected_model,
-                    details={
-                        "turn": turn_number,
-                        "repeated_count": repeated_tool_signature_count,
-                        "tool_signature": current_tool_signature,
-                    },
-                )
-                yield _repeated_tool_signature_message(
-                    tool_calls=normalized_tool_calls,
-                    repeated_count=repeated_tool_signature_count,
-                    history=history,
-                )
-                return
-            if (
-                current_semantic_tool_signature
-                and repeated_semantic_tool_signature_count >= int(settings.agent_repeated_semantic_tool_signature_threshold)
-            ):
-                _record_loop_event(
-                    event_type="repeated_semantic_tool_signature",
-                    stage=stage,
-                    mode=mode,
-                    model=selected_model,
-                    details={
-                        "turn": turn_number,
-                        "repeated_count": repeated_semantic_tool_signature_count,
-                        "tool_signature": current_semantic_tool_signature,
-                    },
-                )
-                if current_is_document_signature:
-                    synthesized = await _safe_synthesize_from_document_evidence(
-                        history=history,
-                        user_context=user_context,
-                        selected_model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                        reason="document_query_family_churn",
-                    )
-                    if synthesized:
-                        yield synthesized
-                        return
-                    yield _repeated_document_retrieval_message(
-                        tool_calls=normalized_tool_calls,
-                        history=history,
-                    )
-                    return
-                synthesized = await _safe_synthesize_from_rss_evidence(
-                    history=history,
-                    user_context=user_context,
-                    selected_model=selected_model,
-                    mode=mode,
-                    stage=stage,
-                    reason="repeated_semantic_tool_signature",
-                )
-                if synthesized:
-                    yield synthesized
-                    return
-                yield _repeated_semantic_research_message(
-                    tool_calls=normalized_tool_calls,
-                    history=history,
-                )
-                return
-            if current_rss_query_family_signature:
-                family_count = recent_rss_query_family_signatures.count(current_rss_query_family_signature)
-                if family_count >= int(settings.agent_repeated_rss_query_family_threshold):
-                    _record_loop_event(
-                        event_type="rss_query_family_churn",
-                        stage=stage,
-                        mode=mode,
-                        model=selected_model,
-                        details={
-                            "turn": turn_number,
-                            "family_signature": current_rss_query_family_signature,
-                            "family_count": family_count,
-                        },
-                    )
-                    synthesized = await _safe_synthesize_from_rss_evidence(
-                        history=history,
-                        user_context=user_context,
-                        selected_model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                        reason="rss_query_family_churn",
-                    )
-                    if synthesized:
-                        yield synthesized
-                        return
-                    yield _repeated_semantic_research_message(
-                        tool_calls=normalized_tool_calls,
-                        history=history,
-                    )
-                    return
-                if (
-                    rss_owned_headline_prompt
-                    and len(recent_rss_query_family_signatures) >= int(settings.agent_headline_roundup_rss_turn_cap)
-                ):
-                    _record_loop_event(
-                        event_type="headline_roundup_convergence",
-                        stage=stage,
-                        mode=mode,
-                        model=selected_model,
-                        details={
-                            "turn": turn_number,
-                            "family_signature": current_rss_query_family_signature,
-                            "rss_turns": len(recent_rss_query_family_signatures),
-                        },
-                    )
-                    synthesized = await _safe_synthesize_from_rss_evidence(
-                        history=history,
-                        user_context=user_context,
-                        selected_model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                        reason="headline_roundup_convergence",
-                    )
-                    if synthesized:
-                        yield synthesized
-                        return
-            if current_is_document_signature and _has_nonempty_document_summary_evidence(history):
-                if any(_tool_call_name(call) == "search_library" for call in normalized_tool_calls):
-                    _record_loop_event(
-                        event_type="document_summary_followed_by_search",
-                        stage=stage,
-                        mode=mode,
-                        model=selected_model,
-                        details={
-                            "turn": turn_number,
-                            "tool_names": [_tool_call_name(call) for call in normalized_tool_calls],
-                        },
-                    )
-                    synthesized = await _safe_synthesize_from_document_evidence(
-                        history=history,
-                        user_context=user_context,
-                        selected_model=selected_model,
-                        mode=mode,
-                        stage=stage,
-                        reason="document_summary_already_available",
-                    )
-                    if synthesized:
-                        yield synthesized
-                        return
-            if current_is_document_signature and turn_number >= max_turns - 1:
-                synthesized = await _safe_synthesize_from_document_evidence(
-                    history=history,
-                    user_context=user_context,
-                    selected_model=selected_model,
-                    mode=mode,
-                    stage=stage,
-                    reason="turn_budget_near_exhaustion",
-                )
-                if synthesized:
-                    yield synthesized
-                    return
-            if _exploration_churn_detected(recent_exploration_signatures):
-                _record_loop_event(
-                    event_type="exploration_churn",
-                    stage=stage,
-                    mode=mode,
-                    model=selected_model,
-                    details={
-                        "turn": turn_number,
-                        "recent_signatures": list(recent_exploration_signatures),
-                        "window": int(settings.agent_exploration_churn_window),
-                        "max_unique_signatures": int(settings.agent_exploration_churn_max_unique_signatures),
-                    },
-                )
-                yield _exploration_churn_message(
-                    tool_calls=normalized_tool_calls,
-                    history=history,
-                )
-                return
-            log.info(
-                "Tool calls executed (streaming turn)",
-                turn=turn + 1,
-                tools=[_tool_call_name(tc) for tc in normalized_tool_calls],
-                model=selected_model,
-                mode=mode,
-                stage=stage,
-            )
         else:
             _log_agent_final_turn(
                 turn=turn_number,
@@ -3671,7 +3437,10 @@ async def stream_agent(
                     for token in _chunk_plain_text(message.content or ""):
                         yield token
                 return
-            if _should_skip_final_stream_pass(selected_model):
+            if not streaming:
+                yield message.content or ""
+                return
+            if setup.provider.skip_duplicate_final_stream:
                 for token in _chunk_plain_text(message.content or ""):
                     yield token
                 return
@@ -3684,4 +3453,152 @@ async def stream_agent(
                 yield token
             return
 
+    if not streaming:
+        log.warning("Agent hit max turns without a final response", max_turns=max_turns)
     yield _max_turns_message(history)
+
+
+async def run_agent(
+    messages: List[Dict[str, Any]],
+    user_context: UserContext,
+    mode: str = "chat",
+    model_override: str | None = None,
+    stage: str | None = None,
+    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    event_emitter: AgentEventEmitter | None = None,
+) -> str:
+    """Run the non-streaming loop and emit one ordered lifecycle stream."""
+    selected_model = model_override or settings.llm_model
+    emitter = event_emitter or AgentEventEmitter(
+        session_id=user_context.session_id,
+        task_id=user_context.task_id,
+    )
+    await emitter.start_once(
+        mode=mode,
+        model=selected_model,
+        stage=stage,
+        streaming=False,
+    )
+    try:
+        result = "".join(
+            [
+                chunk
+                async for chunk in _run_agent_chunks(
+                    messages,
+                    user_context,
+                    mode=mode,
+                    model_override=model_override,
+                    stage=stage,
+                    runtime_message_callback=runtime_message_callback,
+                    pre_tool_callback=pre_tool_callback,
+                    event_emitter=emitter,
+                    streaming=False,
+                )
+            ]
+        )
+    except asyncio.CancelledError:
+        await emitter.terminal_once(AgentEventType.RUN_CANCELLED)
+        raise
+    except ApprovalRequired as exc:
+        await emitter.emit(
+            AgentEventType.APPROVAL_REQUIRED,
+            tool_name=exc.tool_name,
+            approval_kind=exc.approval_kind,
+            reason=exc.reason,
+        )
+        raise
+    except Exception as exc:
+        await emitter.terminal_once(
+            AgentEventType.RUN_FAILED,
+            error_type=type(exc).__name__,
+            failure_phase="agent_loop",
+        )
+        raise
+    await emitter.terminal_once(
+        AgentEventType.RUN_COMPLETED,
+        content_chars=len(result),
+    )
+    return result
+
+
+async def stream_agent(
+    messages: List[Dict[str, Any]],
+    user_context: UserContext,
+    mode: str = "chat",
+    model_override: str | None = None,
+    stage: str | None = None,
+    runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
+    provisional_text_callback: Callable[[str, str], Awaitable[None]] | None = None,
+    event_emitter: AgentEventEmitter | None = None,
+) -> AsyncGenerator[str, None]:
+    """Run the streaming loop and emit one ordered lifecycle stream."""
+    selected_model = model_override or settings.llm_model
+    emitter = event_emitter or AgentEventEmitter(
+        session_id=user_context.session_id,
+        task_id=user_context.task_id,
+    )
+    await emitter.start_once(
+        mode=mode,
+        model=selected_model,
+        stage=stage,
+        streaming=True,
+    )
+    wrapped_provisional_callback = wrap_provisional_text_callback(
+        emitter,
+        provisional_text_callback,
+    )
+    content_chars = 0
+    inner_stream = _run_agent_chunks(
+        messages,
+        user_context,
+        mode=mode,
+        model_override=model_override,
+        stage=stage,
+        runtime_message_callback=runtime_message_callback,
+        pre_tool_callback=pre_tool_callback,
+        provisional_text_callback=wrapped_provisional_callback,
+        event_emitter=emitter,
+        streaming=True,
+    )
+    try:
+        async for chunk in inner_stream:
+            content_chars += len(chunk)
+            if emitter.is_observed:
+                await emitter.emit(
+                    AgentEventType.TEXT_DELTA,
+                    content=chunk,
+                    provisional=False,
+                )
+            yield chunk
+    except asyncio.CancelledError:
+        await emitter.terminal_once(AgentEventType.RUN_CANCELLED)
+        raise
+    except ApprovalRequired as exc:
+        await emitter.emit(
+            AgentEventType.APPROVAL_REQUIRED,
+            tool_name=exc.tool_name,
+            approval_kind=exc.approval_kind,
+            reason=exc.reason,
+        )
+        raise
+    except GeneratorExit:
+        await emitter.terminal_once(
+            AgentEventType.RUN_CANCELLED,
+            reason="consumer_closed_stream",
+        )
+        raise
+    except Exception as exc:
+        await emitter.terminal_once(
+            AgentEventType.RUN_FAILED,
+            error_type=type(exc).__name__,
+            failure_phase="agent_loop",
+        )
+        raise
+    finally:
+        await inner_stream.aclose()
+    await emitter.terminal_once(
+        AgentEventType.RUN_COMPLETED,
+        content_chars=content_chars,
+    )

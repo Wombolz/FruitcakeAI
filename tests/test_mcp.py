@@ -26,6 +26,7 @@ import yaml
 
 from app.mcp.registry import MCPRegistry, _extract_text, _serialize_user_context, _to_litellm_schema
 from app.mcp.client import MCPClient
+from app.agent.runtime.models import build_tool_call_result
 
 
 # ── _to_litellm_schema ─────────────────────────────────────────────────────────
@@ -438,6 +439,40 @@ async def test_registry_docker_call_can_inject_user_context():
             "_fruitcake_user_context": {"user_id": 12, "username": "admin"},
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_registry_preserves_mcp_structured_content_on_string_result():
+    registry = MCPRegistry()
+    registry._tool_map["generate_image"] = ("image_lab", "streamable_http")
+    registry._server_configs["image_lab"] = {}
+
+    fake_client = MagicMock()
+    fake_client.is_connected.return_value = True
+    fake_client.call_tool = AsyncMock(
+        return_value={
+            "success": True,
+            "result": {
+                "content": [{"type": "text", "text": "Image generated."}],
+                "structuredContent": {"image_path": "generated_images/result.png", "seed": 42},
+            },
+        }
+    )
+    registry._clients["image_lab"] = fake_client
+
+    output = await registry.call_tool("generate_image", {"prompt": "A small observatory"})
+    normalized = build_tool_call_result(
+        tool_call_id="call_image",
+        name="generate_image",
+        content=output,
+    )
+
+    assert output == "Image generated."
+    assert normalized.structured_content == {
+        "image_path": "generated_images/result.png",
+        "seed": 42,
+    }
+    assert normalized.artifacts[0]["path"] == "generated_images/result.png"
 
 
 def test_default_mcp_config_defines_shell_server_contract():

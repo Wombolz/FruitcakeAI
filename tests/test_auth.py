@@ -1811,6 +1811,39 @@ def test_build_assistant_evidence_metadata_includes_generated_image_artifact():
     ]
 
 
+def test_build_assistant_evidence_metadata_prefers_normalized_artifacts_and_citations():
+    from app.api.chat import _build_assistant_evidence_metadata
+
+    evidence = _build_assistant_evidence_metadata(
+        [
+            {
+                "tool": "generate_image",
+                "arguments": {"prompt": "A navigation diagram"},
+                "result_summary": "Image generated.",
+                "structured_content": {"image_path": "generated_images/navigation.png"},
+                "artifacts": [
+                    {
+                        "kind": "image",
+                        "path": "generated_images/navigation.png",
+                        "prompt": "A navigation diagram",
+                        "source_tool": "generate_image",
+                    }
+                ],
+                "citations": [
+                    {"url": "https://example.com/reference", "title": "Reference"}
+                ],
+            }
+        ]
+    )
+
+    assert evidence is not None
+    assert evidence["image_artifacts"][0]["path"] == "generated_images/navigation.png"
+    assert evidence["image_artifacts"][0]["title"] == "A navigation diagram"
+    assert evidence["citations"] == [
+        {"url": "https://example.com/reference", "title": "Reference"}
+    ]
+
+
 def test_generated_image_reference_normalization_preserves_inline_placement():
     from app.api.chat import _ensure_generated_image_markdown_references
 

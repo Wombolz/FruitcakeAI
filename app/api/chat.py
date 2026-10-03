@@ -17,6 +17,7 @@ import re
 import time
 import ast
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, unquote, urlparse
@@ -64,11 +65,22 @@ from app.agent.core import (
     run_agent,
     stream_agent,
 )
+from app.agent.runtime import AgentEvent, AgentEventEmitter, AgentEventType
+from app.autonomy.approval import ApprovalRequired, _approval_armed
 from app.auth.dependencies import get_current_user
 from app.config import settings
-from app.db.models import ChatMessage, ChatSession, Task, User
+from app.db.models import ChatMessage, ChatRun, ChatSession, Task, User
 from app.db.session import get_db
-from app.chat_runtime import get_chat_run_manager
+from app.chat_runtime import (
+    apply_chat_run_event,
+    create_chat_run,
+    get_chat_run_manager,
+    latest_chat_run,
+    mark_chat_run_terminal,
+    owned_chat_run,
+    serialize_chat_approval,
+    serialize_chat_run,
+)
 from app.llm_registry import available_llm_models, is_configured_model
 from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
@@ -81,6 +93,7 @@ from app.agent.tools import (
     get_tool_execution_records,
     reset_tool_execution_records,
     restore_tool_execution_records,
+    replay_waiting_approval_tool,
 )
 from app.task_service import TaskValidationError, create_task_record
 
@@ -173,6 +186,7 @@ class SendMessageRequest(BaseModel):
     client_send_id: Optional[str] = None
     allowed_tools: Optional[List[str]] = None
     blocked_tools: Optional[List[str]] = None
+    approval_mode: bool = False
 
 
 class StopChatResponse(BaseModel):
@@ -183,6 +197,24 @@ class StopChatResponse(BaseModel):
 class ChatSessionStatusResponse(BaseModel):
     session_id: int
     active: bool
+    run_id: Optional[str] = None
+    status: Optional[str] = None
+    phase: Optional[str] = None
+    mode: Optional[str] = None
+    stage: Optional[str] = None
+    model: Optional[str] = None
+    last_event_sequence: int = 0
+    waiting_approval: Optional[Dict[str, Any]] = None
+    error_classification: Optional[str] = None
+    started_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    user_message_id: Optional[int] = None
+    assistant_message_id: Optional[int] = None
+
+
+class ChatApprovalDecision(BaseModel):
+    approved: bool
 
 
 class RenameSessionRequest(BaseModel):
@@ -246,6 +278,7 @@ class ChatSocketPayload:
     client_send_id: Optional[str]
     allowed_tools: Optional[List[str]]
     blocked_tools: Optional[List[str]]
+    approval_mode: bool = False
 
 
 # ── GET /chat/personas ────────────────────────────────────────────────────────
@@ -838,17 +871,48 @@ async def send_message(
     runtime_history_messages: List[Dict[str, Any]] = []
     handoff_metadata: Dict[str, Any] = {}
     assistant_metadata: Dict[str, Any] | None = None
+    pending_tool_calls: List[Dict[str, Any]] = []
     chat_run_manager = get_chat_run_manager()
     current_task = asyncio.current_task()
+    run_stage = "chat_complex" if effective_complex else "chat_simple"
+    chat_run = await create_chat_run(
+        db,
+        session_id=session_id,
+        user_id=current_user.id,
+        user_message_id=int(user_msg.id),
+        client_send_id=body.client_send_id,
+        model=session.llm_model,
+        mode=execution_mode,
+        stage=run_stage,
+    )
+    await db.commit()
+
+    async def _record_run_event(event: AgentEvent) -> None:
+        await apply_chat_run_event(db, chat_run, event)
+        if event.type != AgentEventType.TEXT_DELTA:
+            await db.commit()
+
+    async def _capture_pre_tool(tool_calls: List[Dict[str, Any]]) -> None:
+        pending_tool_calls.clear()
+        pending_tool_calls.extend(tool_calls)
+
+    event_emitter = AgentEventEmitter(
+        run_id=chat_run.id,
+        session_id=session_id,
+        callback=_record_run_event,
+    )
+    approval_token = None
     try:
         if current_task is not None:
-            await chat_run_manager.register(session_id, current_task)
+            await chat_run_manager.register(session_id, current_task, run_id=chat_run.id)
+        approval_token = _approval_armed.set(body.approval_mode and not bool(session.is_incognito))
         record_token = reset_tool_execution_records()
         handoff_token = reset_task_handoff_payload()
         runtime_history_token = reset_agent_runtime_history()
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
             session_id=session_id,
+            chat_run_id=chat_run.id,
             source="chat_rest",
         )
 
@@ -868,9 +932,22 @@ async def send_message(
                 user_prompt=body.content,
                 mode=execution_mode,
                 model_override=session.llm_model,
-                stage="chat_complex" if effective_complex else "chat_simple",
+                stage=run_stage,
                 enable_validation=should_validate,
                 runtime_message_callback=_flush_runtime_messages,
+                pre_tool_callback=_capture_pre_tool,
+                event_emitter=event_emitter,
+            )
+        except ApprovalRequired as exc:
+            pending_message = await _persist_chat_approval_wait(
+                db=db,
+                run=chat_run,
+                exc=exc,
+                pending_tool_calls=pending_tool_calls,
+            )
+            return JSONResponse(
+                status_code=status.HTTP_202_ACCEPTED,
+                content=_chat_approval_response(chat_run, pending_message),
             )
         except Exception as e:
             runtime_history_messages = await _flush_pending_runtime_history()
@@ -916,6 +993,14 @@ async def send_message(
         )
         db.add(assistant_msg)
         await _mark_recalled_memories_materialized(db, _memory_ids)
+        await db.flush()
+        await mark_chat_run_terminal(
+            db,
+            chat_run,
+            status="completed",
+            phase="completed",
+            assistant_message_id=int(assistant_msg.id),
+        )
         await db.commit()
         _log_chat_latency_breakdown(
             session_id=session_id,
@@ -930,6 +1015,7 @@ async def send_message(
             "content": reply,
             "message_id": int(assistant_msg.id),
             "session_id": session_id,
+            "run_id": chat_run.id,
             "metadata": {
                 "active_skills": list(user_context.active_skill_slugs or []),
                 "skill_selection_mode": user_context.skill_selection_mode or "",
@@ -938,16 +1024,39 @@ async def send_message(
             },
         }
     except asyncio.CancelledError:
+        await db.rollback()
+        persisted_run = await db.get(ChatRun, chat_run.id)
+        if persisted_run is not None:
+            await mark_chat_run_terminal(
+                db,
+                persisted_run,
+                status="cancelled",
+                phase="cancelled",
+                error_classification="user_cancelled",
+            )
+            await db.commit()
         log.info("Chat REST run stopped", session_id=session_id, user_id=current_user.id)
         return JSONResponse(status_code=409, content={"detail": "Chat stopped by user"})
-    except Exception:
+    except Exception as exc:
         await db.rollback()
+        persisted_run = await db.get(ChatRun, chat_run.id)
+        if persisted_run is not None and persisted_run.status == "running":
+            await mark_chat_run_terminal(
+                db,
+                persisted_run,
+                status="failed",
+                phase="failed",
+                error_classification=type(exc).__name__,
+            )
+            await db.commit()
         raise
     finally:
         if prompt_claimed:
             await chat_run_manager.mark_prompt_finished(session_id, body.content)
         if current_task is not None:
             await chat_run_manager.clear(session_id, current_task)
+        if approval_token is not None:
+            _approval_armed.reset(approval_token)
         try:
             if record_token is not None:
                 restore_tool_execution_records(record_token)
@@ -981,15 +1090,321 @@ async def stop_chat_session(
     return StopChatResponse(stopped=stopped, session_id=session_id)
 
 
-@router.get("/sessions/{session_id}/status", response_model=ChatSessionStatusResponse)
+@router.get(
+    "/sessions/{session_id}/status",
+    response_model=ChatSessionStatusResponse,
+    response_model_exclude_none=True,
+    response_model_exclude_defaults=True,
+)
 async def get_chat_session_status(
     session_id: int,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ChatSessionStatusResponse:
     await _get_session_or_404(session_id, current_user.id, db)
-    active = await get_chat_run_manager().is_active(session_id)
-    return ChatSessionStatusResponse(session_id=session_id, active=active)
+    manager = get_chat_run_manager()
+    active = await manager.is_active(session_id)
+    run = await latest_chat_run(db, session_id)
+    if run is None:
+        return ChatSessionStatusResponse(session_id=session_id, active=active)
+    active = (await manager.active_run_id(session_id)) == run.id
+    if run.status == "running" and not active:
+        await mark_chat_run_terminal(
+            db,
+            run,
+            status="failed",
+            phase="interrupted",
+            error_classification="process_interrupted",
+        )
+        await db.commit()
+    return ChatSessionStatusResponse(**serialize_chat_run(run, active=active))
+
+
+@router.get("/runs/{run_id}/status")
+async def get_chat_run_status(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    run = await owned_chat_run(db, run_id=run_id, user_id=current_user.id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Chat run not found")
+    active = (await get_chat_run_manager().active_run_id(run.session_id)) == run.id
+    if run.status == "running" and not active:
+        await mark_chat_run_terminal(
+            db,
+            run,
+            status="failed",
+            phase="interrupted",
+            error_classification="process_interrupted",
+        )
+        await db.commit()
+    return serialize_chat_run(run, active=active)
+
+
+async def _persist_chat_approval_wait(
+    *,
+    db: AsyncSession,
+    run: ChatRun,
+    exc: ApprovalRequired,
+    pending_tool_calls: List[Dict[str, Any]],
+) -> ChatMessage:
+    blocked_arguments = dict((exc.payload or {}).get("arguments") or {})
+    matching_call = next(
+        (
+            call
+            for call in pending_tool_calls
+            if _tool_call_name_from_payload(call) == exc.tool_name
+            and (
+                not blocked_arguments
+                or _tool_call_arguments_from_payload(call) == blocked_arguments
+            )
+        ),
+        pending_tool_calls[0] if pending_tool_calls else None,
+    )
+    if not isinstance(matching_call, dict):
+        raise RuntimeError("Approval was requested without a captured tool call")
+    call_id = str(matching_call.get("id") or "").strip()
+    payload = dict(exc.payload or {})
+    payload.update(
+        {
+            "reason": exc.reason,
+            "approval_kind": exc.approval_kind,
+            "tool_call_id": call_id,
+        }
+    )
+    pending_message = ChatMessage(
+        session_id=run.session_id,
+        role="assistant",
+        content="",
+        tool_calls=json.dumps([matching_call], ensure_ascii=True, sort_keys=True),
+    )
+    db.add(pending_message)
+    run.status = "waiting_approval"
+    run.phase = "waiting_approval"
+    run.updated_at = datetime.now(timezone.utc)
+    run.approval_kind = exc.approval_kind
+    run.approval_payload = payload
+    await db.flush()
+    await db.commit()
+    return pending_message
+
+
+def _chat_approval_response(run: ChatRun, pending_message: ChatMessage) -> Dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": "Approval is required before I can perform that action.",
+        "message_id": int(pending_message.id),
+        "session_id": run.session_id,
+        "run_id": run.id,
+        "state": "waiting_approval",
+        "waiting_approval": serialize_chat_approval(run),
+        "metadata": {},
+    }
+
+
+@router.post("/runs/{run_id}/approval")
+async def decide_chat_run_approval(
+    run_id: str,
+    body: ChatApprovalDecision,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    run = await owned_chat_run(db, run_id=run_id, user_id=current_user.id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Chat run not found")
+    if run.status != "waiting_approval":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Chat run is not waiting for approval (status={run.status})",
+        )
+    session = await _get_session_or_404(run.session_id, current_user.id, db)
+    if session.is_incognito:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Persistent actions are disabled in incognito sessions.",
+        )
+    payload = run.approval_payload
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=409, detail="Chat run has no replayable approval payload")
+
+    decision_payload = dict(payload)
+    decision_payload["decision"] = "approved" if body.approved else "denied"
+    decision_payload["decided_at"] = datetime.now(timezone.utc).isoformat()
+    run.approval_payload = decision_payload
+    if not body.approved:
+        await mark_chat_run_terminal(
+            db,
+            run,
+            status="cancelled",
+            phase="approval_denied",
+            error_classification="approval_denied",
+        )
+        await db.commit()
+        return serialize_chat_run(run, active=False)
+
+    run.status = "running"
+    run.phase = "replaying_approved_tool"
+    await db.commit()
+    manager = get_chat_run_manager()
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        await manager.register(run.session_id, current_task, run_id=run.id)
+
+    record_token = reset_tool_execution_records()
+    runtime_history_token = reset_agent_runtime_history()
+    handoff_token = reset_task_handoff_payload()
+    approval_token = None
+    usage_token = bind_llm_usage_context(
+        user_id=current_user.id,
+        session_id=run.session_id,
+        chat_run_id=run.id,
+        source="chat_approval_resume",
+    )
+
+    async def _record_run_event(event: AgentEvent) -> None:
+        await apply_chat_run_event(db, run, event)
+        if event.type != AgentEventType.TEXT_DELTA:
+            await db.commit()
+
+    event_emitter = AgentEventEmitter(
+        run_id=run.id,
+        session_id=run.session_id,
+        callback=_record_run_event,
+        starting_sequence=int(run.last_event_sequence or 0),
+    )
+    try:
+        user_context = UserContext.from_user(current_user, persona_name=session.persona)
+        prompt_message = await db.get(ChatMessage, run.user_message_id) if run.user_message_id else None
+        user_prompt = str(getattr(prompt_message, "content", "") or "")
+        user_context = await hydrate_user_context(db, user_context, query=user_prompt)
+        user_context.session_id = run.session_id
+        user_context.is_incognito = False
+
+        replay_token = _approval_armed.set(False)
+        try:
+            replay_result, replay_details = await replay_waiting_approval_tool(payload, user_context)
+        finally:
+            _approval_armed.reset(replay_token)
+        tool_call_id = str(payload.get("tool_call_id") or "").strip()
+        await event_emitter.emit(
+            AgentEventType.TOOL_COMPLETED,
+            tool_call_id=tool_call_id,
+            tool_name=str(payload.get("tool_name") or "unknown"),
+            content_chars=len(str(replay_result or "")),
+            resumed_after_approval=True,
+        )
+        tool_message = ChatMessage(
+            session_id=run.session_id,
+            role="tool",
+            content=str(replay_result or ""),
+            tool_results=json.dumps(
+                {"tool_call_id": tool_call_id},
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+        )
+        db.add(tool_message)
+        run.phase = "approved_tool_completed"
+        await db.commit()
+
+        history = await _load_history(run.session_id, db)
+        pending_tool_calls: List[Dict[str, Any]] = []
+
+        async def _capture_pre_tool(tool_calls: List[Dict[str, Any]]) -> None:
+            pending_tool_calls.clear()
+            pending_tool_calls.extend(tool_calls)
+
+        _flush_runtime_messages, _flush_pending_runtime_history, _ = (
+            _build_runtime_history_flush_helpers(
+                session_id=run.session_id,
+                db=db,
+                get_runtime_history=get_agent_runtime_history,
+            )
+        )
+        approval_token = _approval_armed.set(True)
+        try:
+            reply = await _execute_chat_turn(
+                history,
+                user_context,
+                user_prompt=user_prompt,
+                mode=str(run.mode or "chat"),
+                model_override=run.model,
+                stage=str(run.stage or "chat_simple"),
+                enable_validation=False,
+                runtime_message_callback=_flush_runtime_messages,
+                pre_tool_callback=_capture_pre_tool,
+                event_emitter=event_emitter,
+            )
+        except ApprovalRequired as exc:
+            pending_message = await _persist_chat_approval_wait(
+                db=db,
+                run=run,
+                exc=exc,
+                pending_tool_calls=pending_tool_calls,
+            )
+            return _chat_approval_response(run, pending_message)
+
+        await _flush_pending_runtime_history()
+        reply = _ensure_generated_image_markdown_references(reply, get_tool_execution_records())
+        assistant_metadata = _build_assistant_message_metadata(
+            handoff_metadata=get_task_handoff_payload() or {},
+            executed_tools=get_tool_execution_records(),
+            recalled_memory_ids=[],
+        )
+        assistant_message = ChatMessage(
+            session_id=run.session_id,
+            role="assistant",
+            content=reply,
+            tool_results=(
+                _encode_assistant_message_metadata(assistant_metadata)
+                if assistant_metadata
+                else None
+            ),
+        )
+        db.add(assistant_message)
+        await db.flush()
+        run.approval_kind = None
+        await mark_chat_run_terminal(
+            db,
+            run,
+            status="completed",
+            phase="completed",
+            assistant_message_id=int(assistant_message.id),
+        )
+        await db.commit()
+        return {
+            "role": "assistant",
+            "content": reply,
+            "message_id": int(assistant_message.id),
+            "session_id": run.session_id,
+            "run_id": run.id,
+            "state": "completed",
+            "replayed_tool": replay_details,
+            "metadata": assistant_metadata or {},
+        }
+    except Exception as exc:
+        await db.rollback()
+        persisted_run = await db.get(ChatRun, run.id)
+        if persisted_run is not None and persisted_run.status == "running":
+            await mark_chat_run_terminal(
+                db,
+                persisted_run,
+                status="failed",
+                phase="failed",
+                error_classification=type(exc).__name__,
+            )
+            await db.commit()
+        raise
+    finally:
+        if approval_token is not None:
+            _approval_armed.reset(approval_token)
+        restore_tool_execution_records(record_token)
+        restore_agent_runtime_history(runtime_history_token)
+        restore_task_handoff_payload(handoff_token)
+        reset_llm_usage_context(usage_token)
+        if current_task is not None:
+            await manager.clear(run.session_id, current_task)
 
 
 async def _run_websocket_message(
@@ -1003,6 +1418,7 @@ async def _run_websocket_message(
     client_send_id: Optional[str],
     allowed_tools: Optional[List[str]],
     blocked_tools: Optional[List[str]],
+    approval_mode: bool = False,
 ) -> None:
     prompt_claimed = False
     send_id_claimed = False
@@ -1223,6 +1639,41 @@ async def _run_websocket_message(
         else:
             metrics.inc_chat_complexity_simple_count()
 
+        run_stage = "chat_complex" if effective_complex else "chat_simple"
+        chat_run = await create_chat_run(
+            db,
+            session_id=session_id,
+            user_id=current_user.id,
+            user_message_id=int(user_msg.id),
+            client_send_id=client_send_id,
+            model=session.llm_model,
+            mode=execution_mode,
+            stage=run_stage,
+        )
+        await db.commit()
+        await _send_json_if_open(
+            {
+                "type": "run_started",
+                "run_id": chat_run.id,
+                "session_id": session_id,
+            }
+        )
+        pending_tool_calls: List[Dict[str, Any]] = []
+
+        async def _record_run_event(event: AgentEvent) -> None:
+            await apply_chat_run_event(db, chat_run, event)
+            if event.type != AgentEventType.TEXT_DELTA:
+                await db.commit()
+
+        event_emitter = AgentEventEmitter(
+            run_id=chat_run.id,
+            session_id=session_id,
+            callback=_record_run_event,
+        )
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            await get_chat_run_manager().register(session_id, current_task, run_id=chat_run.id)
+        approval_token = _approval_armed.set(approval_mode and not bool(session.is_incognito))
         record_token = reset_tool_execution_records()
         handoff_token = reset_task_handoff_payload()
         runtime_history_token = reset_agent_runtime_history()
@@ -1231,6 +1682,7 @@ async def _run_websocket_message(
         usage_token = bind_llm_usage_context(
             user_id=current_user.id,
             session_id=session_id,
+            chat_run_id=chat_run.id,
             source="chat_websocket",
         )
         _flush_runtime_messages, _flush_pending_runtime_history, _get_consumed_runtime_message_count = (
@@ -1248,6 +1700,8 @@ async def _run_websocket_message(
                 await _emit_state("tool_completed", tool_names=tool_names)
 
         async def _emit_pre_tool_state(tool_calls: List[Dict[str, Any]]) -> None:
+            pending_tool_calls.clear()
+            pending_tool_calls.extend(tool_calls)
             tool_names = _tool_call_names_from_calls(tool_calls)
             tool_details = _build_live_tool_details(tool_calls)
             state = "image_rendering" if any(name == "generate_image" for name in tool_names) else "tool_active"
@@ -1284,7 +1738,10 @@ async def _run_websocket_message(
                     runtime_message_callback=_flush_runtime_messages_with_state,
                     pre_tool_callback=_emit_pre_tool_state,
                     state_callback=_emit_state,
+                    event_emitter=event_emitter,
                 )
+            except ApprovalRequired:
+                raise
             except Exception as e:
                 runtime_history_messages = await _flush_pending_runtime_history()
                 handoff_metadata = get_task_handoff_payload() or {}
@@ -1330,12 +1787,15 @@ async def _run_websocket_message(
                     runtime_message_callback=_flush_runtime_messages_with_state,
                     pre_tool_callback=_emit_pre_tool_state,
                     provisional_text_callback=_emit_provisional_text,
+                    event_emitter=event_emitter,
                 )
                 async with contextlib.aclosing(agent_stream):
                     async for token_chunk in agent_stream:
                         full_response.append(token_chunk)
                         if not provisional_draft_committed:
                             await _send_json_if_open({"type": "token", "content": token_chunk})
+            except ApprovalRequired:
+                raise
             except Exception as e:
                 runtime_history_messages = await _flush_pending_runtime_history()
                 handoff_metadata = get_task_handoff_payload() or {}
@@ -1391,6 +1851,14 @@ async def _run_websocket_message(
         )
         db.add(assistant_msg)
         await _mark_recalled_memories_materialized(db, _memory_ids)
+        await db.flush()
+        await mark_chat_run_terminal(
+            db,
+            chat_run,
+            status="completed",
+            phase="completed",
+            assistant_message_id=int(assistant_msg.id),
+        )
         await db.commit()
         _log_chat_latency_breakdown(
             session_id=session_id,
@@ -1406,6 +1874,7 @@ async def _run_websocket_message(
                 "type": "done",
                 "content": complete,
                 "message_id": int(assistant_msg.id),
+                "run_id": chat_run.id,
                 "metadata": {
                     "active_skills": list(user_context.active_skill_slugs or []),
                     "skill_selection_mode": user_context.skill_selection_mode or "",
@@ -1422,9 +1891,46 @@ async def _run_websocket_message(
             client_send_id=client_send_id or "",
             prompt_fingerprint=prompt_fingerprint,
             assistant_message_id=assistant_msg.id,
+            run_id=chat_run.id,
+        )
+    except ApprovalRequired as exc:
+        pending_message = await _persist_chat_approval_wait(
+            db=db,
+            run=chat_run,
+            exc=exc,
+            pending_tool_calls=pending_tool_calls,
+        )
+        await _emit_state(
+            "waiting_approval",
+            tool_names=[exc.tool_name],
+        )
+        await _send_json_if_open(
+            {
+                "type": "approval_required",
+                "run_id": chat_run.id,
+                "message_id": int(pending_message.id),
+                "waiting_approval": serialize_chat_approval(chat_run),
+            }
+        )
+        log.info(
+            "chat.websocket_waiting_approval",
+            session_id=session_id,
+            run_id=chat_run.id,
+            tool=exc.tool_name,
         )
     except asyncio.CancelledError:
         await db.rollback()
+        if "chat_run" in locals():
+            persisted_run = await db.get(ChatRun, chat_run.id)
+            if persisted_run is not None:
+                await mark_chat_run_terminal(
+                    db,
+                    persisted_run,
+                    status="cancelled",
+                    phase="cancelled",
+                    error_classification="user_cancelled",
+                )
+                await db.commit()
         log.info(
             "chat.websocket_message_stopped",
             session_id=session_id,
@@ -1433,8 +1939,19 @@ async def _run_websocket_message(
             client_send_id=client_send_id or "",
         )
         raise
-    except Exception:
+    except Exception as exc:
         await db.rollback()
+        if "chat_run" in locals():
+            persisted_run = await db.get(ChatRun, chat_run.id)
+            if persisted_run is not None and persisted_run.status == "running":
+                await mark_chat_run_terminal(
+                    db,
+                    persisted_run,
+                    status="failed",
+                    phase="failed",
+                    error_classification=type(exc).__name__,
+                )
+                await db.commit()
         log.exception(
             "chat.websocket_message_error",
             session_id=session_id,
@@ -1456,6 +1973,8 @@ async def _run_websocket_message(
             restore_task_handoff_payload(handoff_token)
         if "runtime_history_token" in locals():
             restore_agent_runtime_history(runtime_history_token)
+        if "approval_token" in locals() and approval_token is not None:
+            _approval_armed.reset(approval_token)
 
 
 # ── WebSocket /chat/sessions/{id}/ws (streaming) ─────────────────────────────
@@ -1531,12 +2050,14 @@ async def chat_websocket(
             client_send_id = message_data.get("client_send_id") if isinstance(message_data, dict) else None
             allowed_tools = message_data.get("allowed_tools") if isinstance(message_data, dict) else None
             blocked_tools = message_data.get("blocked_tools") if isinstance(message_data, dict) else None
+            approval_mode = bool(message_data.get("approval_mode", False)) if isinstance(message_data, dict) else False
             return ChatSocketPayload(
                 raw=message_data,
                 content=content,
                 client_send_id=client_send_id,
                 allowed_tools=allowed_tools,
                 blocked_tools=blocked_tools,
+                approval_mode=approval_mode,
             )
 
         async def _read_next_payload() -> Optional[ChatSocketPayload]:
@@ -1628,6 +2149,7 @@ async def chat_websocket(
                     client_send_id=message_payload.client_send_id,
                     allowed_tools=message_payload.allowed_tools,
                     blocked_tools=message_payload.blocked_tools,
+                    approval_mode=message_payload.approval_mode,
                 )
             )
             await chat_run_manager.register(session_id, active_message_task)
@@ -2081,6 +2603,7 @@ async def _execute_chat_turn(
     runtime_message_callback=None,
     pre_tool_callback=None,
     state_callback: Callable[..., Awaitable[None]] | None = None,
+    event_emitter: AgentEventEmitter | None = None,
 ) -> str:
     started = time.perf_counter()
     reply = await run_agent(
@@ -2091,6 +2614,7 @@ async def _execute_chat_turn(
         stage=stage,
         runtime_message_callback=runtime_message_callback,
         pre_tool_callback=pre_tool_callback,
+        event_emitter=event_emitter,
     )
     executed_tools = get_tool_execution_records()
     should_run_validation = settings.chat_validation_enabled and (enable_validation or bool(executed_tools))
@@ -2108,6 +2632,8 @@ async def _execute_chat_turn(
     while True:
         if state_callback is not None:
             await state_callback("validating")
+        if event_emitter is not None:
+            await event_emitter.emit(AgentEventType.VALIDATION_STARTED, attempt=attempts + 1)
         validation = validate_chat_response(
             user_prompt,
             current,
@@ -2134,6 +2660,12 @@ async def _execute_chat_turn(
         attempts += 1
         if state_callback is not None:
             await state_callback("retrying", retry_reason=validation.retry_reason, attempt=attempts)
+        if event_emitter is not None:
+            await event_emitter.emit(
+                AgentEventType.VALIDATION_RETRY,
+                retry_reason=validation.retry_reason,
+                attempt=attempts,
+            )
 
         retry_instruction = build_chat_retry_instruction(validation.retry_reason)
         corrective = {"role": "system", "content": retry_instruction}
@@ -2151,6 +2683,7 @@ async def _execute_chat_turn(
             stage=f"{stage}_retry",
             runtime_message_callback=runtime_message_callback,
             pre_tool_callback=pre_tool_callback,
+            event_emitter=event_emitter,
         )
 
 
@@ -2552,6 +3085,28 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
                 cleaned_images.append(cleaned_item)
             if cleaned_images:
                 normalized_evidence["image_artifacts"] = cleaned_images
+        citations = evidence.get("citations")
+        if isinstance(citations, list):
+            cleaned_citations = []
+            for item in citations[:12]:
+                if not isinstance(item, dict):
+                    continue
+                cleaned_item = {}
+                for key, max_len in (
+                    ("url", 500),
+                    ("title", 200),
+                    ("label", 200),
+                    ("source", 120),
+                    ("document", 300),
+                    ("path", 500),
+                ):
+                    value = str(item.get(key) or "").strip()
+                    if value:
+                        cleaned_item[key] = value[:max_len]
+                if cleaned_item:
+                    cleaned_citations.append(cleaned_item)
+            if cleaned_citations:
+                normalized_evidence["citations"] = cleaned_citations
         if normalized_evidence:
             normalized["evidence"] = normalized_evidence
 
@@ -2617,7 +3172,35 @@ def _build_assistant_evidence_metadata(
     image_artifacts = _build_assistant_image_artifacts(executed_tools)
     if image_artifacts:
         evidence["image_artifacts"] = image_artifacts
+    citations = _build_assistant_citations(executed_tools)
+    if citations:
+        evidence["citations"] = citations
     return evidence
+
+
+def _build_assistant_citations(executed_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    citations: List[Dict[str, Any]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for record in executed_tools or []:
+        if not isinstance(record, dict) or not isinstance(record.get("citations"), list):
+            continue
+        for item in record["citations"]:
+            if not isinstance(item, dict):
+                continue
+            cleaned = {
+                str(key): value
+                for key, value in item.items()
+                if str(key) in {"url", "title", "label", "source", "document", "path"}
+                and value not in (None, "")
+            }
+            key = tuple(sorted((name, str(value)) for name, value in cleaned.items()))
+            if not cleaned or key in seen:
+                continue
+            seen.add(key)
+            citations.append(cleaned)
+            if len(citations) >= 12:
+                return citations
+    return citations
 
 
 def _source_kind_for_url(url: str) -> str:
@@ -2687,7 +3270,12 @@ def _build_assistant_tool_details(executed_tools: List[Dict[str, Any]]) -> List[
             }
             if tool_name == "fetch_page" and detail_kind == "url":
                 detail["source_kind"] = _source_kind_for_url(value)
-                source_title = _extract_fetch_page_title(str(record.get("result_summary") or ""))
+                structured = record.get("structured_content")
+                source_title = (
+                    str(structured.get("title") or "").strip()
+                    if isinstance(structured, dict)
+                    else ""
+                ) or _extract_fetch_page_title(str(record.get("result_summary") or ""))
                 if source_title:
                     detail["source_title"] = source_title
             details.append(detail)
@@ -2707,7 +3295,22 @@ def _build_assistant_image_artifacts(executed_tools: List[Dict[str, Any]]) -> Li
         tool_name = str(record.get("tool") or "").strip()
         if tool_name not in _IMAGE_EVIDENCE_TOOL_NAMES:
             continue
-        payload = _parse_image_tool_result(record.get("result_summary"))
+        normalized_artifacts = record.get("artifacts")
+        payload = (
+            next(
+                (
+                    dict(item)
+                    for item in normalized_artifacts
+                    if isinstance(item, dict)
+                    and str(item.get("path") or item.get("image_path") or "").strip()
+                ),
+                None,
+            )
+            if isinstance(normalized_artifacts, list)
+            else None
+        )
+        if payload is None:
+            payload = _parse_image_tool_result(record.get("result_summary"))
         if not payload:
             continue
         image_path = str(payload.get("image_path") or payload.get("path") or "").strip()
