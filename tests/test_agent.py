@@ -27,6 +27,7 @@ from app.agent.core import (
     _acompletion_with_budget,
     _apply_provider_prompt_cache_kwargs,
     _build_messages,
+    _compact_tool_message,
     _filter_tools_for_prompt,
     _is_rss_owned_headline_prompt,
     _rewrite_headline_rss_tool_calls,
@@ -38,7 +39,43 @@ from app.agent.core import (
     restore_agent_loop_diagnostics,
     run_agent,
 )
-from app.agent.tools import TOOL_SCHEMAS, _parse_iso_datetime, _sample_document_chunks_evenly, get_tools_for_user
+
+
+def test_compact_tool_message_preserves_every_structured_catalog_entry():
+    workflows = [
+        {
+            "id": f"workflow_{index}",
+            "title": f"Workflow {index}",
+            "capabilities": ["textToImage", "imageToImage"],
+            "verbose_configuration": "X" * 500,
+        }
+        for index in range(13)
+    ]
+    message = {
+        "role": "tool",
+        "tool_call_id": "call_workflows",
+        "content": json.dumps({"workflows": workflows}),
+    }
+
+    compacted = _compact_tool_message(
+        message,
+        tool_name_lookup={"call_workflows": "list_image_workflows"},
+        max_chars=4000,
+    )
+
+    content = compacted["content"]
+    assert '"entry_count":13' in content
+    assert '"all_entries_retained":true' in content
+    assert "workflow_0" in content
+    assert "workflow_12" in content
+    assert "verbose_configuration" not in content
+from app.agent.tools import (
+    TOOL_SCHEMAS,
+    _parse_iso_datetime,
+    _sample_document_chunks_evenly,
+    get_tools_for_user,
+    normalize_tool_schema,
+)
 from app.config import settings
 from tests.conftest import TestSessionLocal
 
@@ -1616,6 +1653,47 @@ def test_get_task_schema_has_required_task_id():
     required = schema["function"]["parameters"].get("required", [])
     assert "task_id" in props
     assert required == ["task_id"]
+
+
+def test_normalize_tool_schema_adds_properties_to_free_form_objects():
+    source = {
+        "type": "function",
+        "function": {
+            "name": "dynamic_request",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "object", "description": "Free-form query values."},
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                },
+            },
+        },
+    }
+
+    normalized = normalize_tool_schema(source)
+
+    assert normalized["function"]["parameters"]["properties"]["query"]["properties"] == {}
+    assert normalized["function"]["parameters"]["properties"]["items"]["items"]["properties"] == {}
+    assert "properties" not in source["function"]["parameters"]["properties"]["query"]
+
+
+def test_get_tools_for_user_normalizes_builtin_free_form_object_schemas():
+    from unittest.mock import MagicMock, patch
+
+    ctx = _make_context(persona="family_assistant", blocked=[])
+    mock_registry = MagicMock()
+    mock_registry._is_ready = False
+
+    with patch("app.mcp.registry.get_mcp_registry", return_value=mock_registry):
+        tools = get_tools_for_user(ctx)
+
+    api_request = next(tool for tool in tools if tool["function"]["name"] == "api_request")
+    query_params = api_request["function"]["parameters"]["properties"]["query_params"]
+    assert query_params["type"] == "object"
+    assert query_params["properties"] == {}
 
 
 # ── Persona / blocked-tools filtering ─────────────────────────────────────────

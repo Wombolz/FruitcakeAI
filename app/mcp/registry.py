@@ -48,6 +48,28 @@ def _to_litellm_schema(tool: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _find_invalid_schema_field(value: Any, path: str = "parameters") -> str | None:
+    """Return the first malformed JSON Schema field that providers reject."""
+    if not isinstance(value, dict):
+        return f"{path} must be an object"
+    properties = value.get("properties")
+    if properties is not None and not isinstance(properties, dict):
+        return f"{path}.properties must be an object"
+    for key, child in value.items():
+        child_path = f"{path}.{key}"
+        if isinstance(child, dict):
+            invalid = _find_invalid_schema_field(child, child_path)
+            if invalid:
+                return invalid
+        elif isinstance(child, list):
+            for index, item in enumerate(child):
+                if isinstance(item, dict):
+                    invalid = _find_invalid_schema_field(item, f"{child_path}[{index}]")
+                    if invalid:
+                        return invalid
+    return None
+
+
 def _extract_text(result: Any) -> str:
     """
     Flatten an MCP tool result to a plain string for the LLM.
@@ -113,6 +135,7 @@ class MCPRegistry:
         self._raw_config: Dict[str, Any] = {}
         # Duplicate tool name conflicts (deterministic first-wins policy)
         self._duplicate_tools: List[Dict[str, Any]] = []
+        self._invalid_tools: List[Dict[str, Any]] = []
         self._is_ready = False
         self._server_tools: Dict[str, Tuple[str, List[Dict[str, Any]]]] = {}
 
@@ -122,6 +145,18 @@ class MCPRegistry:
         Duplicate names are retained in diagnostics and never silently override.
         """
         name = tool["name"]
+        schema = _to_litellm_schema(tool)
+        invalid_reason = _find_invalid_schema_field(schema["function"]["parameters"])
+        if invalid_reason:
+            diagnostic = {
+                "tool": name,
+                "server": server_name,
+                "type": server_type,
+                "reason": invalid_reason,
+            }
+            self._invalid_tools.append(diagnostic)
+            log.error("Invalid MCP tool schema (tool quarantined)", **diagnostic)
+            return
         if name in self._tool_map:
             existing_server, existing_type = self._tool_map[name]
             conflict = {
@@ -137,7 +172,7 @@ class MCPRegistry:
             return
 
         self._tool_map[name] = (server_name, server_type)
-        self._litellm_schemas.append(_to_litellm_schema(tool))
+        self._litellm_schemas.append(schema)
 
     def _set_server_tools(self, name: str, kind: str, tools: List[Dict[str, Any]]) -> None:
         # Rebuild atomically in config order so live changes preserve first-wins
@@ -146,6 +181,7 @@ class MCPRegistry:
         self._tool_map.clear()
         self._litellm_schemas.clear()
         self._duplicate_tools.clear()
+        self._invalid_tools.clear()
         order = dict.fromkeys([*self._server_configs, *self._server_tools])
         for server in order:
             server_kind, entries = self._server_tools.get(server, ("", []))
@@ -360,6 +396,7 @@ class MCPRegistry:
             "tools": tools,
             "disabled_servers": disabled,
             "duplicate_tools": list(self._duplicate_tools),
+            "invalid_tools": list(self._invalid_tools),
         }
 
     def get_diagnostics(self) -> Dict[str, Any]:
@@ -412,6 +449,7 @@ class MCPRegistry:
             "ready": self._is_ready,
             "tool_count": len(self._litellm_schemas),
             "duplicate_tools": list(self._duplicate_tools),
+            "invalid_tools": list(self._invalid_tools),
             "servers": servers,
         }
 

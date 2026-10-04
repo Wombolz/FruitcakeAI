@@ -1241,7 +1241,9 @@ def _compact_tool_message(
     max_chars: int,
 ) -> Dict[str, Any]:
     content = str(message.get("content") or "")
-    compact_summary = _compact_text(content, max_chars=max_chars)
+    compact_summary = _compact_structured_catalog(content, max_chars=max_chars)
+    if compact_summary is None:
+        compact_summary = _compact_text(content, max_chars=max_chars)
     tool_call_id = str(message.get("tool_call_id") or "").strip()
     tool_name = tool_name_lookup.get(tool_call_id) or "unknown_tool"
     compacted = (
@@ -1253,6 +1255,82 @@ def _compact_tool_message(
         f"Summary: {compact_summary}"
     )
     return {**message, "content": compacted}
+
+
+_CATALOG_IDENTITY_FIELDS = (
+    "id",
+    "name",
+    "title",
+    "label",
+    "slug",
+    "key",
+    "type",
+    "status",
+    "description",
+    "capabilities",
+)
+
+
+def _compact_structured_catalog(content: str, *, max_chars: int) -> str | None:
+    """Compact JSON catalogs without dropping entries from the middle or tail."""
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    list_fields = [(key, value) for key, value in payload.items() if isinstance(value, list)]
+    if len(list_fields) != 1 or not list_fields[0][1]:
+        return None
+    field_name, entries = list_fields[0]
+
+    projected: list[Any] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            projected.append(entry)
+            continue
+        summary: dict[str, Any] = {}
+        for key in _CATALOG_IDENTITY_FIELDS:
+            value = entry.get(key)
+            if isinstance(value, (str, int, float, bool)) and value not in ("", None):
+                summary[key] = value
+            elif isinstance(value, list) and all(isinstance(item, (str, int, float, bool)) for item in value):
+                summary[key] = value
+        if not summary:
+            for key, value in entry.items():
+                if isinstance(value, (str, int, float, bool)) and value not in ("", None):
+                    summary[key] = value
+                if len(summary) >= 3:
+                    break
+        projected.append(summary)
+
+    compact_payload = {
+        field_name: projected,
+        "_compaction": {
+            "all_entries_retained": True,
+            "entry_count": len(entries),
+            "detail_fields_omitted": True,
+        },
+    }
+    rendered = json.dumps(compact_payload, ensure_ascii=True, separators=(",", ":"))
+    if len(rendered) <= max_chars:
+        return rendered
+
+    identity_only: list[Any] = []
+    for entry in projected:
+        if not isinstance(entry, dict):
+            identity_only.append(entry)
+            continue
+        identity = {
+            key: entry[key]
+            for key in ("id", "name", "title", "label", "slug", "key", "type")
+            if key in entry
+        }
+        identity_only.append(identity or entry)
+    compact_payload[field_name] = identity_only
+    rendered = json.dumps(compact_payload, ensure_ascii=True, separators=(",", ":"))
+    return rendered if len(rendered) <= max_chars else None
 
 
 def _is_compaction_boundary_message(message: Dict[str, Any]) -> bool:

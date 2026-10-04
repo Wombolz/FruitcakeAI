@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
+import copy
 import io
 import json
 import logging
@@ -912,6 +913,34 @@ def is_incognito_blocked_tool(name: str) -> bool:
     return normalized.startswith(_INCOGNITO_MUTATING_PREFIXES)
 
 
+def _normalize_json_schema_objects(value: Any) -> Any:
+    """Give strict local-model parsers an explicit properties object."""
+    if isinstance(value, list):
+        return [_normalize_json_schema_objects(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    normalized = {
+        key: _normalize_json_schema_objects(child)
+        for key, child in value.items()
+    }
+    if normalized.get("type") == "object" and "properties" not in normalized:
+        normalized["properties"] = {}
+    return normalized
+
+
+def normalize_tool_schema(tool: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize one unified tool schema without mutating its registry source."""
+    normalized = copy.deepcopy(tool)
+    function = normalized.get("function")
+    if not isinstance(function, dict):
+        return normalized
+    parameters = function.get("parameters")
+    if isinstance(parameters, dict):
+        function["parameters"] = _normalize_json_schema_objects(parameters)
+    return normalized
+
+
 def get_tools_for_user(user_context: UserContext) -> List[Dict[str, Any]]:
     """
     Return the complete tool list for this user/persona.
@@ -946,7 +975,7 @@ def get_tools_for_user(user_context: UserContext) -> List[Dict[str, Any]]:
     if user_context.is_incognito:
         tools = [t for t in tools if not is_incognito_blocked_tool(t["function"]["name"])]
 
-    return tools
+    return [normalize_tool_schema(tool) for tool in tools]
 
 
 # ── Tool dispatch ─────────────────────────────────────────────────────────────

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.37
+
+- Added Brave Search as the preferred web-search provider when configured, with bounded DuckDuckGo fallback and provider-aware caching and diagnostics.
+- Prevented privacy-sensitive request and message locals from appearing in rendered application tracebacks while preserving useful exception stacks.
+- Hardened local and external MCP tool schemas by normalizing free-form object parameters and quarantining malformed schemas before they reach model providers.
+- Preserved every entry in structured catalog-style tool results during history compaction instead of silently dropping later entries.
+- Corrected chat validation so calendar and other non-research rundowns do not require citations, while web- and feed-grounded answers still require source links.
+
 ## v0.7.36
 
 - Unified streaming and collected chat execution around one canonical agent loop with typed lifecycle events, shared convergence behavior, centralized provider capabilities, and normalized structured tool results.

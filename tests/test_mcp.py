@@ -24,7 +24,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
-from app.mcp.registry import MCPRegistry, _extract_text, _serialize_user_context, _to_litellm_schema
+from app.mcp.registry import (
+    MCPRegistry,
+    _extract_text,
+    _find_invalid_schema_field,
+    _serialize_user_context,
+    _to_litellm_schema,
+)
 from app.mcp.client import MCPClient
 from app.agent.runtime.models import build_tool_call_result
 
@@ -60,6 +66,39 @@ def test_to_litellm_schema_missing_description():
     mcp_tool = {"name": "no_desc", "inputSchema": {"type": "object", "properties": {}}}
     result = _to_litellm_schema(mcp_tool)
     assert result["function"]["description"] == ""
+
+
+def test_find_invalid_schema_field_rejects_non_object_properties():
+    schema = {
+        "type": "object",
+        "properties": {
+            "options": {"type": "object", "properties": []},
+        },
+    }
+
+    assert _find_invalid_schema_field(schema) == "parameters.properties.options.properties must be an object"
+
+
+def test_registry_quarantines_invalid_tool_schema():
+    registry = MCPRegistry()
+    registry._register_tool(
+        {
+            "name": "broken_action",
+            "description": "Malformed dynamic action",
+            "inputSchema": {"type": "object", "properties": []},
+        },
+        "optional_server",
+        "stdio",
+    )
+
+    assert not registry.knows_tool("broken_action")
+    assert registry.get_tools_for_agent() == []
+    assert registry._invalid_tools == [{
+        "tool": "broken_action",
+        "server": "optional_server",
+        "type": "stdio",
+        "reason": "parameters.properties must be an object",
+    }]
 
 
 # ── _extract_text ──────────────────────────────────────────────────────────────

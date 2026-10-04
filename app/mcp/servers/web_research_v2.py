@@ -2,7 +2,7 @@
 FruitcakeAI v5 — Web Research MCP Server (internal_python) — v2
 
 Tools exposed to the agent:
-  web_search  — DuckDuckGo HTML search (no API key required)
+  web_search  — Brave Search API with a temporary DuckDuckGo fallback
   fetch_page  — Fetch and clean a URL's text content
 
 Designed to be called by the MCP registry:
@@ -25,6 +25,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 import structlog
 
+from app.config import settings
+
 log = structlog.get_logger(__name__)
 
 _HEADERS = {
@@ -38,6 +40,7 @@ _HEADERS = {
 }
 
 _DDG_SEARCH_URL = "https://html.duckduckgo.com/html/"
+_BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 _FETCH_TIMEOUT = 15
 _SEARCH_TIMEOUT = 15
 _MAX_PAGE_CHARS = 8000
@@ -57,7 +60,7 @@ _CACHE_MAX_ENTRIES = 128
 _WEB_SEARCH_SCHEMA: Dict[str, Any] = {
     "name": "web_search",
     "description": (
-        "Search the web using DuckDuckGo. Use this to look up current events, "
+        "Search the web. Use this to look up current events, "
         "factual information, product details, or anything that benefits from "
         "fresh web results. Returns titles, URLs, and snippets."
     ),
@@ -75,7 +78,7 @@ _WEB_SEARCH_SCHEMA: Dict[str, Any] = {
             },
             "region": {
                 "type": "string",
-                "description": "DuckDuckGo region code, e.g. us-en",
+                "description": "Search region code, e.g. us-en",
                 "default": "us-en",
             },
         },
@@ -208,7 +211,8 @@ async def _web_search(arguments: Dict[str, Any], user_context: Any = None) -> st
 
     region = (arguments.get("region") or "us-en").strip() or "us-en"
 
-    cache_key = f"search::{query}::{max_results}::{region}"
+    provider = "brave" if settings.brave_search_api_key.strip() else "duckduckgo"
+    cache_key = f"search::{provider}::{query}::{max_results}::{region}"
     cached = _SEARCH_CACHE.get(cache_key)
     if cached is not None:
         log.info("web_search cache_hit", query=query, max_results=max_results, region=region)
@@ -220,36 +224,22 @@ async def _web_search(arguments: Dict[str, Any], user_context: Any = None) -> st
 
     started = time.perf_counter()
 
-    try:
-        async with httpx.AsyncClient(
-            headers=_HEADERS,
-            timeout=httpx.Timeout(_SEARCH_TIMEOUT),
-            follow_redirects=True,
-        ) as client:
-            response = await client.post(
-                _DDG_SEARCH_URL,
-                data={"q": query, "b": "", "kl": region},
-            )
-            response.raise_for_status()
-    except httpx.TimeoutException:
-        log.warning("web_search timeout", query=query, region=region)
-        return f"Web search timed out for: {query}"
-    except httpx.HTTPStatusError as e:
-        status = e.response.status_code if e.response is not None else "unknown"
-        log.warning("web_search http_status_error", query=query, region=region, status=status)
-        return f"Web search failed with HTTP {status} for: {query}"
-    except httpx.RequestError as e:
-        log.warning("web_search request_error", query=query, region=region, error=str(e))
-        return f"Web search failed due to a network error: {e}"
-    except Exception as e:
-        log.exception("web_search unexpected_error", query=query, region=region, error=str(e))
-        return f"Web search failed unexpectedly: {e}"
+    results: List[Dict[str, str]] = []
+    failure = ""
+    if provider == "brave":
+        results, failure = await _search_brave(query, max_results, region)
+        if not results and settings.brave_search_fallback_to_ddg:
+            log.warning("web_search provider_fallback", primary="brave", fallback="duckduckgo", reason=failure)
+            results, fallback_failure = await _search_duckduckgo(query, max_results, region)
+            failure = fallback_failure or failure
+            provider = "duckduckgo_fallback"
+    else:
+        results, failure = await _search_duckduckgo(query, max_results, region)
 
-    results = _parse_ddg_html(response.text, max_results)
     if not results:
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
-        log.info("web_search no_results", query=query, region=region, elapsed_ms=elapsed_ms)
-        return f"No results found for: {query}"
+        log.info("web_search no_results", query=query, region=region, provider=provider, elapsed_ms=elapsed_ms)
+        return failure or f"No results found for: {query}"
 
     formatted = _format_search_results(query=query, results=results)
 
@@ -258,12 +248,100 @@ async def _web_search(arguments: Dict[str, Any], user_context: Any = None) -> st
         "web_search success",
         query=query,
         region=region,
+        provider=provider,
         result_count=len(results),
         elapsed_ms=elapsed_ms,
     )
 
     _SEARCH_CACHE.set(cache_key, formatted)
     return formatted
+
+
+def _brave_locale(region: str) -> tuple[str, str]:
+    parts = [part.lower() for part in str(region or "").replace("_", "-").split("-") if part]
+    country = parts[0] if parts and len(parts[0]) == 2 else "us"
+    language = parts[1] if len(parts) > 1 and len(parts[1]) == 2 else "en"
+    return country, language
+
+
+async def _search_brave(
+    query: str,
+    max_results: int,
+    region: str,
+) -> tuple[List[Dict[str, str]], str]:
+    country, language = _brave_locale(region)
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": settings.brave_search_api_key.strip(),
+    }
+    try:
+        async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(_SEARCH_TIMEOUT)) as client:
+            response = await client.get(
+                _BRAVE_SEARCH_URL,
+                params={
+                    "q": query,
+                    "count": max_results,
+                    "country": country,
+                    "search_lang": language,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.TimeoutException:
+        log.warning("web_search brave_timeout", query=query, region=region)
+        return [], f"Web search timed out for: {query}"
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        retry_after = exc.response.headers.get("X-RateLimit-Reset") if exc.response is not None else None
+        log.warning("web_search brave_http_error", query=query, region=region, status=status, retry_after=retry_after)
+        return [], f"Web search failed with HTTP {status} for: {query}"
+    except (httpx.RequestError, ValueError) as exc:
+        log.warning("web_search brave_request_error", query=query, region=region, error=str(exc))
+        return [], f"Web search failed due to a provider error for: {query}"
+
+    raw_results = ((payload.get("web") or {}).get("results") or []) if isinstance(payload, dict) else []
+    results: List[Dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        title = _clean_text_inline(str(item.get("title") or ""))
+        url = str(item.get("url") or "").strip()
+        snippet = _clean_text_inline(str(item.get("description") or ""))
+        if not title or not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        results.append({"title": title, "url": url, "snippet": snippet})
+        if len(results) >= max_results:
+            break
+    return results, "" if results else f"No results found for: {query}"
+
+
+async def _search_duckduckgo(
+    query: str,
+    max_results: int,
+    region: str,
+) -> tuple[List[Dict[str, str]], str]:
+    try:
+        async with httpx.AsyncClient(
+            headers=_HEADERS,
+            timeout=httpx.Timeout(_SEARCH_TIMEOUT),
+            follow_redirects=True,
+        ) as client:
+            response = await client.post(_DDG_SEARCH_URL, data={"q": query, "b": "", "kl": region})
+            response.raise_for_status()
+    except httpx.TimeoutException:
+        log.warning("web_search ddg_timeout", query=query, region=region)
+        return [], f"Web search timed out for: {query}"
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        log.warning("web_search ddg_http_error", query=query, region=region, status=status)
+        return [], f"Web search failed with HTTP {status} for: {query}"
+    except httpx.RequestError as exc:
+        log.warning("web_search ddg_request_error", query=query, region=region, error=str(exc))
+        return [], f"Web search failed due to a network error: {exc}"
+    return _parse_ddg_html(response.text, max_results), ""
 
 
 def _parse_ddg_html(html: str, max_results: int) -> List[Dict[str, str]]:
