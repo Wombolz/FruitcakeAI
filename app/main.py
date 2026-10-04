@@ -146,6 +146,7 @@ def create_app() -> FastAPI:
     from app.api.mcp_server import router as mcp_server_router
     from app.api.secrets import router as secrets_router
     from app.api.workspace import router as workspace_router
+    from app.api.settings import router as settings_router
 
     app.include_router(auth_router, prefix="/auth", tags=["auth"])
     app.include_router(admin_router, prefix="/admin", tags=["admin"])
@@ -160,6 +161,7 @@ def create_app() -> FastAPI:
     app.include_router(llm_router, prefix="/llm", tags=["llm"])
     app.include_router(mcp_server_router, prefix="/mcp/fruitcake", tags=["mcp"])
     app.include_router(workspace_router, prefix="/workspace", tags=["workspace"])
+    app.include_router(settings_router, prefix="/settings", tags=["settings"])
 
     return app
 

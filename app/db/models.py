@@ -5,6 +5,7 @@ Phase 4: Memory, Task, DeviceToken models added.
 """
 
 import json
+import uuid
 from datetime import datetime
 
 from sqlalchemy import (
@@ -35,6 +36,13 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
+    public_id = Column(
+        String(36),
+        unique=True,
+        index=True,
+        nullable=False,
+        default=lambda: str(uuid.uuid4()),
+    )
     username = Column(String(50), unique=True, index=True, nullable=False)
     email = Column(String(255), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
@@ -115,6 +123,12 @@ class User(Base):
         cascade="all, delete-orphan",
         foreign_keys="ApprovedHostRoot.user_id",
     )
+    assistant_preferences = relationship(
+        "UserAssistantPreferences",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
     @property
     def library_scopes(self) -> list[str]:
@@ -134,6 +148,23 @@ class User(Base):
 
     def __repr__(self):
         return f"<User(username='{self.username}', role='{self.role}')>"
+
+
+class UserAssistantPreferences(Base):
+    """User-owned preferences that do not belong to deployment policy."""
+
+    __tablename__ = "user_assistant_preferences"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    notifications_enabled = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    delivery_enabled = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    appearance = Column(String(20), default="system", server_default="system", nullable=False)
+    reduce_motion = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    version = Column(Integer, default=1, server_default="1", nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="assistant_preferences")
 
 
 class Document(Base):
