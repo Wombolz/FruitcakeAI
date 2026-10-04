@@ -240,7 +240,7 @@ async def _list_events(args: Dict[str, Any], user_context: Any) -> str:
     max_results = min(int(args.get("max_results", 20)), 100)
     calendar_id = args.get("calendar_id")
 
-    provider = _get_provider()
+    provider = await _resolve_provider(user_context)
     if provider is None:
         return _not_configured()
 
@@ -279,7 +279,7 @@ async def _create_event(args: Dict[str, Any], user_context: Any) -> str:
     if not title or not start or not end:
         return "Error: title, start, and end are required."
 
-    provider = _get_provider()
+    provider = await _resolve_provider(user_context)
     if provider is None:
         return _not_configured()
 
@@ -314,7 +314,7 @@ async def _delete_event(args: Dict[str, Any], user_context: Any) -> str:
     if args.get("confirm") is not True:
         return "Deletion requires explicit confirmation. Ask the user to confirm before deleting."
 
-    provider = _get_provider()
+    provider = await _resolve_provider(user_context)
     if provider is None:
         return _not_configured()
 
@@ -367,7 +367,7 @@ async def _search_events(args: Dict[str, Any], user_context: Any) -> str:
     start_dt = now - timedelta(days=days_back)
     end_dt = now + timedelta(days=days_forward)
 
-    provider = _get_provider()
+    provider = await _resolve_provider(user_context)
     if provider is None:
         return _not_configured()
 
@@ -470,11 +470,84 @@ def _get_provider() -> Optional[Any]:
     return None
 
 
+async def _resolve_provider(user_context: Any) -> Optional[Any]:
+    user_id = _user_id_from_context(user_context)
+    if user_id is None:
+        return _get_provider()
+
+    from app.db.session import AsyncSessionLocal
+    from app.integrations.service import (
+        refresh_google_integration,
+        resolve_user_integration,
+    )
+
+    async with AsyncSessionLocal() as db:
+        google = await resolve_user_integration(
+            db, user_id=user_id, provider="google", service="calendar"
+        )
+        if google is not None:
+            now = datetime.now(timezone.utc)
+            expires_at = google.expires_at
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at is not None and expires_at <= now + timedelta(seconds=60) and google.refresh_token:
+                try:
+                    await refresh_google_integration(db, user_id=user_id)
+                    await db.commit()
+                    google = await resolve_user_integration(
+                        db, user_id=user_id, provider="google", service="calendar"
+                    )
+                except Exception as exc:
+                    await db.rollback()
+                    log.warning("Google Calendar token refresh failed", user_id=user_id, error_class=exc.__class__.__name__)
+            if google is not None and google.access_token:
+                return _GoogleProvider(
+                    access_token=google.access_token,
+                    refresh_token=google.refresh_token,
+                    expires_at=google.expires_at,
+                    default_calendar=str(google.config.get("default_calendar") or "primary"),
+                )
+
+        apple = await resolve_user_integration(
+            db, user_id=user_id, provider="apple", service="calendar"
+        )
+        if apple is not None and apple.credential:
+            return _AppleProvider(
+                url=str(apple.config.get("url") or ""),
+                username=str(apple.config.get("username") or apple.account_identifier),
+                password=apple.credential,
+                default_calendar=str(apple.config.get("default_calendar") or "home"),
+            )
+
+    if settings.calendar_allow_deployment_fallback_for_users:
+        log.warning("Using deployment calendar fallback", user_id=user_id)
+        return _get_provider()
+    return None
+
+
+def _user_id_from_context(user_context: Any) -> int | None:
+    if isinstance(user_context, dict):
+        value = user_context.get("user_id")
+    else:
+        value = getattr(user_context, "user_id", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def verify_apple_caldav(*, url: str, username: str, password: str) -> None:
+    """Verify credentials before persisting a user-owned CalDAV connection."""
+    provider = _AppleProvider(url=url, username=username, password=password)
+    principal = await provider._get_principal()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: list(principal.calendars()))
+
+
 def _not_configured() -> str:
     return (
-        "Calendar integration is not configured. "
-        "To enable Google Calendar: set GOOGLE_CALENDAR_ENABLED=true and configure a service account. "
-        "To enable Apple Calendar: set APPLE_CALDAV_ENABLED=true with your CalDAV URL and app password."
+        "Calendar integration is not connected for this user. "
+        "Connect Google Calendar or Apple Calendar in Settings and try again."
     )
 
 
@@ -542,7 +615,14 @@ class _EventPayload:
 class _GoogleProvider:
     """Google Calendar API. Requires google-api-python-client google-auth."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        access_token: str = "",
+        refresh_token: str = "",
+        expires_at: datetime | None = None,
+        default_calendar: str = "",
+    ):
         try:
             import googleapiclient  # noqa: F401
         except ImportError:
@@ -550,29 +630,47 @@ class _GoogleProvider:
                 "google-api-python-client not installed. "
                 "Run: pip install google-api-python-client google-auth"
             )
-        if not settings.google_calendar_enabled:
+        if not access_token and not settings.google_calendar_enabled:
             raise RuntimeError("GOOGLE_CALENDAR_ENABLED=false")
+        self._access_token = access_token
+        self._refresh_token = refresh_token
+        self._expires_at = expires_at
+        self._default_calendar = default_calendar
         self._service = None
         self._lock = asyncio.Lock()
 
     def default_calendar_id(self) -> str:
-        return settings.google_calendar_default_id or "primary"
+        return self._default_calendar or settings.google_calendar_default_id or "primary"
 
     async def _get_service(self):
         async with self._lock:
             if self._service:
                 return self._service
             from google.oauth2 import service_account
+            from google.oauth2.credentials import Credentials
             from googleapiclient.discovery import build
 
-            sa_file = settings.google_calendar_service_account_file
-            if not sa_file:
-                raise RuntimeError("GOOGLE_CALENDAR_SERVICE_ACCOUNT_FILE not set")
-
             scopes = ["https://www.googleapis.com/auth/calendar"]
-            creds = service_account.Credentials.from_service_account_file(sa_file, scopes=scopes)
-            if settings.google_calendar_delegated_user:
-                creds = creds.with_subject(settings.google_calendar_delegated_user)
+            if self._access_token:
+                credential_expiry = self._expires_at
+                if credential_expiry is not None and credential_expiry.tzinfo is not None:
+                    credential_expiry = credential_expiry.astimezone(timezone.utc).replace(tzinfo=None)
+                creds = Credentials(
+                    token=self._access_token,
+                    refresh_token=self._refresh_token or None,
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=settings.google_oauth_client_id or None,
+                    client_secret=settings.google_oauth_client_secret or None,
+                    scopes=scopes,
+                    expiry=credential_expiry,
+                )
+            else:
+                sa_file = settings.google_calendar_service_account_file
+                if not sa_file:
+                    raise RuntimeError("GOOGLE_CALENDAR_SERVICE_ACCOUNT_FILE not set")
+                creds = service_account.Credentials.from_service_account_file(sa_file, scopes=scopes)
+                if settings.google_calendar_delegated_user:
+                    creds = creds.with_subject(settings.google_calendar_delegated_user)
 
             loop = asyncio.get_running_loop()
             self._service = await loop.run_in_executor(
@@ -667,27 +765,38 @@ class _GoogleProvider:
 class _AppleProvider:
     """Apple Calendar via CalDAV. Requires caldav icalendar."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        url: str = "",
+        username: str = "",
+        password: str = "",
+        default_calendar: str = "",
+    ):
         try:
             import caldav  # noqa: F401
         except ImportError:
             raise RuntimeError("caldav not installed. Run: pip install caldav icalendar")
-        if not settings.apple_caldav_enabled:
+        if not url and not settings.apple_caldav_enabled:
             raise RuntimeError("APPLE_CALDAV_ENABLED=false")
-        if not settings.apple_caldav_url or not settings.apple_caldav_username:
+        effective_url = url or settings.apple_caldav_url
+        effective_username = username or settings.apple_caldav_username
+        effective_password = password or settings.apple_caldav_app_password
+        if not effective_url or not effective_username:
             raise RuntimeError("APPLE_CALDAV_URL and APPLE_CALDAV_USERNAME required")
 
         import caldav
         self._client = caldav.DAVClient(
-            settings.apple_caldav_url,
-            username=settings.apple_caldav_username,
-            password=settings.apple_caldav_app_password,
+            effective_url,
+            username=effective_username,
+            password=effective_password,
         )
+        self._default_calendar = default_calendar
         self._principal = None
         self._lock = asyncio.Lock()
 
     def default_calendar_id(self) -> str:
-        return settings.apple_caldav_default_calendar or "home"
+        return self._default_calendar or settings.apple_caldav_default_calendar or "home"
 
     async def _get_principal(self):
         async with self._lock:

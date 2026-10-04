@@ -92,6 +92,7 @@ class User(Base):
     memory_relations = relationship("MemoryRelation", back_populates="user", cascade="all, delete-orphan")
     memory_observations = relationship("MemoryObservation", back_populates="user", cascade="all, delete-orphan")
     secrets = relationship("Secret", back_populates="user", cascade="all, delete-orphan")
+    integrations = relationship("UserIntegration", back_populates="user", cascade="all, delete-orphan")
     secret_access_events = relationship("SecretAccessEvent", back_populates="user", cascade="all, delete-orphan")
     webhook_configs = relationship("WebhookConfig", back_populates="user", cascade="all, delete-orphan")
     rss_sources = relationship("RSSSource", back_populates="user", cascade="all, delete-orphan")
@@ -372,6 +373,72 @@ class SecretAccessEvent(Base):
             f"<SecretAccessEvent(user_id={self.user_id}, secret_name='{self.secret_name}', "
             f"tool_name='{self.tool_name}', success={self.success})>"
         )
+
+
+class UserIntegration(Base):
+    """One user-owned external account connection for a provider service."""
+
+    __tablename__ = "user_integrations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "provider", "service", name="uq_user_integration_provider_service"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    public_id = Column(String(36), unique=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider = Column(String(50), nullable=False)
+    service = Column(String(50), nullable=False)
+    status = Column(String(30), nullable=False, default="connected", server_default="connected")
+    account_identifier = Column(String(255), nullable=True)
+    scopes_json = Column(Text, nullable=False, default="[]", server_default="[]")
+    config_json = Column(Text, nullable=False, default="{}", server_default="{}")
+    access_token_secret_id = Column(Integer, ForeignKey("secrets.id", ondelete="SET NULL"), nullable=True)
+    refresh_token_secret_id = Column(Integer, ForeignKey("secrets.id", ondelete="SET NULL"), nullable=True)
+    credential_secret_id = Column(Integer, ForeignKey("secrets.id", ondelete="SET NULL"), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    last_success_at = Column(DateTime(timezone=True), nullable=True)
+    error_class = Column(String(100), nullable=True)
+    error_message = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="integrations")
+    access_token_secret = relationship("Secret", foreign_keys=[access_token_secret_id])
+    refresh_token_secret = relationship("Secret", foreign_keys=[refresh_token_secret_id])
+    credential_secret = relationship("Secret", foreign_keys=[credential_secret_id])
+
+    @property
+    def scopes(self) -> list[str]:
+        return json.loads(self.scopes_json or "[]")
+
+    @scopes.setter
+    def scopes(self, value: list[str]) -> None:
+        self.scopes_json = json.dumps(value)
+
+    @property
+    def config(self) -> dict:
+        return json.loads(self.config_json or "{}")
+
+    @config.setter
+    def config(self, value: dict) -> None:
+        self.config_json = json.dumps(value)
+
+
+class IntegrationOAuthState(Base):
+    """Short-lived, one-time state for a user-owned OAuth connection flow."""
+
+    __tablename__ = "integration_oauth_states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    nonce = Column(String(100), unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider = Column(String(50), nullable=False)
+    service = Column(String(50), nullable=False)
+    redirect_uri = Column(String(500), nullable=False)
+    code_challenge = Column(String(128), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 

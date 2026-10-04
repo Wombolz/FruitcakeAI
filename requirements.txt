@@ -50,9 +50,9 @@ beautifulsoup4>=4.12.0
 feedparser>=6.0.0
 filelock==3.20.3
 
-# ── Calendar integrations (optional — install only if using) ──────────────────
-# Google Calendar: pip install google-api-python-client google-auth
-#   then set GOOGLE_CALENDAR_ENABLED=true in .env
+# ── Calendar integrations ─────────────────────────────────────────────────────
+google-api-python-client>=2.0,<3
+google-auth>=2.0,<3
 caldav>=1.3.0
 icalendar>=5.0.0
 

@@ -164,6 +164,9 @@ class Settings(BaseSettings):
     google_calendar_service_account_file: str = ""
     google_calendar_delegated_user: str = ""   # e.g. "you@gmail.com" for domain-wide delegation
     google_calendar_default_id: str = "primary"
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
+    google_oauth_redirect_uri: str = ""
 
     # ── Apple CalDAV (optional) ────────────────────────────────────────────────
     apple_caldav_enabled: bool = False
@@ -171,6 +174,7 @@ class Settings(BaseSettings):
     apple_caldav_username: str = ""     # Apple ID email
     apple_caldav_app_password: str = "" # App-specific password from appleid.apple.com
     apple_caldav_default_calendar: str = "home"
+    calendar_allow_deployment_fallback_for_users: bool = True
 
     # ── APNs Push (Phase 4 Sprint 4.3) ────────────────────────────────────────
     # Leave empty to disable push (tasks still run, results not pushed to device)
