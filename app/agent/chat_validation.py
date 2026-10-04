@@ -35,6 +35,31 @@ DETAIL_FOLLOWUP_KEYWORDS = {
     "rundown",
     "ship seizure",
 }
+SOURCE_LINK_KEYWORDS = {
+    "research",
+    "headline",
+    "headlines",
+    "news",
+    "sources",
+    "source",
+    "citation",
+    "citations",
+    "web",
+    "search",
+    "article",
+    "articles",
+    "story",
+    "stories",
+}
+SOURCE_LINK_TOOLS = {
+    "web_search",
+    "fetch_page",
+    "get_feed_items",
+    "search_feeds",
+    "list_recent_feed_items",
+    "search_my_feeds",
+    "search_my_feeds_timeline",
+}
 TOOL_LEAKAGE_PATTERNS = (
     r"\(to=functions\.[^)]+\)",
     r"\bthe tool name must be provided correctly\b",
@@ -153,6 +178,7 @@ TASK_UPDATE_SUCCESS_PATTERNS = (
 @dataclass
 class ChatValidationResult:
     is_research_style: bool
+    requires_source_links: bool
     is_empty_result: bool
     has_tool_call_leakage: bool
     has_continuation_narration: bool
@@ -173,6 +199,7 @@ def validate_chat_response(
     prompt = (user_prompt or "").strip().lower()
     text = (response or "").strip()
     is_research_style = _is_validation_worthy_prompt(prompt)
+    requires_source_links = _requires_source_links(prompt, executed_tools or [])
     has_tool_call_leakage = _has_tool_call_leakage(text)
     has_continuation_narration = _has_continuation_narration(text, executed_tools or [])
     mutation_unconfirmed = _is_calendar_mutation_prompt(prompt) and _claims_calendar_mutation_success(text) and not _calendar_mutation_confirmed(executed_tools or [])
@@ -206,7 +233,7 @@ def validate_chat_response(
         elif invalid_urls:
             should_retry = True
             retry_reason = "invalid_links"
-        elif not valid_urls:
+        elif requires_source_links and not valid_urls:
             should_retry = True
             retry_reason = "missing_links"
         elif empty_result:
@@ -234,6 +261,7 @@ def validate_chat_response(
 
     return ChatValidationResult(
         is_research_style=is_research_style,
+        requires_source_links=requires_source_links,
         is_empty_result=empty_result,
         has_tool_call_leakage=has_tool_call_leakage,
         has_continuation_narration=has_continuation_narration,
@@ -310,6 +338,16 @@ def should_validate_chat_response(
 def _is_validation_worthy_prompt(prompt: str) -> bool:
     return any(word in prompt for word in RESEARCH_KEYWORDS) or any(
         phrase in prompt for phrase in DETAIL_FOLLOWUP_KEYWORDS
+    )
+
+
+def _requires_source_links(prompt: str, executed_tools: list[dict[str, Any]]) -> bool:
+    if any(word in prompt for word in SOURCE_LINK_KEYWORDS):
+        return True
+    return any(
+        str(record.get("tool") or "").strip() in SOURCE_LINK_TOOLS
+        for record in executed_tools
+        if isinstance(record, dict)
     )
 
 

@@ -42,6 +42,29 @@ def test_validate_chat_response_accepts_valid_research_links():
     assert out.valid_urls == ["https://apnews.com/article/something"]
 
 
+def test_validate_chat_response_does_not_require_links_for_calendar_rundown():
+    out = validate_chat_response(
+        "Give me a rundown of the events for the next week on my calendar",
+        "Sunday: Saturn at Opposition. Tuesday: Soccer Practice from 5 to 6 PM.",
+        executed_tools=[{"tool": "list_events", "result_summary": "Two events found."}],
+    )
+
+    assert out.is_research_style is True
+    assert out.requires_source_links is False
+    assert out.should_retry is False
+
+
+def test_validate_chat_response_requires_links_when_web_tool_supplied_evidence():
+    out = validate_chat_response(
+        "What happened today?",
+        "A major announcement was made this afternoon.",
+        executed_tools=[{"tool": "web_search", "result_summary": "Search results"}],
+    )
+
+    assert out.requires_source_links is True
+    assert out.retry_reason == "missing_links"
+
+
 def test_validate_chat_response_flags_tool_call_leakage():
     out = validate_chat_response(
         "Check my rss sources for the latest news on Iran and cite sources",
@@ -720,6 +743,8 @@ async def test_calendar_prompt_with_typo_does_not_block_tools(client):
         model_override=None,
         stage=None,
         runtime_message_callback=None,
+        pre_tool_callback=None,
+        event_emitter=None,
     ):
         captured["blocked_tools"] = list(user_context.blocked_tools or [])
         return "ok"

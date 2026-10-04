@@ -14,8 +14,10 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.db.session import engine
+from app.logging_config import configure_application_logging
 from app.metrics import metrics
 
+configure_application_logging()
 log = structlog.get_logger(__name__)
 
 

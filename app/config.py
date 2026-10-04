@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     # ── Application ──────────────────────────────────────────────────────────
     app_name: str = "FruitcakeAI"
-    app_version: str = "0.7.36"
+    app_version: str = "0.7.37"
     debug: bool = False
     log_level: str = "INFO"
     app_port: int = 30417
@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     gemini_models: str = ""
     local_models: str = ""
     secrets_master_key: str = ""
+    # Web search. Brave is preferred when configured; DuckDuckGo remains a
+    # no-key fallback during the provider transition.
+    brave_search_api_key: str = ""
+    brave_search_fallback_to_ddg: bool = True
     # For Ollama / llama.cpp (openai_compat)
     local_api_base: str = "http://localhost:11434/v1"
     local_api_key: str = "sk-local"
