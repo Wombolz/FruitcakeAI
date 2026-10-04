@@ -37,6 +37,9 @@ class EffectiveUserSettings:
 
 @dataclass(frozen=True)
 class _PreferenceSnapshot:
+    preferred_model_profile_id: int | None
+    preferred_vision_model_profile_id: int | None
+    preferred_reasoning_effort: str
     notifications_enabled: bool
     delivery_enabled: bool
     appearance: str
@@ -59,10 +62,55 @@ class UserSettingsResolver:
         *,
         overrides: Mapping[str, Any] | None = None,
     ) -> EffectiveUserSettings:
+        from app.model_profiles import get_model_profile_service
+
+        profile_service = get_model_profile_service()
+        await profile_service.ensure_loaded(db)
         preferences = await self._load_preferences(db, user)
+        preferred_model = profile_service.for_database_id(
+            preferences.preferred_model_profile_id if preferences else None
+        )
+        if preferred_model is not None and not preferred_model.enabled:
+            preferred_model = None
+        deployment_model = profile_service.for_model(settings.llm_model)
+        if deployment_model is not None and not deployment_model.enabled:
+            deployment_model = None
+        effective_model = preferred_model or deployment_model
+        preferred_vision = profile_service.for_database_id(
+            preferences.preferred_vision_model_profile_id if preferences else None
+        )
+        if preferred_vision is not None and (not preferred_vision.enabled or not preferred_vision.supports_vision):
+            preferred_vision = None
+        requested_reasoning = preferences.preferred_reasoning_effort if preferences and preferred_model else ""
+        user_reasoning = (
+            requested_reasoning
+            if effective_model is not None and requested_reasoning in effective_model.reasoning_efforts
+            else ""
+        )
+        effective_reasoning = user_reasoning or (
+            effective_model.default_reasoning_effort if effective_model is not None else ""
+        )
         values: dict[str, ResolvedSetting] = {
-            "default_chat_model": ResolvedSetting(settings.llm_model, "deployment"),
-            "default_vision_model": ResolvedSetting(settings.image_vision_model or None, "deployment"),
+            "default_chat_model": ResolvedSetting(
+                preferred_model.model_id if preferred_model else settings.llm_model,
+                "user" if preferred_model else "deployment",
+            ),
+            "model_profile_id": ResolvedSetting(
+                effective_model.public_id if effective_model else None,
+                "user" if preferred_model else "deployment",
+            ),
+            "default_vision_model": ResolvedSetting(
+                preferred_vision.model_id if preferred_vision else (settings.image_vision_model or None),
+                "user" if preferred_vision else "deployment",
+            ),
+            "vision_model_profile_id": ResolvedSetting(
+                preferred_vision.public_id if preferred_vision else None,
+                "user" if preferred_vision else "deployment",
+            ),
+            "reasoning_effort": ResolvedSetting(
+                effective_reasoning or None,
+                "user" if user_reasoning else ("admin" if effective_reasoning else "deployment"),
+            ),
             "chat_routing_preference": ResolvedSetting(
                 user.chat_routing_preference or "auto",
                 "user",
@@ -121,6 +169,9 @@ class UserSettingsResolver:
             )
         ).scalar_one_or_none()
         snapshot = None if row is None else _PreferenceSnapshot(
+            preferred_model_profile_id=row.preferred_model_profile_id,
+            preferred_vision_model_profile_id=row.preferred_vision_model_profile_id,
+            preferred_reasoning_effort=str(row.preferred_reasoning_effort or ""),
             notifications_enabled=bool(row.notifications_enabled),
             delivery_enabled=bool(row.delivery_enabled),
             appearance=str(row.appearance or "system"),

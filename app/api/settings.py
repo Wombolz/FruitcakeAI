@@ -14,6 +14,7 @@ from app.auth.dependencies import get_current_user
 from app.db.models import User, UserAssistantPreferences
 from app.db.session import get_db
 from app.settings_service import EffectiveUserSettings, get_user_settings_resolver
+from app.model_profiles import get_model_profile_service
 from app.time_utils import is_valid_timezone_name
 
 
@@ -32,7 +33,10 @@ class UserSettingsOut(BaseModel):
     public_id: str
     version: int
     default_chat_model: SettingValueOut
+    model_profile_id: SettingValueOut
     default_vision_model: SettingValueOut
+    vision_model_profile_id: SettingValueOut
+    reasoning_effort: SettingValueOut
     chat_routing_preference: SettingValueOut
     timezone: SettingValueOut
     active_hours_start: SettingValueOut
@@ -47,6 +51,9 @@ class UpdateUserSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_version: int | None = None
+    preferred_model_profile_id: str | None = None
+    preferred_vision_model_profile_id: str | None = None
+    preferred_reasoning_effort: str | None = None
     chat_routing_preference: Literal["auto", "fast", "deep"] | None = None
     timezone: str | None = None
     active_hours_start: str | None = None
@@ -87,6 +94,8 @@ async def update_my_settings(
     if not fields:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No settings supplied")
     _validate_schedule_fields(body, fields)
+    profile_service = get_model_profile_service()
+    await profile_service.ensure_loaded(db)
 
     row = (
         await db.execute(
@@ -105,6 +114,28 @@ async def update_my_settings(
     if row is None:
         row = UserAssistantPreferences(user_id=current_user.id)
         db.add(row)
+
+    selected_model = profile_service.for_public_id(body.preferred_model_profile_id) if body.preferred_model_profile_id else None
+    selected_vision = profile_service.for_public_id(body.preferred_vision_model_profile_id) if body.preferred_vision_model_profile_id else None
+    if "preferred_model_profile_id" in fields:
+        if body.preferred_model_profile_id and (selected_model is None or not selected_model.enabled):
+            raise HTTPException(status_code=422, detail="preferred_model_profile_id is unavailable")
+        row.preferred_model_profile_id = selected_model.database_id if selected_model else None
+        if selected_model is None or row.preferred_reasoning_effort not in selected_model.reasoning_efforts:
+            row.preferred_reasoning_effort = None
+    if "preferred_vision_model_profile_id" in fields:
+        if body.preferred_vision_model_profile_id and (
+            selected_vision is None or not selected_vision.enabled or not selected_vision.supports_vision
+        ):
+            raise HTTPException(status_code=422, detail="preferred_vision_model_profile_id is not an available vision model")
+        row.preferred_vision_model_profile_id = selected_vision.database_id if selected_vision else None
+    if "preferred_reasoning_effort" in fields:
+        effective_model = selected_model or profile_service.for_database_id(row.preferred_model_profile_id)
+        if body.preferred_reasoning_effort and (
+            effective_model is None or body.preferred_reasoning_effort not in effective_model.reasoning_efforts
+        ):
+            raise HTTPException(status_code=422, detail="preferred_reasoning_effort is unsupported by the selected model")
+        row.preferred_reasoning_effort = body.preferred_reasoning_effort
 
     if "chat_routing_preference" in fields:
         current_user.chat_routing_preference = body.chat_routing_preference or "auto"

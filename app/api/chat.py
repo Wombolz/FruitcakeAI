@@ -81,7 +81,12 @@ from app.chat_runtime import (
     serialize_chat_approval,
     serialize_chat_run,
 )
-from app.llm_registry import available_llm_models, is_configured_model
+from app.model_profiles import (
+    get_model_profile_service,
+    model_profile_to_dict,
+    reasoning_effort_for_model,
+)
+from app.settings_service import get_user_settings_resolver
 from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
 from app.mcp.servers.filesystem import resolve_workspace_path_for_user
@@ -363,9 +368,11 @@ async def list_tools(
 @router.get("/models")
 async def list_models(
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     del current_user
-    return {"models": available_llm_models()}
+    profiles = await get_model_profile_service().list_profiles(db, enabled_only=True)
+    return {"models": [model_profile_to_dict(profile) for profile in profiles]}
 
 
 # ── POST /chat/sessions ───────────────────────────────────────────────────────
@@ -381,11 +388,12 @@ async def create_session(
             status_code=403,
             detail="Incognito sessions are limited to admin users.",
         )
+    effective_settings = await get_user_settings_resolver().resolve(db, current_user)
     session = ChatSession(
         user_id=current_user.id,
         title=body.title or ("Incognito session" if body.is_incognito else "New conversation"),
         persona=current_user.persona or "family_assistant",
-        llm_model=settings.llm_model,
+        llm_model=str(effective_settings.value("default_chat_model") or settings.llm_model),
         sort_order=0,
         is_incognito=body.is_incognito,
     )
@@ -647,7 +655,10 @@ async def update_session_model(
     current_user: User = Depends(get_current_user),
 ) -> ChatSession:
     requested = body.llm_model.strip()
-    if not is_configured_model(requested):
+    profile_service = get_model_profile_service()
+    await profile_service.ensure_loaded(db)
+    profile = profile_service.for_model(requested)
+    if profile is None or not profile.enabled:
         raise HTTPException(status_code=400, detail=f"Unknown or unavailable model '{requested}'")
 
     session = await _get_session_or_404(session_id, current_user.id, db)
@@ -731,6 +742,11 @@ async def send_message(
     request_started = time.perf_counter()
     stage_timings_ms: Dict[str, float] = {}
     session = await _get_session_or_404(session_id, current_user.id, db)
+    effective_user_settings = await get_user_settings_resolver().resolve(db, current_user)
+    reasoning_effort = reasoning_effort_for_model(
+        session.llm_model,
+        effective_user_settings.value("reasoning_effort"),
+    )
     request_fingerprint = str(abs(hash(" ".join(str(body.content or "").split()))))[:12]
     prompt_claimed = False
 
@@ -932,6 +948,7 @@ async def send_message(
                 user_prompt=body.content,
                 mode=execution_mode,
                 model_override=session.llm_model,
+                reasoning_effort_override=reasoning_effort,
                 stage=run_stage,
                 enable_validation=should_validate,
                 runtime_message_callback=_flush_runtime_messages,
@@ -1275,6 +1292,11 @@ async def decide_chat_run_approval(
     )
     try:
         user_context = UserContext.from_user(current_user, persona_name=session.persona)
+        effective_user_settings = await get_user_settings_resolver().resolve(db, current_user)
+        reasoning_effort = reasoning_effort_for_model(
+            run.model,
+            effective_user_settings.value("reasoning_effort"),
+        )
         prompt_message = await db.get(ChatMessage, run.user_message_id) if run.user_message_id else None
         user_prompt = str(getattr(prompt_message, "content", "") or "")
         user_context = await hydrate_user_context(db, user_context, query=user_prompt)
@@ -1330,6 +1352,7 @@ async def decide_chat_run_approval(
                 user_prompt=user_prompt,
                 mode=str(run.mode or "chat"),
                 model_override=run.model,
+                reasoning_effort_override=reasoning_effort,
                 stage=str(run.stage or "chat_simple"),
                 enable_validation=False,
                 runtime_message_callback=_flush_runtime_messages,
@@ -1551,6 +1574,11 @@ async def _run_websocket_message(
             db=db,
         )
 
+        effective_user_settings = await get_user_settings_resolver().resolve(db, current_user)
+        reasoning_effort = reasoning_effort_for_model(
+            session.llm_model,
+            effective_user_settings.value("reasoning_effort"),
+        )
         user_context = UserContext.from_user(current_user, persona_name=session.persona)
         _apply_tool_overrides(
             user_context,
@@ -1733,6 +1761,7 @@ async def _run_websocket_message(
                     user_prompt=user_message,
                     mode=execution_mode,
                     model_override=session.llm_model,
+                    reasoning_effort_override=reasoning_effort,
                     stage="chat_complex" if effective_complex else "chat_simple",
                     enable_validation=True,
                     runtime_message_callback=_flush_runtime_messages_with_state,
@@ -1783,6 +1812,7 @@ async def _run_websocket_message(
                     user_context,
                     mode=execution_mode,
                     model_override=session.llm_model,
+                    reasoning_effort_override=reasoning_effort,
                     stage="chat_simple",
                     runtime_message_callback=_flush_runtime_messages_with_state,
                     pre_tool_callback=_emit_pre_tool_state,
@@ -2600,6 +2630,7 @@ async def _execute_chat_turn(
     model_override: str | None,
     stage: str,
     enable_validation: bool,
+    reasoning_effort_override: str | None = None,
     runtime_message_callback=None,
     pre_tool_callback=None,
     state_callback: Callable[..., Awaitable[None]] | None = None,
@@ -2611,6 +2642,7 @@ async def _execute_chat_turn(
         user_context,
         mode=mode,
         model_override=model_override,
+        reasoning_effort_override=reasoning_effort_override,
         stage=stage,
         runtime_message_callback=runtime_message_callback,
         pre_tool_callback=pre_tool_callback,
@@ -2680,6 +2712,7 @@ async def _execute_chat_turn(
             user_context,
             mode=mode,
             model_override=model_override,
+            reasoning_effort_override=reasoning_effort_override,
             stage=f"{stage}_retry",
             runtime_message_callback=runtime_message_callback,
             pre_tool_callback=pre_tool_callback,

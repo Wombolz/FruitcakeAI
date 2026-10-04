@@ -156,6 +156,9 @@ class UserAssistantPreferences(Base):
     __tablename__ = "user_assistant_preferences"
 
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    preferred_model_profile_id = Column(Integer, ForeignKey("model_profiles.id", ondelete="SET NULL"), nullable=True)
+    preferred_vision_model_profile_id = Column(Integer, ForeignKey("model_profiles.id", ondelete="SET NULL"), nullable=True)
+    preferred_reasoning_effort = Column(String(20), nullable=True)
     notifications_enabled = Column(Boolean, default=True, server_default=text("true"), nullable=False)
     delivery_enabled = Column(Boolean, default=True, server_default=text("true"), nullable=False)
     appearance = Column(String(20), default="system", server_default="system", nullable=False)
@@ -165,6 +168,60 @@ class UserAssistantPreferences(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     user = relationship("User", back_populates="assistant_preferences")
+    preferred_model_profile = relationship("ModelProfile", foreign_keys=[preferred_model_profile_id])
+    preferred_vision_model_profile = relationship("ModelProfile", foreign_keys=[preferred_vision_model_profile_id])
+
+
+class ModelProfile(Base):
+    """Validated runtime capabilities for one provider-qualified model."""
+
+    __tablename__ = "model_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    public_id = Column(String(36), unique=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    model_id = Column(String(200), unique=True, index=True, nullable=False)
+    display_name = Column(String(200), nullable=False)
+    provider_family = Column(String(50), nullable=False)
+    enabled = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    is_local = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    supports_text = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    supports_vision = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    supports_tools = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    supports_thinking = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    supports_native_streaming = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    reasoning_efforts_json = Column(Text, default="[]", server_default="[]", nullable=False)
+    default_reasoning_effort = Column(String(20), nullable=True)
+    tool_mode = Column(String(20), default="enabled", server_default="enabled", nullable=False)
+    allowed_tools_json = Column(Text, default="[]", server_default="[]", nullable=False)
+    blocked_tools_json = Column(Text, default="[]", server_default="[]", nullable=False)
+    keep_alive = Column(String(30), nullable=True)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    @property
+    def reasoning_efforts(self) -> list[str]:
+        return json.loads(self.reasoning_efforts_json or "[]")
+
+    @reasoning_efforts.setter
+    def reasoning_efforts(self, value: list[str]) -> None:
+        self.reasoning_efforts_json = json.dumps(value)
+
+    @property
+    def allowed_tools(self) -> list[str]:
+        return json.loads(self.allowed_tools_json or "[]")
+
+    @allowed_tools.setter
+    def allowed_tools(self, value: list[str]) -> None:
+        self.allowed_tools_json = json.dumps(value)
+
+    @property
+    def blocked_tools(self) -> list[str]:
+        return json.loads(self.blocked_tools_json or "[]")
+
+    @blocked_tools.setter
+    def blocked_tools(self, value: list[str]) -> None:
+        self.blocked_tools_json = json.dumps(value)
 
 
 class Document(Base):

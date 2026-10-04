@@ -44,11 +44,15 @@ async def override_get_db():
 @pytest.fixture(autouse=True)
 async def setup_db():
     """Create all tables before each test; drop them after."""
+    from app.model_profiles import get_model_profile_service
+
+    get_model_profile_service().clear()
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+    get_model_profile_service().clear()
 
 
 @pytest.fixture

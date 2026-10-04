@@ -741,6 +741,7 @@ async def test_calendar_prompt_with_typo_does_not_block_tools(client):
         user_context,
         mode="chat",
         model_override=None,
+        reasoning_effort_override=None,
         stage=None,
         runtime_message_callback=None,
         pre_tool_callback=None,
