@@ -225,6 +225,53 @@ class ModelProfile(Base):
         self.blocked_tools_json = json.dumps(value)
 
 
+class UserModelAccess(Base):
+    """Explicit per-user model policy; absence means deployment defaults apply."""
+
+    __tablename__ = "user_model_access"
+    __table_args__ = (
+        UniqueConstraint("user_id", "model_profile_id", name="uq_user_model_access_profile"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    model_profile_id = Column(
+        Integer,
+        ForeignKey("model_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    allowed = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class AdminPolicyEvent(Base):
+    """Content-free audit trail for administrative identity and access changes."""
+
+    __tablename__ = "admin_policy_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    target_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    action = Column(String(100), nullable=False, index=True)
+    summary_json = Column(Text, default="{}", server_default="{}", nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    @property
+    def summary(self) -> dict:
+        try:
+            value = json.loads(self.summary_json or "{}")
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @summary.setter
+    def summary(self, value: dict) -> None:
+        self.summary_json = json.dumps(value if isinstance(value, dict) else {})
+
+
 class Document(Base):
     __tablename__ = "documents"
 

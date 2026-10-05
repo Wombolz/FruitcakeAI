@@ -34,6 +34,7 @@ from app.autonomy.approval import approval_reason_for_tool
 from app.autonomy.push import get_apns_pusher
 from app.config import settings
 from app.db.models import (
+    AdminPolicyEvent,
     AuditLog,
     ChatRun,
     DeviceToken,
@@ -48,7 +49,9 @@ from app.db.models import (
     TaskRun,
     TaskStep,
     User,
+    UserModelAccess,
 )
+from app.model_profiles import get_model_profile_service
 from app.db.models import TaskRunArtifact
 from app.db.session import get_db
 from app.chat_runtime import build_chat_run_inspection, get_chat_run_manager
@@ -80,6 +83,8 @@ class UserOut(BaseModel):
     calendar_access: List[str]
     is_active: bool
     created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+    last_login: Optional[datetime]
 
     class Config:
         from_attributes = True
@@ -104,6 +109,55 @@ class UpdateUserRequest(BaseModel):
     library_scopes: Optional[List[str]] = None
     calendar_access: Optional[List[str]] = None
     is_active: Optional[bool] = None
+
+
+class UserModelAccessUpdate(BaseModel):
+    allowed_profile_ids: List[str]
+
+
+class UserModelAccessItem(BaseModel):
+    profile_id: str
+    model_id: str
+    display_name: str
+    provider_family: str
+    enabled: bool
+    allowed: bool
+    source: str
+
+
+class UserModelAccessOut(BaseModel):
+    user_id: int
+    policy_mode: str
+    models: List[UserModelAccessItem]
+
+
+class AdminPolicyEventOut(BaseModel):
+    id: int
+    actor_user_id: Optional[int]
+    target_user_id: Optional[int]
+    action: str
+    summary: Dict[str, Any]
+    created_at: datetime
+
+
+VALID_USER_ROLES = {"admin", "parent", "restricted", "guest"}
+
+
+def _record_policy_event(
+    db: AsyncSession,
+    *,
+    actor_user_id: int,
+    target_user_id: int,
+    action: str,
+    summary: Dict[str, Any],
+) -> None:
+    event = AdminPolicyEvent(
+        actor_user_id=actor_user_id,
+        target_user_id=target_user_id,
+        action=action,
+    )
+    event.summary = summary
+    db.add(event)
 
 
 class TestPushRequest(BaseModel):
@@ -1188,6 +1242,8 @@ async def create_user(
     current_user: User = Depends(require_admin),
 ) -> User:
     """Create a new user account (admin only)."""
+    if body.role not in VALID_USER_ROLES:
+        raise HTTPException(status_code=400, detail=f"Unknown role '{body.role}'")
     result = await db.execute(
         select(User).where(
             (User.username == body.username) | (User.email == body.email)
@@ -1220,6 +1276,13 @@ async def create_user(
 
     db.add(user)
     await db.flush()
+    _record_policy_event(
+        db,
+        actor_user_id=current_user.id,
+        target_user_id=user.id,
+        action="user.created",
+        summary={"role": user.role, "persona": user.persona},
+    )
     await db.refresh(user)
     return user
 
@@ -1240,6 +1303,10 @@ async def update_user(
         raise HTTPException(status_code=404, detail="User not found")
 
     if body.role is not None:
+        if body.role not in VALID_USER_ROLES:
+            raise HTTPException(status_code=400, detail=f"Unknown role '{body.role}'")
+        if user.id == current_user.id and body.role != "admin":
+            raise HTTPException(status_code=400, detail="You cannot remove your own admin role")
         user.role = body.role
 
     if body.persona is not None:
@@ -1266,11 +1333,128 @@ async def update_user(
         user.calendar_access = body.calendar_access
 
     if body.is_active is not None:
+        if user.id == current_user.id and not body.is_active:
+            raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
         user.is_active = body.is_active
 
+    changed_fields = sorted(body.model_fields_set)
+    _record_policy_event(
+        db,
+        actor_user_id=current_user.id,
+        target_user_id=user.id,
+        action="user.updated",
+        summary={"changed_fields": changed_fields},
+    )
     await db.flush()
     await db.refresh(user)
     return user
+
+
+async def _user_model_access_payload(db: AsyncSession, user_id: int) -> UserModelAccessOut:
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    service = get_model_profile_service()
+    profiles = await service.list_profiles(db)
+    rows = (
+        await db.execute(select(UserModelAccess).where(UserModelAccess.user_id == user_id))
+    ).scalars().all()
+    policy = {row.model_profile_id: bool(row.allowed) for row in rows}
+    explicit = bool(policy)
+    return UserModelAccessOut(
+        user_id=user_id,
+        policy_mode="explicit" if explicit else "deployment_default",
+        models=[
+            UserModelAccessItem(
+                profile_id=profile.public_id,
+                model_id=profile.model_id,
+                display_name=profile.display_name,
+                provider_family=profile.provider_family,
+                enabled=profile.enabled,
+                allowed=policy.get(profile.database_id, profile.enabled if not explicit else False),
+                source="explicit" if explicit else "deployment_default",
+            )
+            for profile in profiles
+        ],
+    )
+
+
+@router.get("/users/{user_id}/model-access", response_model=UserModelAccessOut)
+async def get_user_model_access(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> UserModelAccessOut:
+    return await _user_model_access_payload(db, user_id)
+
+
+@router.put("/users/{user_id}/model-access", response_model=UserModelAccessOut)
+async def update_user_model_access(
+    user_id: int,
+    body: UserModelAccessUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> UserModelAccessOut:
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    service = get_model_profile_service()
+    profiles = await service.list_profiles(db)
+    by_public_id = {profile.public_id: profile for profile in profiles}
+    requested = set(body.allowed_profile_ids)
+    unknown = sorted(requested - set(by_public_id))
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown model profile ids: {', '.join(unknown)}")
+
+    existing = {
+        row.model_profile_id: row
+        for row in (
+            await db.execute(select(UserModelAccess).where(UserModelAccess.user_id == user_id))
+        ).scalars().all()
+    }
+    for profile in profiles:
+        row = existing.get(profile.database_id)
+        if row is None:
+            row = UserModelAccess(user_id=user_id, model_profile_id=profile.database_id)
+            db.add(row)
+        row.allowed = profile.public_id in requested
+        row.updated_by_user_id = current_user.id
+
+    _record_policy_event(
+        db,
+        actor_user_id=current_user.id,
+        target_user_id=user_id,
+        action="model_access.updated",
+        summary={"allowed_profile_ids": sorted(requested), "allowed_count": len(requested)},
+    )
+    await db.flush()
+    from app.settings_service import get_user_settings_resolver
+    get_user_settings_resolver().invalidate(user)
+    return await _user_model_access_payload(db, user_id)
+
+
+@router.get("/policy-audit", response_model=List[AdminPolicyEventOut])
+async def list_policy_audit(
+    target_user_id: Optional[int] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> List[AdminPolicyEventOut]:
+    query = select(AdminPolicyEvent).order_by(AdminPolicyEvent.created_at.desc()).limit(limit)
+    if target_user_id is not None:
+        query = query.where(AdminPolicyEvent.target_user_id == target_user_id)
+    rows = (await db.execute(query)).scalars().all()
+    return [
+        AdminPolicyEventOut(
+            id=row.id,
+            actor_user_id=row.actor_user_id,
+            target_user_id=row.target_user_id,
+            action=row.action,
+            summary=row.summary,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
 
 
 # ── GET /admin/audit ──────────────────────────────────────────────────────────

@@ -62,25 +62,41 @@ class UserSettingsResolver:
         *,
         overrides: Mapping[str, Any] | None = None,
     ) -> EffectiveUserSettings:
+        from app.model_access import allowed_model_profiles, model_access_map
         from app.model_profiles import get_model_profile_service
 
         profile_service = get_model_profile_service()
         await profile_service.ensure_loaded(db)
+        allowed_profiles = await allowed_model_profiles(db, user.id)
+        allowed_ids = {profile.database_id for profile in allowed_profiles}
+        explicit_model_policy = bool(await model_access_map(db, user.id))
         preferences = await self._load_preferences(db, user)
         preferred_model = profile_service.for_database_id(
             preferences.preferred_model_profile_id if preferences else None
         )
-        if preferred_model is not None and not preferred_model.enabled:
+        if preferred_model is not None and (
+            not preferred_model.enabled or preferred_model.database_id not in allowed_ids
+        ):
             preferred_model = None
         deployment_model = profile_service.for_model(settings.llm_model)
-        if deployment_model is not None and not deployment_model.enabled:
+        if deployment_model is not None and (
+            not deployment_model.enabled or deployment_model.database_id not in allowed_ids
+        ):
             deployment_model = None
-        effective_model = preferred_model or deployment_model
+        fallback_model = next((profile for profile in allowed_profiles if profile.supports_text), None)
+        effective_model = preferred_model or deployment_model or fallback_model
         preferred_vision = profile_service.for_database_id(
             preferences.preferred_vision_model_profile_id if preferences else None
         )
-        if preferred_vision is not None and (not preferred_vision.enabled or not preferred_vision.supports_vision):
+        if preferred_vision is not None and (
+            not preferred_vision.enabled
+            or not preferred_vision.supports_vision
+            or preferred_vision.database_id not in allowed_ids
+        ):
             preferred_vision = None
+        fallback_vision = next((profile for profile in allowed_profiles if profile.supports_vision), None)
+        effective_vision = preferred_vision or fallback_vision
+        deployment_vision_value = None if explicit_model_policy else (settings.image_vision_model or None)
         requested_reasoning = preferences.preferred_reasoning_effort if preferences and preferred_model else ""
         user_reasoning = (
             requested_reasoning
@@ -92,20 +108,20 @@ class UserSettingsResolver:
         )
         values: dict[str, ResolvedSetting] = {
             "default_chat_model": ResolvedSetting(
-                preferred_model.model_id if preferred_model else settings.llm_model,
-                "user" if preferred_model else "deployment",
+                effective_model.model_id if effective_model else None,
+                "user" if preferred_model else ("deployment" if deployment_model else "admin"),
             ),
             "model_profile_id": ResolvedSetting(
                 effective_model.public_id if effective_model else None,
-                "user" if preferred_model else "deployment",
+                "user" if preferred_model else ("deployment" if deployment_model else "admin"),
             ),
             "default_vision_model": ResolvedSetting(
-                preferred_vision.model_id if preferred_vision else (settings.image_vision_model or None),
-                "user" if preferred_vision else "deployment",
+                effective_vision.model_id if effective_vision else deployment_vision_value,
+                "user" if preferred_vision else ("admin" if explicit_model_policy else "deployment"),
             ),
             "vision_model_profile_id": ResolvedSetting(
-                preferred_vision.public_id if preferred_vision else None,
-                "user" if preferred_vision else "deployment",
+                effective_vision.public_id if effective_vision else None,
+                "user" if preferred_vision else ("admin" if explicit_model_policy else "deployment"),
             ),
             "reasoning_effort": ResolvedSetting(
                 effective_reasoning or None,

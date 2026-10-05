@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import User
 from app.db.session import get_db
 from app.model_profiles import get_model_profile_service, model_profile_to_dict
+from app.model_access import allowed_model_profiles
 
 router = APIRouter()
 
@@ -19,6 +20,5 @@ async def list_llm_models(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
-    del current_user
-    profiles = await get_model_profile_service().list_profiles(db, enabled_only=True)
+    profiles = await allowed_model_profiles(db, current_user.id)
     return {"models": [model_profile_to_dict(profile) for profile in profiles]}

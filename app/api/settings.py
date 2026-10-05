@@ -15,6 +15,7 @@ from app.db.models import User, UserAssistantPreferences
 from app.db.session import get_db
 from app.settings_service import EffectiveUserSettings, get_user_settings_resolver
 from app.model_profiles import get_model_profile_service
+from app.model_access import model_is_allowed
 from app.time_utils import is_valid_timezone_name
 
 
@@ -118,14 +119,15 @@ async def update_my_settings(
     selected_model = profile_service.for_public_id(body.preferred_model_profile_id) if body.preferred_model_profile_id else None
     selected_vision = profile_service.for_public_id(body.preferred_vision_model_profile_id) if body.preferred_vision_model_profile_id else None
     if "preferred_model_profile_id" in fields:
-        if body.preferred_model_profile_id and (selected_model is None or not selected_model.enabled):
+        if body.preferred_model_profile_id and not await model_is_allowed(db, current_user.id, selected_model):
             raise HTTPException(status_code=422, detail="preferred_model_profile_id is unavailable")
         row.preferred_model_profile_id = selected_model.database_id if selected_model else None
         if selected_model is None or row.preferred_reasoning_effort not in selected_model.reasoning_efforts:
             row.preferred_reasoning_effort = None
     if "preferred_vision_model_profile_id" in fields:
         if body.preferred_vision_model_profile_id and (
-            selected_vision is None or not selected_vision.enabled or not selected_vision.supports_vision
+            not await model_is_allowed(db, current_user.id, selected_vision)
+            or not selected_vision.supports_vision
         ):
             raise HTTPException(status_code=422, detail="preferred_vision_model_profile_id is not an available vision model")
         row.preferred_vision_model_profile_id = selected_vision.database_id if selected_vision else None

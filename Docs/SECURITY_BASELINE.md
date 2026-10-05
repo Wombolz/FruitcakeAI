@@ -1,6 +1,6 @@
 # Security Baseline
 
-This document describes the current security baseline for FruitcakeAI as of release `v0.7.22`.
+This document describes the current security baseline for FruitcakeAI as of release `v0.7.37`.
 
 It is not a formal security audit. It is the minimum operator and contributor reference for understanding:
 
@@ -35,6 +35,8 @@ This baseline assumes a trusted local network or a deliberately hardened reverse
   - `guest`
 - Admin endpoints are protected by `require_admin`.
 - Inactive or missing users are rejected at the auth dependency layer.
+- Administrators can assign explicit per-user model allow-lists. Those policies constrain model discovery, saved preferences, session model changes, and later turns in already-open sessions.
+- Administrative authority covers identity and access metadata; it does not implicitly expose another user's chats, documents, memories, or integration credentials.
 
 ### Local-first operation
 
@@ -84,6 +86,7 @@ This baseline assumes a trusted local network or a deliberately hardened reverse
 - Task runs are persisted separately from tasks.
 - Task run artifacts preserve prepared datasets, draft/final output, validation reports, and run diagnostics.
 - Audit logs persist tool-call traces for admin review.
+- Separate content-free policy events record user lifecycle and model-access changes without copying private conversation or library content into the audit trail.
 - Memory deletes are soft deletes, preserving history unless explicitly redesigned later.
 
 ## Operator Responsibilities
@@ -133,6 +136,8 @@ These are mandatory for any deployment beyond personal local testing.
 
 - `/admin/health`
 - `/admin/users`
+- `/admin/users/{id}/model-access`
+- `/admin/policy-audit`
 - `/admin/audit`
 - `/admin/task-runs`
 - `/admin/task-runs/{id}/inspect`

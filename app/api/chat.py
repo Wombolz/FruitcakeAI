@@ -86,6 +86,7 @@ from app.model_profiles import (
     model_profile_to_dict,
     reasoning_effort_for_model,
 )
+from app.model_access import allowed_model_profiles, model_id_is_allowed, model_is_allowed
 from app.settings_service import get_user_settings_resolver
 from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
@@ -370,8 +371,7 @@ async def list_models(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
-    del current_user
-    profiles = await get_model_profile_service().list_profiles(db, enabled_only=True)
+    profiles = await allowed_model_profiles(db, current_user.id)
     return {"models": [model_profile_to_dict(profile) for profile in profiles]}
 
 
@@ -389,11 +389,17 @@ async def create_session(
             detail="Incognito sessions are limited to admin users.",
         )
     effective_settings = await get_user_settings_resolver().resolve(db, current_user)
+    default_model = effective_settings.value("default_chat_model")
+    if not default_model:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No chat model is available for your account. Ask an administrator to update model access.",
+        )
     session = ChatSession(
         user_id=current_user.id,
         title=body.title or ("Incognito session" if body.is_incognito else "New conversation"),
         persona=current_user.persona or "family_assistant",
-        llm_model=str(effective_settings.value("default_chat_model") or settings.llm_model),
+        llm_model=str(default_model),
         sort_order=0,
         is_incognito=body.is_incognito,
     )
@@ -658,7 +664,7 @@ async def update_session_model(
     profile_service = get_model_profile_service()
     await profile_service.ensure_loaded(db)
     profile = profile_service.for_model(requested)
-    if profile is None or not profile.enabled:
+    if not await model_is_allowed(db, current_user.id, profile):
         raise HTTPException(status_code=400, detail=f"Unknown or unavailable model '{requested}'")
 
     session = await _get_session_or_404(session_id, current_user.id, db)
@@ -742,6 +748,11 @@ async def send_message(
     request_started = time.perf_counter()
     stage_timings_ms: Dict[str, float] = {}
     session = await _get_session_or_404(session_id, current_user.id, db)
+    if not await model_id_is_allowed(db, current_user.id, session.llm_model):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This model is no longer available for your account. Choose another model to continue.",
+        )
     effective_user_settings = await get_user_settings_resolver().resolve(db, current_user)
     reasoning_effort = reasoning_effort_for_model(
         session.llm_model,
@@ -2168,6 +2179,14 @@ async def chat_websocket(
             await db.refresh(current_user, attribute_names=["chat_routing_preference"])
             sr = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
             session = sr.scalar_one_or_none() or session
+            if not await model_id_is_allowed(db, current_user.id, session.llm_model):
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "content": "This model is no longer available for your account. Choose another model to continue.",
+                    }
+                )
+                return
             active_message_task = asyncio.create_task(
                 _run_websocket_message(
                     session_id=session_id,
