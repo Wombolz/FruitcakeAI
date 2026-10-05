@@ -8,6 +8,7 @@ import contextlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -129,6 +130,7 @@ async def test_me(client):
     resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     assert resp.json()["username"] == "eve"
+    assert UUID(resp.json()["public_id"]).version == 4
     assert resp.json()["chat_routing_preference"] == "auto"
 
 

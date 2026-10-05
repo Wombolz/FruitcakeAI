@@ -5,6 +5,7 @@ Phase 4: Memory, Task, DeviceToken models added.
 """
 
 import json
+import uuid
 from datetime import datetime
 
 from sqlalchemy import (
@@ -35,6 +36,13 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
+    public_id = Column(
+        String(36),
+        unique=True,
+        index=True,
+        nullable=False,
+        default=lambda: str(uuid.uuid4()),
+    )
     username = Column(String(50), unique=True, index=True, nullable=False)
     email = Column(String(255), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
@@ -84,6 +92,7 @@ class User(Base):
     memory_relations = relationship("MemoryRelation", back_populates="user", cascade="all, delete-orphan")
     memory_observations = relationship("MemoryObservation", back_populates="user", cascade="all, delete-orphan")
     secrets = relationship("Secret", back_populates="user", cascade="all, delete-orphan")
+    integrations = relationship("UserIntegration", back_populates="user", cascade="all, delete-orphan")
     secret_access_events = relationship("SecretAccessEvent", back_populates="user", cascade="all, delete-orphan")
     webhook_configs = relationship("WebhookConfig", back_populates="user", cascade="all, delete-orphan")
     rss_sources = relationship("RSSSource", back_populates="user", cascade="all, delete-orphan")
@@ -115,6 +124,12 @@ class User(Base):
         cascade="all, delete-orphan",
         foreign_keys="ApprovedHostRoot.user_id",
     )
+    assistant_preferences = relationship(
+        "UserAssistantPreferences",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
     @property
     def library_scopes(self) -> list[str]:
@@ -134,6 +149,127 @@ class User(Base):
 
     def __repr__(self):
         return f"<User(username='{self.username}', role='{self.role}')>"
+
+
+class UserAssistantPreferences(Base):
+    """User-owned preferences that do not belong to deployment policy."""
+
+    __tablename__ = "user_assistant_preferences"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    preferred_model_profile_id = Column(Integer, ForeignKey("model_profiles.id", ondelete="SET NULL"), nullable=True)
+    preferred_vision_model_profile_id = Column(Integer, ForeignKey("model_profiles.id", ondelete="SET NULL"), nullable=True)
+    preferred_reasoning_effort = Column(String(20), nullable=True)
+    notifications_enabled = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    delivery_enabled = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    appearance = Column(String(20), default="system", server_default="system", nullable=False)
+    reduce_motion = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    version = Column(Integer, default=1, server_default="1", nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="assistant_preferences")
+    preferred_model_profile = relationship("ModelProfile", foreign_keys=[preferred_model_profile_id])
+    preferred_vision_model_profile = relationship("ModelProfile", foreign_keys=[preferred_vision_model_profile_id])
+
+
+class ModelProfile(Base):
+    """Validated runtime capabilities for one provider-qualified model."""
+
+    __tablename__ = "model_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    public_id = Column(String(36), unique=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    model_id = Column(String(200), unique=True, index=True, nullable=False)
+    display_name = Column(String(200), nullable=False)
+    provider_family = Column(String(50), nullable=False)
+    enabled = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    is_local = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    supports_text = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    supports_vision = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    supports_tools = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    supports_thinking = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    supports_native_streaming = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    reasoning_efforts_json = Column(Text, default="[]", server_default="[]", nullable=False)
+    default_reasoning_effort = Column(String(20), nullable=True)
+    tool_mode = Column(String(20), default="enabled", server_default="enabled", nullable=False)
+    allowed_tools_json = Column(Text, default="[]", server_default="[]", nullable=False)
+    blocked_tools_json = Column(Text, default="[]", server_default="[]", nullable=False)
+    keep_alive = Column(String(30), nullable=True)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    @property
+    def reasoning_efforts(self) -> list[str]:
+        return json.loads(self.reasoning_efforts_json or "[]")
+
+    @reasoning_efforts.setter
+    def reasoning_efforts(self, value: list[str]) -> None:
+        self.reasoning_efforts_json = json.dumps(value)
+
+    @property
+    def allowed_tools(self) -> list[str]:
+        return json.loads(self.allowed_tools_json or "[]")
+
+    @allowed_tools.setter
+    def allowed_tools(self, value: list[str]) -> None:
+        self.allowed_tools_json = json.dumps(value)
+
+    @property
+    def blocked_tools(self) -> list[str]:
+        return json.loads(self.blocked_tools_json or "[]")
+
+    @blocked_tools.setter
+    def blocked_tools(self, value: list[str]) -> None:
+        self.blocked_tools_json = json.dumps(value)
+
+
+class UserModelAccess(Base):
+    """Explicit per-user model policy; absence means deployment defaults apply."""
+
+    __tablename__ = "user_model_access"
+    __table_args__ = (
+        UniqueConstraint("user_id", "model_profile_id", name="uq_user_model_access_profile"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    model_profile_id = Column(
+        Integer,
+        ForeignKey("model_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    allowed = Column(Boolean, default=True, server_default=text("true"), nullable=False)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class AdminPolicyEvent(Base):
+    """Content-free audit trail for administrative identity and access changes."""
+
+    __tablename__ = "admin_policy_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    target_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    action = Column(String(100), nullable=False, index=True)
+    summary_json = Column(Text, default="{}", server_default="{}", nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    @property
+    def summary(self) -> dict:
+        try:
+            value = json.loads(self.summary_json or "{}")
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @summary.setter
+    def summary(self, value: dict) -> None:
+        self.summary_json = json.dumps(value if isinstance(value, dict) else {})
 
 
 class Document(Base):
@@ -284,6 +420,72 @@ class SecretAccessEvent(Base):
             f"<SecretAccessEvent(user_id={self.user_id}, secret_name='{self.secret_name}', "
             f"tool_name='{self.tool_name}', success={self.success})>"
         )
+
+
+class UserIntegration(Base):
+    """One user-owned external account connection for a provider service."""
+
+    __tablename__ = "user_integrations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "provider", "service", name="uq_user_integration_provider_service"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    public_id = Column(String(36), unique=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider = Column(String(50), nullable=False)
+    service = Column(String(50), nullable=False)
+    status = Column(String(30), nullable=False, default="connected", server_default="connected")
+    account_identifier = Column(String(255), nullable=True)
+    scopes_json = Column(Text, nullable=False, default="[]", server_default="[]")
+    config_json = Column(Text, nullable=False, default="{}", server_default="{}")
+    access_token_secret_id = Column(Integer, ForeignKey("secrets.id", ondelete="SET NULL"), nullable=True)
+    refresh_token_secret_id = Column(Integer, ForeignKey("secrets.id", ondelete="SET NULL"), nullable=True)
+    credential_secret_id = Column(Integer, ForeignKey("secrets.id", ondelete="SET NULL"), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    last_success_at = Column(DateTime(timezone=True), nullable=True)
+    error_class = Column(String(100), nullable=True)
+    error_message = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="integrations")
+    access_token_secret = relationship("Secret", foreign_keys=[access_token_secret_id])
+    refresh_token_secret = relationship("Secret", foreign_keys=[refresh_token_secret_id])
+    credential_secret = relationship("Secret", foreign_keys=[credential_secret_id])
+
+    @property
+    def scopes(self) -> list[str]:
+        return json.loads(self.scopes_json or "[]")
+
+    @scopes.setter
+    def scopes(self, value: list[str]) -> None:
+        self.scopes_json = json.dumps(value)
+
+    @property
+    def config(self) -> dict:
+        return json.loads(self.config_json or "{}")
+
+    @config.setter
+    def config(self, value: dict) -> None:
+        self.config_json = json.dumps(value)
+
+
+class IntegrationOAuthState(Base):
+    """Short-lived, one-time state for a user-owned OAuth connection flow."""
+
+    __tablename__ = "integration_oauth_states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    nonce = Column(String(100), unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider = Column(String(50), nullable=False)
+    service = Column(String(50), nullable=False)
+    redirect_uri = Column(String(500), nullable=False)
+    code_challenge = Column(String(128), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 

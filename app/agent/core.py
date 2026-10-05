@@ -568,7 +568,7 @@ def _litellm_kwargs(model: str | None = None, *, is_incognito: bool = False) -> 
     provider = resolve_provider_capabilities(selected_model)
     if provider.is_local:
         kwargs["api_base"] = _normalized_local_api_base()
-        keep_alive = str(settings.local_model_keep_alive or "").strip()
+        keep_alive = provider.runtime_keep_alive or str(settings.local_model_keep_alive or "").strip()
         if keep_alive and not is_incognito:
             kwargs["keep_alive"] = keep_alive
         return kwargs
@@ -2806,12 +2806,23 @@ def _initialize_agent_loop(
     user_context: UserContext,
     mode: str,
     model_override: str | None,
+    reasoning_effort_override: str | None,
     stage: str | None,
 ) -> _AgentLoopSetup:
     history = list(messages)
     max_turns = TURN_LIMITS.get(mode, 8)
     selected_model = model_override or settings.llm_model
+    provider = resolve_provider_capabilities(
+        selected_model,
+        reasoning_effort_override=reasoning_effort_override,
+    )
     tools = get_tools_for_user(user_context)
+    if provider.tool_mode == "restricted":
+        allowed = set(provider.allowed_tools)
+        tools = [tool for tool in tools if tool["function"]["name"] in allowed]
+    if provider.blocked_tools:
+        blocked = set(provider.blocked_tools)
+        tools = [tool for tool in tools if tool["function"]["name"] not in blocked]
     tools = _apply_local_tool_investigation_filters(
         tools=tools,
         model=selected_model,
@@ -2843,7 +2854,7 @@ def _initialize_agent_loop(
         history=history,
         max_turns=max_turns,
         selected_model=selected_model,
-        provider=resolve_provider_capabilities(selected_model),
+        provider=provider,
         tools=tools,
         extra=_litellm_kwargs(selected_model, is_incognito=user_context.is_incognito),
         state=_AgentLoopState(),
@@ -3277,6 +3288,7 @@ async def _run_agent_chunks(
     user_context: UserContext,
     mode: str = "chat",
     model_override: str | None = None,
+    reasoning_effort_override: str | None = None,
     stage: str | None = None,
     runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
@@ -3296,6 +3308,7 @@ async def _run_agent_chunks(
         user_context=user_context,
         mode=mode,
         model_override=model_override,
+        reasoning_effort_override=reasoning_effort_override,
         stage=stage,
     )
     history = setup.history
@@ -3541,6 +3554,7 @@ async def run_agent(
     user_context: UserContext,
     mode: str = "chat",
     model_override: str | None = None,
+    reasoning_effort_override: str | None = None,
     stage: str | None = None,
     runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
@@ -3567,6 +3581,7 @@ async def run_agent(
                     user_context,
                     mode=mode,
                     model_override=model_override,
+                    reasoning_effort_override=reasoning_effort_override,
                     stage=stage,
                     runtime_message_callback=runtime_message_callback,
                     pre_tool_callback=pre_tool_callback,
@@ -3605,6 +3620,7 @@ async def stream_agent(
     user_context: UserContext,
     mode: str = "chat",
     model_override: str | None = None,
+    reasoning_effort_override: str | None = None,
     stage: str | None = None,
     runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
@@ -3633,6 +3649,7 @@ async def stream_agent(
         user_context,
         mode=mode,
         model_override=model_override,
+        reasoning_effort_override=reasoning_effort_override,
         stage=stage,
         runtime_message_callback=runtime_message_callback,
         pre_tool_callback=pre_tool_callback,

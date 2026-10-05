@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.38
+
+- Added stable public user identity and versioned per-user assistant preferences with layered deployment, user, and request-level resolution.
+- Added hot-reloadable model profiles for capabilities, reasoning effort, tool policy, local keep-alive, and default model selection without requiring a backend restart.
+- Added encrypted user-owned Apple/CalDAV and Google Calendar integrations while retaining deployment credentials as an explicit fallback.
+- Added administrator-managed per-user model access policy and enforced it across model listings, chat session updates, and effective settings resolution.
+- Added migrations `045` through `048` for assistant preferences, model profiles, user integrations, and user model access.
+
 ## v0.7.37
 
 - Added Brave Search as the preferred web-search provider when configured, with bounded DuckDuckGo fallback and provider-aware caching and diagnostics.

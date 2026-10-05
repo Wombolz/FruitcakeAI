@@ -68,8 +68,7 @@ Every subsystem is independently testable, swap-able, and extensible. If you wan
 - The backend is not positioned as internet-hardened by default.
 - The native client story is still split from the backend repository.
 - Setup and testing are currently macOS-first.
-- Apple ID / CalDAV and Google Calendar identity are currently shared application-wide rather than isolated per user.
-- Per-user access to those integrations is planned, but it is not the current development priority.
+- Settings and integration management are still evolving, and some deployment-level defaults remain operator-managed.
 - Some workflows are well-soaked for daily use; others are still alpha-grade and may shift quickly.
 - Internal planning and maintainer workflow are intentionally not the same thing as the public contribution surface.
 
@@ -123,6 +122,9 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 **Agent and personas**
 - LiteLLM agent loop — works with Ollama, Claude, or OpenAI via one env var change
 - Multi-user JWT auth with role-based personas (`admin`, `parent`, `restricted`, `guest`)
+- Stable public user identity with versioned per-user assistant preferences
+- Hot-reloadable model profiles and administrator-managed per-user model access
+- User-owned Apple/CalDAV and Google Calendar integrations with encrypted credentials
 - Per-persona tool scoping, content filtering, and tone configuration
 - Streaming chat via WebSocket; REST fallback
 - WebSocket chat no longer replays stale completed sends from reused server-side message state

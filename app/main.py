@@ -32,6 +32,14 @@ async def lifespan(app: FastAPI):
 
     log.info("Database extension check complete")
 
+    from app.db.session import AsyncSessionLocal
+    from app.model_profiles import get_model_profile_service
+
+    async with AsyncSessionLocal() as db:
+        await get_model_profile_service().ensure_seeded(db)
+        await db.commit()
+    log.info("Model profiles loaded", count=get_model_profile_service().profile_count)
+
     # Initialize RAG service (loads embedding model + connects to pgvector)
     from app.rag.service import get_rag_service
     await get_rag_service().startup()
@@ -146,6 +154,9 @@ def create_app() -> FastAPI:
     from app.api.mcp_server import router as mcp_server_router
     from app.api.secrets import router as secrets_router
     from app.api.workspace import router as workspace_router
+    from app.api.settings import router as settings_router
+    from app.api.model_profiles import router as model_profiles_router
+    from app.api.integrations import router as integrations_router
 
     app.include_router(auth_router, prefix="/auth", tags=["auth"])
     app.include_router(admin_router, prefix="/admin", tags=["admin"])
@@ -160,6 +171,9 @@ def create_app() -> FastAPI:
     app.include_router(llm_router, prefix="/llm", tags=["llm"])
     app.include_router(mcp_server_router, prefix="/mcp/fruitcake", tags=["mcp"])
     app.include_router(workspace_router, prefix="/workspace", tags=["workspace"])
+    app.include_router(settings_router, prefix="/settings", tags=["settings"])
+    app.include_router(model_profiles_router, prefix="/admin", tags=["admin"])
+    app.include_router(integrations_router, prefix="/integrations", tags=["integrations"])
 
     return app
 
