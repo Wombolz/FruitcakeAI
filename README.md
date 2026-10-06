@@ -124,6 +124,7 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - Multi-user JWT auth with role-based personas (`admin`, `parent`, `restricted`, `guest`)
 - Stable public user identity with versioned per-user assistant preferences
 - Hot-reloadable model profiles and administrator-managed per-user model access
+- Model-aware context budgeting with configurable context windows, output/reasoning reserves, evidence retention, and runtime diagnostics
 - User-owned Apple/CalDAV and Google Calendar integrations with encrypted credentials
 - Per-persona tool scoping, content filtering, and tone configuration
 - Streaming chat via WebSocket; REST fallback
@@ -185,7 +186,9 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 
 **Integrations**
 - Calendar — Google Calendar and Apple Calendar
-- Web research — Brave, DuckDuckGo, NewsAPI
+- Provider-neutral web research with configurable Brave and DuckDuckGo routing
+- Citation-rich Brave LLM Context for multi-source research prompts when configured
+- NewsAPI support for existing news workflows
 - RSS — feed management, discovery, and search
 - Webhooks — inbound triggers from GitHub, Zapier, IFTTT, or any HTTP client
 - Docker stdio MCP — drop in any MCP-compatible server via config

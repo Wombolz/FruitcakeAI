@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.39
+
+- Added model-aware context budgets to hot-reloadable model profiles, including explicit context-window, output, reasoning, and safety reserves.
+- Replaced fixed chat and final-task synthesis limits with request-aware budgeting, evidence-class retention, bounded compaction, and inspectable context diagnostics.
+- Added a provider-neutral web-research service with configurable Brave or DuckDuckGo routing and bounded fallback behavior.
+- Added Brave LLM Context as a citation-rich research path, including deterministic routing for suitable prompts and visible query/depth evidence in chat.
+- Increased fetched-page evidence capacity while preserving recent source material, source boundaries, and trailing citations during compaction.
+- Prevented false compaction reports and added one bounded retry plus a visible fallback for empty final model answers.
+- Added migration `049_model_context_budgets` and expanded chat, task, MCP, model-profile, and web-research regression coverage.
+
 ## v0.7.38
 
 - Added stable public user identity and versioned per-user assistant preferences with layered deployment, user, and request-level resolution.

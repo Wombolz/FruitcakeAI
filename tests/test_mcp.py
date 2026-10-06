@@ -514,6 +514,34 @@ async def test_registry_preserves_mcp_structured_content_on_string_result():
     assert normalized.artifacts[0]["path"] == "generated_images/result.png"
 
 
+@pytest.mark.asyncio
+async def test_registry_preserves_internal_mcp_text_and_structured_content():
+    registry = MCPRegistry()
+    registry._tool_map["web_context"] = ("web_research", "internal_python")
+    module = MagicMock()
+    module.call_tool = AsyncMock(
+        return_value={
+            "content": [{"type": "text", "text": "Grounded web context."}],
+            "structuredContent": {
+                "provider": "brave",
+                "citations": [{"url": "https://example.org", "title": "Example"}],
+            },
+        }
+    )
+    registry._modules["web_research"] = module
+
+    output = await registry.call_tool("web_context", {"query": "example"})
+    normalized = build_tool_call_result(
+        tool_call_id="call_context",
+        name="web_context",
+        content=output,
+    )
+
+    assert output == "Grounded web context."
+    assert normalized.structured_content["provider"] == "brave"
+    assert normalized.citations == [{"url": "https://example.org", "title": "Example"}]
+
+
 def test_default_mcp_config_defines_shell_server_contract():
     config_path = Path("config/mcp_config.yaml")
     cfg = yaml.safe_load(config_path.read_text())

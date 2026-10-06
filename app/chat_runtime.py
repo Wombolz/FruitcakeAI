@@ -35,28 +35,46 @@ _DURABLE_EVENT_PHASES: dict[AgentEventType, str] = {
     AgentEventType.RUN_CANCELLED: "cancelled",
 }
 
+_TRACE_ONLY_EVENT_TYPES = {
+    AgentEventType.CONTEXT_BUDGET,
+}
+
 _TRACE_PAYLOAD_KEYS = {
     "approval_kind",
+    "aggressive",
     "argument_keys",
     "artifact_count",
     "citation_count",
     "content_chars",
+    "context_window_tokens",
+    "estimated_headroom_tokens",
+    "estimated_input_tokens",
     "error_type",
     "failure_phase",
     "has_structured_content",
     "history_length",
+    "history_budget_tokens",
+    "history_tokens",
     "mode",
     "model",
+    "output_reserve_tokens",
+    "policy_source",
     "phase",
     "reason",
+    "reasoning_reserve_tokens",
     "resumed_after_approval",
     "retry_reason",
     "stage",
+    "safety_margin_tokens",
     "tool_call_id",
+    "tool_compactions",
     "tool_count",
     "tool_name",
+    "tool_results_compacted",
+    "tool_schema_tokens",
     "tools_enabled",
     "turn",
+    "usable_input_tokens",
 }
 
 
@@ -279,7 +297,7 @@ async def apply_chat_run_event(db: AsyncSession, run: ChatRun, event: AgentEvent
         phase = str(event.payload.get("phase") or "running").strip() or "running"
     if phase:
         run.phase = phase
-    if event.type in _DURABLE_EVENT_PHASES:
+    if event.type in _DURABLE_EVENT_PHASES or event.type in _TRACE_ONLY_EVENT_TYPES:
         trace = ChatRunEvent(
             run_id=run.id,
             sequence=int(event.sequence),
@@ -457,6 +475,11 @@ async def build_chat_run_inspection(
     provider_family = _provider_family(run.model)
     tool_requested = event_counts[AgentEventType.TOOL_REQUESTED.value]
     cache_percent = round((cached_tokens / prompt_tokens) * 100.0, 2) if prompt_tokens else 0.0
+    context_budget_events = [
+        dict(row.payload)
+        for row in event_rows
+        if row.event_type == AgentEventType.CONTEXT_BUDGET.value
+    ]
 
     run_payload = serialize_chat_run(run, active=active)
     for timestamp_key in ("started_at", "updated_at", "finished_at"):
@@ -498,6 +521,10 @@ async def build_chat_run_inspection(
         "phase_timings_ms": {
             phase: round(duration, 2)
             for phase, duration in sorted(phase_timings.items())
+        },
+        "context_budget": {
+            "event_count": len(context_budget_events),
+            "latest": context_budget_events[-1] if context_budget_events else None,
         },
         "tools": tool_names,
         "timeline": timeline,

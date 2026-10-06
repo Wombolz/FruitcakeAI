@@ -90,6 +90,61 @@ async def test_admin_profile_change_updates_provider_capabilities_without_restar
 
 
 @pytest.mark.asyncio
+async def test_admin_can_update_model_context_budget_without_restart(client, monkeypatch):
+    model = "ollama_chat/context-profile:test"
+    monkeypatch.setattr(settings, "local_models", model)
+    get_model_profile_service().clear()
+    headers = await _register(client, "contextadmin", role="admin")
+    listed = await client.get("/admin/model-profiles", headers=headers)
+    profile = next(item for item in listed.json()["profiles"] if item["model_id"] == model)
+
+    updated = await client.patch(
+        f"/admin/model-profiles/{profile['profile_id']}",
+        headers=headers,
+        json={
+            "context_window_tokens": 131_072,
+            "output_reserve_tokens": 12_288,
+            "reasoning_reserve_tokens": 8_192,
+            "context_safety_margin_tokens": 4_096,
+        },
+    )
+
+    assert updated.status_code == 200, updated.text
+    payload = updated.json()
+    assert payload["context_window_tokens"] == 131_072
+    assert payload["output_reserve_tokens"] == 12_288
+    assert payload["reasoning_reserve_tokens"] == 8_192
+    assert payload["context_safety_margin_tokens"] == 4_096
+    snapshot = get_model_profile_service().for_model(model)
+    assert snapshot is not None
+    assert snapshot.context_window_tokens == 131_072
+
+
+@pytest.mark.asyncio
+async def test_admin_profile_rejects_context_reserves_that_consume_input_window(client, monkeypatch):
+    model = "ollama_chat/invalid-context-profile:test"
+    monkeypatch.setattr(settings, "local_models", model)
+    get_model_profile_service().clear()
+    headers = await _register(client, "invalidcontextadmin", role="admin")
+    listed = await client.get("/admin/model-profiles", headers=headers)
+    profile = next(item for item in listed.json()["profiles"] if item["model_id"] == model)
+
+    response = await client.patch(
+        f"/admin/model-profiles/{profile['profile_id']}",
+        headers=headers,
+        json={
+            "context_window_tokens": 8_192,
+            "output_reserve_tokens": 5_000,
+            "reasoning_reserve_tokens": 1_000,
+            "context_safety_margin_tokens": 500,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "leave at least 2048 tokens" in response.json()["error"]
+
+
+@pytest.mark.asyncio
 async def test_qwen_38_profile_rejects_unsupported_reasoning_value(client, monkeypatch):
     model = "ollama_chat/qwen3.8:27b-q4_K_M"
     monkeypatch.setattr(settings, "local_models", model)

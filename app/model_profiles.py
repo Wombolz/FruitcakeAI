@@ -15,6 +15,10 @@ from app.llm_registry import available_llm_models
 
 TOOL_MODES = {"enabled", "text_only", "restricted"}
 QWEN_38_REASONING_EFFORTS = ("low", "medium", "xhigh")
+DEFAULT_CONTEXT_WINDOW_TOKENS = 65_536
+DEFAULT_OUTPUT_RESERVE_TOKENS = 8_192
+DEFAULT_REASONING_RESERVE_TOKENS = 4_096
+DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS = 2_048
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,10 @@ class ModelProfileSnapshot:
     allowed_tools: tuple[str, ...]
     blocked_tools: tuple[str, ...]
     keep_alive: str
+    context_window_tokens: int
+    output_reserve_tokens: int
+    reasoning_reserve_tokens: int
+    context_safety_margin_tokens: int
 
 
 class ModelProfileService:
@@ -127,6 +135,10 @@ class ModelProfileService:
             default_reasoning_effort=default_reasoning,
             tool_mode="text_only" if model_id in text_only_models else "enabled",
             keep_alive=str(settings.local_model_keep_alive or "").strip() if is_local else None,
+            context_window_tokens=DEFAULT_CONTEXT_WINDOW_TOKENS,
+            output_reserve_tokens=DEFAULT_OUTPUT_RESERVE_TOKENS,
+            reasoning_reserve_tokens=(DEFAULT_REASONING_RESERVE_TOKENS if reasoning_efforts else 0),
+            context_safety_margin_tokens=DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
         )
         row.reasoning_efforts = reasoning_efforts or ([default_reasoning] if default_reasoning else [])
         row.allowed_tools = []
@@ -154,6 +166,12 @@ class ModelProfileService:
             allowed_tools=tuple(row.allowed_tools),
             blocked_tools=tuple(row.blocked_tools),
             keep_alive=str(row.keep_alive or ""),
+            context_window_tokens=int(row.context_window_tokens or DEFAULT_CONTEXT_WINDOW_TOKENS),
+            output_reserve_tokens=int(row.output_reserve_tokens or DEFAULT_OUTPUT_RESERVE_TOKENS),
+            reasoning_reserve_tokens=int(row.reasoning_reserve_tokens or 0),
+            context_safety_margin_tokens=int(
+                row.context_safety_margin_tokens or DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS
+            ),
         )
 
 
@@ -184,6 +202,10 @@ def model_profile_to_dict(profile: ModelProfileSnapshot) -> dict[str, Any]:
         "allowed_tools": list(profile.allowed_tools),
         "blocked_tools": list(profile.blocked_tools),
         "keep_alive": profile.keep_alive or None,
+        "context_window_tokens": profile.context_window_tokens,
+        "output_reserve_tokens": profile.output_reserve_tokens,
+        "reasoning_reserve_tokens": profile.reasoning_reserve_tokens,
+        "context_safety_margin_tokens": profile.context_safety_margin_tokens,
     }
 
 

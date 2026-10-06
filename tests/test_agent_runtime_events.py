@@ -51,6 +51,16 @@ def _response(*, content: str = "", tool_calls=None):
     )
 
 
+def _stream_response(content: str):
+    async def _stream():
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content=content))],
+            usage=None,
+        )
+
+    return _stream()
+
+
 def _context() -> UserContext:
     return UserContext(
         user_id=1,
@@ -181,8 +191,12 @@ async def test_run_agent_emits_lifecycle_without_changing_plain_text_result():
     assert [event.type for event in events] == [
         AgentEventType.RUN_STARTED,
         AgentEventType.MODEL_TURN_STARTED,
+        AgentEventType.CONTEXT_BUDGET,
         AgentEventType.RUN_COMPLETED,
     ]
+    assert events[2].payload["context_window_tokens"] >= 8_192
+    assert events[2].payload["estimated_input_tokens"] >= 0
+    assert "content" not in events[2].payload
     assert events[-1].payload == {"content_chars": len(result)}
 
 
@@ -237,14 +251,16 @@ async def test_run_agent_emits_tool_sequence_and_preserves_legacy_callbacks():
     assert event_types == [
         AgentEventType.RUN_STARTED,
         AgentEventType.MODEL_TURN_STARTED,
+        AgentEventType.CONTEXT_BUDGET,
         AgentEventType.TOOL_REQUESTED,
         AgentEventType.TOOL_STARTED,
         AgentEventType.TOOL_COMPLETED,
         AgentEventType.SYNTHESIS_STARTED,
         AgentEventType.MODEL_TURN_STARTED,
+        AgentEventType.CONTEXT_BUDGET,
         AgentEventType.RUN_COMPLETED,
     ]
-    requested = events[2]
+    requested = events[3]
     assert requested.payload["tool_name"] == "read_file"
     assert requested.payload["argument_keys"] == ["path"]
 
@@ -299,7 +315,12 @@ async def test_stream_agent_emits_visible_deltas_and_terminal_event():
         patch("app.agent.core.get_tools_for_user", return_value=[]),
         patch(
             "app.agent.core.litellm.acompletion",
-            new=AsyncMock(return_value=_response(content="Streamed answer")),
+            new=AsyncMock(
+                side_effect=[
+                    _response(content="Streamed answer"),
+                    _stream_response("Streamed answer"),
+                ]
+            ),
         ),
         patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
     ):
@@ -337,7 +358,12 @@ async def test_stream_agent_emits_cancelled_when_consumer_closes_stream():
         patch("app.agent.core.get_tools_for_user", return_value=[]),
         patch(
             "app.agent.core.litellm.acompletion",
-            new=AsyncMock(return_value=_response(content="A response long enough to chunk.")),
+            new=AsyncMock(
+                side_effect=[
+                    _response(content="A response long enough to chunk."),
+                    _stream_response("A response long enough to chunk."),
+                ]
+            ),
         ),
         patch("app.agent.core.record_llm_usage_event", new=AsyncMock()),
     ):

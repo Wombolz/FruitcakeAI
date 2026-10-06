@@ -26,6 +26,7 @@ import httpx
 import structlog
 
 from app.config import settings
+from app.web_research import CallbackSearchProvider, WebResearchService, WebSearchRequest
 
 log = structlog.get_logger(__name__)
 
@@ -41,9 +42,9 @@ _HEADERS = {
 
 _DDG_SEARCH_URL = "https://html.duckduckgo.com/html/"
 _BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+_BRAVE_CONTEXT_URL = "https://api.search.brave.com/res/v1/llm/context"
 _FETCH_TIMEOUT = 15
 _SEARCH_TIMEOUT = 15
-_MAX_PAGE_CHARS = 8000
 
 # Rate limiting aligned with the reference DuckDuckGo MCP server
 _SEARCHES_PER_MINUTE = 30
@@ -102,6 +103,50 @@ _FETCH_PAGE_SCHEMA: Dict[str, Any] = {
             },
         },
         "required": ["url"],
+    },
+}
+
+_WEB_CONTEXT_SCHEMA: Dict[str, Any] = {
+    "name": "web_context",
+    "description": (
+        "Retrieve citation-rich, pre-extracted web evidence for a research question. "
+        "Use this instead of repeated web_search and fetch_page calls when the question "
+        "needs synthesis across several current web sources."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The focused research question, up to 600 characters",
+            },
+            "depth": {
+                "type": "string",
+                "enum": ["standard", "deep"],
+                "description": "Standard uses about 8K provider tokens; deep uses about 16K",
+                "default": "standard",
+            },
+            "max_sources": {
+                "type": "integer",
+                "description": "Maximum source URLs to include (1-50)",
+                "default": 20,
+            },
+            "region": {
+                "type": "string",
+                "description": "Search region code, e.g. us-en",
+                "default": "us-en",
+            },
+            "freshness": {
+                "type": "string",
+                "description": "Optional freshness filter: pd, pw, pm, py, or a date range",
+            },
+            "threshold": {
+                "type": "string",
+                "enum": ["strict", "balanced", "lenient"],
+                "description": "Optional relevance threshold",
+            },
+        },
+        "required": ["query"],
     },
 }
 
@@ -183,16 +228,21 @@ _PAGE_CACHE = TTLCache(_PAGE_CACHE_TTL_SECONDS, _CACHE_MAX_ENTRIES)
 # ── Public MCP interface ──────────────────────────────────────────────────────
 
 def get_tools() -> List[Dict[str, Any]]:
-    return [_WEB_SEARCH_SCHEMA, _FETCH_PAGE_SCHEMA]
+    tools = [_WEB_SEARCH_SCHEMA, _FETCH_PAGE_SCHEMA]
+    if settings.brave_context_enabled and settings.brave_search_api_key.strip():
+        tools.append(_WEB_CONTEXT_SCHEMA)
+    return tools
 
 
 async def call_tool(
     tool_name: str, arguments: Dict[str, Any], user_context: Any = None
-) -> str:
+) -> Any:
     if tool_name == "web_search":
         return await _web_search(arguments, user_context=user_context)
     if tool_name == "fetch_page":
         return await _fetch_page(arguments, user_context=user_context)
+    if tool_name == "web_context":
+        return await _web_context(arguments, user_context=user_context)
     return f"Unknown tool: {tool_name}"
 
 
@@ -211,8 +261,9 @@ async def _web_search(arguments: Dict[str, Any], user_context: Any = None) -> st
 
     region = (arguments.get("region") or "us-en").strip() or "us-en"
 
-    provider = "brave" if settings.brave_search_api_key.strip() else "duckduckgo"
-    cache_key = f"search::{provider}::{query}::{max_results}::{region}"
+    service = _build_web_research_service()
+    provider_chain = ",".join(service.provider_names) or "unavailable"
+    cache_key = f"search::{provider_chain}::{query}::{max_results}::{region}"
     cached = _SEARCH_CACHE.get(cache_key)
     if cached is not None:
         log.info("web_search cache_hit", query=query, max_results=max_results, region=region)
@@ -224,23 +275,31 @@ async def _web_search(arguments: Dict[str, Any], user_context: Any = None) -> st
 
     started = time.perf_counter()
 
-    results: List[Dict[str, str]] = []
-    failure = ""
-    if provider == "brave":
-        results, failure = await _search_brave(query, max_results, region)
-        if not results and settings.brave_search_fallback_to_ddg:
-            log.warning("web_search provider_fallback", primary="brave", fallback="duckduckgo", reason=failure)
-            results, fallback_failure = await _search_duckduckgo(query, max_results, region)
-            failure = fallback_failure or failure
-            provider = "duckduckgo_fallback"
-    else:
-        results, failure = await _search_duckduckgo(query, max_results, region)
+    response = await service.search(
+        WebSearchRequest(query=query, max_results=max_results, region=region)
+    )
+    provider = response.provider
+    if response.fallback_from:
+        log.warning(
+            "web_search provider_fallback",
+            primary=response.fallback_from,
+            fallback=response.provider,
+            attempts=list(response.attempts),
+        )
 
-    if not results:
+    if not response.results:
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         log.info("web_search no_results", query=query, region=region, provider=provider, elapsed_ms=elapsed_ms)
-        return failure or f"No results found for: {query}"
+        return response.error or f"No results found for: {query}"
 
+    results = [
+        {
+            "title": result.title,
+            "url": result.url,
+            "snippet": result.excerpt,
+        }
+        for result in response.results
+    ]
     formatted = _format_search_results(query=query, results=results)
 
     elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
@@ -257,11 +316,223 @@ async def _web_search(arguments: Dict[str, Any], user_context: Any = None) -> st
     return formatted
 
 
+def _build_web_research_service() -> WebResearchService:
+    """Resolve an ordered provider chain without changing the MCP tool contract."""
+    brave = CallbackSearchProvider(
+        name="brave",
+        search_callback=_search_brave,
+        available=lambda: bool(settings.brave_search_api_key.strip()),
+    )
+    duckduckgo = CallbackSearchProvider(
+        name="duckduckgo",
+        search_callback=_search_duckduckgo,
+    )
+    preference = str(settings.web_search_provider or "auto").strip().casefold()
+    if preference == "duckduckgo":
+        return WebResearchService([duckduckgo])
+    if preference == "brave":
+        providers = [brave]
+        if settings.brave_search_fallback_to_ddg:
+            providers.append(duckduckgo)
+        return WebResearchService(providers)
+    providers = [brave, duckduckgo] if settings.brave_search_api_key.strip() else [duckduckgo]
+    if not settings.brave_search_fallback_to_ddg and providers and providers[0] is brave:
+        providers = [brave]
+    return WebResearchService(providers)
+
+
 def _brave_locale(region: str) -> tuple[str, str]:
     parts = [part.lower() for part in str(region or "").replace("_", "-").split("-") if part]
     country = parts[0] if parts and len(parts[0]) == 2 else "us"
     language = parts[1] if len(parts) > 1 and len(parts[1]) == 2 else "en"
     return country, language
+
+
+async def _web_context(arguments: Dict[str, Any], user_context: Any = None) -> Any:
+    del user_context
+    if not settings.brave_context_enabled or not settings.brave_search_api_key.strip():
+        return "Web context is not configured."
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        return "No web context query provided."
+    query = query[:600]
+    depth = str(arguments.get("depth") or "standard").strip().casefold()
+    default_tokens = max(1_024, min(int(settings.brave_context_default_tokens), 32_768))
+    maximum_tokens = 16_384 if depth == "deep" else default_tokens
+    try:
+        max_sources = max(1, min(int(arguments.get("max_sources", 20)), 50))
+    except (TypeError, ValueError):
+        max_sources = 20
+    region = str(arguments.get("region") or "us-en").strip() or "us-en"
+    country, language = _brave_locale(region)
+    payload: Dict[str, Any] = {
+        "q": query,
+        "country": country.upper(),
+        "search_lang": language,
+        "count": max_sources,
+        "maximum_number_of_urls": max_sources,
+        "maximum_number_of_tokens": maximum_tokens,
+        "enable_source_metadata": True,
+    }
+    freshness = str(arguments.get("freshness") or "").strip()
+    if freshness:
+        payload["freshness"] = freshness
+    threshold = str(arguments.get("threshold") or "").strip().casefold()
+    if threshold in {"strict", "balanced", "lenient"}:
+        payload["context_threshold_mode"] = threshold
+
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "Content-Type": "application/json",
+        "X-Subscription-Token": settings.brave_search_api_key.strip(),
+    }
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(
+            headers=headers,
+            timeout=httpx.Timeout(max(5, int(settings.brave_context_timeout_seconds))),
+        ) as client:
+            response = await client.post(_BRAVE_CONTEXT_URL, json=payload)
+            response.raise_for_status()
+            response_payload = response.json()
+            usage_headers = {
+                str(key).lower(): str(value)
+                for key, value in response.headers.items()
+                if str(key).lower().startswith("x-ratelimit")
+            }
+    except httpx.TimeoutException:
+        log.warning("web_context brave_timeout", query=query, depth=depth)
+        return f"Web context timed out for: {query}"
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        log.warning("web_context brave_http_error", query=query, depth=depth, status=status)
+        return f"Web context failed with HTTP {status} for: {query}"
+    except (httpx.RequestError, ValueError) as exc:
+        log.warning("web_context brave_request_error", query=query, depth=depth, error_type=type(exc).__name__)
+        return f"Web context failed due to a provider error for: {query}"
+
+    formatted, source_count, snippet_count = _format_brave_context(
+        query=query,
+        payload=response_payload,
+        requested_tokens=maximum_tokens,
+    )
+    log.info(
+        "web_context success",
+        query=query,
+        depth=depth,
+        requested_tokens=maximum_tokens,
+        source_count=source_count,
+        snippet_count=snippet_count,
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+    )
+    citations = _structured_brave_sources(response_payload)
+    return {
+        "content": [{"type": "text", "text": formatted}],
+        "structuredContent": {
+            "provider": "brave",
+            "capability": "llm_context",
+            "query": query,
+            "requested_tokens": maximum_tokens,
+            "source_count": source_count,
+            "snippet_count": snippet_count,
+            "coverage_note": "Extracted passages may be partial.",
+            "sources": citations,
+            "citations": citations,
+            "usage": usage_headers,
+        },
+    }
+
+
+def _structured_brave_sources(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    grounding = payload.get("grounding") or {}
+    generic = (grounding.get("generic") or []) if isinstance(grounding, dict) else []
+    source_metadata = payload.get("sources") or {}
+    citations: List[Dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for item in generic if isinstance(generic, list) else []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        metadata = source_metadata.get(url) if isinstance(source_metadata, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        title = _clean_text_inline(str(item.get("title") or metadata.get("title") or "Untitled source"))
+        citation: Dict[str, Any] = {"url": url, "title": title, "source": "brave"}
+        age = metadata.get("age") or []
+        if isinstance(age, list):
+            published_at = next(
+                (str(age[index]).strip() for index in (3, 1, 0) if len(age) > index and str(age[index]).strip()),
+                "",
+            )
+            if published_at:
+                citation["published_at"] = published_at
+        citations.append(citation)
+    return citations
+
+
+def _format_brave_context(
+    *,
+    query: str,
+    payload: Any,
+    requested_tokens: int,
+) -> tuple[str, int, int]:
+    if not isinstance(payload, dict):
+        return f"No web context found for: {query}", 0, 0
+    grounding = payload.get("grounding") or {}
+    generic = (grounding.get("generic") or []) if isinstance(grounding, dict) else []
+    sources = payload.get("sources") or {}
+    if not isinstance(generic, list) or not generic:
+        return f"No web context found for: {query}", 0, 0
+
+    lines = [
+        f"Web context for: {query}",
+        "Provider: Brave LLM Context",
+        f"Requested provider budget: {requested_tokens} tokens",
+        "Use the source URLs below for citations. Extracted passages may be partial.",
+        "",
+    ]
+    source_count = 0
+    snippet_count = 0
+    seen_urls: set[str] = set()
+    for item in generic:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        source_count += 1
+        source_meta = sources.get(url) if isinstance(sources, dict) else {}
+        source_meta = source_meta if isinstance(source_meta, dict) else {}
+        title = _clean_text_inline(str(item.get("title") or source_meta.get("title") or "Untitled source"))
+        age = source_meta.get("age") or []
+        published_at = ""
+        if isinstance(age, list):
+            published_at = next(
+                (str(age[index]).strip() for index in (3, 1, 0) if len(age) > index and str(age[index]).strip()),
+                "",
+            )
+        lines.extend([f"[Source {source_count}] {title}", f"URL: {url}"])
+        if published_at:
+            lines.append(f"Published/updated: {published_at}")
+        snippets = item.get("snippets") or []
+        if not isinstance(snippets, list):
+            snippets = [snippets]
+        for snippet in snippets:
+            text = str(snippet or "").strip()
+            if not text:
+                continue
+            snippet_count += 1
+            lines.append(f"Passage {snippet_count}: {text}")
+        lines.append("")
+    if not source_count:
+        return f"No web context found for: {query}", 0, 0
+    return "\n".join(lines).rstrip(), source_count, snippet_count
 
 
 async def _search_brave(
@@ -521,11 +792,12 @@ async def _fetch_page(arguments: Dict[str, Any], user_context: Any = None) -> st
         log.info("fetch_page empty_extracted_text", url=url, content_type=content_type)
         return f"No readable text content found at: {url}"
 
-    was_truncated = len(text) > _MAX_PAGE_CHARS
+    max_page_chars = max(1_000, int(settings.web_fetch_max_chars))
+    was_truncated = len(text) > max_page_chars
     if was_truncated:
         text = (
-            text[:_MAX_PAGE_CHARS]
-            + f"\n\n[... content truncated at {_MAX_PAGE_CHARS} characters ...]"
+            text[:max_page_chars]
+            + f"\n\n[... content truncated at {max_page_chars} characters ...]"
         )
 
     title = _extract_title(response.text)

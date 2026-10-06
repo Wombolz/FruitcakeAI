@@ -20,6 +20,11 @@ import litellm
 import structlog
 
 from app.agent.context import UserContext
+from app.agent.context_budget import (
+    evidence_class_for_tool,
+    plan_request_budget,
+    tool_result_char_budget,
+)
 from app.agent.litellm_ollama_patch import (
     apply_litellm_ollama_stream_patch,
     apply_litellm_ollama_tool_history_patch,
@@ -431,14 +436,26 @@ async def _acompletion_with_budget(
     stage: str | None,
     stream: bool = False,
     tools: List[Dict[str, Any]] | None = None,
-    tool_choice: str | None = None,
+    tool_choice: Any = None,
     extra_kwargs: Dict[str, Any] | None = None,
     stream_kwargs: Dict[str, Any] | None = None,
+    event_emitter: AgentEventEmitter | None = None,
 ) -> Any:
     extra_kwargs = dict(extra_kwargs or {})
     stream_kwargs = dict(stream_kwargs or {})
 
-    projected_history, report = _project_history_for_model(history, aggressive=False)
+    initial_messages = _build_messages(history, user_context, model=model)
+    initial_budget = plan_request_budget(
+        model=model,
+        request_messages=initial_messages,
+        history=history,
+        tools=tools,
+    )
+    projected_history, report = _project_history_for_model(
+        history,
+        aggressive=False,
+        history_token_limit=initial_budget.history_budget_tokens,
+    )
     projected_history, repaired_tool_chains = _sanitize_history_tool_chains(projected_history)
     if repaired_tool_chains:
         log.warning(
@@ -450,8 +467,30 @@ async def _acompletion_with_budget(
             session_id=user_context.session_id,
             task_id=user_context.task_id,
         )
-    _record_budget_event(report, stage=stage, mode=mode, model=model)
     request_messages = _build_messages(projected_history, user_context, model=model)
+    final_budget = plan_request_budget(
+        model=model,
+        request_messages=request_messages,
+        history=projected_history,
+        tools=tools,
+    )
+    report["request_budget"] = final_budget.to_dict()
+    _record_budget_event(report, stage=stage, mode=mode, model=model)
+    _log_context_budget(
+        budget=final_budget.to_dict(),
+        report=report,
+        model=model,
+        mode=mode,
+        stage=stage,
+        user_context=user_context,
+        aggressive=False,
+    )
+    await _emit_context_budget_event(
+        event_emitter,
+        budget=final_budget.to_dict(),
+        report=report,
+        aggressive=False,
+    )
     extra_kwargs = _apply_provider_prompt_cache_kwargs(
         extra_kwargs,
         messages=request_messages,
@@ -481,7 +520,12 @@ async def _acompletion_with_budget(
     except Exception as exc:
         if not settings.agent_overflow_retry_enabled or not _is_context_window_error(exc):
             raise
-        aggressive_history, aggressive_report = _project_history_for_model(history, aggressive=True)
+        aggressive_limit = max(0, initial_budget.history_budget_tokens // 2)
+        aggressive_history, aggressive_report = _project_history_for_model(
+            history,
+            aggressive=True,
+            history_token_limit=aggressive_limit,
+        )
         aggressive_history, repaired_aggressive_tool_chains = _sanitize_history_tool_chains(aggressive_history)
         if repaired_aggressive_tool_chains:
             log.warning(
@@ -494,8 +538,30 @@ async def _acompletion_with_budget(
                 task_id=user_context.task_id,
                 aggressive=True,
             )
-        _record_budget_event(aggressive_report, stage=stage, mode=mode, model=model)
         aggressive_messages = _build_messages(aggressive_history, user_context, model=model)
+        aggressive_budget = plan_request_budget(
+            model=model,
+            request_messages=aggressive_messages,
+            history=aggressive_history,
+            tools=tools,
+        )
+        aggressive_report["request_budget"] = aggressive_budget.to_dict()
+        _record_budget_event(aggressive_report, stage=stage, mode=mode, model=model)
+        _log_context_budget(
+            budget=aggressive_budget.to_dict(),
+            report=aggressive_report,
+            model=model,
+            mode=mode,
+            stage=stage,
+            user_context=user_context,
+            aggressive=True,
+        )
+        await _emit_context_budget_event(
+            event_emitter,
+            budget=aggressive_budget.to_dict(),
+            report=aggressive_report,
+            aggressive=True,
+        )
         _log_prompt_cache_shape(
             messages=aggressive_messages,
             tools=tools,
@@ -1241,20 +1307,38 @@ def _compact_tool_message(
     max_chars: int,
 ) -> Dict[str, Any]:
     content = str(message.get("content") or "")
-    compact_summary = _compact_structured_catalog(content, max_chars=max_chars)
-    if compact_summary is None:
-        compact_summary = _compact_text(content, max_chars=max_chars)
     tool_call_id = str(message.get("tool_call_id") or "").strip()
     tool_name = tool_name_lookup.get(tool_call_id) or "unknown_tool"
+    evidence_class = evidence_class_for_tool(tool_name)
+    compact_summary = _compact_structured_catalog(content, max_chars=max_chars)
+    if compact_summary is None:
+        compact_summary = (
+            _compact_evidence_text(content, max_chars=max_chars)
+            if evidence_class != "ordinary"
+            else _compact_text(content, max_chars=max_chars)
+        )
     compacted = (
         "Compacted tool result.\n"
         f"Tool: {tool_name}\n"
+        f"Evidence class: {evidence_class}\n"
         f"Tool call id: {tool_call_id or 'unknown'}\n"
         f"Fingerprint: {_content_fingerprint(content)}\n"
         f"Original chars: {len(content)}\n"
         f"Summary: {compact_summary}"
     )
     return {**message, "content": compacted}
+
+
+def _compact_evidence_text(content: str, *, max_chars: int) -> str:
+    """Keep both source framing and trailing citations when evidence is reduced."""
+    text = str(content or "").strip()
+    if len(text) <= max_chars:
+        return text
+    marker = "\n\n[... middle evidence omitted by context budget ...]\n\n"
+    available = max(0, max_chars - len(marker))
+    head_chars = int(available * 0.7)
+    tail_chars = available - head_chars
+    return f"{text[:head_chars].rstrip()}{marker}{text[-tail_chars:].lstrip()}"
 
 
 _CATALOG_IDENTITY_FIELDS = (
@@ -1366,13 +1450,28 @@ def _project_history_for_model(
     history: List[Dict[str, Any]],
     *,
     aggressive: bool = False,
+    history_token_limit: int | None = None,
+    tool_result_max_chars: int | None = None,
 ) -> tuple[List[Dict[str, Any]], dict[str, Any]]:
+    effective_history_limit = (
+        max(0, int(history_token_limit))
+        if history_token_limit is not None
+        else int(settings.agent_history_soft_token_limit)
+    )
+    effective_tool_result_max_chars = (
+        max(400, int(tool_result_max_chars))
+        if tool_result_max_chars is not None
+        else int(settings.agent_tool_result_max_chars)
+    )
     projected = list(history)
     report: dict[str, Any] = {
         "aggressive": aggressive,
+        "history_token_limit": effective_history_limit,
+        "tool_result_max_chars": effective_tool_result_max_chars,
         "estimated_tokens_before": _estimate_history_tokens(history),
         "estimated_tokens_after": 0,
         "tool_results_compacted": 0,
+        "tool_compactions": [],
         "compaction_boundary_applied": False,
         "boundary_messages_collapsed": 0,
         "boundary_messages_preserved": 0,
@@ -1386,21 +1485,47 @@ def _project_history_for_model(
         content = str(message.get("content") or "")
         if not content:
             continue
-        should_compact = aggressive or len(content) > int(settings.agent_tool_result_max_chars)
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        tool_name = tool_lookup.get(tool_call_id) or "unknown_tool"
+        result_limit = (
+            effective_tool_result_max_chars
+            if aggressive
+            else tool_result_char_budget(
+                tool_name,
+                history_budget_tokens=effective_history_limit,
+                ordinary_max_chars=effective_tool_result_max_chars,
+            )
+        )
+        compaction_limit = result_limit
+        should_compact = aggressive or len(content) > compaction_limit
         if not should_compact and index not in recent_tool_indices:
-            should_compact = len(content) > max(400, int(settings.agent_tool_result_max_chars) // 2)
+            compaction_limit = max(400, result_limit // 2)
+            should_compact = len(content) > compaction_limit
         if not should_compact:
             continue
-        projected[index] = _compact_tool_message(
+        compacted_message = _compact_tool_message(
             message,
             tool_name_lookup=tool_lookup,
-            max_chars=int(settings.agent_tool_result_max_chars),
+            max_chars=compaction_limit,
         )
+        retained_content = str(compacted_message.get("content") or "")
+        if len(retained_content) >= len(content):
+            continue
+        projected[index] = compacted_message
         report["tool_results_compacted"] += 1
+        report["tool_compactions"].append(
+            {
+                "tool": tool_name,
+                "evidence_class": evidence_class_for_tool(tool_name),
+                "original_chars": len(content),
+                "retained_chars": len(retained_content),
+                "limit_chars": compaction_limit,
+            }
+        )
 
     estimated_after = _estimate_history_tokens(projected)
     keep_recent_messages = max(1, int(settings.agent_recent_messages_keep))
-    if projected and (aggressive or estimated_after > int(settings.agent_history_soft_token_limit)):
+    if projected and (aggressive or estimated_after > effective_history_limit):
         cut = _snap_cut_to_tool_chain(projected, max(0, len(projected) - keep_recent_messages))
         prefix = projected[:cut]
         suffix = projected[cut:]
@@ -1422,6 +1547,68 @@ def _project_history_for_model(
 
     report["estimated_tokens_after"] = estimated_after
     return projected, report
+
+
+def _log_context_budget(
+    *,
+    budget: dict[str, Any],
+    report: dict[str, Any],
+    model: str,
+    mode: str,
+    stage: str | None,
+    user_context: UserContext,
+    aggressive: bool,
+) -> None:
+    log_method = log.warning if budget.get("over_budget") else log.info
+    log_method(
+        "agent.context_budget",
+        model=model,
+        mode=mode,
+        stage=stage,
+        session_id=user_context.session_id,
+        task_id=user_context.task_id,
+        policy_source=budget.get("policy_source"),
+        context_window_tokens=budget.get("context_window_tokens"),
+        usable_input_tokens=budget.get("usable_input_tokens"),
+        estimated_input_tokens=budget.get("estimated_input_tokens"),
+        history_tokens=budget.get("history_tokens"),
+        history_budget_tokens=budget.get("history_budget_tokens"),
+        fixed_message_tokens=budget.get("fixed_message_tokens"),
+        tool_schema_tokens=budget.get("tool_schema_tokens"),
+        estimated_headroom_tokens=budget.get("estimated_headroom_tokens"),
+        tool_results_compacted=report.get("tool_results_compacted"),
+        compaction_boundary_applied=report.get("compaction_boundary_applied"),
+        aggressive=aggressive,
+    )
+
+
+async def _emit_context_budget_event(
+    emitter: AgentEventEmitter | None,
+    *,
+    budget: dict[str, Any],
+    report: dict[str, Any],
+    aggressive: bool,
+) -> None:
+    if emitter is None or not emitter.is_observed:
+        return
+    await emitter.emit(
+        AgentEventType.CONTEXT_BUDGET,
+        model=budget.get("model"),
+        policy_source=budget.get("policy_source"),
+        context_window_tokens=budget.get("context_window_tokens"),
+        output_reserve_tokens=budget.get("output_reserve_tokens"),
+        reasoning_reserve_tokens=budget.get("reasoning_reserve_tokens"),
+        safety_margin_tokens=budget.get("safety_margin_tokens"),
+        usable_input_tokens=budget.get("usable_input_tokens"),
+        estimated_input_tokens=budget.get("estimated_input_tokens"),
+        history_tokens=budget.get("history_tokens"),
+        history_budget_tokens=budget.get("history_budget_tokens"),
+        tool_schema_tokens=budget.get("tool_schema_tokens"),
+        estimated_headroom_tokens=budget.get("estimated_headroom_tokens"),
+        tool_results_compacted=report.get("tool_results_compacted"),
+        tool_compactions=list(report.get("tool_compactions") or [])[:8],
+        aggressive=aggressive,
+    )
 
 
 def _record_budget_event(report: dict[str, Any], *, stage: str | None, mode: str, model: str) -> None:
@@ -1666,19 +1853,110 @@ def _is_rss_owned_headline_prompt(messages: List[Dict[str, Any]]) -> bool:
     return True
 
 
+WEB_CONTEXT_RESEARCH_MARKERS = (
+    "across sources",
+    "analyze",
+    "analysis",
+    "compare",
+    "comparison",
+    "comprehensive",
+    "deep dive",
+    "detailed",
+    "evidence",
+    "how has",
+    "in-depth",
+    "investigate",
+    "latest developments",
+    "research",
+    "synthesize",
+    "what changed",
+)
+WEB_CONTEXT_DEEP_MARKERS = (
+    "comprehensive",
+    "deep dive",
+    "detailed",
+    "in-depth",
+    "thorough",
+)
+
+
+def _prompt_benefits_from_web_context(messages: List[Dict[str, Any]]) -> bool:
+    """Reserve provider context for prompts that ask for multi-source synthesis."""
+    text = _latest_user_message_text(messages).casefold()
+    return bool(text and any(marker in text for marker in WEB_CONTEXT_RESEARCH_MARKERS))
+
+
+def _web_context_depth_for_prompt(messages: List[Dict[str, Any]]) -> str:
+    text = _latest_user_message_text(messages).casefold()
+    return "deep" if any(marker in text for marker in WEB_CONTEXT_DEEP_MARKERS) else "standard"
+
+
+def _apply_web_context_first_turn_policy(
+    tools: List[Dict[str, Any]] | None,
+    *,
+    turn_number: int,
+    enabled: bool,
+) -> tuple[List[Dict[str, Any]] | None, Any]:
+    if not enabled or turn_number != 1 or not tools:
+        return tools, "auto"
+    context_tools = [
+        tool
+        for tool in tools
+        if str(((tool.get("function") or {}).get("name") or "")).strip() == "web_context"
+    ]
+    if not context_tools:
+        return tools, "auto"
+    return context_tools, {"type": "function", "function": {"name": "web_context"}}
+
+
+def _rewrite_web_context_tool_calls(
+    tool_calls: List[Dict[str, Any]],
+    *,
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Normalize the forced context call so provider depth follows user intent."""
+    rewritten: List[Dict[str, Any]] = []
+    depth = _web_context_depth_for_prompt(messages)
+    fallback_query = _latest_user_message_text(messages).strip()
+    for call in tool_calls:
+        if _tool_call_name(call) != "web_context":
+            rewritten.append(call)
+            continue
+        arguments = _tool_call_arguments(call)
+        arguments["depth"] = depth
+        if not str(arguments.get("query") or "").strip() and fallback_query:
+            arguments["query"] = fallback_query[:600]
+        function = dict(call.get("function") or {})
+        function["arguments"] = json.dumps(arguments)
+        rewritten.append({**call, "function": function})
+    return rewritten
+
+
 def _filter_tools_for_prompt(
     tools: List[Dict[str, Any]],
     *,
+    messages: List[Dict[str, Any]],
     rss_owned_headline_prompt: bool,
     mode: str,
     stage: str | None,
     selected_model: str,
     user_context: UserContext,
 ) -> List[Dict[str, Any]]:
+    filtered = list(tools)
+    if not _prompt_benefits_from_web_context(messages):
+        filtered = [
+            tool
+            for tool in filtered
+            if str(((tool.get("function") or {}).get("name") or "")).strip() != "web_context"
+        ]
     if not rss_owned_headline_prompt or mode not in {"chat", "chat_orchestrated"}:
-        return tools
-    filtered = [tool for tool in tools if str(((tool.get("function") or {}).get("name") or "")).strip() != "web_search"]
-    if len(filtered) != len(tools):
+        return filtered
+    without_web_search = [
+        tool
+        for tool in filtered
+        if str(((tool.get("function") or {}).get("name") or "")).strip() != "web_search"
+    ]
+    if len(without_web_search) != len(filtered):
         log.info(
             "agent.headline_roundup_rss_lane",
             skipped_web_search=True,
@@ -1688,7 +1966,7 @@ def _filter_tools_for_prompt(
             session_id=user_context.session_id,
             task_id=user_context.task_id,
         )
-    return filtered
+    return without_web_search
 
 
 def _rss_result_item_count(content: str) -> int:
@@ -2698,6 +2976,7 @@ async def _stream_final_response(
     *,
     selected_model: str,
     stage: str | None,
+    event_emitter: AgentEventEmitter | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Stream the final assistant text for a simple chat turn.
@@ -2722,6 +3001,7 @@ async def _stream_final_response(
             stream=True,
             extra_kwargs=extra,
             stream_kwargs=stream_kwargs,
+            event_emitter=event_emitter,
         )
     except Exception as e:
         log.error(
@@ -2779,6 +3059,7 @@ class _AgentLoopState:
     recent_exploration_signatures: List[str] = field(default_factory=list)
     recent_rss_query_family_signatures: List[str] = field(default_factory=list)
     prior_recent_feed_fetches: int = 0
+    empty_final_retries: int = 0
 
 
 @dataclass
@@ -2791,6 +3072,7 @@ class _AgentLoopSetup:
     extra: Dict[str, Any]
     state: _AgentLoopState
     rss_owned_headline_prompt: bool
+    web_context_first: bool
 
 
 @dataclass(frozen=True)
@@ -2798,6 +3080,7 @@ class _PreparedAgentTurn:
     number: int
     history: List[Dict[str, Any]]
     tools: List[Dict[str, Any]] | None
+    tool_choice: Any
 
 
 def _initialize_agent_loop(
@@ -2844,11 +3127,19 @@ def _initialize_agent_loop(
         )
     tools = _filter_tools_for_prompt(
         tools,
+        messages=messages,
         rss_owned_headline_prompt=rss_owned_headline_prompt,
         mode=mode,
         stage=stage,
         selected_model=selected_model,
         user_context=user_context,
+    )
+    web_context_first = bool(
+        _prompt_benefits_from_web_context(messages)
+        and any(
+            str(((tool.get("function") or {}).get("name") or "")).strip() == "web_context"
+            for tool in tools
+        )
     )
     return _AgentLoopSetup(
         history=history,
@@ -2859,6 +3150,7 @@ def _initialize_agent_loop(
         extra=_litellm_kwargs(selected_model, is_incognito=user_context.is_incognito),
         state=_AgentLoopState(),
         rss_owned_headline_prompt=rss_owned_headline_prompt,
+        web_context_first=web_context_first,
     )
 
 
@@ -2879,6 +3171,21 @@ async def _prepare_agent_turn(
         stage=stage,
         user_context=user_context,
     )
+    turn_tools, tool_choice = _apply_web_context_first_turn_policy(
+        turn_tools,
+        turn_number=turn_number,
+        enabled=setup.web_context_first,
+    )
+    if tool_choice != "auto":
+        log.info(
+            "agent.web_context_first_turn",
+            model=setup.selected_model,
+            mode=mode,
+            stage=stage,
+            session_id=user_context.session_id,
+            task_id=user_context.task_id,
+            depth=_web_context_depth_for_prompt(setup.history),
+        )
     turn_history = _apply_generated_image_response_contract(turn_history)
     _log_agent_turn_start(
         turn=turn_number,
@@ -2909,6 +3216,7 @@ async def _prepare_agent_turn(
         number=turn_number,
         history=turn_history,
         tools=turn_tools,
+        tool_choice=tool_choice,
     )
 
 
@@ -2932,6 +3240,10 @@ async def _execute_agent_tool_turn(
 ) -> str | None:
     """Execute one tool turn and apply the shared convergence policy."""
     normalized_tool_calls = list(normalized_message.get("tool_calls") or [])
+    normalized_tool_calls = _rewrite_web_context_tool_calls(
+        normalized_tool_calls,
+        messages=original_messages,
+    )
     normalized_tool_calls, state.prior_recent_feed_fetches = _rewrite_headline_rss_tool_calls(
         normalized_tool_calls,
         rss_owned_headline_prompt=rss_owned_headline_prompt,
@@ -3229,6 +3541,8 @@ async def _complete_agent_turn(
     extra: Dict[str, Any],
     usage_stage: str | None,
     error_message: str,
+    tool_choice: Any = "auto",
+    event_emitter: AgentEventEmitter | None = None,
 ) -> Any:
     """Invoke one compatibility completion with shared local-tool recovery."""
     try:
@@ -3239,8 +3553,9 @@ async def _complete_agent_turn(
             mode=mode,
             stage=stage,
             tools=tools,
-            tool_choice="auto",
+            tool_choice=tool_choice,
             extra_kwargs=extra,
+            event_emitter=event_emitter,
         )
     except Exception as exc:
         if tools and (
@@ -3269,6 +3584,7 @@ async def _complete_agent_turn(
                 mode=mode,
                 stage=f"{stage}_local_tool_fallback" if stage else "local_tool_fallback",
                 extra_kwargs=extra,
+                event_emitter=event_emitter,
             )
         else:
             log.error(
@@ -3341,6 +3657,7 @@ async def _run_agent_chunks(
         )
         turn_history = prepared_turn.history
         turn_tools = prepared_turn.tools
+        turn_tool_choice = prepared_turn.tool_choice
         native_turn: ModelTurnResult | None = None
         native_text_emitted = False
         provisional_text_active = False
@@ -3367,9 +3684,10 @@ async def _run_agent_chunks(
                     stage=stage,
                     stream=True,
                     tools=turn_tools,
-                    tool_choice="auto",
+                    tool_choice=turn_tool_choice,
                     extra_kwargs=native_extra,
                     stream_kwargs=stream_kwargs,
+                    event_emitter=event_emitter,
                 )
                 try:
                     async for event in iter_model_stream_events(provider_stream):
@@ -3472,6 +3790,8 @@ async def _run_agent_chunks(
                 extra=extra,
                 usage_stage=(f"{stage}_probe" if stage else "stream_probe") if streaming else stage,
                 error_message="LLM call failed (streaming turn)" if streaming else "LLM call failed",
+                tool_choice=turn_tool_choice,
+                event_emitter=event_emitter,
             )
             message: Any = response.choices[0].message
         else:
@@ -3513,26 +3833,70 @@ async def _run_agent_chunks(
                 yield stop_response
                 return
         else:
+            final_content = str(message.content or "").strip()
+            if not final_content:
+                if loop_state.empty_final_retries < 1:
+                    loop_state.empty_final_retries += 1
+                    log.warning(
+                        "agent.empty_final_answer_retry",
+                        turn=turn_number,
+                        model=selected_model,
+                        mode=mode,
+                        stage=stage,
+                        session_id=user_context.session_id,
+                        task_id=user_context.task_id,
+                    )
+                    if event_emitter is not None:
+                        await event_emitter.emit(
+                            AgentEventType.VALIDATION_RETRY,
+                            turn=turn_number,
+                            retry_reason="empty_final_answer",
+                        )
+                    history.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "The previous model turn returned no user-visible answer. "
+                                "Respond now with a complete, concise answer to the user's latest request."
+                            ),
+                        }
+                    )
+                    continue
+                fallback = (
+                    "I couldn't produce a usable answer from the model response. "
+                    "Please retry, or narrow the request if it continues."
+                )
+                log.error(
+                    "agent.empty_final_answer_exhausted",
+                    turn=turn_number,
+                    model=selected_model,
+                    mode=mode,
+                    stage=stage,
+                    session_id=user_context.session_id,
+                    task_id=user_context.task_id,
+                )
+                yield fallback
+                return
             _log_agent_final_turn(
                 turn=turn_number,
                 mode=mode,
                 stage=stage,
                 selected_model=selected_model,
                 user_context=user_context,
-                content=message.content or "",
+                content=final_content,
             )
             if native_turn is not None:
                 if provisional_text_active and provisional_text_callback is not None:
                     await provisional_text_callback("commit", "")
                 if not native_text_emitted:
-                    for token in _chunk_plain_text(message.content or ""):
+                    for token in _chunk_plain_text(final_content):
                         yield token
                 return
             if not streaming:
-                yield message.content or ""
+                yield final_content
                 return
             if setup.provider.skip_duplicate_final_stream:
-                for token in _chunk_plain_text(message.content or ""):
+                for token in _chunk_plain_text(final_content):
                     yield token
                 return
             async for token in _stream_final_response(
@@ -3540,6 +3904,7 @@ async def _run_agent_chunks(
                 user_context,
                 selected_model=selected_model,
                 stage=stage,
+                event_emitter=event_emitter,
             ):
                 yield token
             return

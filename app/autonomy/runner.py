@@ -32,6 +32,7 @@ from app.autonomy.approval import ApprovalRequired, _approval_armed
 from app.autonomy.configured_executor import build_preserved_runtime_state, resolve_task_execution_contract
 from app.autonomy.model_routing import TaskModelProfile, resolve_task_model_profile
 from app.config import settings
+from app.agent.context_budget import task_synthesis_evidence_budget
 from app.db.models import Task, TaskRun, TaskRunArtifact, TaskStep, User
 from app.llm_usage import bind_llm_usage_context, reset_llm_usage_context
 from app.metrics import metrics
@@ -1074,6 +1075,10 @@ class TaskRunner:
                         await db.commit()
                     continue
 
+            is_final_step = self._is_final_synthesis_step(step, steps)
+            synthesis_budget = task_synthesis_evidence_budget(
+                model_profile.final_synthesis_model if model_profile else None
+            )
             # Summaries from previous succeeded steps keep context compact.
             prior_summaries: list[str] = []
             prior_full_outputs: list[str] = []
@@ -1094,11 +1099,23 @@ class TaskRunner:
                 summary_steps = prev_steps[-max_prior_summaries:]
                 for prev in summary_steps:
                     prior_summaries.append(f"Step {prev.step_index}: {prev.output_summary}")
-                max_prior_full_outputs = max(1, int(settings.task_final_synthesis_max_prior_outputs))
+                max_prior_full_outputs = max(
+                    1,
+                    int(settings.task_final_synthesis_max_prior_outputs),
+                    synthesis_budget.max_prior_outputs,
+                )
                 output_steps = [prev for prev in prev_steps if prev.result][-max_prior_full_outputs:]
                 omitted_prior_outputs = max(0, len([prev for prev in prev_steps if prev.result]) - len(output_steps))
-                max_prior_output_tokens = max(50, int(settings.task_final_synthesis_max_prior_output_tokens))
-                max_prior_output_chars = max(200, int(settings.task_final_synthesis_max_prior_output_chars))
+                max_prior_output_tokens = max(
+                    50,
+                    int(settings.task_final_synthesis_max_prior_output_tokens),
+                    synthesis_budget.max_tokens_per_output,
+                )
+                max_prior_output_chars = max(
+                    200,
+                    int(settings.task_final_synthesis_max_prior_output_chars),
+                    synthesis_budget.max_chars_per_output,
+                )
                 for prev in output_steps:
                     if prev.result:
                         truncated_output = _truncate_text_to_estimated_tokens(
@@ -1113,7 +1130,7 @@ class TaskRunner:
                             f"Step {prev.step_index} full output:\n{truncated_output}"
                         )
 
-            is_final_step = self._is_final_synthesis_step(step, steps)
+            run_debug["task_synthesis_evidence_budget"] = synthesis_budget.to_dict()
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             if isinstance(run_context, dict) and isinstance(run_context.get("executor_config"), dict):
                 latest_skill_event = {}

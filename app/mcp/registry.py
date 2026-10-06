@@ -329,7 +329,7 @@ class MCPRegistry:
             try:
                 result = await module.call_tool(tool_name, arguments, user_context)
                 return ToolOutputText(
-                    str(result),
+                    _extract_text(result),
                     structured_content=_extract_structured_content(result),
                 )
             except Exception as e:

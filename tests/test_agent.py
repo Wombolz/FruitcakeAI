@@ -23,14 +23,17 @@ from unittest.mock import AsyncMock, patch
 from sqlalchemy import select
 
 from app.agent.context import UserContext
+from app.agent.context_budget import RequestBudget
 from app.agent.core import (
     _acompletion_with_budget,
+    _apply_web_context_first_turn_policy,
     _apply_provider_prompt_cache_kwargs,
     _build_messages,
     _compact_tool_message,
     _filter_tools_for_prompt,
     _is_rss_owned_headline_prompt,
     _rewrite_headline_rss_tool_calls,
+    _rewrite_web_context_tool_calls,
     _sanitize_history_tool_chains,
     _content_fingerprint,
     _rss_evidence_summary,
@@ -184,6 +187,60 @@ async def test_run_agent_retries_once_after_context_window_error(monkeypatch):
     assert result == "recovered"
     assert diagnostics["overflow_retries"] == 1
     assert diagnostics["overflow_retry_succeeded"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_agent_retries_once_after_empty_final_answer(monkeypatch):
+    from app.agent.runtime.events import AgentEventEmitter, AgentEventType
+
+    ctx = _make_context()
+    responses = [
+        _FakeResponse(_FakeMessage(content="   ")),
+        _FakeResponse(_FakeMessage(content="Recovered answer.")),
+    ]
+    events = []
+
+    async def _collect(event):
+        events.append(event)
+
+    emitter = AgentEventEmitter(callback=_collect)
+    with patch("app.agent.core.get_tools_for_user", return_value=[]):
+        with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=responses)) as completion:
+            result = await run_agent(
+                [{"role": "user", "content": "Answer this question."}],
+                ctx,
+                mode="task",
+                event_emitter=emitter,
+            )
+
+    assert result == "Recovered answer."
+    assert completion.await_count == 2
+    retry_events = [event for event in events if event.type == AgentEventType.VALIDATION_RETRY]
+    assert len(retry_events) == 1
+    assert retry_events[0].payload["retry_reason"] == "empty_final_answer"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_returns_visible_fallback_after_repeated_empty_answers():
+    ctx = _make_context()
+    responses = [
+        _FakeResponse(_FakeMessage(content=None)),
+        _FakeResponse(_FakeMessage(content="\n\t")),
+    ]
+
+    with patch("app.agent.core.get_tools_for_user", return_value=[]):
+        with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=responses)) as completion:
+            result = await run_agent(
+                [{"role": "user", "content": "Answer this question."}],
+                ctx,
+                mode="task",
+            )
+
+    assert result == (
+        "I couldn't produce a usable answer from the model response. "
+        "Please retry, or narrow the request if it continues."
+    )
+    assert completion.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -426,6 +483,23 @@ async def test_run_agent_repo_map_style_exploration_compacts_multi_turn_history(
             }
         ],
     ]
+    model_budget = RequestBudget(
+        model="gpt-5",
+        policy_source="test",
+        context_window_tokens=10_320,
+        output_reserve_tokens=8_192,
+        reasoning_reserve_tokens=0,
+        safety_margin_tokens=2_048,
+        usable_input_tokens=80,
+        message_tokens=0,
+        history_tokens=0,
+        fixed_message_tokens=0,
+        tool_schema_tokens=0,
+        estimated_input_tokens=0,
+        history_budget_tokens=80,
+        estimated_headroom_tokens=80,
+        over_budget=False,
+    )
 
     token = reset_agent_loop_diagnostics()
     try:
@@ -437,8 +511,9 @@ async def test_run_agent_repo_map_style_exploration_compacts_multi_turn_history(
             ],
         ):
             with patch("app.agent.core.dispatch_tool_calls", new=AsyncMock(side_effect=tool_results)):
-                with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=_fake_acompletion)):
-                    result = await run_agent([{"role": "user", "content": "Build a repo map for the app package."}], ctx, mode="task")
+                    with patch("app.agent.core.plan_request_budget", return_value=model_budget):
+                        with patch("app.agent.core.litellm.acompletion", new=AsyncMock(side_effect=_fake_acompletion)):
+                            result = await run_agent([{"role": "user", "content": "Build a repo map for the app package."}], ctx, mode="task")
         diagnostics = get_agent_loop_diagnostics()
     finally:
         restore_agent_loop_diagnostics(token)
@@ -1114,6 +1189,7 @@ def test_filter_tools_for_prompt_removes_web_search_for_rss_owned_headlines():
 
     filtered = _filter_tools_for_prompt(
         tools,
+        messages=[{"role": "user", "content": "Give me 10 headlines from today's news"}],
         rss_owned_headline_prompt=True,
         mode="chat",
         stage="chat_simple",
@@ -1123,6 +1199,86 @@ def test_filter_tools_for_prompt_removes_web_search_for_rss_owned_headlines():
 
     names = [tool["function"]["name"] for tool in filtered]
     assert names == ["list_recent_feed_items"]
+
+
+def test_filter_tools_for_prompt_only_exposes_web_context_for_research_intent():
+    ctx = _make_context()
+    tools = [
+        {"type": "function", "function": {"name": "web_search"}},
+        {"type": "function", "function": {"name": "web_context"}},
+    ]
+
+    lookup = _filter_tools_for_prompt(
+        tools,
+        messages=[{"role": "user", "content": "What is the capital of Georgia?"}],
+        rss_owned_headline_prompt=False,
+        mode="chat",
+        stage="chat_simple",
+        selected_model="gpt-5-mini",
+        user_context=ctx,
+    )
+    research = _filter_tools_for_prompt(
+        tools,
+        messages=[{"role": "user", "content": "Research and compare current reporting on Georgia."}],
+        rss_owned_headline_prompt=False,
+        mode="chat_orchestrated",
+        stage="chat_complex",
+        selected_model="gpt-5-mini",
+        user_context=ctx,
+    )
+
+    assert {tool["function"]["name"] for tool in lookup} == {"web_search"}
+    assert {tool["function"]["name"] for tool in research} == {"web_search", "web_context"}
+
+
+def test_web_context_first_turn_policy_forces_only_context_then_restores_tools():
+    tools = [
+        {"type": "function", "function": {"name": "web_search"}},
+        {"type": "function", "function": {"name": "fetch_page"}},
+        {"type": "function", "function": {"name": "web_context"}},
+    ]
+
+    first_tools, first_choice = _apply_web_context_first_turn_policy(
+        tools,
+        turn_number=1,
+        enabled=True,
+    )
+    later_tools, later_choice = _apply_web_context_first_turn_policy(
+        tools,
+        turn_number=2,
+        enabled=True,
+    )
+
+    assert [tool["function"]["name"] for tool in first_tools] == ["web_context"]
+    assert first_choice == {"type": "function", "function": {"name": "web_context"}}
+    assert later_tools == tools
+    assert later_choice == "auto"
+
+
+def test_rewrite_web_context_tool_call_uses_deep_mode_and_preserves_query():
+    calls = [
+        {
+            "id": "context_1",
+            "type": "function",
+            "function": {
+                "name": "web_context",
+                "arguments": json.dumps({"query": "Qwen model comparison", "depth": "standard"}),
+            },
+        }
+    ]
+
+    rewritten = _rewrite_web_context_tool_calls(
+        calls,
+        messages=[
+            {
+                "role": "user",
+                "content": "Give me a detailed comparison of Qwen 3.6 and Qwen 3.8.",
+            }
+        ],
+    )
+
+    arguments = json.loads(rewritten[0]["function"]["arguments"])
+    assert arguments == {"query": "Qwen model comparison", "depth": "deep"}
 
 
 def test_rewrite_headline_rss_tool_calls_downgrades_repeat_refresh():
@@ -3007,6 +3163,104 @@ def test_project_history_keeps_tool_chain_on_same_side_of_cut(monkeypatch):
     sanitized, repaired = _sanitize_history_tool_chains(projected)
     assert repaired == 0
     assert sanitized[-3].get("tool_calls")
+
+
+def test_project_history_preserves_larger_recent_web_evidence(monkeypatch):
+    from app.agent.core import _project_history_for_model
+
+    monkeypatch.setattr(settings, "agent_tool_result_max_chars", 4000)
+    monkeypatch.setattr(settings, "agent_tool_recent_keep", 4)
+    history = [
+        {"role": "user", "content": "Research the source."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_page", "function": {"name": "fetch_page", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_page", "content": "E" * 12_000},
+    ]
+
+    projected, report = _project_history_for_model(history, history_token_limit=40_000)
+
+    assert projected[-1]["content"] == history[-1]["content"]
+    assert report["tool_results_compacted"] == 0
+
+
+def test_project_history_compacts_web_evidence_with_head_and_tail(monkeypatch):
+    from app.agent.core import _project_history_for_model
+
+    monkeypatch.setattr(settings, "agent_tool_result_max_chars", 4000)
+    monkeypatch.setattr(settings, "agent_tool_recent_keep", 4)
+    content = "HEAD-SOURCE\n" + ("E" * 24_000) + "\nTAIL-CITATION"
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_page", "function": {"name": "fetch_page", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_page", "content": content},
+    ]
+
+    projected, report = _project_history_for_model(history, history_token_limit=40_000)
+
+    compacted = projected[-1]["content"]
+    assert "HEAD-SOURCE" in compacted
+    assert "TAIL-CITATION" in compacted
+    assert "Evidence class: source_document" in compacted
+    assert report["tool_compactions"][0]["limit_chars"] == 20_000
+
+
+def test_project_history_old_web_evidence_uses_reduced_budget_without_false_compaction(monkeypatch):
+    from app.agent.core import _project_history_for_model
+
+    monkeypatch.setattr(settings, "agent_tool_result_max_chars", 4000)
+    monkeypatch.setattr(settings, "agent_tool_recent_keep", 4)
+    old_content = "HEAD-SOURCE\n" + ("E" * 11_400) + "\nTAIL-CITATION"
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_old_page", "function": {"name": "fetch_page", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_old_page", "content": old_content},
+    ]
+    for index in range(4):
+        call_id = f"call_recent_{index}"
+        history.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": call_id, "function": {"name": "web_search", "arguments": "{}"}},
+                    ],
+                },
+                {"role": "tool", "tool_call_id": call_id, "content": f"Recent result {index}"},
+            ]
+        )
+
+    projected, report = _project_history_for_model(history, history_token_limit=40_000)
+
+    compacted = projected[1]["content"]
+    assert len(compacted) < len(old_content)
+    assert "HEAD-SOURCE" in compacted
+    assert "TAIL-CITATION" in compacted
+    assert report["tool_results_compacted"] == 1
+    assert report["tool_compactions"] == [
+        {
+            "tool": "fetch_page",
+            "evidence_class": "source_document",
+            "original_chars": len(old_content),
+            "retained_chars": len(compacted),
+            "limit_chars": 10_000,
+        }
+    ]
 
 
 # ── litellm ollama tool-history patch ─────────────────────────────────────────
