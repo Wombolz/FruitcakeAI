@@ -18,6 +18,7 @@ class AgentEventType(str, Enum):
     RUN_STARTED = "run_started"
     PHASE_CHANGED = "phase_changed"
     MODEL_TURN_STARTED = "model_turn_started"
+    CONTEXT_BUDGET = "context_budget"
     REASONING_STARTED = "reasoning_started"
     TEXT_DELTA = "text_delta"
     PROVISIONAL_TEXT_RESET = "provisional_text_reset"

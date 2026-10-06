@@ -1627,6 +1627,11 @@ def test_build_assistant_tool_details_includes_web_query_and_page_url():
 
     details = _build_assistant_tool_details(
         [
+            {
+                "tool": "web_context",
+                "arguments": {"query": "Qwen 3.8 changes", "depth": "deep"},
+                "result_summary": "context",
+            },
             {"tool": "web_search", "arguments": {"query": "NASA Swift reboot"}, "result_summary": "result"},
             {
                 "tool": "fetch_page",
@@ -1637,6 +1642,12 @@ def test_build_assistant_tool_details_includes_web_query_and_page_url():
     )
 
     assert details == [
+        {
+            "tool_name": "web_context",
+            "detail_kind": "query",
+            "label": "Query",
+            "value": "Qwen 3.8 changes",
+        },
         {
             "tool_name": "web_search",
             "detail_kind": "query",
@@ -1722,6 +1733,14 @@ def test_build_live_tool_details_exposes_only_safe_operator_context():
     tool_calls = [
         {
             "function": {
+                "name": "web_context",
+                "arguments": json.dumps(
+                    {"query": "Qwen 3.8 benchmark changes", "depth": "deep", "api_key": "secret"}
+                ),
+            }
+        },
+        {
+            "function": {
                 "name": "web_search",
                 "arguments": json.dumps({"query": "reflecting pool Washington DC", "api_key": "secret"}),
             }
@@ -1743,6 +1762,10 @@ def test_build_live_tool_details_exposes_only_safe_operator_context():
     ]
 
     assert _build_live_tool_details(tool_calls) == [
+        {
+            "tool_name": "web_context",
+            "arguments": {"query": "Qwen 3.8 benchmark changes", "depth": "deep"},
+        },
         {"tool_name": "web_search", "arguments": {"query": "reflecting pool Washington DC"}},
         {"tool_name": "fetch_page", "arguments": {"url": "https://example.com/article"}},
         {"tool_name": "read_file", "arguments": {"path": "reports/repo_map.md"}},

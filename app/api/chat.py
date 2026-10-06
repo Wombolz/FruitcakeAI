@@ -130,6 +130,7 @@ _RSS_EVIDENCE_TOOL_NAMES = {
 }
 _WEB_EVIDENCE_TOOL_NAMES = {
     "web_search",
+    "web_context",
     "fetch_page",
     "api_request",
     "get_daily_market_data",
@@ -2467,6 +2468,7 @@ def _build_live_tool_details(tool_calls: List[Dict[str, Any]]) -> List[Dict[str,
 
 _LIVE_TOOL_ARGUMENT_FIELDS: Dict[str, Dict[str, tuple[str, ...]]] = {
     "web_search": {"query": ("query", "q")},
+    "web_context": {"query": ("query", "q"), "depth": ("depth",)},
     "fetch_page": {"url": ("url",)},
     "search_library": {"query": ("query",), "document": ("document_name", "filename")},
     "summarize_document": {
@@ -3289,7 +3291,7 @@ def _build_assistant_tool_details(executed_tools: List[Dict[str, Any]]) -> List[
             continue
 
         candidates: list[tuple[str, str, str]] = []
-        if tool_name in {"web_search", "search_library", "search_my_feeds", "search_feeds"}:
+        if tool_name in {"web_search", "web_context", "search_library", "search_my_feeds", "search_feeds"}:
             query = str(arguments.get("query") or "").strip()
             if query:
                 candidates.append(("query", "Query", query))

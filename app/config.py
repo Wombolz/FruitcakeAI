@@ -59,8 +59,13 @@ class Settings(BaseSettings):
     secrets_master_key: str = ""
     # Web search. Brave is preferred when configured; DuckDuckGo remains a
     # no-key fallback during the provider transition.
+    web_search_provider: str = "auto"
     brave_search_api_key: str = ""
     brave_search_fallback_to_ddg: bool = True
+    brave_context_enabled: bool = True
+    brave_context_default_tokens: int = 8_192
+    brave_context_timeout_seconds: int = 30
+    web_fetch_max_chars: int = 20_000
     # For Ollama / llama.cpp (openai_compat)
     local_api_base: str = "http://localhost:11434/v1"
     local_api_key: str = "sk-local"

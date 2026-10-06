@@ -71,6 +71,30 @@ async def _seed_trace(*, user_id: int, model: str, suffix: str) -> str:
             (AgentEventType.RUN_STARTED, {"model": model, "private_prompt": "do not retain"}),
             (AgentEventType.MODEL_TURN_STARTED, {"turn": 1, "tool_count": 12}),
             (
+                AgentEventType.CONTEXT_BUDGET,
+                {
+                    "model": model,
+                    "policy_source": "model_profile",
+                    "context_window_tokens": 65536,
+                    "usable_input_tokens": 55296,
+                    "estimated_input_tokens": 12000,
+                    "history_tokens": 7000,
+                    "history_budget_tokens": 50000,
+                    "tool_schema_tokens": 3000,
+                    "estimated_headroom_tokens": 43296,
+                    "tool_compactions": [
+                        {
+                            "tool": "web_context",
+                            "evidence_class": "provider_context",
+                            "original_chars": 48000,
+                            "retained_chars": 32000,
+                            "limit_chars": 32000,
+                        }
+                    ],
+                    "private_prompt": "do not retain",
+                },
+            ),
+            (
                 AgentEventType.TOOL_REQUESTED,
                 {
                     "turn": 1,
@@ -167,6 +191,18 @@ async def test_chat_run_inspection_qualifies_local_and_openai_traces(
     assert payload["metrics"]["cached_prompt_tokens"] == 600
     assert payload["metrics"]["prompt_cache_percent"] == 60.0
     assert payload["tools"] == ["web_search"]
+    assert payload["context_budget"]["event_count"] == 1
+    assert payload["context_budget"]["latest"]["tool_schema_tokens"] == 3000
+    assert payload["context_budget"]["latest"]["estimated_headroom_tokens"] == 43296
+    assert payload["context_budget"]["latest"]["tool_compactions"] == [
+        {
+            "tool": "web_context",
+            "evidence_class": "provider_context",
+            "original_chars": 48000,
+            "retained_chars": 32000,
+            "limit_chars": 32000,
+        }
+    ]
     serialized = json.dumps(payload, default=str)
     assert "private prompt" not in serialized
     assert "private search query" not in serialized

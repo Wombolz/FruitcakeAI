@@ -37,6 +37,10 @@ class ModelProfileCreate(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
     blocked_tools: list[str] = Field(default_factory=list)
     keep_alive: str | None = None
+    context_window_tokens: int = Field(default=65_536, ge=8_192, le=2_000_000)
+    output_reserve_tokens: int = Field(default=8_192, ge=512, le=262_144)
+    reasoning_reserve_tokens: int = Field(default=0, ge=0, le=262_144)
+    context_safety_margin_tokens: int = Field(default=2_048, ge=256, le=131_072)
 
 
 class ModelProfileUpdate(BaseModel):
@@ -55,6 +59,10 @@ class ModelProfileUpdate(BaseModel):
     allowed_tools: list[str] | None = None
     blocked_tools: list[str] | None = None
     keep_alive: str | None = None
+    context_window_tokens: int | None = Field(default=None, ge=8_192, le=2_000_000)
+    output_reserve_tokens: int | None = Field(default=None, ge=512, le=262_144)
+    reasoning_reserve_tokens: int | None = Field(default=None, ge=0, le=262_144)
+    context_safety_margin_tokens: int | None = Field(default=None, ge=256, le=131_072)
 
 
 @router.get("/model-profiles")
@@ -88,6 +96,12 @@ async def create_model_profile(
         body.supports_tools,
         body.supports_thinking,
     )
+    _validate_context_budget(
+        body.context_window_tokens,
+        body.output_reserve_tokens,
+        body.reasoning_reserve_tokens,
+        body.context_safety_margin_tokens,
+    )
     row = ModelProfile(
         model_id=body.model_id.strip(),
         display_name=body.display_name.strip(),
@@ -102,6 +116,10 @@ async def create_model_profile(
         default_reasoning_effort=body.default_reasoning_effort,
         tool_mode=body.tool_mode,
         keep_alive=(body.keep_alive or "").strip() or None,
+        context_window_tokens=body.context_window_tokens,
+        output_reserve_tokens=body.output_reserve_tokens,
+        reasoning_reserve_tokens=body.reasoning_reserve_tokens,
+        context_safety_margin_tokens=body.context_safety_margin_tokens,
         updated_by_user_id=current_user.id,
     )
     row.reasoning_efforts = _normalized_values(body.reasoning_efforts)
@@ -132,6 +150,8 @@ async def update_model_profile(
     for field in (
         "display_name", "enabled", "supports_text", "supports_vision", "supports_tools",
         "supports_thinking", "supports_native_streaming", "tool_mode",
+        "context_window_tokens", "output_reserve_tokens", "reasoning_reserve_tokens",
+        "context_safety_margin_tokens",
     ):
         if field in fields and getattr(body, field) is None:
             raise HTTPException(status_code=422, detail=f"{field} cannot be null")
@@ -149,10 +169,32 @@ async def update_model_profile(
         bool(supports_tools),
         bool(supports_thinking),
     )
+    context_window_tokens = (
+        body.context_window_tokens if "context_window_tokens" in fields else row.context_window_tokens
+    )
+    output_reserve_tokens = (
+        body.output_reserve_tokens if "output_reserve_tokens" in fields else row.output_reserve_tokens
+    )
+    reasoning_reserve_tokens = (
+        body.reasoning_reserve_tokens if "reasoning_reserve_tokens" in fields else row.reasoning_reserve_tokens
+    )
+    context_safety_margin_tokens = (
+        body.context_safety_margin_tokens
+        if "context_safety_margin_tokens" in fields
+        else row.context_safety_margin_tokens
+    )
+    _validate_context_budget(
+        int(context_window_tokens),
+        int(output_reserve_tokens),
+        int(reasoning_reserve_tokens),
+        int(context_safety_margin_tokens),
+    )
 
     for field in (
         "display_name", "enabled", "supports_text", "supports_vision", "supports_tools",
         "supports_thinking", "supports_native_streaming", "default_reasoning_effort", "tool_mode",
+        "context_window_tokens", "output_reserve_tokens", "reasoning_reserve_tokens",
+        "context_safety_margin_tokens",
     ):
         if field in fields:
             setattr(row, field, getattr(body, field))
@@ -195,3 +237,17 @@ def _validate_profile_policy(
         raise HTTPException(status_code=422, detail="tool_mode must be text_only when tools are unsupported")
     if (efforts or default_reasoning_effort) and not supports_thinking:
         raise HTTPException(status_code=422, detail="reasoning settings require supports_thinking")
+
+
+def _validate_context_budget(
+    context_window_tokens: int,
+    output_reserve_tokens: int,
+    reasoning_reserve_tokens: int,
+    context_safety_margin_tokens: int,
+) -> None:
+    reserved = output_reserve_tokens + reasoning_reserve_tokens + context_safety_margin_tokens
+    if reserved > context_window_tokens - 2_048:
+        raise HTTPException(
+            status_code=422,
+            detail="context reserves must leave at least 2048 tokens for model input",
+        )
