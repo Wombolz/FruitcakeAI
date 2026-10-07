@@ -14,6 +14,7 @@ _NEWS_SOURCE_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 _NEWS_SECTION_RE = re.compile(r"^\s*#{2,4}\s+(.+?)\s*$")
 _NEWS_ITEM_RE = re.compile(r"^\s*[-*]\s+\*\*(.+?)\*\*\s*$")
 _MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,4}\s+(.+?)\s*$")
+_STAT_ITEM_RE = re.compile(r"^\s*[-*]?\s*\*\*([^*:\n]{1,80}):\*\*\s*(.+?)\s*$")
 _NEWS_TOOL_NAMES = {
     "get_feed_items",
     "list_recent_feed_items",
@@ -358,6 +359,49 @@ def _build_news_block(content: str) -> dict[str, Any] | None:
     }
 
 
+def _build_stat_blocks(content: str, available: int) -> list[dict[str, Any]]:
+    lines = str(content or "").splitlines()
+    blocks: list[dict[str, Any]] = []
+    index = 0
+    while index < len(lines) and len(blocks) < available:
+        heading = _MARKDOWN_HEADING_RE.match(lines[index])
+        if not heading:
+            index += 1
+            continue
+        cursor = index + 1
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+        items: list[dict[str, str]] = []
+        end = cursor
+        while end < len(lines) and len(items) < 8:
+            match = _STAT_ITEM_RE.match(lines[end])
+            if not match:
+                break
+            label = " ".join(match.group(1).split()).strip()[:80]
+            value = " ".join(match.group(2).split()).strip()[:240]
+            if label and value:
+                items.append({"label": label, "value": value})
+            end += 1
+        if len(items) < 3:
+            index += 1
+            continue
+        source_markdown = "\n".join(lines[index:end]).strip()
+        if len(source_markdown) <= 4_000:
+            blocks.append(
+                {
+                    "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+                    "id": f"stat_group_{len(blocks) + 1}",
+                    "type": "stat_group",
+                    "source_markdown": source_markdown,
+                    "source_fingerprint": _source_fingerprint(source_markdown),
+                    "title": heading.group(1).strip()[:160],
+                    "items": items,
+                }
+            )
+        index = max(end, index + 1)
+    return blocks
+
+
 def build_assistant_content_blocks(
     content: str,
     executed_tools: list[dict[str, Any]] | None = None,
@@ -420,6 +464,8 @@ def build_assistant_content_blocks(
         news_block = _build_news_block(content)
         if news_block:
             blocks.append(news_block)
+    if len(blocks) < CONTENT_BLOCK_LIMIT:
+        blocks.extend(_build_stat_blocks(content, CONTENT_BLOCK_LIMIT - len(blocks)))
     return blocks
 
 
@@ -445,11 +491,42 @@ def normalize_assistant_content_blocks(value: Any) -> list[dict[str, Any]]:
             cleaned = _normalize_news_block(item, source_markdown)
         elif block_type == "table":
             cleaned = _normalize_table_block(item, source_markdown, len(cleaned_blocks))
+        elif block_type == "stat_group":
+            cleaned = _normalize_stat_block(item, source_markdown, len(cleaned_blocks))
         else:
             cleaned = None
         if cleaned:
             cleaned_blocks.append(cleaned)
     return cleaned_blocks
+
+
+def _normalize_stat_block(
+    item: dict[str, Any],
+    source_markdown: str,
+    block_index: int,
+) -> dict[str, Any] | None:
+    raw_items = item.get("items")
+    if not source_markdown or len(source_markdown) > 4_000 or not isinstance(raw_items, list):
+        return None
+    cleaned_items: list[dict[str, str]] = []
+    for raw_item in raw_items[:8]:
+        if not isinstance(raw_item, dict):
+            continue
+        label = " ".join(str(raw_item.get("label") or "").split()).strip()[:80]
+        value = " ".join(str(raw_item.get("value") or "").split()).strip()[:240]
+        if label and value:
+            cleaned_items.append({"label": label, "value": value})
+    if len(cleaned_items) < 3:
+        return None
+    return {
+        "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+        "id": str(item.get("id") or f"stat_group_{block_index + 1}")[:80],
+        "type": "stat_group",
+        "source_markdown": source_markdown,
+        "source_fingerprint": _source_fingerprint(source_markdown),
+        "title": str(item.get("title") or "Summary").strip()[:160] or "Summary",
+        "items": cleaned_items,
+    }
 
 
 def _normalize_news_block(item: dict[str, Any], source_markdown: str) -> dict[str, Any] | None:

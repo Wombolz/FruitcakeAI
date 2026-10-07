@@ -1781,6 +1781,82 @@ def test_build_assistant_content_blocks_does_not_promote_news_without_rss_tool()
     assert _build_assistant_content_blocks(content) == []
 
 
+def test_build_assistant_content_blocks_extracts_bounded_stat_group():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Current conditions are stable.
+
+### System Health
+- **Status:** Healthy
+- **Active tasks:** 12
+- **Queue depth:** 3
+- **Last check:** 2 minutes ago
+
+No intervention is required.
+"""
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert blocks == [
+        {
+            "schema_version": 1,
+            "id": "stat_group_1",
+            "type": "stat_group",
+            "source_markdown": """### System Health
+- **Status:** Healthy
+- **Active tasks:** 12
+- **Queue depth:** 3
+- **Last check:** 2 minutes ago""",
+            "source_fingerprint": blocks[0]["source_fingerprint"],
+            "title": "System Health",
+            "items": [
+                {"label": "Status", "value": "Healthy"},
+                {"label": "Active tasks", "value": "12"},
+                {"label": "Queue depth", "value": "3"},
+                {"label": "Last check", "value": "2 minutes ago"},
+            ],
+        }
+    ]
+
+
+def test_build_assistant_content_blocks_leaves_short_fact_list_as_prose():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### Result
+- **Status:** Healthy
+- **Queue depth:** 3
+"""
+
+    assert _build_assistant_content_blocks(content) == []
+
+
+def test_normalize_assistant_metadata_preserves_bounded_stat_group():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "id": "stat_group_1",
+                    "type": "stat_group",
+                    "source_markdown": "### Quote\n- **Price:** $42\n- **Change:** +1.2%\n- **Status:** Open",
+                    "title": "Quote",
+                    "items": [
+                        {"label": "Price", "value": "$42"},
+                        {"label": "Change", "value": "+1.2%"},
+                        {"label": "Status", "value": "Open"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    normalized = metadata["content_blocks"][0]
+    assert normalized["schema_version"] == 1
+    assert normalized["type"] == "stat_group"
+    assert normalized["items"][1] == {"label": "Change", "value": "+1.2%"}
+
+
 def test_normalize_assistant_metadata_preserves_bounded_news_digest():
     from app.api.chat import _normalize_assistant_metadata_payload
 
