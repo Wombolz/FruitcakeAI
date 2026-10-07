@@ -16,6 +16,10 @@ _NEWS_ITEM_RE = re.compile(r"^\s*[-*]\s+\*\*(.+?)\*\*(?:\s+(.+?))?\s*$")
 _BARE_SOURCE_URL_RE = re.compile(r"https?://[^\s)>]+")
 _MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,4}\s+(.+?)\s*$")
 _STAT_ITEM_RE = re.compile(r"^\s*[-*]?\s*\*\*([^*:\n]{1,80}):\*\*\s*(.+?)\s*$")
+_TIMELINE_HEADING_HINTS = ("timeline", "chronology", "history", "sequence", "events", "schedule", "milestones", "incident")
+_TIMELINE_ITEM_RE = re.compile(
+    r"^\s*[-*]\s+\*\*([^*]{1,100}?)(?::)?\*\*\s*(?:[—–-]\s*)?(.+?)\s*$"
+)
 _NEWS_TOOL_NAMES = {
     "get_feed_items",
     "list_recent_feed_items",
@@ -501,6 +505,9 @@ def _build_stat_blocks(content: str, available: int) -> list[dict[str, Any]]:
         if not heading:
             index += 1
             continue
+        if any(hint in heading.group(1).casefold() for hint in _TIMELINE_HEADING_HINTS):
+            index += 1
+            continue
         cursor = index + 1
         while cursor < len(lines) and not lines[cursor].strip():
             cursor += 1
@@ -529,6 +536,53 @@ def _build_stat_blocks(content: str, available: int) -> list[dict[str, Any]]:
                     "source_fingerprint": _source_fingerprint(source_markdown),
                     "title": heading.group(1).strip()[:160],
                     "items": items,
+                }
+            )
+        index = max(end, index + 1)
+    return blocks
+
+
+def _build_timeline_blocks(content: str, available: int) -> list[dict[str, Any]]:
+    lines = str(content or "").splitlines()
+    blocks: list[dict[str, Any]] = []
+    index = 0
+    while index < len(lines) and len(blocks) < available:
+        heading = _MARKDOWN_HEADING_RE.match(lines[index])
+        if not heading:
+            index += 1
+            continue
+        title = heading.group(1).strip()[:160]
+        if not any(hint in title.casefold() for hint in _TIMELINE_HEADING_HINTS):
+            index += 1
+            continue
+        cursor = index + 1
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+        events: list[dict[str, str]] = []
+        end = cursor
+        while end < len(lines) and len(events) < 20:
+            match = _TIMELINE_ITEM_RE.match(lines[end])
+            if not match:
+                break
+            label = " ".join(match.group(1).split()).strip().rstrip(":")[:100]
+            detail = " ".join(match.group(2).split()).strip()[:600]
+            if label and detail:
+                events.append({"label": label, "detail": detail})
+            end += 1
+        if len(events) < 2:
+            index += 1
+            continue
+        source_markdown = "\n".join(lines[index:end]).strip()
+        if len(source_markdown) <= 12_000:
+            blocks.append(
+                {
+                    "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+                    "id": f"timeline_{len(blocks) + 1}",
+                    "type": "timeline",
+                    "source_markdown": source_markdown,
+                    "source_fingerprint": _source_fingerprint(source_markdown),
+                    "title": title,
+                    "events": events,
                 }
             )
         index = max(end, index + 1)
@@ -602,6 +656,8 @@ def build_assistant_content_blocks(
             blocks.append(news_block)
     if len(blocks) < CONTENT_BLOCK_LIMIT:
         blocks.extend(_build_stat_blocks(content, CONTENT_BLOCK_LIMIT - len(blocks)))
+    if len(blocks) < CONTENT_BLOCK_LIMIT:
+        blocks.extend(_build_timeline_blocks(content, CONTENT_BLOCK_LIMIT - len(blocks)))
     return blocks
 
 
@@ -629,11 +685,42 @@ def normalize_assistant_content_blocks(value: Any) -> list[dict[str, Any]]:
             cleaned = _normalize_table_block(item, source_markdown, len(cleaned_blocks))
         elif block_type == "stat_group":
             cleaned = _normalize_stat_block(item, source_markdown, len(cleaned_blocks))
+        elif block_type == "timeline":
+            cleaned = _normalize_timeline_block(item, source_markdown, len(cleaned_blocks))
         else:
             cleaned = None
         if cleaned:
             cleaned_blocks.append(cleaned)
     return cleaned_blocks
+
+
+def _normalize_timeline_block(
+    item: dict[str, Any],
+    source_markdown: str,
+    block_index: int,
+) -> dict[str, Any] | None:
+    raw_events = item.get("events")
+    if not source_markdown or len(source_markdown) > 12_000 or not isinstance(raw_events, list):
+        return None
+    events: list[dict[str, str]] = []
+    for raw_event in raw_events[:20]:
+        if not isinstance(raw_event, dict):
+            continue
+        label = " ".join(str(raw_event.get("label") or "").split()).strip()[:100]
+        detail = " ".join(str(raw_event.get("detail") or "").split()).strip()[:600]
+        if label and detail:
+            events.append({"label": label, "detail": detail})
+    if len(events) < 2:
+        return None
+    return {
+        "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+        "id": str(item.get("id") or f"timeline_{block_index + 1}")[:80],
+        "type": "timeline",
+        "source_markdown": source_markdown,
+        "source_fingerprint": _source_fingerprint(source_markdown),
+        "title": str(item.get("title") or "Timeline").strip()[:160] or "Timeline",
+        "events": events,
+    }
 
 
 def _normalize_stat_block(

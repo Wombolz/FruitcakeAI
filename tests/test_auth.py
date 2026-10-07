@@ -1959,6 +1959,73 @@ def test_normalize_assistant_metadata_preserves_bounded_stat_group():
     assert normalized["items"][1] == {"label": "Change", "value": "+1.2%"}
 
 
+def test_build_assistant_content_blocks_extracts_explicit_timeline():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """The incident unfolded in three stages.
+
+### Incident Timeline
+- **09:15 AM:** Monitoring detected elevated error rates.
+- **09:28 AM** — Operators disabled the affected integration.
+- **10:05 AM** Service recovered and validation completed.
+
+No data was lost.
+"""
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "timeline"
+    assert blocks[0]["title"] == "Incident Timeline"
+    assert blocks[0]["events"] == [
+        {"label": "09:15 AM", "detail": "Monitoring detected elevated error rates."},
+        {"label": "09:28 AM", "detail": "Operators disabled the affected integration."},
+        {"label": "10:05 AM", "detail": "Service recovered and validation completed."},
+    ]
+
+
+def test_build_assistant_content_blocks_does_not_promote_generic_bold_list_to_timeline():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### Recommendations
+- **First:** Check the logs.
+- **Second:** Restart the service.
+- **Third:** Verify recovery.
+"""
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert all(block["type"] != "timeline" for block in blocks)
+
+
+def test_normalize_assistant_metadata_preserves_bounded_timeline():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "id": "timeline_1",
+                    "type": "timeline",
+                    "source_markdown": "### Timeline\n- **Day 1:** Started\n- **Day 2:** Finished",
+                    "title": "Timeline",
+                    "events": [
+                        {"label": "Day 1", "detail": "Started"},
+                        {"label": "Day 2", "detail": "Finished"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    block = metadata["content_blocks"][0]
+    assert block["schema_version"] == 1
+    assert block["events"] == [
+        {"label": "Day 1", "detail": "Started"},
+        {"label": "Day 2", "detail": "Finished"},
+    ]
+
+
 def test_normalize_assistant_metadata_preserves_bounded_news_digest():
     from app.api.chat import _normalize_assistant_metadata_payload
 
