@@ -1712,6 +1712,36 @@ def test_build_assistant_content_blocks_captures_nearby_table_heading():
     assert blocks[0]["column_alignments"] == ["left", "right"]
 
 
+def test_build_assistant_content_blocks_derives_title_from_nearby_intro():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Here are ten highly rated restaurants in Savannah:
+
+---
+
+| # | Restaurant | Rating |
+|---:|---|---:|
+| 1 | Mrs. Wilkes' Dining Room | 4.6 |
+| 2 | The Olde Pink House | 4.5 |"""
+    blocks = _build_assistant_content_blocks(content)
+
+    assert blocks[0]["title"] == "Ten highly rated restaurants in Savannah"
+    assert blocks[0]["source_markdown"].startswith("| # | Restaurant")
+
+
+def test_build_assistant_content_blocks_does_not_use_list_item_as_table_title():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """- Compare these results carefully
+
+| Model | Score |
+|---|---:|
+| Local | 92 |
+| Cloud | 95 |"""
+
+    assert "title" not in _build_assistant_content_blocks(content)[0]
+
+
 def test_build_assistant_content_blocks_caps_native_tables_at_eight():
     from app.api.chat import _build_assistant_content_blocks
 
@@ -1932,6 +1962,120 @@ def test_build_assistant_content_blocks_leaves_short_fact_list_as_prose():
     assert _build_assistant_content_blocks(content) == []
 
 
+def test_build_assistant_content_blocks_leaves_place_shaped_stats_as_prose_without_place_evidence():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = (
+        "### 1. **Three Tree Coffee Roasters** ⭐ 4.5\n"
+        "- **Address:** 441 S Main St, Statesboro, GA 30458\n"
+        "- **Distance from Downtown:** ~0.2 mi south\n"
+        "- **Phone:** (912) 681-8733\n"
+        "- **Website:** <https://threetreecoffee.com/>"
+    )
+
+    assert _build_assistant_content_blocks(content) == []
+
+
+def test_build_assistant_content_blocks_extracts_bounded_code_artifact():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Use this helper to normalize the value.
+
+### normalize.py
+```python
+def normalize(value: str) -> str:
+    return " ".join(value.split()).strip()
+```
+
+It intentionally preserves no surrounding whitespace.
+"""
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "code_artifact"
+    assert blocks[0]["title"] == "normalize.py"
+    assert blocks[0]["code"] == {
+        "language": "python",
+        "filename": "normalize.py",
+        "content": 'def normalize(value: str) -> str:\n    return " ".join(value.split()).strip()',
+    }
+
+
+def test_build_assistant_content_blocks_links_code_to_tool_backed_workspace_file():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### scripts/check.py
+```python
+def check() -> bool:
+    return True
+```
+"""
+    blocks = _build_assistant_content_blocks(
+        content,
+        [
+            {
+                "tool": "write_file",
+                "arguments": {"path": "/workspace/1/scripts/check.py"},
+                "result_summary": "Workspace file written",
+                "is_error": False,
+            }
+        ],
+    )
+
+    assert blocks[0]["code"]["path"] == "scripts/check.py"
+    assert blocks[0]["code"]["filename"] == "check.py"
+
+
+def test_build_assistant_content_blocks_does_not_promote_short_inline_command():
+    from app.api.chat import _build_assistant_content_blocks
+
+    assert _build_assistant_content_blocks("Run:\n```bash\npytest -q\n```") == []
+
+
+def test_code_artifact_supersedes_markdown_table_inside_fence():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### Markdown example
+```markdown
+| Name | Value |
+|---|---:|
+| Alpha | 1 |
+| Beta | 2 |
+```
+"""
+    blocks = _build_assistant_content_blocks(content)
+
+    assert [block["type"] for block in blocks] == ["code_artifact"]
+
+
+def test_normalize_assistant_metadata_preserves_bounded_code_artifact():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "type": "code_artifact",
+                    "source_markdown": "```swift\nlet value = 1\nprint(value)\n```",
+                    "title": "Example.swift",
+                    "code": {
+                        "language": "swift",
+                        "filename": "Example.swift",
+                        "content": "let value = 1\nprint(value)",
+                        "path": "/workspace/1/Sources/Example.swift",
+                    },
+                }
+            ]
+        }
+    )
+
+    block = metadata["content_blocks"][0]
+    assert block["type"] == "code_artifact"
+    assert block["code"]["path"] == "Sources/Example.swift"
+    assert block["code"]["language"] == "swift"
+
+
 def test_normalize_assistant_metadata_preserves_bounded_stat_group():
     from app.api.chat import _normalize_assistant_metadata_payload
 
@@ -2124,6 +2268,140 @@ def test_normalize_assistant_metadata_preserves_bounded_file_artifact():
         "media_type": "text/csv",
         "operation": "appended",
     }
+
+
+def test_build_assistant_content_blocks_extracts_tool_backed_place_group():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = (
+        "### Coffee nearby\n"
+        "- **The Daily Grind** — Coffee shop at 17 Main St.\n"
+        "- **Three Tree Coffee Roasters** — Cafe at 441 S Main St.\n\n"
+        "Both are close to downtown."
+    )
+    blocks = _build_assistant_content_blocks(
+        content,
+        [
+            {
+                "tool": "search_places",
+                "arguments": {"query": "coffee", "near": "Statesboro"},
+                "is_error": False,
+                "structured_content": {
+                    "capability": "place_search",
+                    "provider": "brave",
+                    "places": [
+                        {
+                            "name": "The Daily Grind",
+                            "address": "17 Main St, Statesboro, GA",
+                            "latitude": 32.448,
+                            "longitude": -81.783,
+                            "category": "Coffee shop",
+                            "rating": 4.6,
+                            "rating_max": 5,
+                            "review_count": 82,
+                            "url": "https://example.com/daily-grind",
+                            "provider": "brave",
+                        },
+                        {
+                            "name": "Three Tree Coffee Roasters",
+                            "address": "441 S Main St, Statesboro, GA",
+                            "category": "Cafe",
+                            "provider": "brave",
+                        },
+                        {
+                            "name": "Unmentioned Cafe",
+                            "address": "99 Hidden St",
+                            "provider": "brave",
+                        },
+                    ],
+                },
+            }
+        ],
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "place_group"
+    assert blocks[0]["title"] == "Coffee nearby"
+    assert blocks[0]["provider"] == "brave"
+    assert [place["name"] for place in blocks[0]["places"]] == [
+        "The Daily Grind",
+        "Three Tree Coffee Roasters",
+    ]
+    assert blocks[0]["places"][0]["rating"] == 4.6
+    assert "Both are close to downtown." not in blocks[0]["source_markdown"]
+
+
+def test_place_group_supersedes_overlapping_markdown_table():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = (
+        "### Nearby places\n"
+        "| Name | Address |\n"
+        "|---|---|\n"
+        "| The Daily Grind | 17 Main St |\n"
+        "| Three Tree Coffee | 441 S Main St |"
+    )
+    blocks = _build_assistant_content_blocks(
+        content,
+        [
+            {
+                "tool": "search_places",
+                "is_error": False,
+                "structured_content": {
+                    "capability": "place_search",
+                    "provider": "nominatim",
+                    "places": [
+                        {"name": "The Daily Grind", "address": "17 Main St"},
+                        {"name": "Three Tree Coffee", "address": "441 S Main St"},
+                    ],
+                },
+            }
+        ],
+    )
+
+    assert [block["type"] for block in blocks] == ["place_group"]
+
+
+def test_normalize_assistant_metadata_preserves_bounded_place_group():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "type": "place_group",
+                    "source_markdown": "- **Cafe** — 1 Main St",
+                    "title": "Nearby",
+                    "provider": "brave",
+                    "places": [
+                        {
+                            "name": "Cafe",
+                            "address": "1 Main St",
+                            "latitude": 32.0,
+                            "longitude": -81.0,
+                            "rating": 4.5,
+                            "review_count": 12,
+                            "url": "javascript:alert(1)",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    block = metadata["content_blocks"][0]
+    assert block["schema_version"] == 1
+    assert block["type"] == "place_group"
+    assert block["places"] == [
+        {
+            "name": "Cafe",
+            "address": "1 Main St",
+            "latitude": 32.0,
+            "longitude": -81.0,
+            "rating": 4.5,
+            "review_count": 12,
+        }
+    ]
 
 
 def test_normalize_assistant_metadata_preserves_bounded_news_digest():

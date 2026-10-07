@@ -18,6 +18,16 @@ _BARE_SOURCE_URL_RE = re.compile(r"https?://[^\s)>]+")
 _MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,4}\s+(.+?)\s*$")
 _STAT_ITEM_RE = re.compile(r"^\s*[-*]?\s*\*\*([^*:\n]{1,80}):\*\*\s*(.+?)\s*$")
 _TIMELINE_HEADING_HINTS = ("timeline", "chronology", "history", "sequence", "events", "schedule", "milestones", "incident")
+_PLACE_STAT_LABELS = {
+    "address",
+    "distance",
+    "distance from downtown",
+    "location",
+    "phone",
+    "price",
+    "rating",
+    "website",
+}
 _TIMELINE_ITEM_RE = re.compile(
     r"^\s*[-*]\s+\*\*([^*]{1,100}?)(?::)?\*\*\s*(?:[—–-]\s*)?(.+?)\s*$"
 )
@@ -29,9 +39,13 @@ _NEWS_TOOL_NAMES = {
     "search_my_feeds_timeline",
 }
 _FILE_ARTIFACT_TOOL_NAMES = {"write_file", "append_file"}
+_PLACE_TOOL_NAMES = {"search_places"}
+_CODE_FILE_TOOL_NAMES = {"read_file", "write_file", "append_file"}
 _SOURCE_RESULT_TOOL_NAMES = _NEWS_TOOL_NAMES | {"web_search", "web_context"}
 _RESULT_ITEM_RE = re.compile(r"^\s*(?:\[\d+\]|(?:Source\s+)?\d+[.):])\s+(.+?)\s*$", re.I)
 _RESULT_FIELD_RE = re.compile(r"^\s*(Feed|Source|Published|Published/updated|Summary|URL):\s*(.+?)\s*$", re.I)
+_CODE_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})([^\n]*)$")
+_CODE_FILENAME_RE = re.compile(r"(?:filename|file|title)\s*=\s*[\"']?([^\"'\s]+)", re.I)
 
 
 def _source_fingerprint(source_markdown: str) -> str:
@@ -297,14 +311,48 @@ def _chart_hint(columns: list[str], rows: list[list[str]]) -> dict[str, Any] | N
 
 def _heading_before(lines: list[str], table_index: int) -> tuple[int, str | None]:
     cursor = table_index - 1
-    while cursor >= 0 and not lines[cursor].strip():
+    while cursor >= 0 and (
+        not lines[cursor].strip()
+        or re.fullmatch(r"\s*(?:-{3,}|\*{3,}|_{3,})\s*", lines[cursor])
+    ):
         cursor -= 1
     if cursor < 0:
         return table_index, None
     match = _MARKDOWN_HEADING_RE.match(lines[cursor])
-    if not match:
+    if match:
+        return cursor, match.group(1).strip()[:160]
+
+    # Tables often follow a short introductory sentence rather than a formal
+    # Markdown heading. Preserve that prose in the response, but use a compact
+    # form of it to name the native table and its detached window.
+    candidate_lines: list[str] = []
+    while cursor >= 0 and len(candidate_lines) < 3:
+        line = lines[cursor].strip()
+        if not line:
+            break
+        if (
+            line.startswith(("|", "```", ">", "#"))
+            or re.match(r"^(?:[-*+]\s|\d+[.)]\s)", line)
+        ):
+            break
+        candidate_lines.append(line)
+        cursor -= 1
+    if not candidate_lines:
         return table_index, None
-    return cursor, match.group(1).strip()[:160]
+
+    candidate = " ".join(reversed(candidate_lines))
+    candidate = re.sub(r"[*_`]", "", candidate).strip()
+    candidate = re.sub(
+        r"^(?:here\s+(?:are|is)|below\s+(?:are|is)|the\s+following\s+(?:table\s+)?(?:shows|lists|compares|summarizes))\s+",
+        "",
+        candidate,
+        flags=re.I,
+    )
+    candidate = candidate.rstrip(".:; ").strip()
+    if not (3 <= len(candidate) <= 140):
+        return table_index, None
+    candidate = candidate[0].upper() + candidate[1:]
+    return table_index, candidate[:140]
 
 
 def _build_news_block(content: str) -> dict[str, Any] | None:
@@ -527,6 +575,13 @@ def _build_stat_blocks(content: str, available: int) -> list[dict[str, Any]]:
         if len(items) < 3:
             index += 1
             continue
+        item_labels = {item["label"].casefold() for item in items}
+        if "address" in item_labels and len(item_labels & _PLACE_STAT_LABELS) >= 3:
+            # Place listings need tool-backed place metadata for native rendering.
+            # Otherwise retain the original prose rather than producing oversized
+            # metric tiles for each address, phone number, and website.
+            index = max(end, index + 1)
+            continue
         source_markdown = "\n".join(lines[index:end]).strip()
         if len(source_markdown) <= 4_000:
             blocks.append(
@@ -671,6 +726,272 @@ def _build_file_artifact_blocks(
     return blocks
 
 
+def _code_language_from_filename(filename: str) -> str:
+    extension = filename.casefold().rsplit(".", 1)[-1] if "." in filename else ""
+    return {
+        "bash": "bash", "c": "c", "cpp": "cpp", "css": "css", "go": "go",
+        "html": "html", "java": "java", "js": "javascript", "json": "json",
+        "jsx": "jsx", "kt": "kotlin", "md": "markdown", "php": "php",
+        "py": "python", "rb": "ruby", "rs": "rust", "sh": "bash",
+        "sql": "sql", "swift": "swift", "toml": "toml", "ts": "typescript",
+        "tsx": "tsx", "xml": "xml", "yaml": "yaml", "yml": "yaml",
+    }.get(extension, "")
+
+
+def _clean_code_filename(value: Any) -> str:
+    filename = " ".join(str(value or "").split()).strip().strip("`*#")[:200]
+    if not filename or "\x00" in filename:
+        return ""
+    return filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+
+def _workspace_code_paths(executed_tools: list[dict[str, Any]]) -> list[str]:
+    paths: list[str] = []
+    for record in executed_tools or []:
+        if not isinstance(record, dict) or bool(record.get("is_error")):
+            continue
+        if str(record.get("tool") or "") not in _CODE_FILE_TOOL_NAMES:
+            continue
+        arguments = record.get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        path = str(arguments.get("path") or "").strip()[:500]
+        if not path or "\x00" in path:
+            continue
+        relative_path = _workspace_relative_artifact_path(path)
+        if relative_path and relative_path not in paths:
+            paths.append(relative_path)
+    return paths
+
+
+def _build_code_artifact_blocks(
+    content: str,
+    executed_tools: list[dict[str, Any]],
+    available: int,
+) -> list[dict[str, Any]]:
+    lines = str(content or "").splitlines()
+    blocks: list[dict[str, Any]] = []
+    workspace_paths = _workspace_code_paths(executed_tools)
+    index = 0
+    while index < len(lines) and len(blocks) < available:
+        opening = _CODE_FENCE_RE.match(lines[index])
+        if not opening:
+            index += 1
+            continue
+        fence, raw_info = opening.groups()
+        cursor = index + 1
+        while cursor < len(lines):
+            closing = lines[cursor].strip()
+            if closing.startswith(fence[0] * len(fence)) and not closing.strip(fence[0]).strip():
+                break
+            cursor += 1
+        if cursor >= len(lines):
+            index += 1
+            continue
+        code = "\n".join(lines[index + 1 : cursor])
+        if not code.strip() or len(code) > 16_000:
+            index = cursor + 1
+            continue
+        nonempty_lines = sum(1 for line in code.splitlines() if line.strip())
+        if nonempty_lines < 2 and len(code.strip()) < 160:
+            index = cursor + 1
+            continue
+
+        info = raw_info.strip()[:300]
+        filename_match = _CODE_FILENAME_RE.search(info)
+        filename = _clean_code_filename(filename_match.group(1) if filename_match else "")
+        info_without_filename = _CODE_FILENAME_RE.sub("", info).strip()
+        language = (info_without_filename.split(maxsplit=1)[0] if info_without_filename else "").casefold()[:40]
+        if language and ("/" in language or "." in language):
+            filename = filename or _clean_code_filename(language)
+            language = ""
+
+        source_start, heading = _heading_before(lines, index)
+        if not filename and heading:
+            heading_filename = _clean_code_filename(heading)
+            if "." in heading_filename and " " not in heading_filename:
+                filename = heading_filename
+        if not language and filename:
+            language = _code_language_from_filename(filename)
+
+        path = ""
+        if filename:
+            path = next(
+                (candidate for candidate in workspace_paths if candidate.rsplit("/", 1)[-1] == filename),
+                "",
+            )
+        if not path and len(workspace_paths) == 1:
+            path = workspace_paths[0]
+            filename = filename or _clean_code_filename(path)
+            language = language or _code_language_from_filename(filename)
+
+        source_markdown = "\n".join(lines[source_start : cursor + 1]).strip()
+        if len(source_markdown) > 20_000:
+            index = cursor + 1
+            continue
+        title = heading or filename or ((language.upper() + " Code") if language else "Code")
+        code_payload: dict[str, Any] = {
+            "language": language or "text",
+            "filename": filename,
+            "content": code,
+        }
+        if path:
+            code_payload["path"] = path
+        blocks.append(
+            {
+                "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+                "id": f"code_artifact_{len(blocks) + 1}",
+                "type": "code_artifact",
+                "source_markdown": source_markdown,
+                "source_fingerprint": _source_fingerprint(source_markdown),
+                "title": title[:200],
+                "code": code_payload,
+            }
+        )
+        index = cursor + 1
+    return blocks
+
+
+def _clean_place_for_block(raw_place: Any) -> dict[str, Any] | None:
+    if not isinstance(raw_place, dict):
+        return None
+    name = " ".join(str(raw_place.get("name") or "").split()).strip()[:200]
+    if not name:
+        return None
+    place: dict[str, Any] = {"name": name}
+    for key, limit in (
+        ("address", 500),
+        ("category", 120),
+        ("phone", 80),
+        ("price_range", 40),
+        ("distance_unit", 30),
+        ("provider", 40),
+    ):
+        value = " ".join(str(raw_place.get(key) or "").split()).strip()[:limit]
+        if value:
+            place[key] = value
+    url = _safe_source_url(raw_place.get("url"))
+    if url:
+        place["url"] = url
+    categories = raw_place.get("categories")
+    if isinstance(categories, list):
+        cleaned_categories = [
+            " ".join(str(value or "").split()).strip()[:120]
+            for value in categories[:8]
+            if " ".join(str(value or "").split()).strip()
+        ]
+        if cleaned_categories:
+            place["categories"] = cleaned_categories
+    for key in ("latitude", "longitude", "rating", "rating_max", "distance"):
+        try:
+            value = float(raw_place[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if key == "latitude" and not -90 <= value <= 90:
+            continue
+        if key == "longitude" and not -180 <= value <= 180:
+            continue
+        place[key] = value
+    try:
+        review_count = int(raw_place.get("review_count"))
+    except (TypeError, ValueError):
+        review_count = -1
+    if review_count >= 0:
+        place["review_count"] = review_count
+    return place
+
+
+def _place_source_section(
+    content: str,
+    places: list[dict[str, Any]],
+) -> tuple[str, str, list[dict[str, Any]]]:
+    lines = str(content or "").splitlines()
+    matched_lines: list[int] = []
+    matched_places: list[dict[str, Any]] = []
+    for place in places:
+        candidates = [
+            str(place.get("name") or "").casefold(),
+            str(place.get("url") or "").casefold(),
+            str(place.get("address") or "").casefold(),
+        ]
+        candidates = [value for value in candidates if len(value) >= 4]
+        indexes = [
+            index
+            for index, line in enumerate(lines)
+            if any(value in line.casefold() for value in candidates)
+        ]
+        if indexes:
+            matched_lines.extend(indexes)
+            matched_places.append(place)
+    if not matched_lines:
+        return "", "", []
+
+    start = min(matched_lines)
+    end = max(matched_lines) + 1
+    title = "Places"
+    for index in range(start - 1, max(-1, start - 4), -1):
+        line = lines[index].strip()
+        if not line:
+            continue
+        heading = _MARKDOWN_HEADING_RE.match(lines[index])
+        if heading:
+            start = index
+            title = heading.group(1).strip()[:160] or title
+        break
+    while end < len(lines) and end - max(matched_lines) <= 4:
+        line = lines[end]
+        if _MARKDOWN_HEADING_RE.match(line) or not line.strip():
+            break
+        end += 1
+    source_markdown = "\n".join(lines[start:end]).strip()
+    if not source_markdown or len(source_markdown) > 12_000:
+        return "", "", []
+    return source_markdown, title, matched_places[:8]
+
+
+def _build_place_group_block(
+    content: str,
+    executed_tools: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for record in reversed(executed_tools or []):
+        if not isinstance(record, dict) or str(record.get("tool") or "") not in _PLACE_TOOL_NAMES:
+            continue
+        if bool(record.get("is_error")):
+            continue
+        structured = record.get("structured_content")
+        if not isinstance(structured, dict) or structured.get("capability") != "place_search":
+            continue
+        raw_places = structured.get("places")
+        if not isinstance(raw_places, list):
+            continue
+        places = [place for raw in raw_places[:8] if (place := _clean_place_for_block(raw))]
+        source_markdown, title, matched_places = _place_source_section(content, places)
+        if not source_markdown or not matched_places:
+            continue
+        provider = " ".join(str(structured.get("provider") or "").split()).strip()[:40]
+        return {
+            "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+            "id": "place_group_1",
+            "type": "place_group",
+            "source_markdown": source_markdown,
+            "source_fingerprint": _source_fingerprint(source_markdown),
+            "title": title,
+            "provider": provider,
+            "places": matched_places,
+        }
+    return None
+
+
+def _blocks_overlap(content: str, lhs: str, rhs: str) -> bool:
+    lhs_start = content.find(lhs)
+    rhs_start = content.find(rhs)
+    if lhs_start < 0 or rhs_start < 0:
+        return False
+    lhs_range = range(lhs_start, lhs_start + len(lhs))
+    rhs_range = range(rhs_start, rhs_start + len(rhs))
+    return lhs_range.start < rhs_range.stop and rhs_range.start < lhs_range.stop
+
+
 def build_assistant_content_blocks(
     content: str,
     executed_tools: list[dict[str, Any]] | None = None,
@@ -729,6 +1050,16 @@ def build_assistant_content_blocks(
         for record in (executed_tools or [])
         if isinstance(record, dict)
     }
+    if executed_tool_names & _PLACE_TOOL_NAMES and len(blocks) < CONTENT_BLOCK_LIMIT:
+        place_block = _build_place_group_block(content, executed_tools or [])
+        if place_block:
+            place_source = str(place_block.get("source_markdown") or "")
+            blocks = [
+                block
+                for block in blocks
+                if not _blocks_overlap(content, str(block.get("source_markdown") or ""), place_source)
+            ]
+            blocks.append(place_block)
     if executed_tool_names & _NEWS_TOOL_NAMES and len(blocks) < CONTENT_BLOCK_LIMIT:
         news_block = _build_news_block(content) or _build_news_block_from_rss_evidence(
             content,
@@ -744,6 +1075,21 @@ def build_assistant_content_blocks(
                 CONTENT_BLOCK_LIMIT - len(blocks),
             )
         )
+    if len(blocks) < CONTENT_BLOCK_LIMIT:
+        code_blocks = _build_code_artifact_blocks(
+            content,
+            executed_tools or [],
+            CONTENT_BLOCK_LIMIT - len(blocks),
+        )
+        for code_block in code_blocks:
+            code_source = str(code_block.get("source_markdown") or "")
+            blocks = [
+                block
+                for block in blocks
+                if not _blocks_overlap(content, str(block.get("source_markdown") or ""), code_source)
+            ]
+            if len(blocks) < CONTENT_BLOCK_LIMIT:
+                blocks.append(code_block)
     if len(blocks) < CONTENT_BLOCK_LIMIT:
         blocks.extend(_build_stat_blocks(content, CONTENT_BLOCK_LIMIT - len(blocks)))
     if len(blocks) < CONTENT_BLOCK_LIMIT:
@@ -779,11 +1125,73 @@ def normalize_assistant_content_blocks(value: Any) -> list[dict[str, Any]]:
             cleaned = _normalize_timeline_block(item, source_markdown, len(cleaned_blocks))
         elif block_type == "file_artifact":
             cleaned = _normalize_file_artifact_block(item, source_markdown, len(cleaned_blocks))
+        elif block_type == "place_group":
+            cleaned = _normalize_place_group_block(item, source_markdown, len(cleaned_blocks))
+        elif block_type == "code_artifact":
+            cleaned = _normalize_code_artifact_block(item, source_markdown, len(cleaned_blocks))
         else:
             cleaned = None
         if cleaned:
             cleaned_blocks.append(cleaned)
     return cleaned_blocks
+
+
+def _normalize_code_artifact_block(
+    item: dict[str, Any],
+    source_markdown: str,
+    block_index: int,
+) -> dict[str, Any] | None:
+    raw_code = item.get("code")
+    if not source_markdown or len(source_markdown) > 20_000 or not isinstance(raw_code, dict):
+        return None
+    content = str(raw_code.get("content") or "")
+    if not content.strip() or len(content) > 16_000:
+        return None
+    language = " ".join(str(raw_code.get("language") or "text").split()).strip()[:40]
+    filename = _clean_code_filename(raw_code.get("filename"))
+    path = str(raw_code.get("path") or "").strip()[:500]
+    if "\x00" in path:
+        path = ""
+    code = {
+        "language": language or "text",
+        "filename": filename,
+        "content": content,
+    }
+    if path:
+        code["path"] = _workspace_relative_artifact_path(path)
+    return {
+        "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+        "id": str(item.get("id") or f"code_artifact_{block_index + 1}")[:80],
+        "type": "code_artifact",
+        "source_markdown": source_markdown,
+        "source_fingerprint": _source_fingerprint(source_markdown),
+        "title": str(item.get("title") or filename or "Code").strip()[:200] or "Code",
+        "code": code,
+    }
+
+
+def _normalize_place_group_block(
+    item: dict[str, Any],
+    source_markdown: str,
+    block_index: int,
+) -> dict[str, Any] | None:
+    raw_places = item.get("places")
+    if not source_markdown or len(source_markdown) > 12_000 or not isinstance(raw_places, list):
+        return None
+    places = [place for raw in raw_places[:8] if (place := _clean_place_for_block(raw))]
+    if not places:
+        return None
+    provider = " ".join(str(item.get("provider") or "").split()).strip()[:40]
+    return {
+        "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+        "id": str(item.get("id") or f"place_group_{block_index + 1}")[:80],
+        "type": "place_group",
+        "source_markdown": source_markdown,
+        "source_fingerprint": _source_fingerprint(source_markdown),
+        "title": str(item.get("title") or "Places").strip()[:160] or "Places",
+        "provider": provider,
+        "places": places,
+    }
 
 
 def _normalize_file_artifact_block(

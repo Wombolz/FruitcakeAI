@@ -35,12 +35,95 @@ async def test_search_places_formats_results():
     ]
 
     with patch("app.json_api.fetch_json", new=AsyncMock(return_value=payload)) as mocked:
-        result = await search_places(query="Zaxby's", near="Statesboro, GA", limit=3)
+        result = await search_places(
+            query="Zaxby's", near="Statesboro, GA", limit=3, provider="nominatim"
+        )
 
     assert "Place search results for: Zaxby's near Statesboro, GA" in result
     assert "147 Tormenta Way" in result
-    assert "lat=32.4377, lon=-81.7640" in result
+    assert "lat=32.4377, lon=-81.764" in result
+    assert result.structured_content["provider"] == "nominatim"
+    assert result.structured_content["places"][0]["latitude"] == 32.4377
     mocked.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_search_places_normalizes_brave_results(monkeypatch):
+    monkeypatch.setattr("app.json_api.settings.brave_search_api_key", "test-key")
+    payload = {
+        "results": [
+            {
+                "title": "The Daily Grind",
+                "url": "https://example.com/daily-grind",
+                "coordinates": [32.448, -81.783],
+                "postal_address": {"displayAddress": "17 Main St, Statesboro, GA"},
+                "categories": ["Coffee shop", "Cafe"],
+                "contact": {"telephone": "+1 555-0100"},
+                "rating": {"ratingValue": 4.6, "bestRating": 5, "reviewCount": 82},
+                "distance": {"value": 1.2, "units": "mi"},
+            }
+        ]
+    }
+
+    with patch("app.json_api.fetch_json", new=AsyncMock(return_value=payload)) as mocked:
+        result = await search_places(
+            query="coffee", near="Statesboro GA United States", limit=3, provider="brave"
+        )
+
+    structured = result.structured_content
+    assert structured["provider"] == "brave"
+    assert structured["fallback_used"] is False
+    assert structured["places"] == [
+        {
+            "name": "The Daily Grind",
+            "address": "17 Main St, Statesboro, GA",
+            "latitude": 32.448,
+            "longitude": -81.783,
+            "category": "Coffee shop",
+            "categories": ["Coffee shop", "Cafe"],
+            "url": "https://example.com/daily-grind",
+            "phone": "+1 555-0100",
+            "rating": 4.6,
+            "rating_max": 5.0,
+            "review_count": 82,
+            "distance": 1.2,
+            "distance_unit": "mi",
+            "provider": "brave",
+        }
+    ]
+    assert structured["citations"][0]["url"] == "https://example.com/daily-grind"
+    assert "rating=4.6 (82 reviews)" in result
+    request = mocked.await_args.kwargs
+    assert request["url"].endswith("/local/place_search")
+    assert request["params"]["location"] == "Statesboro GA United States"
+    assert request["headers"]["X-Subscription-Token"] == "test-key"
+
+
+@pytest.mark.asyncio
+async def test_search_places_auto_falls_back_to_nominatim(monkeypatch):
+    monkeypatch.setattr("app.json_api.settings.brave_search_api_key", "test-key")
+    brave_error = JsonApiError("Brave unavailable")
+    nominatim_places = [
+        {
+            "name": "Fallback Cafe",
+            "address": "1 Main St",
+            "latitude": 32.0,
+            "longitude": -81.0,
+            "provider": "nominatim",
+        }
+    ]
+
+    with (
+        patch("app.json_api._search_places_brave", new=AsyncMock(side_effect=brave_error)) as brave,
+        patch("app.json_api._search_places_nominatim", new=AsyncMock(return_value=nominatim_places)) as nominatim,
+    ):
+        result = await search_places(query="cafe", near="Statesboro", provider="auto")
+
+    assert result.structured_content["provider"] == "nominatim"
+    assert result.structured_content["providers_attempted"] == ["brave", "nominatim"]
+    assert result.structured_content["fallback_used"] is True
+    brave.assert_awaited_once()
+    nominatim.assert_awaited_once()
 
 
 def test_extract_json_path_supports_nested_dicts_and_lists():

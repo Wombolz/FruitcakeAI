@@ -321,6 +321,12 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "query": {"type": "string", "description": "Business or place name to look up."},
                     "near": {"type": "string", "description": "Optional city, state, ZIP, or region to narrow the lookup."},
                     "limit": {"type": "integer", "description": "Maximum number of results to return (default 5, max 8).", "default": 5},
+                    "provider": {
+                        "type": "string",
+                        "enum": ["auto", "brave", "nominatim"],
+                        "description": "Optional provider override. Auto prefers Brave when configured and falls back to Nominatim.",
+                        "default": "auto",
+                    },
                 },
                 "required": ["query"],
             },
@@ -1359,6 +1365,7 @@ async def _search_places(
 
     query = str(arguments.get("query", "") or "").strip()
     near = str(arguments.get("near", "") or "").strip()
+    provider = str(arguments.get("provider", "") or "").strip()
     try:
         limit = int(arguments.get("limit", 5))
     except Exception:
@@ -1368,7 +1375,7 @@ async def _search_places(
         return "No place query provided."
 
     try:
-        return await search_places(query=query, near=near or None, limit=limit)
+        return await search_places(query=query, near=near or None, limit=limit, provider=provider or None)
     except JsonApiError as exc:
         log.warning(
             "search_places failed",

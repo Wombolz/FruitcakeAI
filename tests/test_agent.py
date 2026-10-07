@@ -1724,6 +1724,7 @@ def test_search_places_schema_has_required_query():
     assert "query" in props
     assert "near" in props
     assert "limit" in props
+    assert props["provider"]["enum"] == ["auto", "brave", "nominatim"]
     assert required == ["query"]
 
 
@@ -2188,12 +2189,13 @@ async def test_search_places_tool_uses_backend_json_service():
         }
     ])):
         result = await tools_module._search_places(
-            {"query": "Chili's", "near": "Statesboro, GA", "limit": 3},
+            {"query": "Chili's", "near": "Statesboro, GA", "limit": 3, "provider": "nominatim"},
             ctx,
         )
 
     assert "Place search results for: Chili's near Statesboro, GA" in result
     assert "701 Northside Drive E" in result
+    assert result.structured_content["provider"] == "nominatim"
 
 
 @pytest.mark.asyncio
