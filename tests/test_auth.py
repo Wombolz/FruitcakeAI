@@ -1766,6 +1766,108 @@ def test_build_assistant_content_blocks_extracts_rss_news_digest():
     ]
 
 
+def test_build_assistant_content_blocks_accepts_rss_headline_suffix_and_bare_link():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Here are recent headlines:
+
+### Foreign Policy
+- **First headline** *(Al Jazeera, Oct 7)*
+  First grounded summary.
+  🔗 https://example.com/first
+
+- **Second headline** *(BBC, Oct 6)*
+  Second grounded summary.
+  🔗 https://example.com/second
+
+Let me know if you want more.
+"""
+
+    blocks = _build_assistant_content_blocks(
+        content,
+        [{"tool": "search_my_feeds", "arguments": {"query": "topic"}}],
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "news_digest"
+    items = blocks[0]["sections"][0]["items"]
+    assert items == [
+        {
+            "title": "First headline",
+            "summary": "First grounded summary.",
+            "sources": [{"label": "Al Jazeera", "url": "https://example.com/first"}],
+        },
+        {
+            "title": "Second headline",
+            "summary": "Second grounded summary.",
+            "sources": [{"label": "BBC", "url": "https://example.com/second"}],
+        },
+    ]
+
+
+def test_build_assistant_content_blocks_falls_back_to_selected_rss_evidence():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Here are the major headlines:
+
+**International & Politics**
+- **First headline**; a short inline explanation
+  https://example.com/first
+
+**Business**
+- Second headline without bold formatting
+  https://example.com/second
+
+---
+
+Ask if you want a deeper dive.
+"""
+    tool_result = """Recent feed items (2):
+
+[1] First canonical headline
+    Source: NPR
+    Summary: First summary from the feed.
+    URL: https://example.com/first?traffic_source=rss
+
+[2] Second canonical headline
+    Source: BBC
+    Summary: Second summary from the feed.
+    URL: https://example.com/second
+"""
+
+    blocks = _build_assistant_content_blocks(
+        content,
+        [{"tool": "list_recent_feed_items", "arguments": {}, "result_summary": tool_result}],
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "news_digest"
+    assert blocks[0]["sections"] == [
+        {
+            "title": "Selected Headlines",
+            "items": [
+                {
+                    "title": "First canonical headline",
+                    "summary": "First summary from the feed.",
+                    "sources": [
+                        {
+                            "label": "NPR",
+                            "url": "https://example.com/first?traffic_source=rss",
+                        }
+                    ],
+                },
+                {
+                    "title": "Second canonical headline",
+                    "summary": "Second summary from the feed.",
+                    "sources": [{"label": "BBC", "url": "https://example.com/second"}],
+                },
+            ],
+        }
+    ]
+    assert blocks[0]["source_markdown"].startswith("**International & Politics**")
+    assert blocks[0]["source_markdown"].endswith("---")
+
+
 def test_build_assistant_content_blocks_does_not_promote_news_without_rss_tool():
     from app.api.chat import _build_assistant_content_blocks
 

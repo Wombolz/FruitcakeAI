@@ -12,7 +12,8 @@ CONTENT_BLOCK_LIMIT = 8
 
 _NEWS_SOURCE_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 _NEWS_SECTION_RE = re.compile(r"^\s*#{2,4}\s+(.+?)\s*$")
-_NEWS_ITEM_RE = re.compile(r"^\s*[-*]\s+\*\*(.+?)\*\*\s*$")
+_NEWS_ITEM_RE = re.compile(r"^\s*[-*]\s+\*\*(.+?)\*\*(?:\s+(.+?))?\s*$")
+_BARE_SOURCE_URL_RE = re.compile(r"https?://[^\s)>]+")
 _MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,4}\s+(.+?)\s*$")
 _STAT_ITEM_RE = re.compile(r"^\s*[-*]?\s*\*\*([^*:\n]{1,80}):\*\*\s*(.+?)\s*$")
 _NEWS_TOOL_NAMES = {
@@ -24,7 +25,7 @@ _NEWS_TOOL_NAMES = {
 }
 _SOURCE_RESULT_TOOL_NAMES = _NEWS_TOOL_NAMES | {"web_search", "web_context"}
 _RESULT_ITEM_RE = re.compile(r"^\s*(?:\[\d+\]|(?:Source\s+)?\d+[.):])\s+(.+?)\s*$", re.I)
-_RESULT_FIELD_RE = re.compile(r"^\s*(Feed|Source|Published|Published/updated|URL):\s*(.+?)\s*$", re.I)
+_RESULT_FIELD_RE = re.compile(r"^\s*(Feed|Source|Published|Published/updated|Summary|URL):\s*(.+?)\s*$", re.I)
 
 
 def _source_fingerprint(source_markdown: str) -> str:
@@ -38,6 +39,14 @@ def _safe_source_url(value: Any) -> str:
     except ValueError:
         return ""
     return url if parsed.scheme in {"http", "https"} and parsed.netloc else ""
+
+
+def _url_match_key(value: Any) -> str:
+    url = _safe_source_url(value)
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    return f"{parsed.scheme.casefold()}://{parsed.netloc.casefold()}{parsed.path.rstrip('/')}"
 
 
 def _clean_source_item(item: Any) -> dict[str, str] | None:
@@ -92,7 +101,7 @@ def _sources_from_result_text(result_summary: str) -> list[dict[str, str]]:
             current["url"] = value
         elif field in {"feed", "source"}:
             current["source"] = value
-        else:
+        elif field in {"published", "published/updated"}:
             current["published_at"] = value
     flush()
     return sources[:12]
@@ -316,6 +325,10 @@ def _build_news_block(content: str) -> dict[str, Any] | None:
                 index += 1
                 continue
             item_title = headline.group(1).strip()[:240]
+            source_label_hint = ""
+            trailing = str(headline.group(2) or "").strip().strip("* _()")
+            if trailing:
+                source_label_hint = trailing.split(",", 1)[0].strip()[:100]
             index += 1
             summary_lines: list[str] = []
             sources: list[dict[str, str]] = []
@@ -325,9 +338,16 @@ def _build_news_block(content: str) -> dict[str, Any] | None:
                     break
                 raw_line = lines[index].strip()
                 links = _NEWS_SOURCE_LINK_RE.findall(raw_line)
+                if not links:
+                    links = [
+                        (source_label_hint or (urlparse(url).hostname or "Source"), url)
+                        for url in _BARE_SOURCE_URL_RE.findall(raw_line)
+                    ]
                 if links:
                     for label, url in links[:4]:
                         sources.append({"label": label.strip()[:100], "url": url.strip()[:2_000]})
+                    index += 1
+                    break
                 elif raw_line:
                     summary_lines.append(raw_line)
                 index += 1
@@ -356,6 +376,119 @@ def _build_news_block(content: str) -> dict[str, Any] | None:
         "source_fingerprint": _source_fingerprint(source_markdown),
         "title": "News Briefing",
         "sections": sections,
+    }
+
+
+def _rss_items_from_result_text(result_summary: str) -> list[dict[str, Any]]:
+    """Recover the structured fields emitted by Fruitcake's RSS tools."""
+    items: list[dict[str, Any]] = []
+    current: dict[str, str] = {}
+
+    def flush() -> None:
+        nonlocal current
+        url = _safe_source_url(current.get("url"))
+        title = " ".join(current.get("title", "").split()).strip()[:240]
+        if url and title:
+            source = " ".join(current.get("source", "").split()).strip()[:100]
+            summary = " ".join(current.get("summary", "").split()).strip()[:1_200]
+            items.append(
+                {
+                    "title": title,
+                    "summary": summary,
+                    "sources": [{"label": source or (urlparse(url).hostname or "Source"), "url": url}],
+                }
+            )
+        current = {}
+
+    for raw_line in str(result_summary or "").splitlines():
+        item_match = _RESULT_ITEM_RE.match(raw_line)
+        if item_match:
+            flush()
+            current["title"] = item_match.group(1).strip()
+            continue
+        field_match = _RESULT_FIELD_RE.match(raw_line)
+        if field_match:
+            field, value = field_match.groups()
+            field = field.casefold()
+            if field == "url":
+                current["url"] = value
+            elif field in {"feed", "source"}:
+                current["source"] = value
+            elif field == "summary":
+                current["summary"] = value
+            continue
+        compact = raw_line.strip()
+        if current and compact.lower().startswith("summary:"):
+            current["summary"] = compact.split(":", 1)[1].strip()
+        elif current and compact and not compact.endswith(":"):
+            current.setdefault("summary", compact)
+    flush()
+    return items[:30]
+
+
+def _selected_news_source_markdown(content: str, selected_urls: set[str]) -> str:
+    lines = str(content or "").splitlines()
+    matching_lines = [
+        index
+        for index, line in enumerate(lines)
+        if any(url in line for url in selected_urls)
+    ]
+    if not matching_lines:
+        return ""
+    start = matching_lines[0]
+    while start > 0 and lines[start - 1].strip():
+        start -= 1
+    end = matching_lines[-1] + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end].strip() == "---"):
+        end += 1
+    return "\n".join(lines[start:end]).strip()
+
+
+def _build_news_block_from_rss_evidence(
+    content: str,
+    executed_tools: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Build a stable card from RSS evidence when final Markdown varies."""
+    output_urls = set(_BARE_SOURCE_URL_RE.findall(str(content or "")))
+    output_by_key = {_url_match_key(url): url for url in output_urls if _url_match_key(url)}
+    if len(output_by_key) < 2:
+        return None
+    selected_items: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for record in executed_tools:
+        if not isinstance(record, dict) or str(record.get("tool") or "") not in _NEWS_TOOL_NAMES:
+            continue
+        for item in _rss_items_from_result_text(str(record.get("result_summary") or "")):
+            url = str(((item.get("sources") or [{}])[0]).get("url") or "")
+            match_key = _url_match_key(url)
+            if match_key not in output_by_key or match_key in seen_urls:
+                continue
+            seen_urls.add(match_key)
+            selected_items.append(item)
+            if len(selected_items) >= 30:
+                break
+    if len(selected_items) < 2:
+        return None
+    selected_items.sort(
+        key=lambda item: str(content).find(
+            output_by_key.get(
+                _url_match_key(str(((item.get("sources") or [{}])[0]).get("url") or "")),
+                "",
+            )
+        )
+    )
+    selected_output_urls = {output_by_key[key] for key in seen_urls}
+    source_markdown = _selected_news_source_markdown(content, selected_output_urls)
+    if not source_markdown or len(source_markdown) > 24_000:
+        return None
+    return {
+        "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+        "id": "news_digest_1",
+        "type": "news_digest",
+        "source_markdown": source_markdown,
+        "source_fingerprint": _source_fingerprint(source_markdown),
+        "title": "News Briefing",
+        "sections": [{"title": "Selected Headlines", "items": selected_items}],
     }
 
 
@@ -461,7 +594,10 @@ def build_assistant_content_blocks(
         if isinstance(record, dict)
     }
     if executed_tool_names & _NEWS_TOOL_NAMES and len(blocks) < CONTENT_BLOCK_LIMIT:
-        news_block = _build_news_block(content)
+        news_block = _build_news_block(content) or _build_news_block_from_rss_evidence(
+            content,
+            executed_tools or [],
+        )
         if news_block:
             blocks.append(news_block)
     if len(blocks) < CONTENT_BLOCK_LIMIT:
