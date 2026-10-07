@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.40
+
+- Added versioned, bounded assistant content blocks for native tables, charts, news, metrics, timelines, workspace files, places, and code while retaining Markdown fallback content.
+- Preserved structured grounding and source metadata across live responses, persisted history, and session reloads.
+- Added contextual table-title derivation and richer structured data metadata for expanded client inspection and explicit context handback.
+- Made place search provider-neutral with Brave and Nominatim routing plus configurable fallback behavior.
+- Expanded structured-chat extraction and persistence regression coverage across agent, authentication, and JSON API paths.
+
 ## v0.7.39
 
 - Added model-aware context budgets to hot-reloadable model profiles, including explicit context-window, output, reasoning, and safety reserves.
