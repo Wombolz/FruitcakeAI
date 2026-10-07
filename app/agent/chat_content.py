@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 CONTENT_BLOCK_SCHEMA_VERSION = 1
 CONTENT_BLOCK_LIMIT = 8
@@ -20,10 +21,179 @@ _NEWS_TOOL_NAMES = {
     "search_my_feeds",
     "search_my_feeds_timeline",
 }
+_SOURCE_RESULT_TOOL_NAMES = _NEWS_TOOL_NAMES | {"web_search", "web_context"}
+_RESULT_ITEM_RE = re.compile(r"^\s*(?:\[\d+\]|(?:Source\s+)?\d+[.):])\s+(.+?)\s*$", re.I)
+_RESULT_FIELD_RE = re.compile(r"^\s*(Feed|Source|Published|Published/updated|URL):\s*(.+?)\s*$", re.I)
 
 
 def _source_fingerprint(source_markdown: str) -> str:
     return hashlib.sha256(source_markdown.encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_source_url(value: Any) -> str:
+    url = str(value or "").strip()[:500]
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    return url if parsed.scheme in {"http", "https"} and parsed.netloc else ""
+
+
+def _clean_source_item(item: Any) -> dict[str, str] | None:
+    if isinstance(item, str):
+        url = _safe_source_url(item)
+        return {"url": url} if url else None
+    if not isinstance(item, dict):
+        return None
+    url = _safe_source_url(item.get("url"))
+    document = " ".join(str(item.get("document") or "").split()).strip()[:300]
+    path = " ".join(str(item.get("path") or "").split()).strip()[:500]
+    if not (url or document or path):
+        return None
+    cleaned: dict[str, str] = {}
+    if url:
+        cleaned["url"] = url
+    if document:
+        cleaned["document"] = document
+    if path:
+        cleaned["path"] = path
+    for key, limit in (("title", 200), ("label", 120), ("source", 120), ("published_at", 80)):
+        value = " ".join(str(item.get(key) or "").split()).strip()
+        if value:
+            cleaned[key] = value[:limit]
+    return cleaned
+
+
+def _sources_from_result_text(result_summary: str) -> list[dict[str, str]]:
+    """Extract bounded title/URL/source tuples from Fruitcake's text tool formats."""
+    sources: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+
+    def flush() -> None:
+        nonlocal current
+        cleaned = _clean_source_item(current)
+        if cleaned:
+            sources.append(cleaned)
+        current = {}
+
+    for raw_line in str(result_summary or "").splitlines():
+        item_match = _RESULT_ITEM_RE.match(raw_line)
+        if item_match:
+            flush()
+            current["title"] = item_match.group(1).strip()[:200]
+            continue
+        field_match = _RESULT_FIELD_RE.match(raw_line)
+        if not field_match:
+            continue
+        field, value = field_match.groups()
+        field = field.casefold()
+        if field == "url":
+            current["url"] = value
+        elif field in {"feed", "source"}:
+            current["source"] = value
+        else:
+            current["published_at"] = value
+    flush()
+    return sources[:12]
+
+
+def build_assistant_citations(executed_tools: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Normalize structured and legacy text sources into one compact citation contract."""
+    citations: list[dict[str, str]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for record in executed_tools or []:
+        if not isinstance(record, dict):
+            continue
+        tool_name = str(record.get("tool") or "").strip()
+        candidates: list[Any] = []
+        structured = record.get("structured_content")
+        if isinstance(structured, dict):
+            raw = structured.get("citations") or structured.get("sources") or []
+            if isinstance(raw, list):
+                candidates.extend(raw)
+        raw_citations = record.get("citations")
+        if isinstance(raw_citations, list):
+            candidates.extend(raw_citations)
+        if tool_name in _SOURCE_RESULT_TOOL_NAMES:
+            candidates.extend(_sources_from_result_text(str(record.get("result_summary") or "")))
+        for candidate in candidates:
+            cleaned = _clean_source_item(candidate)
+            key = tuple(sorted(cleaned.items())) if cleaned else ()
+            if not cleaned or key in seen:
+                continue
+            seen.add(key)
+            citations.append(cleaned)
+            if len(citations) >= 12:
+                return citations
+    return citations
+
+
+def build_assistant_source_details(executed_tools: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Expose bounded query/provider/document details without leaking tool payloads."""
+    details: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    query_tools = {
+        "web_search", "web_context", "search_library", "search_my_feeds",
+        "search_my_feeds_timeline", "search_feeds",
+    }
+    for record in executed_tools or []:
+        if not isinstance(record, dict):
+            continue
+        tool_name = str(record.get("tool") or "").strip()
+        arguments = record.get("arguments") or {}
+        structured = record.get("structured_content") or {}
+        if not tool_name or not isinstance(arguments, dict):
+            continue
+        candidates: list[tuple[str, str, str]] = []
+        if tool_name in query_tools:
+            query = " ".join(str(arguments.get("query") or "").split()).strip()
+            if query:
+                candidates.append(("query", "Query", query[:500]))
+        if tool_name in {"web_search", "web_context"} and isinstance(structured, dict):
+            provider = " ".join(str(structured.get("provider") or "").split()).strip()
+            if provider:
+                candidates.append(("provider", "Provider", provider[:120]))
+        if tool_name == "fetch_page":
+            url = _safe_source_url(arguments.get("url"))
+            if url:
+                candidates.append(("url", "Page", url))
+        if tool_name == "summarize_document":
+            document = " ".join(str(arguments.get("document_name") or "").split()).strip()
+            if document:
+                candidates.append(("document", "Document", document[:500]))
+        if tool_name == "describe_image":
+            for kind, label, key in (("image", "Image", "path"), ("question", "Question", "question")):
+                value = " ".join(str(arguments.get(key) or "").split()).strip()
+                if value:
+                    candidates.append((kind, label, value[:500]))
+        for kind, label, value in candidates:
+            key = (tool_name, kind, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            detail = {"tool_name": tool_name, "detail_kind": kind, "label": label, "value": value}
+            if tool_name == "fetch_page" and kind == "url":
+                parsed = urlparse(value)
+                detail["source_kind"] = (
+                    "pdf" if parsed.path.casefold().endswith(".pdf")
+                    else "wiki" if (parsed.hostname or "").casefold().endswith("wikipedia.org")
+                    else "web"
+                )
+                source_title = (
+                    str(structured.get("title") or "").strip()
+                    if isinstance(structured, dict)
+                    else ""
+                )
+                if not source_title:
+                    first_line = str(record.get("result_summary") or "").split("\n", 1)[0]
+                    if first_line.startswith("Title: "):
+                        source_title = first_line.removeprefix("Title: ").strip()
+                if source_title:
+                    detail["source_title"] = source_title[:200]
+            details.append(detail)
+            if len(details) >= 8:
+                return details
+    return details
 
 
 def _split_markdown_table_row(line: str) -> list[str]:

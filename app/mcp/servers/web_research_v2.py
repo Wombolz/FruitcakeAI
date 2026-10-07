@@ -191,9 +191,9 @@ class TTLCache:
     def __init__(self, ttl_seconds: int, max_entries: int = 128):
         self.ttl_seconds = ttl_seconds
         self.max_entries = max_entries
-        self._data: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self._data: OrderedDict[str, tuple[float, Any]] = OrderedDict()
 
-    def get(self, key: str) -> Optional[str]:
+    def get(self, key: str) -> Optional[Any]:
         item = self._data.get(key)
         if item is None:
             return None
@@ -207,7 +207,7 @@ class TTLCache:
         self._data.move_to_end(key)
         return value
 
-    def set(self, key: str, value: str) -> None:
+    def set(self, key: str, value: Any) -> None:
         if key in self._data:
             self._data.pop(key, None)
 
@@ -248,7 +248,7 @@ async def call_tool(
 
 # ── DuckDuckGo search ─────────────────────────────────────────────────────────
 
-async def _web_search(arguments: Dict[str, Any], user_context: Any = None) -> str:
+async def _web_search(arguments: Dict[str, Any], user_context: Any = None) -> Any:
     query = (arguments.get("query") or "").strip()
     if not query:
         return "No search query provided."
@@ -301,6 +301,22 @@ async def _web_search(arguments: Dict[str, Any], user_context: Any = None) -> st
         for result in response.results
     ]
     formatted = _format_search_results(query=query, results=results)
+    citations = [
+        {"title": item["title"], "url": item["url"], "source": provider}
+        for item in results
+        if item.get("title") and item.get("url")
+    ]
+    output = {
+        "content": [{"type": "text", "text": formatted}],
+        "structuredContent": {
+            "provider": provider,
+            "capability": "web_search",
+            "query": query,
+            "source_count": len(citations),
+            "sources": citations,
+            "citations": citations,
+        },
+    }
 
     elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
     log.info(
@@ -312,8 +328,8 @@ async def _web_search(arguments: Dict[str, Any], user_context: Any = None) -> st
         elapsed_ms=elapsed_ms,
     )
 
-    _SEARCH_CACHE.set(cache_key, formatted)
-    return formatted
+    _SEARCH_CACHE.set(cache_key, output)
+    return output
 
 
 def _build_web_research_service() -> WebResearchService:

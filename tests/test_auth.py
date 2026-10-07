@@ -2028,6 +2028,101 @@ def test_build_assistant_evidence_metadata_counts_repeated_web_sources():
     assert evidence["source_counts"] == {"web": 3}
 
 
+def test_build_assistant_evidence_metadata_extracts_bounded_rss_story_sources():
+    from app.api.chat import _build_assistant_evidence_metadata
+
+    evidence = _build_assistant_evidence_metadata(
+        [
+            {
+                "tool": "search_my_feeds",
+                "arguments": {"query": "space missions"},
+                "result_summary": """Cached feed results for 'space missions' (cache-only):
+
+[1] Swift Observatory gets a boost
+    Feed: NASA News
+    Published: 2026-10-05T12:00:00Z
+    URL: https://www.nasa.gov/swift-update
+    Mission update.
+
+[2] A second mission
+    Feed: Space News
+    URL: https://example.org/mission
+""",
+            }
+        ]
+    )
+
+    assert evidence is not None
+    assert evidence["tool_details"] == [
+        {
+            "tool_name": "search_my_feeds",
+            "detail_kind": "query",
+            "label": "Query",
+            "value": "space missions",
+        }
+    ]
+    assert evidence["citations"] == [
+        {
+            "url": "https://www.nasa.gov/swift-update",
+            "title": "Swift Observatory gets a boost",
+            "source": "NASA News",
+            "published_at": "2026-10-05T12:00:00Z",
+        },
+        {
+            "url": "https://example.org/mission",
+            "title": "A second mission",
+            "source": "Space News",
+        },
+    ]
+
+
+def test_build_assistant_evidence_metadata_preserves_web_context_provider_and_sources():
+    from app.api.chat import _build_assistant_evidence_metadata
+
+    evidence = _build_assistant_evidence_metadata(
+        [
+            {
+                "tool": "web_context",
+                "arguments": {"query": "Qwen 3.8 benchmark changes"},
+                "result_summary": "Web context for: Qwen 3.8 benchmark changes",
+                "structured_content": {
+                    "provider": "brave",
+                    "citations": [
+                        {
+                            "title": "Qwen 3.8 model card",
+                            "url": "https://huggingface.co/Qwen/Qwen3.8-27B",
+                            "source": "brave",
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+
+    assert evidence is not None
+    assert evidence["tool_details"] == [
+        {
+            "tool_name": "web_context",
+            "detail_kind": "query",
+            "label": "Query",
+            "value": "Qwen 3.8 benchmark changes",
+        },
+        {
+            "tool_name": "web_context",
+            "detail_kind": "provider",
+            "label": "Provider",
+            "value": "brave",
+        },
+    ]
+    assert evidence["citations"] == [
+        {
+            "title": "Qwen 3.8 model card",
+            "url": "https://huggingface.co/Qwen/Qwen3.8-27B",
+            "source": "brave",
+        }
+    ]
+
+
 def test_build_assistant_evidence_metadata_includes_generated_image_artifact():
     from app.api.chat import _build_assistant_evidence_metadata
 
@@ -2242,6 +2337,28 @@ def test_normalize_assistant_metadata_payload_passes_through_image_artifacts():
             "height": 1024,
             "source_tool": "generate_image",
         }
+    ]
+
+
+def test_normalize_assistant_metadata_payload_sanitizes_citations_and_keeps_library_refs():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    normalized = _normalize_assistant_metadata_payload(
+        {
+            "evidence": {
+                "grounded": True,
+                "citations": [
+                    {"title": "Safe source", "url": "https://example.com/story"},
+                    {"title": "Unsafe source", "url": "javascript:alert(1)"},
+                    {"document": "Agents of Chaos.pdf", "path": "library/agents-of-chaos.pdf"},
+                ],
+            }
+        }
+    )
+
+    assert normalized["evidence"]["citations"] == [
+        {"url": "https://example.com/story", "title": "Safe source"},
+        {"document": "Agents of Chaos.pdf", "path": "library/agents-of-chaos.pdf"},
     ]
 
 

@@ -46,7 +46,9 @@ from app.agent.chat_validation import (
 )
 from app.agent.chat_content import (
     build_assistant_activity as _build_assistant_activity,
+    build_assistant_citations as _build_assistant_citations,
     build_assistant_content_blocks as _build_assistant_content_blocks,
+    build_assistant_source_details as _build_assistant_tool_details,
     normalize_assistant_activity,
     normalize_assistant_content_blocks,
 )
@@ -3166,13 +3168,19 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
                     ("title", 200),
                     ("label", 200),
                     ("source", 120),
+                    ("published_at", 80),
                     ("document", 300),
                     ("path", 500),
                 ):
                     value = str(item.get(key) or "").strip()
                     if value:
                         cleaned_item[key] = value[:max_len]
-                if cleaned_item:
+                citation_url = cleaned_item.get("url")
+                if citation_url:
+                    parsed_url = urlparse(citation_url)
+                    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+                        cleaned_item.pop("url", None)
+                if any(cleaned_item.get(key) for key in ("url", "document", "path")):
                     cleaned_citations.append(cleaned_item)
             if cleaned_citations:
                 normalized_evidence["citations"] = cleaned_citations
@@ -3245,113 +3253,6 @@ def _build_assistant_evidence_metadata(
     if citations:
         evidence["citations"] = citations
     return evidence
-
-
-def _build_assistant_citations(executed_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    citations: List[Dict[str, Any]] = []
-    seen: set[tuple[tuple[str, str], ...]] = set()
-    for record in executed_tools or []:
-        if not isinstance(record, dict) or not isinstance(record.get("citations"), list):
-            continue
-        for item in record["citations"]:
-            if not isinstance(item, dict):
-                continue
-            cleaned = {
-                str(key): value
-                for key, value in item.items()
-                if str(key) in {"url", "title", "label", "source", "document", "path"}
-                and value not in (None, "")
-            }
-            key = tuple(sorted((name, str(value)) for name, value in cleaned.items()))
-            if not cleaned or key in seen:
-                continue
-            seen.add(key)
-            citations.append(cleaned)
-            if len(citations) >= 12:
-                return citations
-    return citations
-
-
-def _source_kind_for_url(url: str) -> str:
-    """Cheap URL-only heuristic for per-source iconography — no extra fetch."""
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    path = parsed.path.lower()
-    if path.endswith(".pdf"):
-        return "pdf"
-    if host.endswith("wikipedia.org"):
-        return "wiki"
-    return "web"
-
-
-def _extract_fetch_page_title(result_summary: str) -> str:
-    """fetch_page prefixes its result with `Title: ...` when one was found."""
-    first_line = (result_summary or "").split("\n", 1)[0]
-    prefix = "Title: "
-    if first_line.startswith(prefix):
-        return first_line[len(prefix):].strip()
-    return ""
-
-
-def _build_assistant_tool_details(executed_tools: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    details: List[Dict[str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
-
-    for record in executed_tools or []:
-        if not isinstance(record, dict):
-            continue
-        tool_name = str(record.get("tool") or "").strip()
-        arguments = record.get("arguments") or {}
-        if not tool_name or not isinstance(arguments, dict):
-            continue
-
-        candidates: list[tuple[str, str, str]] = []
-        if tool_name in {"web_search", "web_context", "search_library", "search_my_feeds", "search_feeds"}:
-            query = str(arguments.get("query") or "").strip()
-            if query:
-                candidates.append(("query", "Query", query))
-        if tool_name == "fetch_page":
-            url = str(arguments.get("url") or "").strip()
-            if url:
-                candidates.append(("url", "Page", url))
-        if tool_name == "summarize_document":
-            document_name = str(arguments.get("document_name") or "").strip()
-            if document_name:
-                candidates.append(("document", "Document", document_name))
-        if tool_name == "describe_image":
-            image_path = str(arguments.get("path") or "").strip()
-            if image_path:
-                candidates.append(("image", "Image", image_path))
-            question = str(arguments.get("question") or "").strip()
-            if question:
-                candidates.append(("question", "Question", question))
-
-        for detail_kind, label, value in candidates:
-            key = (tool_name, detail_kind, value)
-            if key in seen:
-                continue
-            seen.add(key)
-            detail: Dict[str, str] = {
-                "tool_name": tool_name,
-                "detail_kind": detail_kind,
-                "label": label,
-                "value": value,
-            }
-            if tool_name == "fetch_page" and detail_kind == "url":
-                detail["source_kind"] = _source_kind_for_url(value)
-                structured = record.get("structured_content")
-                source_title = (
-                    str(structured.get("title") or "").strip()
-                    if isinstance(structured, dict)
-                    else ""
-                ) or _extract_fetch_page_title(str(record.get("result_summary") or ""))
-                if source_title:
-                    detail["source_title"] = source_title
-            details.append(detail)
-            if len(details) >= 8:
-                return details
-
-    return details
 
 
 def _build_assistant_image_artifacts(executed_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
