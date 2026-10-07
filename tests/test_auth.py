@@ -1665,6 +1665,860 @@ def test_build_assistant_tool_details_includes_web_query_and_page_url():
     ]
 
 
+def test_build_assistant_content_blocks_extracts_table_and_chart_hint():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Benchmark comparison:
+
+| Benchmark | Qwen 3.6 | Qwen 3.8 | Delta |
+|---|---:|---:|---:|
+| DeepSWE 1.1 | 13.3 | **42.2** | +28.9 |
+| SWE-bench Pro | 53.5 | 61.7 | +8.2 |
+
+The newer model improves most strongly on agentic coding.
+"""
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert len(blocks) == 1
+    block = blocks[0]
+    assert block["schema_version"] == 1
+    assert block["id"] == "table_1"
+    assert block["type"] == "table"
+    assert block["source_markdown"].startswith("| Benchmark")
+    assert len(block["source_fingerprint"]) == 16
+    assert block["columns"] == ["Benchmark", "Qwen 3.6", "Qwen 3.8", "Delta"]
+    assert block["column_alignments"] == ["left", "right", "right", "right"]
+    assert block["rows"] == [
+        ["DeepSWE 1.1", "13.3", "**42.2**", "+28.9"],
+        ["SWE-bench Pro", "53.5", "61.7", "+8.2"],
+    ]
+    assert block["chart"] == {
+        "kind": "bar",
+        "category_column": 0,
+        "value_columns": [1, 2, 3],
+    }
+
+
+def test_build_assistant_content_blocks_captures_nearby_table_heading():
+    from app.api.chat import _build_assistant_content_blocks
+
+    blocks = _build_assistant_content_blocks(
+        "### Model Results\n\n| Model | Score |\n|:---|---:|\n| Local | 92 |\n| Cloud | 95 |"
+    )
+
+    assert blocks[0]["title"] == "Model Results"
+    assert blocks[0]["source_markdown"].startswith("### Model Results\n\n| Model")
+    assert blocks[0]["column_alignments"] == ["left", "right"]
+
+
+def test_build_assistant_content_blocks_derives_title_from_nearby_intro():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Here are ten highly rated restaurants in Savannah:
+
+---
+
+| # | Restaurant | Rating |
+|---:|---|---:|
+| 1 | Mrs. Wilkes' Dining Room | 4.6 |
+| 2 | The Olde Pink House | 4.5 |"""
+    blocks = _build_assistant_content_blocks(content)
+
+    assert blocks[0]["title"] == "Ten highly rated restaurants in Savannah"
+    assert blocks[0]["source_markdown"].startswith("| # | Restaurant")
+
+
+def test_build_assistant_content_blocks_does_not_use_list_item_as_table_title():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """- Compare these results carefully
+
+| Model | Score |
+|---|---:|
+| Local | 92 |
+| Cloud | 95 |"""
+
+    assert "title" not in _build_assistant_content_blocks(content)[0]
+
+
+def test_build_assistant_content_blocks_caps_native_tables_at_eight():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = "\n\n".join(
+        f"| Table {index} | Value |\n|---|---:|\n| Row | {index} |\n| Other | {index + 1} |"
+        for index in range(1, 10)
+    )
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert len(blocks) == 8
+    assert [block["id"] for block in blocks] == [f"table_{index}" for index in range(1, 9)]
+    assert blocks[-1]["columns"] == ["Table 8", "Value"]
+
+
+def test_build_assistant_content_blocks_extracts_rss_news_digest():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Here are the strongest stories from your feeds:
+
+### Election Updates
+* **Spain Calls Snap Election Amid Housing Crisis**
+  Spain's prime minister called an early election after a legislative defeat.
+  [NPR](https://example.com/spain) | [BBC](https://example.com/spain-bbc)
+* **Brazil Presidential Race Heads to Run-Off**
+  No candidate crossed 50 percent in the first round.
+  [BBC](https://example.com/brazil)
+
+### US & National Policy
+* **Georgia Voting Forum Draws Local Officials**
+  Election directors answered voter questions at a regional forum.
+  [WRBL](https://example.com/georgia)
+"""
+
+    blocks = _build_assistant_content_blocks(
+        content,
+        [{"tool": "list_recent_feed_items", "arguments": {}}],
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "news_digest"
+    assert blocks[0]["schema_version"] == 1
+    assert len(blocks[0]["source_fingerprint"]) == 16
+    assert blocks[0]["title"] == "News Briefing"
+    assert [section["title"] for section in blocks[0]["sections"]] == [
+        "Election Updates",
+        "US & National Policy",
+    ]
+    assert blocks[0]["sections"][0]["items"][0]["sources"] == [
+        {"label": "NPR", "url": "https://example.com/spain"},
+        {"label": "BBC", "url": "https://example.com/spain-bbc"},
+    ]
+
+
+def test_build_assistant_content_blocks_accepts_rss_headline_suffix_and_bare_link():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Here are recent headlines:
+
+### Foreign Policy
+- **First headline** *(Al Jazeera, Oct 7)*
+  First grounded summary.
+  🔗 https://example.com/first
+
+- **Second headline** *(BBC, Oct 6)*
+  Second grounded summary.
+  🔗 https://example.com/second
+
+Let me know if you want more.
+"""
+
+    blocks = _build_assistant_content_blocks(
+        content,
+        [{"tool": "search_my_feeds", "arguments": {"query": "topic"}}],
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "news_digest"
+    items = blocks[0]["sections"][0]["items"]
+    assert items == [
+        {
+            "title": "First headline",
+            "summary": "First grounded summary.",
+            "sources": [{"label": "Al Jazeera", "url": "https://example.com/first"}],
+        },
+        {
+            "title": "Second headline",
+            "summary": "Second grounded summary.",
+            "sources": [{"label": "BBC", "url": "https://example.com/second"}],
+        },
+    ]
+
+
+def test_build_assistant_content_blocks_falls_back_to_selected_rss_evidence():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Here are the major headlines:
+
+**International & Politics**
+- **First headline**; a short inline explanation
+  https://example.com/first
+
+**Business**
+- Second headline without bold formatting
+  https://example.com/second
+
+---
+
+Ask if you want a deeper dive.
+"""
+    tool_result = """Recent feed items (2):
+
+[1] First canonical headline
+    Source: NPR
+    Summary: First summary from the feed.
+    URL: https://example.com/first?traffic_source=rss
+
+[2] Second canonical headline
+    Source: BBC
+    Summary: Second summary from the feed.
+    URL: https://example.com/second
+"""
+
+    blocks = _build_assistant_content_blocks(
+        content,
+        [{"tool": "list_recent_feed_items", "arguments": {}, "result_summary": tool_result}],
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "news_digest"
+    assert blocks[0]["sections"] == [
+        {
+            "title": "Selected Headlines",
+            "items": [
+                {
+                    "title": "First canonical headline",
+                    "summary": "First summary from the feed.",
+                    "sources": [
+                        {
+                            "label": "NPR",
+                            "url": "https://example.com/first?traffic_source=rss",
+                        }
+                    ],
+                },
+                {
+                    "title": "Second canonical headline",
+                    "summary": "Second summary from the feed.",
+                    "sources": [{"label": "BBC", "url": "https://example.com/second"}],
+                },
+            ],
+        }
+    ]
+    assert blocks[0]["source_markdown"].startswith("**International & Politics**")
+    assert blocks[0]["source_markdown"].endswith("---")
+
+
+def test_build_assistant_content_blocks_does_not_promote_news_without_rss_tool():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### News
+* **First story**
+  First summary.
+  [Source](https://example.com/one)
+* **Second story**
+  Second summary.
+  [Source](https://example.com/two)
+"""
+
+    assert _build_assistant_content_blocks(content) == []
+
+
+def test_build_assistant_content_blocks_extracts_bounded_stat_group():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Current conditions are stable.
+
+### System Health
+- **Status:** Healthy
+- **Active tasks:** 12
+- **Queue depth:** 3
+- **Last check:** 2 minutes ago
+
+No intervention is required.
+"""
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert blocks == [
+        {
+            "schema_version": 1,
+            "id": "stat_group_1",
+            "type": "stat_group",
+            "source_markdown": """### System Health
+- **Status:** Healthy
+- **Active tasks:** 12
+- **Queue depth:** 3
+- **Last check:** 2 minutes ago""",
+            "source_fingerprint": blocks[0]["source_fingerprint"],
+            "title": "System Health",
+            "items": [
+                {"label": "Status", "value": "Healthy"},
+                {"label": "Active tasks", "value": "12"},
+                {"label": "Queue depth", "value": "3"},
+                {"label": "Last check", "value": "2 minutes ago"},
+            ],
+        }
+    ]
+
+
+def test_build_assistant_content_blocks_leaves_short_fact_list_as_prose():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### Result
+- **Status:** Healthy
+- **Queue depth:** 3
+"""
+
+    assert _build_assistant_content_blocks(content) == []
+
+
+def test_build_assistant_content_blocks_leaves_place_shaped_stats_as_prose_without_place_evidence():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = (
+        "### 1. **Three Tree Coffee Roasters** ⭐ 4.5\n"
+        "- **Address:** 441 S Main St, Statesboro, GA 30458\n"
+        "- **Distance from Downtown:** ~0.2 mi south\n"
+        "- **Phone:** (912) 681-8733\n"
+        "- **Website:** <https://threetreecoffee.com/>"
+    )
+
+    assert _build_assistant_content_blocks(content) == []
+
+
+def test_build_assistant_content_blocks_extracts_bounded_code_artifact():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Use this helper to normalize the value.
+
+### normalize.py
+```python
+def normalize(value: str) -> str:
+    return " ".join(value.split()).strip()
+```
+
+It intentionally preserves no surrounding whitespace.
+"""
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "code_artifact"
+    assert blocks[0]["title"] == "normalize.py"
+    assert blocks[0]["code"] == {
+        "language": "python",
+        "filename": "normalize.py",
+        "content": 'def normalize(value: str) -> str:\n    return " ".join(value.split()).strip()',
+    }
+
+
+def test_build_assistant_content_blocks_links_code_to_tool_backed_workspace_file():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### scripts/check.py
+```python
+def check() -> bool:
+    return True
+```
+"""
+    blocks = _build_assistant_content_blocks(
+        content,
+        [
+            {
+                "tool": "write_file",
+                "arguments": {"path": "/workspace/1/scripts/check.py"},
+                "result_summary": "Workspace file written",
+                "is_error": False,
+            }
+        ],
+    )
+
+    assert blocks[0]["code"]["path"] == "scripts/check.py"
+    assert blocks[0]["code"]["filename"] == "check.py"
+
+
+def test_build_assistant_content_blocks_does_not_promote_short_inline_command():
+    from app.api.chat import _build_assistant_content_blocks
+
+    assert _build_assistant_content_blocks("Run:\n```bash\npytest -q\n```") == []
+
+
+def test_code_artifact_supersedes_markdown_table_inside_fence():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### Markdown example
+```markdown
+| Name | Value |
+|---|---:|
+| Alpha | 1 |
+| Beta | 2 |
+```
+"""
+    blocks = _build_assistant_content_blocks(content)
+
+    assert [block["type"] for block in blocks] == ["code_artifact"]
+
+
+def test_normalize_assistant_metadata_preserves_bounded_code_artifact():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "type": "code_artifact",
+                    "source_markdown": "```swift\nlet value = 1\nprint(value)\n```",
+                    "title": "Example.swift",
+                    "code": {
+                        "language": "swift",
+                        "filename": "Example.swift",
+                        "content": "let value = 1\nprint(value)",
+                        "path": "/workspace/1/Sources/Example.swift",
+                    },
+                }
+            ]
+        }
+    )
+
+    block = metadata["content_blocks"][0]
+    assert block["type"] == "code_artifact"
+    assert block["code"]["path"] == "Sources/Example.swift"
+    assert block["code"]["language"] == "swift"
+
+
+def test_normalize_assistant_metadata_preserves_bounded_stat_group():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "id": "stat_group_1",
+                    "type": "stat_group",
+                    "source_markdown": "### Quote\n- **Price:** $42\n- **Change:** +1.2%\n- **Status:** Open",
+                    "title": "Quote",
+                    "items": [
+                        {"label": "Price", "value": "$42"},
+                        {"label": "Change", "value": "+1.2%"},
+                        {"label": "Status", "value": "Open"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    normalized = metadata["content_blocks"][0]
+    assert normalized["schema_version"] == 1
+    assert normalized["type"] == "stat_group"
+    assert normalized["items"][1] == {"label": "Change", "value": "+1.2%"}
+
+
+def test_build_assistant_content_blocks_extracts_explicit_timeline():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """The incident unfolded in three stages.
+
+### Incident Timeline
+- **09:15 AM:** Monitoring detected elevated error rates.
+- **09:28 AM** — Operators disabled the affected integration.
+- **10:05 AM** Service recovered and validation completed.
+
+No data was lost.
+"""
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "timeline"
+    assert blocks[0]["title"] == "Incident Timeline"
+    assert blocks[0]["events"] == [
+        {"label": "09:15 AM", "detail": "Monitoring detected elevated error rates."},
+        {"label": "09:28 AM", "detail": "Operators disabled the affected integration."},
+        {"label": "10:05 AM", "detail": "Service recovered and validation completed."},
+    ]
+
+
+def test_build_assistant_content_blocks_does_not_promote_generic_bold_list_to_timeline():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### Recommendations
+- **First:** Check the logs.
+- **Second:** Restart the service.
+- **Third:** Verify recovery.
+"""
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert all(block["type"] != "timeline" for block in blocks)
+
+
+def test_normalize_assistant_metadata_preserves_bounded_timeline():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "id": "timeline_1",
+                    "type": "timeline",
+                    "source_markdown": "### Timeline\n- **Day 1:** Started\n- **Day 2:** Finished",
+                    "title": "Timeline",
+                    "events": [
+                        {"label": "Day 1", "detail": "Started"},
+                        {"label": "Day 2", "detail": "Finished"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    block = metadata["content_blocks"][0]
+    assert block["schema_version"] == 1
+    assert block["events"] == [
+        {"label": "Day 1", "detail": "Started"},
+        {"label": "Day 2", "detail": "Finished"},
+    ]
+
+
+def test_build_assistant_content_blocks_extracts_tool_backed_file_artifact():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = "The report is ready at `reports/weekly-summary.md`."
+    blocks = _build_assistant_content_blocks(
+        content,
+        [
+            {
+                "tool": "write_file",
+                "arguments": {"path": "reports/weekly-summary.md", "content": "private"},
+                "result_summary": "Wrote 7 bytes to weekly-summary.md",
+                "is_error": False,
+            }
+        ],
+    )
+
+    assert blocks == [
+        {
+            "schema_version": 1,
+            "id": "file_artifact_1",
+            "type": "file_artifact",
+            "source_markdown": content,
+            "source_fingerprint": blocks[0]["source_fingerprint"],
+            "title": "weekly-summary.md",
+            "file": {
+                "path": "reports/weekly-summary.md",
+                "filename": "weekly-summary.md",
+                "media_type": "text/markdown",
+                "operation": "written",
+            },
+        }
+    ]
+
+
+def test_build_assistant_content_blocks_requires_successful_referenced_file_write():
+    from app.api.chat import _build_assistant_content_blocks
+
+    failed = {
+        "tool": "write_file",
+        "arguments": {"path": "reports/private.md"},
+        "is_error": True,
+    }
+    unreferenced = {
+        "tool": "append_file",
+        "arguments": {"path": "reports/hidden.md"},
+        "is_error": False,
+    }
+
+    assert _build_assistant_content_blocks("The write failed.", [failed]) == []
+    assert _build_assistant_content_blocks("The report was updated.", [unreferenced]) == []
+
+
+def test_build_assistant_content_blocks_normalizes_absolute_workspace_artifact_path():
+    from app.api.chat import _build_assistant_content_blocks
+
+    blocks = _build_assistant_content_blocks(
+        "Saved to `reports/result.csv`.",
+        [
+            {
+                "tool": "write_file",
+                "arguments": {"path": "/Users/example/fruitcake/workspace/7/reports/result.csv"},
+                "is_error": False,
+            }
+        ],
+    )
+
+    assert blocks[0]["file"]["path"] == "reports/result.csv"
+
+
+def test_normalize_assistant_metadata_preserves_bounded_file_artifact():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "type": "file_artifact",
+                    "source_markdown": "Saved to `reports/result.csv`.",
+                    "file": {
+                        "path": "reports/result.csv",
+                        "filename": "result.csv",
+                        "media_type": "text/csv",
+                        "operation": "appended",
+                    },
+                }
+            ]
+        }
+    )
+
+    block = metadata["content_blocks"][0]
+    assert block["schema_version"] == 1
+    assert block["type"] == "file_artifact"
+    assert block["file"] == {
+        "path": "reports/result.csv",
+        "filename": "result.csv",
+        "media_type": "text/csv",
+        "operation": "appended",
+    }
+
+
+def test_build_assistant_content_blocks_extracts_tool_backed_place_group():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = (
+        "### Coffee nearby\n"
+        "- **The Daily Grind** — Coffee shop at 17 Main St.\n"
+        "- **Three Tree Coffee Roasters** — Cafe at 441 S Main St.\n\n"
+        "Both are close to downtown."
+    )
+    blocks = _build_assistant_content_blocks(
+        content,
+        [
+            {
+                "tool": "search_places",
+                "arguments": {"query": "coffee", "near": "Statesboro"},
+                "is_error": False,
+                "structured_content": {
+                    "capability": "place_search",
+                    "provider": "brave",
+                    "places": [
+                        {
+                            "name": "The Daily Grind",
+                            "address": "17 Main St, Statesboro, GA",
+                            "latitude": 32.448,
+                            "longitude": -81.783,
+                            "category": "Coffee shop",
+                            "rating": 4.6,
+                            "rating_max": 5,
+                            "review_count": 82,
+                            "url": "https://example.com/daily-grind",
+                            "provider": "brave",
+                        },
+                        {
+                            "name": "Three Tree Coffee Roasters",
+                            "address": "441 S Main St, Statesboro, GA",
+                            "category": "Cafe",
+                            "provider": "brave",
+                        },
+                        {
+                            "name": "Unmentioned Cafe",
+                            "address": "99 Hidden St",
+                            "provider": "brave",
+                        },
+                    ],
+                },
+            }
+        ],
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "place_group"
+    assert blocks[0]["title"] == "Coffee nearby"
+    assert blocks[0]["provider"] == "brave"
+    assert [place["name"] for place in blocks[0]["places"]] == [
+        "The Daily Grind",
+        "Three Tree Coffee Roasters",
+    ]
+    assert blocks[0]["places"][0]["rating"] == 4.6
+    assert "Both are close to downtown." not in blocks[0]["source_markdown"]
+
+
+def test_place_group_supersedes_overlapping_markdown_table():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = (
+        "### Nearby places\n"
+        "| Name | Address |\n"
+        "|---|---|\n"
+        "| The Daily Grind | 17 Main St |\n"
+        "| Three Tree Coffee | 441 S Main St |"
+    )
+    blocks = _build_assistant_content_blocks(
+        content,
+        [
+            {
+                "tool": "search_places",
+                "is_error": False,
+                "structured_content": {
+                    "capability": "place_search",
+                    "provider": "nominatim",
+                    "places": [
+                        {"name": "The Daily Grind", "address": "17 Main St"},
+                        {"name": "Three Tree Coffee", "address": "441 S Main St"},
+                    ],
+                },
+            }
+        ],
+    )
+
+    assert [block["type"] for block in blocks] == ["place_group"]
+
+
+def test_normalize_assistant_metadata_preserves_bounded_place_group():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "type": "place_group",
+                    "source_markdown": "- **Cafe** — 1 Main St",
+                    "title": "Nearby",
+                    "provider": "brave",
+                    "places": [
+                        {
+                            "name": "Cafe",
+                            "address": "1 Main St",
+                            "latitude": 32.0,
+                            "longitude": -81.0,
+                            "rating": 4.5,
+                            "review_count": 12,
+                            "url": "javascript:alert(1)",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    block = metadata["content_blocks"][0]
+    assert block["schema_version"] == 1
+    assert block["type"] == "place_group"
+    assert block["places"] == [
+        {
+            "name": "Cafe",
+            "address": "1 Main St",
+            "latitude": 32.0,
+            "longitude": -81.0,
+            "rating": 4.5,
+            "review_count": 12,
+        }
+    ]
+
+
+def test_normalize_assistant_metadata_preserves_bounded_news_digest():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "id": "news_digest_1",
+                    "type": "news_digest",
+                    "source_markdown": "### News\n* **Story**",
+                    "title": "Evening News",
+                    "sections": [
+                        {
+                            "title": "Politics",
+                            "items": [
+                                {
+                                    "title": "First story",
+                                    "summary": "A grounded summary.",
+                                    "sources": [
+                                        {"label": "NPR", "url": "https://example.com/story"},
+                                        {"label": "Bad", "url": "javascript:alert(1)"},
+                                    ],
+                                },
+                                {
+                                    "title": "Second story",
+                                    "summary": "Another grounded summary.",
+                                    "sources": [],
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    block = metadata["content_blocks"][0]
+    assert block["type"] == "news_digest"
+    assert block["schema_version"] == 1
+    assert block["title"] == "Evening News"
+    assert block["sections"][0]["items"][0]["sources"] == [
+        {"label": "NPR", "url": "https://example.com/story"}
+    ]
+
+
+def test_normalize_assistant_metadata_upgrades_legacy_content_block_and_rejects_future_schema():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    normalized = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "id": "legacy_table",
+                    "type": "table",
+                    "source_markdown": "| Name | Value |\n|---|---:|\n| A | 1 |",
+                    "columns": ["Name", "Value"],
+                    "rows": [["A", "1"]],
+                },
+                {
+                    "schema_version": 99,
+                    "id": "future_table",
+                    "type": "table",
+                    "source_markdown": "| Name | Value |\n|---|---|\n| B | 2 |",
+                    "columns": ["Name", "Value"],
+                    "rows": [["B", "2"]],
+                },
+            ]
+        }
+    )
+
+    assert len(normalized["content_blocks"]) == 1
+    assert normalized["content_blocks"][0]["id"] == "legacy_table"
+    assert normalized["content_blocks"][0]["schema_version"] == 1
+    assert normalized["content_blocks"][0]["column_alignments"] == ["left", "left"]
+
+
+def test_build_assistant_activity_is_human_readable_and_bounded():
+    from app.api.chat import _build_assistant_activity
+
+    activities = _build_assistant_activity(
+        [
+            {"tool": "web_context", "arguments": {"query": "Qwen 3.8 benchmarks"}},
+            {
+                "tool": "fetch_page",
+                "arguments": {"url": "https://example.com/report"},
+                "result_summary": "Title: Benchmark report\nBody",
+            },
+            {"tool": "search_library", "arguments": {"query": "model notes"}},
+        ]
+    )
+
+    assert activities == [
+        {"tool_name": "web_context", "label": "Searched the web", "value": "Qwen 3.8 benchmarks"},
+        {"tool_name": "fetch_page", "label": "Read a webpage", "value": "Benchmark report"},
+        {"tool_name": "search_library", "label": "Searched your library", "value": "model notes"},
+    ]
+
+
+def test_assistant_metadata_preserves_content_blocks_and_activity():
+    from app.api.chat import _build_assistant_message_metadata
+
+    metadata = _build_assistant_message_metadata(
+        handoff_metadata={},
+        executed_tools=[{"tool": "web_search", "arguments": {"query": "market data"}}],
+        content="| Name | Value |\n|---|---:|\n| A | 1 |\n| B | 2 |",
+    )
+
+    assert metadata is not None
+    assert metadata["content_blocks"][0]["type"] == "table"
+    assert metadata["content_blocks"][0]["chart"]["value_columns"] == [1]
+    assert metadata["activity"] == [
+        {"tool_name": "web_search", "label": "Searched the web", "value": "market data"}
+    ]
+
+
 def test_build_assistant_tool_details_fetch_page_kind_heuristics():
     from app.api.chat import _build_assistant_tool_details
 
@@ -1795,6 +2649,101 @@ def test_build_assistant_evidence_metadata_counts_repeated_web_sources():
     assert evidence["tool_names"] == ["web_search", "fetch_page"]
     assert evidence["source_kinds"] == ["web"]
     assert evidence["source_counts"] == {"web": 3}
+
+
+def test_build_assistant_evidence_metadata_extracts_bounded_rss_story_sources():
+    from app.api.chat import _build_assistant_evidence_metadata
+
+    evidence = _build_assistant_evidence_metadata(
+        [
+            {
+                "tool": "search_my_feeds",
+                "arguments": {"query": "space missions"},
+                "result_summary": """Cached feed results for 'space missions' (cache-only):
+
+[1] Swift Observatory gets a boost
+    Feed: NASA News
+    Published: 2026-10-05T12:00:00Z
+    URL: https://www.nasa.gov/swift-update
+    Mission update.
+
+[2] A second mission
+    Feed: Space News
+    URL: https://example.org/mission
+""",
+            }
+        ]
+    )
+
+    assert evidence is not None
+    assert evidence["tool_details"] == [
+        {
+            "tool_name": "search_my_feeds",
+            "detail_kind": "query",
+            "label": "Query",
+            "value": "space missions",
+        }
+    ]
+    assert evidence["citations"] == [
+        {
+            "url": "https://www.nasa.gov/swift-update",
+            "title": "Swift Observatory gets a boost",
+            "source": "NASA News",
+            "published_at": "2026-10-05T12:00:00Z",
+        },
+        {
+            "url": "https://example.org/mission",
+            "title": "A second mission",
+            "source": "Space News",
+        },
+    ]
+
+
+def test_build_assistant_evidence_metadata_preserves_web_context_provider_and_sources():
+    from app.api.chat import _build_assistant_evidence_metadata
+
+    evidence = _build_assistant_evidence_metadata(
+        [
+            {
+                "tool": "web_context",
+                "arguments": {"query": "Qwen 3.8 benchmark changes"},
+                "result_summary": "Web context for: Qwen 3.8 benchmark changes",
+                "structured_content": {
+                    "provider": "brave",
+                    "citations": [
+                        {
+                            "title": "Qwen 3.8 model card",
+                            "url": "https://huggingface.co/Qwen/Qwen3.8-27B",
+                            "source": "brave",
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+
+    assert evidence is not None
+    assert evidence["tool_details"] == [
+        {
+            "tool_name": "web_context",
+            "detail_kind": "query",
+            "label": "Query",
+            "value": "Qwen 3.8 benchmark changes",
+        },
+        {
+            "tool_name": "web_context",
+            "detail_kind": "provider",
+            "label": "Provider",
+            "value": "brave",
+        },
+    ]
+    assert evidence["citations"] == [
+        {
+            "title": "Qwen 3.8 model card",
+            "url": "https://huggingface.co/Qwen/Qwen3.8-27B",
+            "source": "brave",
+        }
+    ]
 
 
 def test_build_assistant_evidence_metadata_includes_generated_image_artifact():
@@ -2014,6 +2963,28 @@ def test_normalize_assistant_metadata_payload_passes_through_image_artifacts():
     ]
 
 
+def test_normalize_assistant_metadata_payload_sanitizes_citations_and_keeps_library_refs():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    normalized = _normalize_assistant_metadata_payload(
+        {
+            "evidence": {
+                "grounded": True,
+                "citations": [
+                    {"title": "Safe source", "url": "https://example.com/story"},
+                    {"title": "Unsafe source", "url": "javascript:alert(1)"},
+                    {"document": "Agents of Chaos.pdf", "path": "library/agents-of-chaos.pdf"},
+                ],
+            }
+        }
+    )
+
+    assert normalized["evidence"]["citations"] == [
+        {"url": "https://example.com/story", "title": "Safe source"},
+        {"document": "Agents of Chaos.pdf", "path": "library/agents-of-chaos.pdf"},
+    ]
+
+
 @pytest.mark.asyncio
 async def test_workspace_image_endpoint_serves_owned_workspace_image(client, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
@@ -2071,6 +3042,38 @@ async def test_workspace_image_endpoint_rejects_non_images_and_path_escape(clien
     )
 
     assert non_image.status_code == 400
+    assert escaped.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_workspace_file_endpoint_serves_owned_file_and_rejects_escape(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    await client.post("/auth/register", json={
+        "username": "fileuser",
+        "email": "fileuser@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "fileuser", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    report_path = Path(tmp_path) / "1" / "reports" / "summary.md"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text("# Summary\n", encoding="utf-8")
+
+    response = await client.get(
+        "/workspace/files",
+        params={"path": "reports/summary.md"},
+        headers=headers,
+    )
+    escaped = await client.get(
+        "/workspace/files",
+        params={"path": "../2/reports/summary.md"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"# Summary\n"
+    assert "summary.md" in response.headers["content-disposition"]
     assert escaped.status_code == 400
 
 

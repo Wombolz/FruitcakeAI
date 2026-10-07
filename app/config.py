@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     # ── Application ──────────────────────────────────────────────────────────
     app_name: str = "FruitcakeAI"
-    app_version: str = "0.7.39"
+    app_version: str = "0.7.40"
     debug: bool = False
     log_level: str = "INFO"
     app_port: int = 30417
@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     web_search_provider: str = "auto"
     brave_search_api_key: str = ""
     brave_search_fallback_to_ddg: bool = True
+    place_search_provider: str = "auto"
+    brave_place_fallback_to_nominatim: bool = True
     brave_context_enabled: bool = True
     brave_context_default_tokens: int = 8_192
     brave_context_timeout_seconds: int = 30

@@ -22,7 +22,13 @@ async def test_web_search_prefers_brave_when_key_is_configured(monkeypatch):
     ):
         result = await web_research_v2._web_search({"query": "provider test brave"})
 
-    assert "Brave result" in result
+    assert "Brave result" in result["content"][0]["text"]
+    assert result["structuredContent"]["provider"] == "brave"
+    assert result["structuredContent"]["citations"] == [{
+        "title": "Brave result",
+        "url": "https://example.org/brave",
+        "source": "brave",
+    }]
     brave.assert_awaited_once()
     ddg.assert_not_awaited()
 
@@ -44,7 +50,8 @@ async def test_web_search_falls_back_when_brave_fails(monkeypatch):
     ):
         result = await web_research_v2._web_search({"query": "provider test fallback"})
 
-    assert "Fallback result" in result
+    assert "Fallback result" in result["content"][0]["text"]
+    assert result["structuredContent"]["provider"] == "duckduckgo"
     brave.assert_awaited_once()
     ddg.assert_awaited_once()
 
@@ -65,7 +72,8 @@ async def test_web_search_uses_duckduckgo_without_brave_key(monkeypatch):
     ):
         result = await web_research_v2._web_search({"query": "provider test no key"})
 
-    assert "No-key result" in result
+    assert "No-key result" in result["content"][0]["text"]
+    assert result["structuredContent"]["provider"] == "duckduckgo"
     brave.assert_not_awaited()
     ddg.assert_awaited_once()
 

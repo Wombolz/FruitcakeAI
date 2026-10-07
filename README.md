@@ -39,6 +39,7 @@ FruitcakeAI is not a chat UI wrapper. It's an agent platform with a full working
 - The **task engine** plans and executes multi-step work autonomously, on a schedule, or triggered by webhooks
 - The **chat layer** can now create, inspect, and update real persistent tasks instead of only acting as a one-shot Q&A surface
 - The **visual chat path** can upload and serve workspace images, inspect them with an optional local vision model, and retain generated-image artifacts in conversation history
+- The **structured chat path** turns grounded tables, charts, news, metrics, timelines, files, places, and code into durable native content instead of flattening everything into prose
 - The **memory system** persists what matters across sessions, with 3-tier retrieval and semantic search
 - The **RAG pipeline** ingests your documents and makes them queryable with hybrid BM25 + vector retrieval
 - The **MCP layer** lets you drop in any tool server via a config file — no code changes required
@@ -131,6 +132,8 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - WebSocket chat no longer replays stale completed sends from reused server-side message state
 - Live image-generation turns expose bounded prompt, model, workflow, step, seed, and dimension context for first-class progress rendering
 - Generated images remain attached to assistant history as authenticated workspace artifacts and ordered Markdown references
+- Versioned assistant content blocks preserve structured tables, charts, news, metrics, timelines, files, places, and code across live responses and session reloads
+- Grounded evidence metadata retains source labels, links, search provenance, and tool context for native client inspection
 
 **Memory**
 - Persistent per-user memory written by the agent via `create_memory` tool
