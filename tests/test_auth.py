@@ -1678,28 +1678,38 @@ def test_build_assistant_content_blocks_extracts_table_and_chart_hint():
 The newer model improves most strongly on agentic coding.
 """
 
-    assert _build_assistant_content_blocks(content) == [
-        {
-            "id": "table_1",
-            "type": "table",
-            "source_markdown": (
-                "| Benchmark | Qwen 3.6 | Qwen 3.8 | Delta |\n"
-                "|---|---:|---:|---:|\n"
-                "| DeepSWE 1.1 | 13.3 | **42.2** | +28.9 |\n"
-                "| SWE-bench Pro | 53.5 | 61.7 | +8.2 |"
-            ),
-            "columns": ["Benchmark", "Qwen 3.6", "Qwen 3.8", "Delta"],
-            "rows": [
-                ["DeepSWE 1.1", "13.3", "**42.2**", "+28.9"],
-                ["SWE-bench Pro", "53.5", "61.7", "+8.2"],
-            ],
-            "chart": {
-                "kind": "bar",
-                "category_column": 0,
-                "value_columns": [1, 2, 3],
-            },
-        }
+    blocks = _build_assistant_content_blocks(content)
+
+    assert len(blocks) == 1
+    block = blocks[0]
+    assert block["schema_version"] == 1
+    assert block["id"] == "table_1"
+    assert block["type"] == "table"
+    assert block["source_markdown"].startswith("| Benchmark")
+    assert len(block["source_fingerprint"]) == 16
+    assert block["columns"] == ["Benchmark", "Qwen 3.6", "Qwen 3.8", "Delta"]
+    assert block["column_alignments"] == ["left", "right", "right", "right"]
+    assert block["rows"] == [
+        ["DeepSWE 1.1", "13.3", "**42.2**", "+28.9"],
+        ["SWE-bench Pro", "53.5", "61.7", "+8.2"],
     ]
+    assert block["chart"] == {
+        "kind": "bar",
+        "category_column": 0,
+        "value_columns": [1, 2, 3],
+    }
+
+
+def test_build_assistant_content_blocks_captures_nearby_table_heading():
+    from app.api.chat import _build_assistant_content_blocks
+
+    blocks = _build_assistant_content_blocks(
+        "### Model Results\n\n| Model | Score |\n|:---|---:|\n| Local | 92 |\n| Cloud | 95 |"
+    )
+
+    assert blocks[0]["title"] == "Model Results"
+    assert blocks[0]["source_markdown"].startswith("### Model Results\n\n| Model")
+    assert blocks[0]["column_alignments"] == ["left", "right"]
 
 
 def test_build_assistant_content_blocks_caps_native_tables_at_eight():
@@ -1743,6 +1753,8 @@ def test_build_assistant_content_blocks_extracts_rss_news_digest():
 
     assert len(blocks) == 1
     assert blocks[0]["type"] == "news_digest"
+    assert blocks[0]["schema_version"] == 1
+    assert len(blocks[0]["source_fingerprint"]) == 16
     assert blocks[0]["title"] == "News Briefing"
     assert [section["title"] for section in blocks[0]["sections"]] == [
         "Election Updates",
@@ -1807,10 +1819,42 @@ def test_normalize_assistant_metadata_preserves_bounded_news_digest():
 
     block = metadata["content_blocks"][0]
     assert block["type"] == "news_digest"
+    assert block["schema_version"] == 1
     assert block["title"] == "Evening News"
     assert block["sections"][0]["items"][0]["sources"] == [
         {"label": "NPR", "url": "https://example.com/story"}
     ]
+
+
+def test_normalize_assistant_metadata_upgrades_legacy_content_block_and_rejects_future_schema():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    normalized = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "id": "legacy_table",
+                    "type": "table",
+                    "source_markdown": "| Name | Value |\n|---|---:|\n| A | 1 |",
+                    "columns": ["Name", "Value"],
+                    "rows": [["A", "1"]],
+                },
+                {
+                    "schema_version": 99,
+                    "id": "future_table",
+                    "type": "table",
+                    "source_markdown": "| Name | Value |\n|---|---|\n| B | 2 |",
+                    "columns": ["Name", "Value"],
+                    "rows": [["B", "2"]],
+                },
+            ]
+        }
+    )
+
+    assert len(normalized["content_blocks"]) == 1
+    assert normalized["content_blocks"][0]["id"] == "legacy_table"
+    assert normalized["content_blocks"][0]["schema_version"] == 1
+    assert normalized["content_blocks"][0]["column_alignments"] == ["left", "left"]
 
 
 def test_build_assistant_activity_is_human_readable_and_bounded():
