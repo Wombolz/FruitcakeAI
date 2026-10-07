@@ -1665,6 +1665,193 @@ def test_build_assistant_tool_details_includes_web_query_and_page_url():
     ]
 
 
+def test_build_assistant_content_blocks_extracts_table_and_chart_hint():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Benchmark comparison:
+
+| Benchmark | Qwen 3.6 | Qwen 3.8 | Delta |
+|---|---:|---:|---:|
+| DeepSWE 1.1 | 13.3 | **42.2** | +28.9 |
+| SWE-bench Pro | 53.5 | 61.7 | +8.2 |
+
+The newer model improves most strongly on agentic coding.
+"""
+
+    assert _build_assistant_content_blocks(content) == [
+        {
+            "id": "table_1",
+            "type": "table",
+            "source_markdown": (
+                "| Benchmark | Qwen 3.6 | Qwen 3.8 | Delta |\n"
+                "|---|---:|---:|---:|\n"
+                "| DeepSWE 1.1 | 13.3 | **42.2** | +28.9 |\n"
+                "| SWE-bench Pro | 53.5 | 61.7 | +8.2 |"
+            ),
+            "columns": ["Benchmark", "Qwen 3.6", "Qwen 3.8", "Delta"],
+            "rows": [
+                ["DeepSWE 1.1", "13.3", "**42.2**", "+28.9"],
+                ["SWE-bench Pro", "53.5", "61.7", "+8.2"],
+            ],
+            "chart": {
+                "kind": "bar",
+                "category_column": 0,
+                "value_columns": [1, 2, 3],
+            },
+        }
+    ]
+
+
+def test_build_assistant_content_blocks_caps_native_tables_at_eight():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = "\n\n".join(
+        f"| Table {index} | Value |\n|---|---:|\n| Row | {index} |\n| Other | {index + 1} |"
+        for index in range(1, 10)
+    )
+
+    blocks = _build_assistant_content_blocks(content)
+
+    assert len(blocks) == 8
+    assert [block["id"] for block in blocks] == [f"table_{index}" for index in range(1, 9)]
+    assert blocks[-1]["columns"] == ["Table 8", "Value"]
+
+
+def test_build_assistant_content_blocks_extracts_rss_news_digest():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """Here are the strongest stories from your feeds:
+
+### Election Updates
+* **Spain Calls Snap Election Amid Housing Crisis**
+  Spain's prime minister called an early election after a legislative defeat.
+  [NPR](https://example.com/spain) | [BBC](https://example.com/spain-bbc)
+* **Brazil Presidential Race Heads to Run-Off**
+  No candidate crossed 50 percent in the first round.
+  [BBC](https://example.com/brazil)
+
+### US & National Policy
+* **Georgia Voting Forum Draws Local Officials**
+  Election directors answered voter questions at a regional forum.
+  [WRBL](https://example.com/georgia)
+"""
+
+    blocks = _build_assistant_content_blocks(
+        content,
+        [{"tool": "list_recent_feed_items", "arguments": {}}],
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "news_digest"
+    assert blocks[0]["title"] == "News Briefing"
+    assert [section["title"] for section in blocks[0]["sections"]] == [
+        "Election Updates",
+        "US & National Policy",
+    ]
+    assert blocks[0]["sections"][0]["items"][0]["sources"] == [
+        {"label": "NPR", "url": "https://example.com/spain"},
+        {"label": "BBC", "url": "https://example.com/spain-bbc"},
+    ]
+
+
+def test_build_assistant_content_blocks_does_not_promote_news_without_rss_tool():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### News
+* **First story**
+  First summary.
+  [Source](https://example.com/one)
+* **Second story**
+  Second summary.
+  [Source](https://example.com/two)
+"""
+
+    assert _build_assistant_content_blocks(content) == []
+
+
+def test_normalize_assistant_metadata_preserves_bounded_news_digest():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "id": "news_digest_1",
+                    "type": "news_digest",
+                    "source_markdown": "### News\n* **Story**",
+                    "title": "Evening News",
+                    "sections": [
+                        {
+                            "title": "Politics",
+                            "items": [
+                                {
+                                    "title": "First story",
+                                    "summary": "A grounded summary.",
+                                    "sources": [
+                                        {"label": "NPR", "url": "https://example.com/story"},
+                                        {"label": "Bad", "url": "javascript:alert(1)"},
+                                    ],
+                                },
+                                {
+                                    "title": "Second story",
+                                    "summary": "Another grounded summary.",
+                                    "sources": [],
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    block = metadata["content_blocks"][0]
+    assert block["type"] == "news_digest"
+    assert block["title"] == "Evening News"
+    assert block["sections"][0]["items"][0]["sources"] == [
+        {"label": "NPR", "url": "https://example.com/story"}
+    ]
+
+
+def test_build_assistant_activity_is_human_readable_and_bounded():
+    from app.api.chat import _build_assistant_activity
+
+    activities = _build_assistant_activity(
+        [
+            {"tool": "web_context", "arguments": {"query": "Qwen 3.8 benchmarks"}},
+            {
+                "tool": "fetch_page",
+                "arguments": {"url": "https://example.com/report"},
+                "result_summary": "Title: Benchmark report\nBody",
+            },
+            {"tool": "search_library", "arguments": {"query": "model notes"}},
+        ]
+    )
+
+    assert activities == [
+        {"tool_name": "web_context", "label": "Searched the web", "value": "Qwen 3.8 benchmarks"},
+        {"tool_name": "fetch_page", "label": "Read a webpage", "value": "Benchmark report"},
+        {"tool_name": "search_library", "label": "Searched your library", "value": "model notes"},
+    ]
+
+
+def test_assistant_metadata_preserves_content_blocks_and_activity():
+    from app.api.chat import _build_assistant_message_metadata
+
+    metadata = _build_assistant_message_metadata(
+        handoff_metadata={},
+        executed_tools=[{"tool": "web_search", "arguments": {"query": "market data"}}],
+        content="| Name | Value |\n|---|---:|\n| A | 1 |\n| B | 2 |",
+    )
+
+    assert metadata is not None
+    assert metadata["content_blocks"][0]["type"] == "table"
+    assert metadata["content_blocks"][0]["chart"]["value_columns"] == [1]
+    assert metadata["activity"] == [
+        {"tool_name": "web_search", "label": "Searched the web", "value": "market data"}
+    ]
+
+
 def test_build_assistant_tool_details_fetch_page_kind_heuristics():
     from app.api.chat import _build_assistant_tool_details
 
