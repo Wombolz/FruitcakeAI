@@ -52,6 +52,28 @@ async def get_workspace_image(
     )
 
 
+@router.get("/files")
+async def get_workspace_file(
+    path: str = Query(..., min_length=1),
+    current_user: User = Depends(get_current_user),
+):
+    """Download a file from the current user's workspace through normal API auth."""
+    try:
+        _, resolved = resolve_workspace_path_for_user(int(current_user.id), path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Workspace file not found")
+
+    media_type = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
+    return FileResponse(
+        Path(resolved),
+        media_type=media_type,
+        filename=resolved.name,
+    )
+
+
 def _fallback_image_media_type(suffix: str) -> str:
     return {
         ".png": "image/png",

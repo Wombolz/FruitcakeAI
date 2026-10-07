@@ -2026,6 +2026,106 @@ def test_normalize_assistant_metadata_preserves_bounded_timeline():
     ]
 
 
+def test_build_assistant_content_blocks_extracts_tool_backed_file_artifact():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = "The report is ready at `reports/weekly-summary.md`."
+    blocks = _build_assistant_content_blocks(
+        content,
+        [
+            {
+                "tool": "write_file",
+                "arguments": {"path": "reports/weekly-summary.md", "content": "private"},
+                "result_summary": "Wrote 7 bytes to weekly-summary.md",
+                "is_error": False,
+            }
+        ],
+    )
+
+    assert blocks == [
+        {
+            "schema_version": 1,
+            "id": "file_artifact_1",
+            "type": "file_artifact",
+            "source_markdown": content,
+            "source_fingerprint": blocks[0]["source_fingerprint"],
+            "title": "weekly-summary.md",
+            "file": {
+                "path": "reports/weekly-summary.md",
+                "filename": "weekly-summary.md",
+                "media_type": "text/markdown",
+                "operation": "written",
+            },
+        }
+    ]
+
+
+def test_build_assistant_content_blocks_requires_successful_referenced_file_write():
+    from app.api.chat import _build_assistant_content_blocks
+
+    failed = {
+        "tool": "write_file",
+        "arguments": {"path": "reports/private.md"},
+        "is_error": True,
+    }
+    unreferenced = {
+        "tool": "append_file",
+        "arguments": {"path": "reports/hidden.md"},
+        "is_error": False,
+    }
+
+    assert _build_assistant_content_blocks("The write failed.", [failed]) == []
+    assert _build_assistant_content_blocks("The report was updated.", [unreferenced]) == []
+
+
+def test_build_assistant_content_blocks_normalizes_absolute_workspace_artifact_path():
+    from app.api.chat import _build_assistant_content_blocks
+
+    blocks = _build_assistant_content_blocks(
+        "Saved to `reports/result.csv`.",
+        [
+            {
+                "tool": "write_file",
+                "arguments": {"path": "/Users/example/fruitcake/workspace/7/reports/result.csv"},
+                "is_error": False,
+            }
+        ],
+    )
+
+    assert blocks[0]["file"]["path"] == "reports/result.csv"
+
+
+def test_normalize_assistant_metadata_preserves_bounded_file_artifact():
+    from app.api.chat import _normalize_assistant_metadata_payload
+
+    metadata = _normalize_assistant_metadata_payload(
+        {
+            "content_blocks": [
+                {
+                    "type": "file_artifact",
+                    "source_markdown": "Saved to `reports/result.csv`.",
+                    "file": {
+                        "path": "reports/result.csv",
+                        "filename": "result.csv",
+                        "media_type": "text/csv",
+                        "operation": "appended",
+                    },
+                }
+            ]
+        }
+    )
+
+    block = metadata["content_blocks"][0]
+    assert block["schema_version"] == 1
+    assert block["type"] == "file_artifact"
+    assert block["file"] == {
+        "path": "reports/result.csv",
+        "filename": "result.csv",
+        "media_type": "text/csv",
+        "operation": "appended",
+    }
+
+
 def test_normalize_assistant_metadata_preserves_bounded_news_digest():
     from app.api.chat import _normalize_assistant_metadata_payload
 
@@ -2664,6 +2764,38 @@ async def test_workspace_image_endpoint_rejects_non_images_and_path_escape(clien
     )
 
     assert non_image.status_code == 400
+    assert escaped.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_workspace_file_endpoint_serves_owned_file_and_rejects_escape(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    await client.post("/auth/register", json={
+        "username": "fileuser",
+        "email": "fileuser@example.com",
+        "password": "pass123",
+    })
+    login = await client.post("/auth/login", json={"username": "fileuser", "password": "pass123"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    report_path = Path(tmp_path) / "1" / "reports" / "summary.md"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text("# Summary\n", encoding="utf-8")
+
+    response = await client.get(
+        "/workspace/files",
+        params={"path": "reports/summary.md"},
+        headers=headers,
+    )
+    escaped = await client.get(
+        "/workspace/files",
+        params={"path": "../2/reports/summary.md"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"# Summary\n"
+    assert "summary.md" in response.headers["content-disposition"]
     assert escaped.status_code == 400
 
 

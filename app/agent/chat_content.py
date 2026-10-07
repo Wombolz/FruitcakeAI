@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import mimetypes
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -27,6 +28,7 @@ _NEWS_TOOL_NAMES = {
     "search_my_feeds",
     "search_my_feeds_timeline",
 }
+_FILE_ARTIFACT_TOOL_NAMES = {"write_file", "append_file"}
 _SOURCE_RESULT_TOOL_NAMES = _NEWS_TOOL_NAMES | {"web_search", "web_context"}
 _RESULT_ITEM_RE = re.compile(r"^\s*(?:\[\d+\]|(?:Source\s+)?\d+[.):])\s+(.+?)\s*$", re.I)
 _RESULT_FIELD_RE = re.compile(r"^\s*(Feed|Source|Published|Published/updated|Summary|URL):\s*(.+?)\s*$", re.I)
@@ -589,6 +591,86 @@ def _build_timeline_blocks(content: str, available: int) -> list[dict[str, Any]]
     return blocks
 
 
+def _workspace_relative_artifact_path(path: str) -> str:
+    normalized = path.replace("\\", "/").strip()
+    user_workspace = re.search(r"(?:^|/)workspace/\d+/(.+)$", normalized)
+    if user_workspace:
+        return user_workspace.group(1)
+    return normalized.removeprefix("/workspace/").removeprefix("workspace/")
+
+
+def _artifact_source_line(content: str, path: str, relative_path: str) -> str:
+    candidates = {path, relative_path}
+    candidates.discard("")
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        if line and len(line) <= 1_000 and any(candidate in line for candidate in candidates):
+            return line
+    return ""
+
+
+def _artifact_media_type(filename: str) -> str:
+    suffix = filename.casefold().rsplit(".", 1)[-1] if "." in filename else ""
+    overrides = {
+        "md": "text/markdown",
+        "markdown": "text/markdown",
+        "csv": "text/csv",
+        "json": "application/json",
+        "yaml": "application/yaml",
+        "yml": "application/yaml",
+    }
+    return overrides.get(suffix) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+def _build_file_artifact_blocks(
+    content: str,
+    executed_tools: list[dict[str, Any]],
+    available: int,
+) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for record in executed_tools or []:
+        if len(blocks) >= available:
+            break
+        if not isinstance(record, dict):
+            continue
+        tool_name = str(record.get("tool") or "").strip()
+        if tool_name not in _FILE_ARTIFACT_TOOL_NAMES or bool(record.get("is_error")):
+            continue
+        arguments = record.get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        path = str(arguments.get("path") or "").strip()[:500]
+        if not path or "\x00" in path or path in seen_paths:
+            continue
+        relative_path = _workspace_relative_artifact_path(path)
+        source_markdown = _artifact_source_line(content, path, relative_path)
+        if not source_markdown:
+            continue
+        if relative_path in seen_paths:
+            continue
+        seen_paths.add(relative_path)
+        filename = relative_path.rstrip("/").rsplit("/", 1)[-1][:200]
+        media_type = _artifact_media_type(filename)
+        blocks.append(
+            {
+                "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+                "id": f"file_artifact_{len(blocks) + 1}",
+                "type": "file_artifact",
+                "source_markdown": source_markdown,
+                "source_fingerprint": _source_fingerprint(source_markdown),
+                "title": filename or "Workspace file",
+                "file": {
+                    "path": relative_path,
+                    "filename": filename or "Workspace file",
+                    "media_type": media_type[:120],
+                    "operation": "appended" if tool_name == "append_file" else "written",
+                },
+            }
+        )
+    return blocks
+
+
 def build_assistant_content_blocks(
     content: str,
     executed_tools: list[dict[str, Any]] | None = None,
@@ -655,6 +737,14 @@ def build_assistant_content_blocks(
         if news_block:
             blocks.append(news_block)
     if len(blocks) < CONTENT_BLOCK_LIMIT:
+        blocks.extend(
+            _build_file_artifact_blocks(
+                content,
+                executed_tools or [],
+                CONTENT_BLOCK_LIMIT - len(blocks),
+            )
+        )
+    if len(blocks) < CONTENT_BLOCK_LIMIT:
         blocks.extend(_build_stat_blocks(content, CONTENT_BLOCK_LIMIT - len(blocks)))
     if len(blocks) < CONTENT_BLOCK_LIMIT:
         blocks.extend(_build_timeline_blocks(content, CONTENT_BLOCK_LIMIT - len(blocks)))
@@ -687,11 +777,47 @@ def normalize_assistant_content_blocks(value: Any) -> list[dict[str, Any]]:
             cleaned = _normalize_stat_block(item, source_markdown, len(cleaned_blocks))
         elif block_type == "timeline":
             cleaned = _normalize_timeline_block(item, source_markdown, len(cleaned_blocks))
+        elif block_type == "file_artifact":
+            cleaned = _normalize_file_artifact_block(item, source_markdown, len(cleaned_blocks))
         else:
             cleaned = None
         if cleaned:
             cleaned_blocks.append(cleaned)
     return cleaned_blocks
+
+
+def _normalize_file_artifact_block(
+    item: dict[str, Any],
+    source_markdown: str,
+    block_index: int,
+) -> dict[str, Any] | None:
+    raw_file = item.get("file")
+    if not source_markdown or len(source_markdown) > 1_000 or not isinstance(raw_file, dict):
+        return None
+    path = str(raw_file.get("path") or "").strip()[:500]
+    if not path or "\x00" in path:
+        return None
+    filename = str(raw_file.get("filename") or "").strip()[:200]
+    if not filename:
+        filename = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1][:200]
+    operation = str(raw_file.get("operation") or "written").strip().casefold()
+    if operation not in {"written", "appended"}:
+        operation = "written"
+    media_type = str(raw_file.get("media_type") or "application/octet-stream").strip()[:120]
+    return {
+        "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+        "id": str(item.get("id") or f"file_artifact_{block_index + 1}")[:80],
+        "type": "file_artifact",
+        "source_markdown": source_markdown,
+        "source_fingerprint": _source_fingerprint(source_markdown),
+        "title": str(item.get("title") or filename or "Workspace file").strip()[:200],
+        "file": {
+            "path": path,
+            "filename": filename or "Workspace file",
+            "media_type": media_type or "application/octet-stream",
+            "operation": operation,
+        },
+    }
 
 
 def _normalize_timeline_block(
