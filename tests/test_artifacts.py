@@ -1,7 +1,12 @@
 import pytest
 from pydantic import ValidationError
 
-from app.artifacts.compat import content_block_to_artifact, content_blocks_to_artifacts
+from app.artifacts.compat import (
+    artifact_envelopes_from_tool_records,
+    content_block_to_artifact,
+    content_blocks_to_artifacts,
+    normalize_artifact_envelopes,
+)
 from app.artifacts.contracts import ArtifactEnvelope
 from app.artifacts.registry import (
     ArtifactRendererClass,
@@ -139,3 +144,119 @@ def test_legacy_adapter_is_bounded_and_skips_unknown_blocks():
 
     assert len(artifacts) == 7
     assert all(artifact.type == "core.table" for artifact in artifacts)
+
+
+def test_tool_artifact_html_is_sanitized_before_persistence():
+    artifacts = artifact_envelopes_from_tool_records(
+        [
+            {
+                "tool": "render_report",
+                "structured_content": {
+                    "artifact": {
+                        "type": "core.html",
+                        "schema_version": 1,
+                        "title": "Status report",
+                        "payload": {
+                            "content": (
+                                '<section onclick="steal()"><h2>Status</h2>'
+                                '<script>fetch("https://bad.example")</script>'
+                                '<a href="javascript:alert(1)">bad</a>'
+                                '<a href="https://example.com/report">source</a></section>'
+                            )
+                        },
+                        "fallback": {"media_type": "text/markdown", "content": "## Status"},
+                    }
+                },
+            }
+        ]
+    )
+
+    assert len(artifacts) == 1
+    content = artifacts[0].payload["content"]
+    assert "<h2>Status</h2>" in content
+    assert "script" not in content
+    assert "onclick" not in content
+    assert "javascript:" not in content
+    assert 'href="https://example.com/report"' in content
+
+
+def test_tool_artifact_svg_removes_executable_and_external_content():
+    artifacts = artifact_envelopes_from_tool_records(
+        [
+            {
+                "structured_content": {
+                    "artifacts": [
+                        {
+                            "id": "chart-1",
+                            "type": "core.svg",
+                            "schema_version": 1,
+                            "title": "Trend",
+                            "payload": {
+                                "content": (
+                                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 20" onload="bad()">'
+                                    '<script>alert(1)</script><foreignObject>bad</foreignObject>'
+                                    '<rect width="100" height="20" fill="#3f8c8f" />'
+                                    '</svg>'
+                                )
+                            },
+                        }
+                    ]
+                }
+            }
+        ]
+    )
+
+    assert len(artifacts) == 1
+    content = artifacts[0].payload["content"]
+    assert "<rect" in content
+    assert "script" not in content
+    assert "foreignObject" not in content
+    assert "onload" not in content
+
+
+def test_malformed_renderable_artifact_is_dropped_without_losing_valid_sibling():
+    artifacts = normalize_artifact_envelopes(
+        [
+            {
+                "type": "core.svg",
+                "schema_version": 1,
+                "title": "Broken",
+                "payload": {"content": "not svg"},
+            },
+            {
+                "type": "core.html",
+                "schema_version": 1,
+                "title": "Valid",
+                "payload": {"content": "<p>Safe report</p>"},
+            },
+        ]
+    )
+
+    assert [artifact.title for artifact in artifacts] == ["Valid"]
+
+
+def test_multiple_same_type_artifacts_without_ids_are_preserved():
+    artifacts = artifact_envelopes_from_tool_records(
+        [
+            {
+                "structured_content": {
+                    "artifacts": [
+                        {
+                            "type": "core.html",
+                            "schema_version": 1,
+                            "title": "First",
+                            "payload": {"content": "<p>First</p>"},
+                        },
+                        {
+                            "type": "core.html",
+                            "schema_version": 1,
+                            "title": "Second",
+                            "payload": {"content": "<p>Second</p>"},
+                        },
+                    ]
+                }
+            }
+        ]
+    )
+
+    assert [artifact.title for artifact in artifacts] == ["First", "Second"]

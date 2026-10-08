@@ -11,6 +11,7 @@ from app.artifacts.contracts import (
     ArtifactProvenance,
 )
 from app.artifacts.registry import artifact_registry
+from app.artifacts.sanitize import sanitize_static_html, sanitize_static_svg
 
 _CONTENT_BLOCK_TYPES = {
     "table": "core.table",
@@ -75,4 +76,66 @@ def content_blocks_to_artifacts(value: Any) -> list[ArtifactEnvelope]:
         artifact = content_block_to_artifact(block) if isinstance(block, dict) else None
         if artifact is not None:
             artifacts.append(artifact)
+    return artifacts
+
+
+def _sanitize_renderable_artifact(envelope: ArtifactEnvelope) -> ArtifactEnvelope:
+    if envelope.type not in {"core.html", "core.svg"}:
+        return envelope
+    payload = dict(envelope.payload or {})
+    content = payload.get("content")
+    if envelope.type == "core.html":
+        payload["content"] = sanitize_static_html(content)
+    else:
+        payload["content"] = sanitize_static_svg(content)
+    return envelope.model_copy(update={"payload": payload})
+
+
+def artifact_envelopes_from_tool_records(records: Any) -> list[ArtifactEnvelope]:
+    """Extract validated display artifacts without treating tool payloads as model context."""
+    if not isinstance(records, list):
+        return []
+    artifacts: list[ArtifactEnvelope] = []
+    seen: set[tuple[str, str | None]] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        structured = record.get("structured_content")
+        if not isinstance(structured, dict):
+            continue
+        candidates: list[Any] = []
+        if isinstance(structured.get("artifact"), dict):
+            candidates.append(structured["artifact"])
+        if isinstance(structured.get("artifacts"), list):
+            candidates.extend(structured["artifacts"])
+        if {"type", "schema_version", "title"}.issubset(structured):
+            candidates.append(structured)
+        for envelope in normalize_artifact_envelopes(candidates):
+            key = (
+                envelope.type,
+                envelope.id or envelope.model_dump_json(exclude_none=True),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            artifacts.append(envelope)
+            if len(artifacts) >= 8:
+                return artifacts
+    return artifacts
+
+
+def normalize_artifact_envelopes(value: Any) -> list[ArtifactEnvelope]:
+    if not isinstance(value, list):
+        return []
+    artifacts: list[ArtifactEnvelope] = []
+    for candidate in value[:8]:
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            envelope = artifact_registry.validate(candidate)
+            envelope = _sanitize_renderable_artifact(envelope)
+            envelope = artifact_registry.validate(envelope)
+        except (TypeError, ValueError):
+            continue
+        artifacts.append(envelope)
     return artifacts

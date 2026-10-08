@@ -31,6 +31,7 @@ from sqlalchemy import func, select
 
 import structlog
 
+from app.artifacts import artifact_envelopes_from_tool_records, normalize_artifact_envelopes
 from app.agent.context import UserContext
 from app.agent.chat_intents import (
     is_library_detail_or_excerpt_intent,
@@ -3134,6 +3135,12 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
     cleaned_blocks = normalize_assistant_content_blocks(metadata.get("content_blocks"))
     if cleaned_blocks:
         normalized["content_blocks"] = cleaned_blocks
+    cleaned_artifacts = normalize_artifact_envelopes(metadata.get("artifacts"))
+    if cleaned_artifacts:
+        normalized["artifacts"] = [
+            artifact.model_dump(mode="json", exclude_none=True)
+            for artifact in cleaned_artifacts
+        ]
     cleaned_activity = normalize_assistant_activity(metadata.get("activity"))
     if cleaned_activity:
         normalized["activity"] = cleaned_activity
@@ -3497,6 +3504,12 @@ def _build_assistant_message_metadata(
     content_blocks = _build_assistant_content_blocks(content, executed_tools)
     if content_blocks:
         metadata["content_blocks"] = content_blocks
+    artifacts = artifact_envelopes_from_tool_records(executed_tools)
+    if artifacts:
+        metadata["artifacts"] = [
+            artifact.model_dump(mode="json", exclude_none=True)
+            for artifact in artifacts
+        ]
 
     if recalled_memory_ids:
         metadata["recalled_memory_ids"] = [int(i) for i in recalled_memory_ids]

@@ -2563,6 +2563,35 @@ def test_assistant_metadata_preserves_content_blocks_and_activity():
     ]
 
 
+def test_assistant_metadata_extracts_formal_static_artifact_from_tool_result():
+    from app.api.chat import _build_assistant_message_metadata
+
+    metadata = _build_assistant_message_metadata(
+        handoff_metadata={},
+        executed_tools=[
+            {
+                "tool": "render_report",
+                "result_summary": "Rendered a report.",
+                "structured_content": {
+                    "artifact": {
+                        "id": "report-1",
+                        "type": "core.html",
+                        "schema_version": 1,
+                        "title": "System report",
+                        "payload": {"content": "<h2>Healthy</h2><script>bad()</script>"},
+                        "fallback": {"media_type": "text/markdown", "content": "## Healthy"},
+                    }
+                },
+            }
+        ],
+        content="The system is healthy.",
+    )
+
+    assert metadata["artifacts"][0]["id"] == "report-1"
+    assert metadata["artifacts"][0]["type"] == "core.html"
+    assert metadata["artifacts"][0]["payload"]["content"] == "<h2>Healthy</h2>"
+
+
 def test_build_assistant_tool_details_fetch_page_kind_heuristics():
     from app.api.chat import _build_assistant_tool_details
 
