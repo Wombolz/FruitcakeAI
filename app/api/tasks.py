@@ -13,6 +13,7 @@ POST   /tasks/{id}/reset   Recover a task stuck in 'running' after a restart
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import logging
 
@@ -22,6 +23,7 @@ from sqlalchemy import desc, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import json
+import mimetypes
 import re
 
 from app.agent.definition_loader import FruitcakeAgentPreset, get_agent_preset
@@ -39,6 +41,15 @@ from app.managed_agent_presets import (
     reconcile_agent_instance,
     update_agent_instance,
 )
+
+_ARTIFACT_MEDIA_TYPES = {
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".pdf": "application/pdf",
+}
 from app.memory.service import get_memory_service
 from app.host_root_access import activate_host_root_grant
 from app.mcp.servers.filesystem import resolve_workspace_path_for_user, write_workspace_text
@@ -809,12 +820,21 @@ class TaskAuditRunSummary(BaseModel):
     artifact_types: List[str] = []
     agent_context_budgeting: Optional[Dict[str, Any]] = None
 
+class TaskViewableArtifact(BaseModel):
+    id: int
+    artifact_type: str
+    path: str
+    filename: str
+    media_type: str
+    created_at: datetime
+
 class TaskAuditOut(BaseModel):
     task_id: int
     title: str
     result: Optional[str]
     resolved_agent: Optional[Dict[str, Any]] = None
     latest_run: Optional[TaskAuditRunSummary] = None
+    viewable_artifacts: List[TaskViewableArtifact] = []
     tool_calls: List[TaskAuditEntry]
 
 
@@ -961,6 +981,7 @@ async def get_task_audit(
     task = await _get_owned_task(task_id, current_user.id, db)
     tool_calls: List[TaskAuditEntry] = []
     latest_run: Optional[TaskAuditRunSummary] = None
+    viewable_artifacts: List[TaskViewableArtifact] = []
     if task.last_session_id:
         rows = await db.execute(
             select(AuditLog)
@@ -986,13 +1007,18 @@ async def get_task_audit(
     ).scalar_one_or_none()
     if run is not None:
         artifact_rows = await db.execute(
-            select(TaskRunArtifact.artifact_type, TaskRunArtifact.content_json)
+            select(
+                TaskRunArtifact.id,
+                TaskRunArtifact.artifact_type,
+                TaskRunArtifact.content_json,
+                TaskRunArtifact.created_at,
+            )
             .where(TaskRunArtifact.task_run_id == run.id)
             .order_by(desc(TaskRunArtifact.created_at), desc(TaskRunArtifact.id))
         )
         artifact_types: list[str] = []
         agent_context_budgeting: Optional[Dict[str, Any]] = None
-        for artifact_type, content_json in artifact_rows.all():
+        for artifact_id, artifact_type, content_json, artifact_created_at in artifact_rows.all():
             artifact_name = str(artifact_type or "").strip()
             if artifact_name:
                 artifact_types.append(artifact_name)
@@ -1001,6 +1027,26 @@ async def get_task_audit(
                 if isinstance(decoded, dict):
                     agent_context_budgeting = _normalize_agent_context_budgeting(
                         decoded.get("agent_context_budgeting")
+                    )
+            if artifact_name == "workspace_export":
+                decoded = _decode_json_like(content_json)
+                path = str(decoded.get("path") or "").strip() if isinstance(decoded, dict) else ""
+                if path:
+                    filename = Path(path).name or "artifact"
+                    media_type = (
+                        _ARTIFACT_MEDIA_TYPES.get(Path(filename).suffix.lower())
+                        or mimetypes.guess_type(filename)[0]
+                        or "application/octet-stream"
+                    )
+                    viewable_artifacts.append(
+                        TaskViewableArtifact(
+                            id=int(artifact_id),
+                            artifact_type=artifact_name,
+                            path=path,
+                            filename=filename,
+                            media_type=media_type,
+                            created_at=artifact_created_at,
+                        )
                     )
         latest_run = TaskAuditRunSummary(
             id=run.id,
@@ -1023,6 +1069,7 @@ async def get_task_audit(
         result=task.result,
         resolved_agent=_resolved_agent_summary_for_task(task),
         latest_run=latest_run,
+        viewable_artifacts=viewable_artifacts,
         tool_calls=tool_calls,
     )
 

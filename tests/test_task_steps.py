@@ -724,6 +724,47 @@ async def test_task_detail_exposes_markdown_result_sections_from_final_output_ar
 
 
 @pytest.mark.asyncio
+async def test_task_audit_exposes_viewable_workspace_export_artifacts(client):
+    headers = await _headers(client, "viewableartifactowner")
+    task_resp = await client.post(
+        "/tasks",
+        json={"title": "Report Task", "instruction": "Create a report"},
+        headers=headers,
+    )
+    task_id = task_resp.json()["id"]
+
+    async with TestSessionLocal() as db:
+        run = TaskRun(task_id=task_id, status="completed", summary="done")
+        db.add(run)
+        await db.flush()
+        db.add_all(
+            [
+                TaskRunArtifact(
+                    task_run_id=run.id,
+                    artifact_type="workspace_export",
+                    content_json=json.dumps({"path": "reports/task-report.md"}),
+                ),
+                TaskRunArtifact(
+                    task_run_id=run.id,
+                    artifact_type="run_diagnostics",
+                    content_json=json.dumps({"private": "not viewable"}),
+                ),
+            ]
+        )
+        await db.commit()
+
+    response = await client.get(f"/tasks/{task_id}/audit", headers=headers)
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["viewable_artifacts"]) == 1
+    artifact = payload["viewable_artifacts"][0]
+    assert artifact["artifact_type"] == "workspace_export"
+    assert artifact["path"] == "reports/task-report.md"
+    assert artifact["filename"] == "task-report.md"
+    assert artifact["media_type"] == "text/markdown"
+
+
+@pytest.mark.asyncio
 async def test_list_tasks_includes_latest_final_output_sections(client):
     headers = await _headers(client, "resultsectionslistowner")
     first = await client.post(
