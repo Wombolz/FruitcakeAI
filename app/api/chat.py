@@ -209,6 +209,14 @@ class StopChatResponse(BaseModel):
     session_id: int
 
 
+class StopChatRunResponse(BaseModel):
+    stopped: bool
+    run_id: str
+    session_id: int
+    status: str
+    phase: str
+
+
 class ChatSessionStatusResponse(BaseModel):
     session_id: int
     active: bool
@@ -1126,6 +1134,67 @@ async def stop_chat_session(
     await _get_session_or_404(session_id, current_user.id, db)
     stopped = await get_chat_run_manager().request_stop(session_id)
     return StopChatResponse(stopped=stopped, session_id=session_id)
+
+
+@router.post("/runs/{run_id}/stop", response_model=StopChatRunResponse)
+async def stop_chat_run(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> StopChatRunResponse:
+    run = await owned_chat_run(db, run_id=run_id, user_id=current_user.id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Chat run not found")
+
+    if run.status == "waiting_approval":
+        run.approval_kind = None
+        run.approval_payload = None
+        await mark_chat_run_terminal(
+            db,
+            run,
+            status="cancelled",
+            phase="cancelled",
+            error_classification="user_cancelled",
+        )
+        await db.commit()
+        return StopChatRunResponse(
+            stopped=True,
+            run_id=run.id,
+            session_id=run.session_id,
+            status=run.status,
+            phase=run.phase,
+        )
+
+    if run.status == "cancelled":
+        return StopChatRunResponse(
+            stopped=False,
+            run_id=run.id,
+            session_id=run.session_id,
+            status=run.status,
+            phase=run.phase,
+        )
+
+    if run.status != "running":
+        return StopChatRunResponse(
+            stopped=False,
+            run_id=run.id,
+            session_id=run.session_id,
+            status=run.status,
+            phase=run.phase,
+        )
+
+    stopped = await get_chat_run_manager().request_stop_run(run.session_id, run.id)
+    if stopped:
+        run.phase = "cancelling"
+        run.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+    return StopChatRunResponse(
+        stopped=stopped,
+        run_id=run.id,
+        session_id=run.session_id,
+        status=run.status,
+        phase=run.phase,
+    )
 
 
 @router.get(
