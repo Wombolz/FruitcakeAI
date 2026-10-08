@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 import httpx2
 from mcp import Client
+from mcp.client import advertise
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.subscriptions import ToolsListChanged
@@ -16,6 +17,9 @@ from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from mcp.shared.exceptions import MCPError
 
 from app.mcp.legacy_http import LegacyHTTPClient
+
+MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
+MCP_APP_MIME_TYPE = "text/html;profile=mcp-app"
 
 
 class MCPClient:
@@ -159,6 +163,10 @@ class MCPClient:
                     self._sdk = await stack.enter_async_context(Client(
                         transport, read_timeout_seconds=self.timeout,
                         message_handler=self._message_handler, cache=None,
+                        extensions=[advertise(
+                            MCP_APPS_EXTENSION_ID,
+                            {"mimeTypes": [MCP_APP_MIME_TYPE]},
+                        )],
                     ))
                     if self._sdk.server_info is not None:
                         self._server_info = self._sdk.server_info.model_dump(by_alias=True)
@@ -262,6 +270,24 @@ class MCPClient:
             self._connected = False
             self._stopping = True
             self._wake.set()
+            return {"success": False, "error": self._last_error}
+
+    async def read_resource(self, uri: str) -> dict[str, Any]:
+        """Read a resource from the connected server without exposing auth to a UI."""
+        if not self.is_connected() and not await self.connect():
+            return {"success": False, "error": self._last_error or "MCP server unavailable"}
+        try:
+            if self._legacy is not None:
+                result = await self._legacy.request("resources/read", {"uri": uri})
+            else:
+                assert self._sdk is not None
+                response = await self._sdk.read_resource(uri, cache_mode="bypass")
+                result = response.model_dump(by_alias=True, exclude_none=True)
+            return {"success": True, "result": result}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._last_error = self._error_text(exc)
             return {"success": False, "error": self._last_error}
 
     async def disconnect(self) -> None:

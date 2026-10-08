@@ -134,3 +134,13 @@ for _definition in (
     _builtin("fruitcake.stat_group", "Key Facts", "stat_group"),
 ):
     artifact_registry.register(_definition)
+
+artifact_registry.register(ArtifactTypeDefinition(
+    type="core.mcp_app",
+    display_name="MCP App",
+    renderer_class=ArtifactRendererClass.MCP_APP,
+    renderer="mcp_app",
+    preferred_presentation="inline",
+    capabilities=("open_link",),
+    source="mcp_app",
+))

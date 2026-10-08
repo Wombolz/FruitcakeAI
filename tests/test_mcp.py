@@ -29,9 +29,11 @@ from app.mcp.registry import (
     _extract_text,
     _find_invalid_schema_field,
     _serialize_user_context,
+    _tool_is_model_visible,
+    _tool_ui_metadata,
     _to_litellm_schema,
 )
-from app.mcp.client import MCPClient
+from app.mcp.client import MCP_APP_MIME_TYPE, MCPClient
 from app.agent.runtime.models import build_tool_call_result
 
 
@@ -124,6 +126,42 @@ def test_extract_text_non_dict():
 def test_serialize_user_context_filters_none_fields():
     result = _serialize_user_context({"user_id": 7, "username": "tester", "timezone": None})
     assert result == {"user_id": 7, "username": "tester"}
+
+
+def test_tool_ui_metadata_reads_stable_mcp_apps_shape():
+    tool = {
+        "_meta": {
+            "ui": {
+                "resourceUri": "ui://weather/dashboard.html",
+                "visibility": ["app"],
+            },
+        },
+    }
+
+    assert _tool_ui_metadata(tool) == {
+        "resourceUri": "ui://weather/dashboard.html",
+        "visibility": ["app"],
+    }
+    assert _tool_is_model_visible(tool) is False
+
+
+def test_registry_keeps_app_only_tools_out_of_model_catalog():
+    registry = MCPRegistry()
+    registry._set_server_tools("weather", "streamable_http", [{
+        "name": "refresh_dashboard",
+        "description": "Refresh the app without model involvement",
+        "inputSchema": {"type": "object", "properties": {}},
+        "_meta": {
+            "ui": {
+                "resourceUri": "ui://weather/dashboard.html",
+                "visibility": ["app"],
+            },
+        },
+    }])
+
+    assert registry.get_tools_for_agent() == []
+    assert not registry.knows_tool("refresh_dashboard")
+    assert registry.get_status()["app_only_tools"] == ["refresh_dashboard"]
 
 
 # ── MCPRegistry internals ──────────────────────────────────────────────────────
@@ -512,6 +550,108 @@ async def test_registry_preserves_mcp_structured_content_on_string_result():
         "seed": 42,
     }
     assert normalized.artifacts[0]["path"] == "generated_images/result.png"
+
+
+@pytest.mark.asyncio
+async def test_registry_attaches_mcp_app_artifact_to_linked_tool_result():
+    registry = MCPRegistry()
+    registry._set_server_tools("weather", "streamable_http", [{
+        "name": "show_weather",
+        "title": "Weather Dashboard",
+        "description": "Show current weather in an interactive view.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+        },
+        "_meta": {
+            "ui": {
+                "resourceUri": "ui://weather/dashboard.html",
+                "visibility": ["model", "app"],
+            },
+        },
+    }])
+    registry._server_configs["weather"] = {}
+    fake_client = MagicMock()
+    fake_client.call_tool = AsyncMock(return_value={
+        "success": True,
+        "result": {
+            "content": [{"type": "text", "text": "Weather loaded."}],
+            "structuredContent": {"temperature": 72},
+        },
+    })
+    registry._clients["weather"] = fake_client
+
+    output = await registry.call_tool("show_weather", {"city": "Statesboro"})
+    normalized = build_tool_call_result(
+        tool_call_id="call_weather",
+        name="show_weather",
+        content=output,
+    )
+
+    assert output == "Weather loaded."
+    assert normalized.structured_content["temperature"] == 72
+    assert len(normalized.artifacts) == 1
+    artifact = normalized.artifacts[0]
+    assert artifact["type"] == "core.mcp_app"
+    assert artifact["presentation"]["ui_resource"] == "ui://weather/dashboard.html"
+    assert artifact["provenance"]["server"] == "weather"
+    assert artifact["payload"]["tool_input"] == {"city": "Statesboro"}
+
+
+@pytest.mark.asyncio
+async def test_registry_reads_bounded_mcp_app_resource():
+    registry = MCPRegistry()
+    registry._ui_resources["weather"] = {"ui://weather/dashboard.html"}
+    client = MagicMock()
+    client.read_resource = AsyncMock(return_value={
+        "success": True,
+        "result": {
+            "contents": [{
+                "uri": "ui://weather/dashboard.html",
+                "mimeType": MCP_APP_MIME_TYPE,
+                "text": "<html><body>Weather</body></html>",
+            }],
+        },
+    })
+    registry._clients["weather"] = client
+
+    resource = await registry.read_mcp_app_resource(
+        "weather",
+        "ui://weather/dashboard.html",
+    )
+
+    assert resource["mime_type"] == MCP_APP_MIME_TYPE
+    assert resource["html"] == "<html><body>Weather</body></html>"
+
+
+@pytest.mark.asyncio
+async def test_registry_rejects_wrong_mcp_app_resource_media_type():
+    registry = MCPRegistry()
+    registry._ui_resources["weather"] = {"ui://weather/dashboard.html"}
+    client = MagicMock()
+    client.read_resource = AsyncMock(return_value={
+        "success": True,
+        "result": {
+            "contents": [{
+                "uri": "ui://weather/dashboard.html",
+                "mimeType": "text/html",
+                "text": "<html></html>",
+            }],
+        },
+    })
+    registry._clients["weather"] = client
+
+    with pytest.raises(ValueError, match="unsupported media type"):
+        await registry.read_mcp_app_resource("weather", "ui://weather/dashboard.html")
+
+
+@pytest.mark.asyncio
+async def test_registry_rejects_unlinked_mcp_app_resource():
+    registry = MCPRegistry()
+    registry._clients["weather"] = MagicMock()
+
+    with pytest.raises(LookupError, match="not linked"):
+        await registry.read_mcp_app_resource("weather", "ui://weather/private.html")
 
 
 @pytest.mark.asyncio
