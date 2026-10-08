@@ -1410,6 +1410,14 @@ def test_summarize_document_has_document_name_parameter():
     assert "document_name" in required
 
 
+def test_create_artifact_schema_is_limited_to_static_core_types():
+    schema = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "create_artifact")
+    parameters = schema["function"]["parameters"]
+
+    assert parameters["properties"]["artifact_type"]["enum"] == ["core.html", "core.svg"]
+    assert parameters["required"] == ["artifact_type", "title", "content"]
+
+
 def test_settings_document_summary_model_defaults_empty_and_tool_falls_back_to_llm_model():
     from app.config import Settings
 
@@ -2062,6 +2070,54 @@ async def test_dispatch_execution_record_keeps_structured_artifact_metadata():
     ]
     assert records[0]["structured_content"]["seed"] == 7
     assert records[0]["artifacts"][0]["path"] == "generated_images/map.png"
+
+
+@pytest.mark.asyncio
+async def test_create_artifact_dispatch_returns_short_text_and_structured_envelope():
+    import app.agent.tools as tools_module
+
+    ctx = _make_context()
+    call = {
+        "id": "call_artifact",
+        "type": "function",
+        "function": {
+            "name": "create_artifact",
+            "arguments": json.dumps(
+                {
+                    "artifact_type": "core.html",
+                    "title": "System Health",
+                    "content": (
+                        '<h2 onclick="bad()">Healthy</h2>'
+                        '<script>bad()</script>'
+                        '<a href="https://example.com/docs">Documentation</a>'
+                    ),
+                    "fallback_text": "System health is healthy.",
+                }
+            ),
+        },
+    }
+    token = tools_module.reset_tool_execution_records()
+    try:
+        with patch.object(tools_module, "_write_audit_log", new_callable=AsyncMock):
+            results = await tools_module.dispatch_tool_calls([call], ctx)
+        records = tools_module.get_tool_execution_records()
+    finally:
+        tools_module.restore_tool_execution_records(token)
+
+    assert results[0]["content"] == "Created rendered core.html artifact titled 'System Health'."
+    envelope = records[0]["structured_content"]["artifact"]
+    assert envelope["type"] == "core.html"
+    assert envelope["title"] == "System Health"
+    assert "onclick" not in envelope["payload"]["content"]
+    assert "script" not in envelope["payload"]["content"]
+    assert 'href="https://example.com/docs"' in envelope["payload"]["content"]
+    assert records[0]["artifacts"][0]["type"] == "core.html"
+    recorded_arguments = records[0]["arguments"]
+    assert recorded_arguments["artifact_type"] == "core.html"
+    assert recorded_arguments["title"] == "System Health"
+    assert recorded_arguments["content_chars"] > 0
+    assert recorded_arguments["fallback_chars"] > 0
+    assert "content" not in recorded_arguments
 
 
 @pytest.mark.asyncio

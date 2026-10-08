@@ -104,6 +104,29 @@ def test_structured_tool_result_preserves_plain_model_message():
     ]
 
 
+def test_structured_tool_result_recognizes_formal_artifact_envelope():
+    output = ToolOutputText(
+        "Created rendered artifact.",
+        structured_content={
+            "artifact": {
+                "type": "core.svg",
+                "schema_version": 1,
+                "title": "Request flow",
+                "payload": {"content": '<svg viewBox="0 0 10 10"></svg>'},
+            }
+        },
+    )
+
+    result = build_tool_call_result(
+        tool_call_id="call_artifact",
+        name="create_artifact",
+        content=output,
+    )
+
+    assert result.content == "Created rendered artifact."
+    assert result.artifacts == [output.structured_content["artifact"]]
+
+
 @pytest.mark.asyncio
 async def test_tool_completion_event_reports_structured_metadata_without_content():
     events = []

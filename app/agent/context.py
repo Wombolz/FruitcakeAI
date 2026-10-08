@@ -122,6 +122,7 @@ class UserContext:
             "Rules:",
             "- If a sandboxed tool is available for the requested action, use it and report the tool result rather than refusing from general model policy.",
             "- Do not claim a tool is unavailable when it is present in the current tool list.",
+            "- When create_artifact is available and the user asks to render or display an HTML or SVG artifact, use it instead of printing the markup in a code block. Use code blocks only when the user asks to inspect or edit source code.",
             "- If you just created a task in this conversation and the user asks to change it or run it, prefer updating or running that existing task instead of creating a second similar task.",
             "- For a new task request, use propose_task_draft first and let the user review the draft in the task editor before anything is persisted. Use create_task only after that draft has been reviewed and the user has clearly confirmed the details, unless they explicitly ask you to save immediately.",
             "- Do not turn a short confirmation like 'yes' into a new saved task when the prior assistant message proposed an immediate action such as running a file operation or workspace change now. In that case, treat the confirmation as approval to execute the action in this chat unless the user explicitly asks to save, automate, schedule, or create a task.",
