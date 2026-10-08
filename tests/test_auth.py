@@ -2128,6 +2128,38 @@ No data was lost.
     ]
 
 
+def test_timeline_preserves_event_and_research_source_links():
+    from app.api.chat import _build_assistant_content_blocks
+
+    content = """### Merger Timeline
+- **June 9:** WBD announced its split in a [company release](https://example.com/release).
+- **September 12:** Reporting described the first bid.
+"""
+    tools = [
+        {
+            "tool": "web_search",
+            "arguments": {"query": "WBD Paramount merger timeline"},
+            "structured_content": {
+                "sources": [
+                    {"title": "Deal reporting", "url": "https://example.com/report"},
+                    {"title": "Company release", "url": "https://example.com/release"},
+                ]
+            },
+        }
+    ]
+
+    blocks = _build_assistant_content_blocks(content, tools)
+
+    assert blocks[0]["events"][0]["detail"] == "WBD announced its split in a company release."
+    assert blocks[0]["events"][0]["sources"] == [
+        {"label": "company release", "url": "https://example.com/release"}
+    ]
+    assert blocks[0]["sources"] == [
+        {"label": "Deal reporting", "url": "https://example.com/report"},
+        {"label": "Company release", "url": "https://example.com/release"},
+    ]
+
+
 def test_build_assistant_content_blocks_does_not_promote_generic_bold_list_to_timeline():
     from app.api.chat import _build_assistant_content_blocks
 
@@ -2154,9 +2186,14 @@ def test_normalize_assistant_metadata_preserves_bounded_timeline():
                     "source_markdown": "### Timeline\n- **Day 1:** Started\n- **Day 2:** Finished",
                     "title": "Timeline",
                     "events": [
-                        {"label": "Day 1", "detail": "Started"},
+                        {
+                            "label": "Day 1",
+                            "detail": "Started",
+                            "sources": [{"label": "Launch", "url": "https://example.com/start"}],
+                        },
                         {"label": "Day 2", "detail": "Finished"},
                     ],
+                    "sources": [{"label": "Overview", "url": "https://example.com/overview"}],
                 }
             ]
         }
@@ -2165,8 +2202,15 @@ def test_normalize_assistant_metadata_preserves_bounded_timeline():
     block = metadata["content_blocks"][0]
     assert block["schema_version"] == 1
     assert block["events"] == [
-        {"label": "Day 1", "detail": "Started"},
+        {
+            "label": "Day 1",
+            "detail": "Started",
+            "sources": [{"label": "Launch", "url": "https://example.com/start"}],
+        },
         {"label": "Day 2", "detail": "Finished"},
+    ]
+    assert block["sources"] == [
+        {"label": "Overview", "url": "https://example.com/overview"}
     ]
 
 

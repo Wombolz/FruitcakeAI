@@ -599,7 +599,55 @@ def _build_stat_blocks(content: str, available: int) -> list[dict[str, Any]]:
     return blocks
 
 
-def _build_timeline_blocks(content: str, available: int) -> list[dict[str, Any]]:
+def _timeline_source(label: Any, url: Any) -> dict[str, str] | None:
+    safe_url = _safe_source_url(url)
+    if not safe_url:
+        return None
+    clean_label = " ".join(str(label or "").split()).strip()[:100]
+    if not clean_label:
+        clean_label = urlparse(safe_url).hostname or "Source"
+    return {"label": clean_label, "url": safe_url}
+
+
+def _timeline_sources_from_tools(executed_tools: list[dict[str, Any]]) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for citation in build_assistant_citations(executed_tools):
+        source = _timeline_source(
+            citation.get("title") or citation.get("label") or citation.get("source"),
+            citation.get("url"),
+        )
+        if not source:
+            continue
+        key = _url_match_key(source["url"])
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        sources.append(source)
+        if len(sources) >= 12:
+            break
+    return sources
+
+
+def _timeline_sources_from_markdown(value: str) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for label, url in _NEWS_SOURCE_LINK_RE.findall(value):
+        source = _timeline_source(label, url)
+        if not source:
+            continue
+        key = _url_match_key(source["url"])
+        if key and key not in seen:
+            seen.add(key)
+            sources.append(source)
+    return sources[:4]
+
+
+def _build_timeline_blocks(
+    content: str,
+    available: int,
+    executed_tools: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     lines = str(content or "").splitlines()
     blocks: list[dict[str, Any]] = []
     index = 0
@@ -615,33 +663,40 @@ def _build_timeline_blocks(content: str, available: int) -> list[dict[str, Any]]
         cursor = index + 1
         while cursor < len(lines) and not lines[cursor].strip():
             cursor += 1
-        events: list[dict[str, str]] = []
+        events: list[dict[str, Any]] = []
         end = cursor
         while end < len(lines) and len(events) < 20:
             match = _TIMELINE_ITEM_RE.match(lines[end])
             if not match:
                 break
             label = " ".join(match.group(1).split()).strip().rstrip(":")[:100]
-            detail = " ".join(match.group(2).split()).strip()[:600]
+            raw_detail = " ".join(match.group(2).split()).strip()
+            detail = _NEWS_SOURCE_LINK_RE.sub(r"\1", raw_detail).strip()[:600]
             if label and detail:
-                events.append({"label": label, "detail": detail})
+                event: dict[str, Any] = {"label": label, "detail": detail}
+                event_sources = _timeline_sources_from_markdown(raw_detail)
+                if event_sources:
+                    event["sources"] = event_sources
+                events.append(event)
             end += 1
         if len(events) < 2:
             index += 1
             continue
         source_markdown = "\n".join(lines[index:end]).strip()
         if len(source_markdown) <= 12_000:
-            blocks.append(
-                {
-                    "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
-                    "id": f"timeline_{len(blocks) + 1}",
-                    "type": "timeline",
-                    "source_markdown": source_markdown,
-                    "source_fingerprint": _source_fingerprint(source_markdown),
-                    "title": title,
-                    "events": events,
-                }
-            )
+            block: dict[str, Any] = {
+                "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
+                "id": f"timeline_{len(blocks) + 1}",
+                "type": "timeline",
+                "source_markdown": source_markdown,
+                "source_fingerprint": _source_fingerprint(source_markdown),
+                "title": title,
+                "events": events,
+            }
+            sources = _timeline_sources_from_tools(executed_tools or [])
+            if sources:
+                block["sources"] = sources
+            blocks.append(block)
         index = max(end, index + 1)
     return blocks
 
@@ -1093,7 +1148,13 @@ def build_assistant_content_blocks(
     if len(blocks) < CONTENT_BLOCK_LIMIT:
         blocks.extend(_build_stat_blocks(content, CONTENT_BLOCK_LIMIT - len(blocks)))
     if len(blocks) < CONTENT_BLOCK_LIMIT:
-        blocks.extend(_build_timeline_blocks(content, CONTENT_BLOCK_LIMIT - len(blocks)))
+        blocks.extend(
+            _build_timeline_blocks(
+                content,
+                CONTENT_BLOCK_LIMIT - len(blocks),
+                executed_tools or [],
+            )
+        )
     return blocks
 
 
@@ -1236,17 +1297,34 @@ def _normalize_timeline_block(
     raw_events = item.get("events")
     if not source_markdown or len(source_markdown) > 12_000 or not isinstance(raw_events, list):
         return None
-    events: list[dict[str, str]] = []
+    events: list[dict[str, Any]] = []
     for raw_event in raw_events[:20]:
         if not isinstance(raw_event, dict):
             continue
         label = " ".join(str(raw_event.get("label") or "").split()).strip()[:100]
         detail = " ".join(str(raw_event.get("detail") or "").split()).strip()[:600]
         if label and detail:
-            events.append({"label": label, "detail": detail})
+            event: dict[str, Any] = {"label": label, "detail": detail}
+            raw_sources = raw_event.get("sources")
+            if isinstance(raw_sources, list):
+                sources = [
+                    source
+                    for source in (
+                        _timeline_source(
+                            raw_source.get("label"),
+                            raw_source.get("url"),
+                        )
+                        for raw_source in raw_sources[:4]
+                        if isinstance(raw_source, dict)
+                    )
+                    if source
+                ]
+                if sources:
+                    event["sources"] = sources
+            events.append(event)
     if len(events) < 2:
         return None
-    return {
+    normalized: dict[str, Any] = {
         "schema_version": CONTENT_BLOCK_SCHEMA_VERSION,
         "id": str(item.get("id") or f"timeline_{block_index + 1}")[:80],
         "type": "timeline",
@@ -1255,6 +1333,20 @@ def _normalize_timeline_block(
         "title": str(item.get("title") or "Timeline").strip()[:160] or "Timeline",
         "events": events,
     }
+    raw_sources = item.get("sources")
+    if isinstance(raw_sources, list):
+        sources = [
+            source
+            for source in (
+                _timeline_source(raw_source.get("label"), raw_source.get("url"))
+                for raw_source in raw_sources[:12]
+                if isinstance(raw_source, dict)
+            )
+            if source
+        ]
+        if sources:
+            normalized["sources"] = sources
+    return normalized
 
 
 def _normalize_stat_block(
