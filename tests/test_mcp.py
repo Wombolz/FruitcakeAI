@@ -164,6 +164,133 @@ def test_registry_keeps_app_only_tools_out_of_model_catalog():
     assert registry.get_status()["app_only_tools"] == ["refresh_dashboard"]
 
 
+@pytest.mark.asyncio
+async def test_registry_calls_linked_read_only_app_tool():
+    registry = MCPRegistry()
+    registry._set_server_tools("weather", "streamable_http", [{
+        "name": "refresh_dashboard",
+        "description": "Refresh the app without model involvement",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True},
+        "_meta": {
+            "ui": {
+                "resourceUri": "ui://weather/dashboard.html",
+                "visibility": ["app"],
+            },
+        },
+    }])
+    registry._server_configs["weather"] = {"trust_boundary": {"first_party": True}}
+    client = MagicMock()
+    client.call_tool = AsyncMock(return_value={
+        "success": True,
+        "result": {"structuredContent": {"temperature": 72}},
+    })
+    registry._clients["weather"] = client
+
+    response = await registry.call_mcp_app_tool(
+        server_name="weather",
+        resource_uri="ui://weather/dashboard.html",
+        tool_name="refresh_dashboard",
+        arguments={"city": "Statesboro"},
+    )
+
+    assert response["result"]["structuredContent"]["temperature"] == 72
+    client.call_tool.assert_awaited_once_with(
+        "refresh_dashboard",
+        {"city": "Statesboro"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_registry_rejects_mutating_app_tool():
+    registry = MCPRegistry()
+    registry._set_server_tools("weather", "streamable_http", [{
+        "name": "delete_station",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": False},
+        "_meta": {
+            "ui": {
+                "resourceUri": "ui://weather/dashboard.html",
+                "visibility": ["app"],
+            },
+        },
+    }])
+
+    with pytest.raises(PermissionError, match="not declared read-only"):
+        await registry.call_mcp_app_tool(
+            server_name="weather",
+            resource_uri="ui://weather/dashboard.html",
+            tool_name="delete_station",
+            arguments={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_registry_rejects_untrusted_read_only_app_tool_without_approval():
+    registry = MCPRegistry()
+    registry._set_server_tools("weather", "streamable_http", [{
+        "name": "refresh_dashboard",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True},
+        "_meta": {
+            "ui": {
+                "resourceUri": "ui://weather/dashboard.html",
+                "visibility": ["app"],
+            },
+        },
+    }])
+    registry._server_configs["weather"] = {"trust_boundary": {"first_party": False}}
+
+    with pytest.raises(PermissionError, match="requires approval"):
+        await registry.call_mcp_app_tool(
+            server_name="weather",
+            resource_uri="ui://weather/dashboard.html",
+            tool_name="refresh_dashboard",
+            arguments={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_registry_rejects_app_tool_linked_to_another_resource():
+    registry = MCPRegistry()
+    registry._set_server_tools("weather", "streamable_http", [
+        {
+            "name": "show_weather",
+            "inputSchema": {"type": "object", "properties": {}},
+            "_meta": {
+                "ui": {
+                    "resourceUri": "ui://weather/other.html",
+                    "visibility": ["model", "app"],
+                },
+            },
+        },
+        {
+            "name": "refresh_dashboard",
+            "inputSchema": {"type": "object", "properties": {}},
+            "annotations": {"readOnlyHint": True},
+            "_meta": {
+                "ui": {
+                    "resourceUri": "ui://weather/dashboard.html",
+                    "visibility": ["app"],
+                },
+            },
+        },
+    ])
+
+    with pytest.raises(PermissionError, match="not linked to this UI resource"):
+        await registry.call_mcp_app_tool(
+            server_name="weather",
+            resource_uri="ui://weather/other.html",
+            tool_name="refresh_dashboard",
+            arguments={},
+        )
+
+
 # ── MCPRegistry internals ──────────────────────────────────────────────────────
 
 def _make_fake_module(tool_names: list[str], *, result_prefix: str = "result_of") -> types.ModuleType:

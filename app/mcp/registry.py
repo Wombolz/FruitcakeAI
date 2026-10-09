@@ -24,6 +24,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 import yaml
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
 
 from app.agent.runtime.models import ToolOutputText
 from app.artifacts import artifact_registry
@@ -33,6 +35,8 @@ log = structlog.get_logger(__name__)
 
 _CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "mcp_config.yaml"
 _MCP_APP_RESOURCE_MAX_BYTES = 512_000
+_MCP_APP_TOOL_ARGUMENT_MAX_BYTES = 20_000
+_MCP_APP_TOOL_RESULT_MAX_BYTES = 96_000
 
 
 def _to_litellm_schema(tool: Dict[str, Any]) -> Dict[str, Any]:
@@ -170,6 +174,7 @@ class MCPRegistry:
         # App-only tools are discoverable for diagnostics but never offered to
         # or callable by the model. Interactive app calls are a later slice.
         self._app_tool_map: Dict[str, Tuple[str, str]] = {}
+        self._app_tool_definitions: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._tool_definitions: Dict[str, Dict[str, Any]] = {}
         self._ui_resources: Dict[str, set[str]] = {}
         # All registered tools in LiteLLM format
@@ -193,7 +198,9 @@ class MCPRegistry:
         if isinstance(resource_uri, str) and resource_uri.startswith("ui://"):
             self._ui_resources.setdefault(server_name, set()).add(resource_uri)
         if ui is not None and not _tool_is_model_visible(tool):
-            self._app_tool_map[name] = (server_name, server_type)
+            if name not in self._app_tool_map:
+                self._app_tool_map[name] = (server_name, server_type)
+            self._app_tool_definitions[(server_name, name)] = dict(tool)
             return
         schema = _to_litellm_schema(tool)
         invalid_reason = _find_invalid_schema_field(schema["function"]["parameters"])
@@ -231,6 +238,7 @@ class MCPRegistry:
         self._server_tools[name] = (kind, list(tools))
         self._tool_map.clear()
         self._app_tool_map.clear()
+        self._app_tool_definitions.clear()
         self._tool_definitions.clear()
         self._ui_resources.clear()
         self._litellm_schemas.clear()
@@ -521,6 +529,75 @@ class MCPRegistry:
                 "html": html,
             }
         raise LookupError("MCP App resource was not returned by the server")
+
+    async def call_mcp_app_tool(
+        self,
+        *,
+        server_name: str,
+        resource_uri: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        user_context: Any = None,
+    ) -> Dict[str, Any]:
+        """Call one same-server app-only tool after enforcing read-only policy."""
+        if not resource_uri.startswith("ui://"):
+            raise ValueError("MCP App resources must use the ui:// scheme")
+        if resource_uri not in self._ui_resources.get(server_name, set()):
+            raise LookupError("MCP App resource is not linked by a registered tool")
+
+        definition = self._app_tool_definitions.get((server_name, tool_name))
+        if definition is None:
+            raise LookupError("MCP App tool is not declared by this server")
+        ui = _tool_ui_metadata(definition) or {}
+        if ui.get("resourceUri") != resource_uri:
+            raise PermissionError("MCP App tool is not linked to this UI resource")
+        annotations = definition.get("annotations")
+        if not isinstance(annotations, dict) or annotations.get("readOnlyHint") is not True:
+            raise PermissionError("MCP App tool is not declared read-only")
+        config = self._server_configs.get(server_name, {})
+        trust_boundary = config.get("trust_boundary")
+        if not isinstance(trust_boundary, dict) or trust_boundary.get("first_party") is not True:
+            raise PermissionError("MCP App tool requires approval for a non-first-party server")
+
+        encoded_arguments = json.dumps(
+            arguments,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded_arguments) > _MCP_APP_TOOL_ARGUMENT_MAX_BYTES:
+            raise ValueError("MCP App tool arguments exceed the size limit")
+        schema = definition.get("inputSchema") or {"type": "object", "properties": {}}
+        try:
+            Draft202012Validator.check_schema(schema)
+            Draft202012Validator(schema).validate(arguments)
+        except SchemaError as exc:
+            raise ValueError("MCP App tool has an invalid input schema") from exc
+        except ValidationError as exc:
+            raise ValueError(f"MCP App tool arguments are invalid: {exc.message}") from exc
+
+        client = self._clients.get(server_name)
+        if client is None:
+            raise LookupError(f"MCP server '{server_name}' is not available")
+        effective_args = dict(arguments)
+        if config.get("pass_user_context"):
+            effective_args["_fruitcake_user_context"] = _serialize_user_context(user_context)
+        raw = await client.call_tool(tool_name, effective_args)
+        if not raw.get("success"):
+            raise RuntimeError(raw.get("error") or "MCP App tool call failed")
+        result = raw.get("result")
+        encoded_result = json.dumps(
+            result,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded_result) > _MCP_APP_TOOL_RESULT_MAX_BYTES:
+            raise ValueError("MCP App tool result exceeds the size limit")
+        return {
+            "server": server_name,
+            "resource_uri": resource_uri,
+            "tool": tool_name,
+            "result": result,
+        }
 
     # ── Status ────────────────────────────────────────────────────────────────
 
