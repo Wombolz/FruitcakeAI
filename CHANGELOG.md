@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.41
+
+- Added a versioned, bounded artifact registry with compatibility adapters for existing rich-chat content and safe fallback behavior for unsupported types.
+- Added sanitized `core.html` and `core.svg` artifacts plus a host-owned creation tool that keeps executable content outside the model transcript.
+- Added sandboxed MCP Apps hosting with linked `ui://` resources, structured tool results, app lifecycle events, and durable `core.mcp_app` history metadata.
+- Added audited same-server calls for schema-valid, read-only app tools while keeping mutations, unrelated tools, credentials, and undeclared resources fail-closed.
+- Added the Stocks companion as the first interactive MCP App reference integration without making it a shipping dependency.
+- Added graceful Ollama model release during server shutdown while preserving the configurable local-model keep-alive used during normal operation.
+
 ## v0.7.40
 
 - Added versioned, bounded assistant content blocks for native tables, charts, news, metrics, timelines, workspace files, places, and code while retaining Markdown fallback content.
