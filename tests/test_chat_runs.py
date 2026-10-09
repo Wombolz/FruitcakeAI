@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
@@ -7,6 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from app.autonomy.approval import ApprovalRequired, build_blocked_tool_approval_payload
+from app.chat_runtime import get_chat_run_manager
 from app.db.models import ChatMessage, ChatRun
 
 from tests.conftest import TestSessionLocal
@@ -201,3 +203,90 @@ async def test_chat_approval_denial_does_not_replay_tool(client):
     assert denied.json()["status"] == "cancelled"
     assert denied.json()["phase"] == "approval_denied"
     replay.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stopping_waiting_chat_approval_invalidates_replay(client):
+    headers, session_id = await _authenticated_session(client, "chatstopapproval")
+    async with TestSessionLocal() as db:
+        user_message = ChatMessage(session_id=session_id, role="user", content="write a file")
+        db.add(user_message)
+        await db.flush()
+        run = ChatRun(
+            id="chat_run_stop_waiting",
+            session_id=session_id,
+            user_id=1,
+            user_message_id=user_message.id,
+            status="waiting_approval",
+            phase="waiting_approval",
+            approval_kind="tool",
+        )
+        run.approval_payload = {
+            "payload_type": "blocked_tool_call",
+            "tool_name": "write_file",
+            "arguments": {"path": "reports/no.md", "content": "no"},
+            "reason": "Writing changes workspace data.",
+            "tool_call_id": "call_stop",
+        }
+        db.add(run)
+        await db.commit()
+
+    stopped = await client.post(
+        "/chat/runs/chat_run_stop_waiting/stop",
+        headers=headers,
+    )
+    assert stopped.status_code == 200
+    assert stopped.json()["stopped"] is True
+    assert stopped.json()["status"] == "cancelled"
+
+    approve = await client.post(
+        "/chat/runs/chat_run_stop_waiting/approval",
+        headers=headers,
+        json={"approved": True},
+    )
+    assert approve.status_code == 409
+
+    async with TestSessionLocal() as db:
+        run = await db.get(ChatRun, "chat_run_stop_waiting")
+        assert run.approval_payload is None
+        assert run.approval_kind is None
+
+
+@pytest.mark.asyncio
+async def test_stopping_active_chat_run_cancels_only_that_run(client):
+    headers, session_id = await _authenticated_session(client, "chatstopactive")
+    async with TestSessionLocal() as db:
+        user_message = ChatMessage(session_id=session_id, role="user", content="keep working")
+        db.add(user_message)
+        await db.flush()
+        run = ChatRun(
+            id="chat_run_stop_active",
+            session_id=session_id,
+            user_id=1,
+            user_message_id=user_message.id,
+            status="running",
+            phase="model_active",
+        )
+        db.add(run)
+        await db.commit()
+
+    blocker = asyncio.Event()
+
+    async def _wait_forever():
+        await blocker.wait()
+
+    task = asyncio.create_task(_wait_forever())
+    manager = get_chat_run_manager()
+    await manager.register(session_id, task, run_id="chat_run_stop_active")
+    try:
+        stopped = await client.post(
+            "/chat/runs/chat_run_stop_active/stop",
+            headers=headers,
+        )
+        assert stopped.status_code == 200
+        assert stopped.json()["stopped"] is True
+        assert stopped.json()["phase"] == "cancelling"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        await manager.clear(session_id, task)

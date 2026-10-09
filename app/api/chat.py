@@ -31,6 +31,7 @@ from sqlalchemy import func, select
 
 import structlog
 
+from app.artifacts import artifact_envelopes_from_tool_records, normalize_artifact_envelopes
 from app.agent.context import UserContext
 from app.agent.chat_intents import (
     is_library_detail_or_excerpt_intent,
@@ -207,6 +208,14 @@ class SendMessageRequest(BaseModel):
 class StopChatResponse(BaseModel):
     stopped: bool
     session_id: int
+
+
+class StopChatRunResponse(BaseModel):
+    stopped: bool
+    run_id: str
+    session_id: int
+    status: str
+    phase: str
 
 
 class ChatSessionStatusResponse(BaseModel):
@@ -1126,6 +1135,67 @@ async def stop_chat_session(
     await _get_session_or_404(session_id, current_user.id, db)
     stopped = await get_chat_run_manager().request_stop(session_id)
     return StopChatResponse(stopped=stopped, session_id=session_id)
+
+
+@router.post("/runs/{run_id}/stop", response_model=StopChatRunResponse)
+async def stop_chat_run(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> StopChatRunResponse:
+    run = await owned_chat_run(db, run_id=run_id, user_id=current_user.id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Chat run not found")
+
+    if run.status == "waiting_approval":
+        run.approval_kind = None
+        run.approval_payload = None
+        await mark_chat_run_terminal(
+            db,
+            run,
+            status="cancelled",
+            phase="cancelled",
+            error_classification="user_cancelled",
+        )
+        await db.commit()
+        return StopChatRunResponse(
+            stopped=True,
+            run_id=run.id,
+            session_id=run.session_id,
+            status=run.status,
+            phase=run.phase,
+        )
+
+    if run.status == "cancelled":
+        return StopChatRunResponse(
+            stopped=False,
+            run_id=run.id,
+            session_id=run.session_id,
+            status=run.status,
+            phase=run.phase,
+        )
+
+    if run.status != "running":
+        return StopChatRunResponse(
+            stopped=False,
+            run_id=run.id,
+            session_id=run.session_id,
+            status=run.status,
+            phase=run.phase,
+        )
+
+    stopped = await get_chat_run_manager().request_stop_run(run.session_id, run.id)
+    if stopped:
+        run.phase = "cancelling"
+        run.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+    return StopChatRunResponse(
+        stopped=stopped,
+        run_id=run.id,
+        session_id=run.session_id,
+        status=run.status,
+        phase=run.phase,
+    )
 
 
 @router.get(
@@ -3065,6 +3135,12 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
     cleaned_blocks = normalize_assistant_content_blocks(metadata.get("content_blocks"))
     if cleaned_blocks:
         normalized["content_blocks"] = cleaned_blocks
+    cleaned_artifacts = normalize_artifact_envelopes(metadata.get("artifacts"))
+    if cleaned_artifacts:
+        normalized["artifacts"] = [
+            artifact.model_dump(mode="json", exclude_none=True)
+            for artifact in cleaned_artifacts
+        ]
     cleaned_activity = normalize_assistant_activity(metadata.get("activity"))
     if cleaned_activity:
         normalized["activity"] = cleaned_activity
@@ -3428,6 +3504,12 @@ def _build_assistant_message_metadata(
     content_blocks = _build_assistant_content_blocks(content, executed_tools)
     if content_blocks:
         metadata["content_blocks"] = content_blocks
+    artifacts = artifact_envelopes_from_tool_records(executed_tools)
+    if artifacts:
+        metadata["artifacts"] = [
+            artifact.model_dump(mode="json", exclude_none=True)
+            for artifact in artifacts
+        ]
 
     if recalled_memory_ids:
         metadata["recalled_memory_ids"] = [int(i) for i in recalled_memory_ids]

@@ -56,3 +56,21 @@ async def test_chat_run_manager_rejects_duplicate_client_send_id_within_window()
     claimed_recent, active_recent = await manager.claim_client_send_id(1, "send-123")
     assert claimed_recent is False
     assert active_recent is False
+
+
+@pytest.mark.asyncio
+async def test_chat_run_manager_only_stops_matching_active_run():
+    manager = ChatRunManager()
+    blocker = asyncio.Event()
+
+    async def _wait_forever():
+        await blocker.wait()
+
+    task = asyncio.create_task(_wait_forever())
+    await manager.register(7, task, run_id="chat_run_current")
+
+    assert await manager.request_stop_run(7, "chat_run_stale") is False
+    assert task.cancelled() is False
+    assert await manager.request_stop_run(7, "chat_run_current") is True
+    with pytest.raises(asyncio.CancelledError):
+        await task

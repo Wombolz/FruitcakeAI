@@ -24,7 +24,9 @@ from typing import Any, Dict, List, Optional
 import structlog
 
 from app.agent.context import UserContext
-from app.agent.runtime.models import build_tool_call_result
+from app.agent.runtime.models import ToolOutputText, build_tool_call_result
+from app.artifacts import artifact_registry
+from app.artifacts.sanitize import sanitize_static_html, sanitize_static_svg
 from app.autonomy.approval import ApprovalRequired, build_blocked_tool_approval_payload
 
 log = structlog.get_logger(__name__)
@@ -774,6 +776,48 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "create_artifact",
+            "description": (
+                "Create one rendered static HTML or SVG artifact for the current chat. "
+                "Use this when the user asks to display, render, visualize, or create an HTML/SVG artifact rather than showing source code. "
+                "Call once per artifact; multiple calls in one turn are allowed. The content is sanitized and cannot run scripts or load remote resources."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artifact_type": {
+                        "type": "string",
+                        "enum": ["core.html", "core.svg"],
+                        "description": "The static artifact renderer to use.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Short user-facing title for the artifact.",
+                        "maxLength": 200,
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Complete static HTML fragment or SVG document to render.",
+                        "maxLength": 60000,
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Optional short description displayed with the artifact.",
+                        "maxLength": 600,
+                    },
+                    "fallback_text": {
+                        "type": "string",
+                        "description": "Optional plain-text fallback for clients that cannot render the artifact.",
+                        "maxLength": 24000,
+                    },
+                },
+                "required": ["artifact_type", "title", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "summarize_document",
             "description": (
                 "Produce a comprehensive summary of an entire document in the user's library. "
@@ -1059,11 +1103,12 @@ async def _execute_tool_call(
             "are blocked; use a normal session for durable work."
         )
 
+    recorded_arguments = _tool_arguments_for_recording(tool_name, arguments)
     if user_context.is_incognito:
         # Content stays out of server logs for incognito turns; tool name only.
         log.info("Tool call", tool=tool_name, user_id=user_context.user_id, incognito=True)
     else:
-        log.info("Tool call", tool=tool_name, args=arguments, user_id=user_context.user_id)
+        log.info("Tool call", tool=tool_name, args=recorded_arguments, user_id=user_context.user_id)
 
     try:
         result_content = await _call_tool(tool_name, arguments, user_context)
@@ -1082,7 +1127,7 @@ async def _execute_tool_call(
             user_id=user_context.user_id,
             session_id=user_context.session_id,
             tool_name=tool_name,
-            arguments={} if user_context.is_incognito else arguments,
+            arguments={} if user_context.is_incognito else recorded_arguments,
             result_summary=(
                 "[incognito: content withheld]"
                 if user_context.is_incognito
@@ -1097,9 +1142,22 @@ async def _execute_tool_call(
         name=tool_name,
         content=result_content,
     )
-    records.append(normalized_result.to_execution_record(arguments=arguments))
+    records.append(normalized_result.to_execution_record(arguments=recorded_arguments))
     _tool_execution_records.set(records)
     return result_content
+
+
+def _tool_arguments_for_recording(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if tool_name != "create_artifact":
+        return arguments
+    content = str(arguments.get("content") or "")
+    fallback = str(arguments.get("fallback_text") or "")
+    return {
+        "artifact_type": str(arguments.get("artifact_type") or "")[:40],
+        "title": str(arguments.get("title") or "")[:200],
+        "content_chars": len(content),
+        "fallback_chars": len(fallback),
+    }
 
 
 async def _write_audit_log(
@@ -1184,6 +1242,9 @@ async def _call_tool(
 
     if name == "summarize_document":
         return await _summarize_document(arguments, user_context)
+
+    if name == "create_artifact":
+        return _create_artifact(arguments)
 
     if name == "describe_image":
         return await _describe_image(arguments, user_context)
@@ -1656,6 +1717,58 @@ def _workspace_image_data_url(image_path: Path, *, max_dimension: int) -> str:
             image.save(output, format=output_format)
             out_mime = "image/png"
         return f"data:{out_mime};base64,{base64.b64encode(output.getvalue()).decode('ascii')}"
+
+
+def _create_artifact(arguments: Dict[str, Any]) -> ToolOutputText:
+    """Build one safe static display artifact without putting its payload in model context."""
+    artifact_type = str(arguments.get("artifact_type") or "").strip().casefold()
+    title = str(arguments.get("title") or "").strip()
+    content = str(arguments.get("content") or "")
+    summary = str(arguments.get("summary") or "").strip() or None
+    fallback_text = str(arguments.get("fallback_text") or "").strip()
+
+    if len(content.encode("utf-8")) > 64_000:
+        raise ValueError("artifact content exceeds the inline size limit")
+
+    if artifact_type == "core.html":
+        sanitized_content = sanitize_static_html(content)
+        preferred = "inspector"
+    elif artifact_type == "core.svg":
+        sanitized_content = sanitize_static_svg(content)
+        preferred = "inline"
+    else:
+        raise ValueError("artifact_type must be core.html or core.svg")
+
+    candidate: Dict[str, Any] = {
+        "type": artifact_type,
+        "schema_version": 1,
+        "title": title,
+        "payload": {"content": sanitized_content},
+        "presentation": {
+            "preferred": preferred,
+            "expandable": True,
+        },
+        "provenance": {
+            "provider": "fruitcake",
+            "tool": "create_artifact",
+        },
+    }
+    if summary:
+        candidate["summary"] = summary
+    if fallback_text:
+        candidate["fallback"] = {
+            "media_type": "text/plain",
+            "content": fallback_text,
+        }
+
+    envelope = artifact_registry.validate(candidate)
+    structured_content = {
+        "artifact": envelope.model_dump(mode="json", exclude_none=True),
+    }
+    return ToolOutputText(
+        f"Created rendered {artifact_type} artifact titled '{envelope.title}'.",
+        structured_content=structured_content,
+    )
 
 
 async def _summarize_document(

@@ -139,6 +139,19 @@ class ChatRunManager:
         task.cancel()
         return True
 
+    async def request_stop_run(self, session_id: int, run_id: str) -> bool:
+        """Cancel only when the requested run is still the active session run."""
+        normalized_run_id = str(run_id or "").strip()
+        async with self._lock:
+            task = self._active_runs.get(session_id)
+            active_run_id = self._active_run_ids.get(session_id)
+        if not normalized_run_id or active_run_id != normalized_run_id:
+            return False
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
+
     async def is_active(self, session_id: int) -> bool:
         async with self._lock:
             task = self._active_runs.get(session_id)

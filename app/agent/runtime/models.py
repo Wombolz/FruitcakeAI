@@ -135,8 +135,11 @@ def _normalize_artifacts(
 ) -> list[dict[str, Any]]:
     if not structured:
         return []
+    single_artifact = structured.get("artifact")
     raw_artifacts = structured.get("artifacts")
     candidates = list(raw_artifacts) if isinstance(raw_artifacts, list) else []
+    if isinstance(single_artifact, Mapping):
+        candidates.insert(0, single_artifact)
     image_path = str(structured.get("image_path") or "").strip()
     if image_path:
         candidates.insert(
@@ -156,6 +159,15 @@ def _normalize_artifacts(
         if not isinstance(item, Mapping):
             continue
         artifact = dict(item)
+        if {
+            "type",
+            "schema_version",
+            "title",
+        }.issubset(artifact) and any(
+            artifact.get(key) is not None for key in ("payload", "resources", "fallback")
+        ):
+            artifacts.append(artifact)
+            continue
         artifact.setdefault("source_tool", tool_name)
         if artifact.get("path") or artifact.get("url"):
             artifacts.append(artifact)

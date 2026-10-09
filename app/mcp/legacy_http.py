@@ -31,7 +31,15 @@ class LegacyHTTPClient:
         )
         try:
             return await self.request("initialize", {
-                "protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {},
+                    "extensions": {
+                        "io.modelcontextprotocol/ui": {
+                            "mimeTypes": ["text/html;profile=mcp-app"],
+                        },
+                    },
+                },
                 "clientInfo": {"name": "FruitcakeAI", "version": "5.0"},
             })
         except BaseException:

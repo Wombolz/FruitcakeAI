@@ -16,19 +16,27 @@ Adding a new server requires only a config entry — no code changes.
 from __future__ import annotations
 
 import importlib
+import base64
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 import yaml
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
 
 from app.agent.runtime.models import ToolOutputText
-from app.mcp.client import MCPClient
+from app.artifacts import artifact_registry
+from app.mcp.client import MCP_APP_MIME_TYPE, MCPClient
 
 log = structlog.get_logger(__name__)
 
 _CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "mcp_config.yaml"
+_MCP_APP_RESOURCE_MAX_BYTES = 512_000
+_MCP_APP_TOOL_ARGUMENT_MAX_BYTES = 20_000
+_MCP_APP_TOOL_RESULT_MAX_BYTES = 96_000
 
 
 def _to_litellm_schema(tool: Dict[str, Any]) -> Dict[str, Any]:
@@ -95,6 +103,40 @@ def _extract_structured_content(result: Any) -> Dict[str, Any] | None:
     return dict(structured) if isinstance(structured, dict) else None
 
 
+def _tool_ui_metadata(tool: Dict[str, Any]) -> Dict[str, Any] | None:
+    metadata = tool.get("_meta")
+    if not isinstance(metadata, dict):
+        return None
+    ui = metadata.get("ui")
+    if isinstance(ui, dict):
+        return dict(ui)
+    # Compatibility with the pre-2026 flat MCP Apps metadata spelling.
+    resource_uri = metadata.get("ui/resourceUri")
+    visibility = metadata.get("ui/visibility")
+    if resource_uri is None and visibility is None:
+        return None
+    return {"resourceUri": resource_uri, "visibility": visibility}
+
+
+def _tool_is_model_visible(tool: Dict[str, Any]) -> bool:
+    ui = _tool_ui_metadata(tool)
+    if not ui or "visibility" not in ui:
+        return True
+    visibility = ui.get("visibility")
+    return isinstance(visibility, list) and "model" in visibility
+
+
+def _bounded_json_value(value: Any, max_bytes: int) -> Any:
+    """Return JSON-safe data when it fits; otherwise return a compact marker."""
+    try:
+        encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        return {"omitted": True, "reason": "not_json_serializable"}
+    if len(encoded) <= max_bytes:
+        return value
+    return {"omitted": True, "reason": "size_limit", "size_bytes": len(encoded)}
+
+
 def _serialize_user_context(user_context: Any) -> Dict[str, Any]:
     if user_context is None:
         return {}
@@ -129,6 +171,12 @@ class MCPRegistry:
         self._server_configs: Dict[str, Dict[str, Any]] = {}
         # tool_name → (server_name, server_type)
         self._tool_map: Dict[str, Tuple[str, str]] = {}
+        # App-only tools are discoverable for diagnostics but never offered to
+        # or callable by the model. Interactive app calls are a later slice.
+        self._app_tool_map: Dict[str, Tuple[str, str]] = {}
+        self._app_tool_definitions: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._tool_definitions: Dict[str, Dict[str, Any]] = {}
+        self._ui_resources: Dict[str, set[str]] = {}
         # All registered tools in LiteLLM format
         self._litellm_schemas: List[Dict[str, Any]] = []
         # Raw YAML config (used for status reporting)
@@ -145,6 +193,15 @@ class MCPRegistry:
         Duplicate names are retained in diagnostics and never silently override.
         """
         name = tool["name"]
+        ui = _tool_ui_metadata(tool)
+        resource_uri = ui.get("resourceUri") if ui else None
+        if isinstance(resource_uri, str) and resource_uri.startswith("ui://"):
+            self._ui_resources.setdefault(server_name, set()).add(resource_uri)
+        if ui is not None and not _tool_is_model_visible(tool):
+            if name not in self._app_tool_map:
+                self._app_tool_map[name] = (server_name, server_type)
+            self._app_tool_definitions[(server_name, name)] = dict(tool)
+            return
         schema = _to_litellm_schema(tool)
         invalid_reason = _find_invalid_schema_field(schema["function"]["parameters"])
         if invalid_reason:
@@ -172,6 +229,7 @@ class MCPRegistry:
             return
 
         self._tool_map[name] = (server_name, server_type)
+        self._tool_definitions[name] = dict(tool)
         self._litellm_schemas.append(schema)
 
     def _set_server_tools(self, name: str, kind: str, tools: List[Dict[str, Any]]) -> None:
@@ -179,6 +237,10 @@ class MCPRegistry:
         # collision handling and removed tools disappear from future turns.
         self._server_tools[name] = (kind, list(tools))
         self._tool_map.clear()
+        self._app_tool_map.clear()
+        self._app_tool_definitions.clear()
+        self._tool_definitions.clear()
+        self._ui_resources.clear()
         self._litellm_schemas.clear()
         self._duplicate_tools.clear()
         self._invalid_tools.clear()
@@ -346,13 +408,196 @@ class MCPRegistry:
                 effective_args["_fruitcake_user_context"] = _serialize_user_context(user_context)
             raw = await client.call_tool(tool_name, effective_args)
             if raw["success"]:
+                structured_content = _extract_structured_content(raw["result"])
+                app_artifact = self._build_mcp_app_artifact(
+                    tool_name=tool_name,
+                    server_name=server_name,
+                    arguments=arguments,
+                    result=raw["result"],
+                )
+                if app_artifact is not None:
+                    structured_content = dict(structured_content or {})
+                    artifacts = structured_content.get("artifacts")
+                    if not isinstance(artifacts, list):
+                        artifacts = []
+                    structured_content["artifacts"] = [*artifacts, app_artifact]
                 return ToolOutputText(
                     _extract_text(raw["result"]),
-                    structured_content=_extract_structured_content(raw["result"]),
+                    structured_content=structured_content,
                 )
             return f"Tool {tool_name} failed: {raw.get('error', 'unknown error')}"
 
         return f"Unsupported server type for tool: {tool_name}"
+
+    def _build_mcp_app_artifact(
+        self,
+        *,
+        tool_name: str,
+        server_name: str,
+        arguments: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        tool = self._tool_definitions.get(tool_name, {})
+        ui = _tool_ui_metadata(tool)
+        resource_uri = ui.get("resourceUri") if ui else None
+        if not isinstance(resource_uri, str) or not resource_uri.startswith("ui://"):
+            return None
+        fallback = _extract_text(result).strip() or f"{tool_name} completed."
+        candidate = {
+            "type": "core.mcp_app",
+            "schema_version": 1,
+            "title": str(tool.get("title") or tool_name.replace("_", " ").title())[:200],
+            "summary": str(tool.get("description") or "Interactive MCP App result")[:600],
+            "payload": {
+                "tool_input": _bounded_json_value(arguments, 20_000),
+                "tool_result": _bounded_json_value(result, 36_000),
+            },
+            "resources": [{
+                "uri": resource_uri,
+                "media_type": MCP_APP_MIME_TYPE,
+                "title": "MCP App interface",
+                "role": "ui",
+            }],
+            "provenance": {
+                "provider": "mcp",
+                "server": server_name,
+                "tool": tool_name,
+            },
+            "presentation": {
+                "preferred": "inline",
+                "expandable": True,
+                "renderer": "mcp_app",
+                "ui_resource": resource_uri,
+            },
+            "fallback": {
+                "media_type": "text/plain",
+                "content": fallback[:24_000],
+            },
+        }
+        try:
+            return artifact_registry.validate(candidate).model_dump(mode="json", exclude_none=True)
+        except ValueError as exc:
+            log.warning(
+                "MCP App artifact rejected",
+                server=server_name,
+                tool=tool_name,
+                error=str(exc),
+            )
+            return None
+
+    async def read_mcp_app_resource(self, server_name: str, uri: str) -> Dict[str, Any]:
+        """Resolve one linked MCP App UI resource through its owning server."""
+        if not uri.startswith("ui://"):
+            raise ValueError("MCP App resources must use the ui:// scheme")
+        if uri not in self._ui_resources.get(server_name, set()):
+            raise LookupError("MCP App resource is not linked by a registered tool")
+        client = self._clients.get(server_name)
+        if client is None:
+            raise LookupError(f"MCP server '{server_name}' is not available")
+        raw = await client.read_resource(uri)
+        if not raw.get("success"):
+            raise RuntimeError(raw.get("error") or "MCP resource read failed")
+        result = raw.get("result")
+        contents = result.get("contents") if isinstance(result, dict) else None
+        if not isinstance(contents, list):
+            raise ValueError("MCP resource response did not include contents")
+        for item in contents:
+            if not isinstance(item, dict) or item.get("uri") != uri:
+                continue
+            media_type = item.get("mimeType") or item.get("mime_type")
+            if media_type != MCP_APP_MIME_TYPE:
+                raise ValueError("MCP App resource has an unsupported media type")
+            if isinstance(item.get("text"), str):
+                data = item["text"].encode("utf-8")
+            elif isinstance(item.get("blob"), str):
+                try:
+                    data = base64.b64decode(item["blob"], validate=True)
+                except ValueError as exc:
+                    raise ValueError("MCP App resource blob is not valid base64") from exc
+            else:
+                raise ValueError("MCP App resource must contain text or a blob")
+            if len(data) > _MCP_APP_RESOURCE_MAX_BYTES:
+                raise ValueError("MCP App resource exceeds the size limit")
+            try:
+                html = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("MCP App resource must be UTF-8 HTML") from exc
+            return {
+                "server": server_name,
+                "uri": uri,
+                "mime_type": media_type,
+                "html": html,
+            }
+        raise LookupError("MCP App resource was not returned by the server")
+
+    async def call_mcp_app_tool(
+        self,
+        *,
+        server_name: str,
+        resource_uri: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        user_context: Any = None,
+    ) -> Dict[str, Any]:
+        """Call one same-server app-only tool after enforcing read-only policy."""
+        if not resource_uri.startswith("ui://"):
+            raise ValueError("MCP App resources must use the ui:// scheme")
+        if resource_uri not in self._ui_resources.get(server_name, set()):
+            raise LookupError("MCP App resource is not linked by a registered tool")
+
+        definition = self._app_tool_definitions.get((server_name, tool_name))
+        if definition is None:
+            raise LookupError("MCP App tool is not declared by this server")
+        ui = _tool_ui_metadata(definition) or {}
+        if ui.get("resourceUri") != resource_uri:
+            raise PermissionError("MCP App tool is not linked to this UI resource")
+        annotations = definition.get("annotations")
+        if not isinstance(annotations, dict) or annotations.get("readOnlyHint") is not True:
+            raise PermissionError("MCP App tool is not declared read-only")
+        config = self._server_configs.get(server_name, {})
+        trust_boundary = config.get("trust_boundary")
+        if not isinstance(trust_boundary, dict) or trust_boundary.get("first_party") is not True:
+            raise PermissionError("MCP App tool requires approval for a non-first-party server")
+
+        encoded_arguments = json.dumps(
+            arguments,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded_arguments) > _MCP_APP_TOOL_ARGUMENT_MAX_BYTES:
+            raise ValueError("MCP App tool arguments exceed the size limit")
+        schema = definition.get("inputSchema") or {"type": "object", "properties": {}}
+        try:
+            Draft202012Validator.check_schema(schema)
+            Draft202012Validator(schema).validate(arguments)
+        except SchemaError as exc:
+            raise ValueError("MCP App tool has an invalid input schema") from exc
+        except ValidationError as exc:
+            raise ValueError(f"MCP App tool arguments are invalid: {exc.message}") from exc
+
+        client = self._clients.get(server_name)
+        if client is None:
+            raise LookupError(f"MCP server '{server_name}' is not available")
+        effective_args = dict(arguments)
+        if config.get("pass_user_context"):
+            effective_args["_fruitcake_user_context"] = _serialize_user_context(user_context)
+        raw = await client.call_tool(tool_name, effective_args)
+        if not raw.get("success"):
+            raise RuntimeError(raw.get("error") or "MCP App tool call failed")
+        result = raw.get("result")
+        encoded_result = json.dumps(
+            result,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded_result) > _MCP_APP_TOOL_RESULT_MAX_BYTES:
+            raise ValueError("MCP App tool result exceeds the size limit")
+        return {
+            "server": server_name,
+            "resource_uri": resource_uri,
+            "tool": tool_name,
+            "result": result,
+        }
 
     # ── Status ────────────────────────────────────────────────────────────────
 
@@ -376,6 +621,7 @@ class MCPRegistry:
                 "shipping_default": bool(self._server_configs.get(server_name, {}).get("shipping_default", False)),
                 "available": True,
                 "connected": client.is_connected() if client else True,
+                "mcp_app": _tool_ui_metadata(self._tool_definitions.get(name, {})) is not None,
             })
 
         disabled = []
@@ -397,6 +643,7 @@ class MCPRegistry:
             "disabled_servers": disabled,
             "duplicate_tools": list(self._duplicate_tools),
             "invalid_tools": list(self._invalid_tools),
+            "app_only_tools": sorted(self._app_tool_map),
         }
 
     def get_diagnostics(self) -> Dict[str, Any]:

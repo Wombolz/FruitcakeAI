@@ -40,6 +40,7 @@ FruitcakeAI is not a chat UI wrapper. It's an agent platform with a full working
 - The **chat layer** can now create, inspect, and update real persistent tasks instead of only acting as a one-shot Q&A surface
 - The **visual chat path** can upload and serve workspace images, inspect them with an optional local vision model, and retain generated-image artifacts in conversation history
 - The **structured chat path** turns grounded tables, charts, news, metrics, timelines, files, places, and code into durable native content instead of flattening everything into prose
+- The **artifact layer** validates versioned rich results and hosts sandboxed MCP Apps while preserving safe text fallbacks for clients without interactive UI support
 - The **memory system** persists what matters across sessions, with 3-tier retrieval and semantic search
 - The **RAG pipeline** ingests your documents and makes them queryable with hybrid BM25 + vector retrieval
 - The **MCP layer** lets you drop in any tool server via a config file — no code changes required
@@ -195,6 +196,7 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - RSS — feed management, discovery, and search
 - Webhooks — inbound triggers from GitHub, Zapier, IFTTT, or any HTTP client
 - Docker stdio MCP — drop in any MCP-compatible server via config
+- MCP Apps — connected servers can provide sandboxed interactive interfaces through standard linked `ui://` resources and bounded app-only read tools
 - FruitcakeImageLab — optional first-party MCP companion for long-running local ComfyUI image generation
 
 **Mobile**
@@ -330,7 +332,7 @@ If bootstrap or verification fails, see [Pre-Alpha Troubleshooting](Docs/PreAlph
 
 ## Adding Capabilities
 
-New tools and data sources are added via `config/mcp_config.yaml` — no code changes required. The official MCP SDK supports local stdio processes, Docker stdio servers, and Streamable HTTP endpoints. Existing companion apps retain their legacy HTTP adapter. The agent discovers tools at startup and refreshes SDK tool catalogs when servers announce changes.
+New tools and data sources are added via `config/mcp_config.yaml` — no code changes required. The official MCP SDK supports local stdio processes, Docker stdio servers, and Streamable HTTP endpoints. Existing companion apps retain their legacy HTTP adapter. The agent discovers tools at startup and refreshes SDK tool catalogs when servers announce changes. Servers that implement MCP Apps can additionally provide linked interactive HTML resources; Fruitcake renders them in a restricted host and retains useful text fallback content.
 
 ```yaml
 mcp_servers:

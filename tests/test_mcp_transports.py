@@ -140,10 +140,13 @@ async def test_sdk_bundled_shell_server_legacy_protocol(tmp_path):
 @pytest.mark.asyncio
 async def test_legacy_http_companion_contract_and_rpc_errors():
     requests = []
+    initialize_params = None
     def handler(request):
+        nonlocal initialize_params
         data = json.loads(request.content)
         requests.append((str(request.url), data["method"]))
         if data["method"] == "initialize":
+            initialize_params = data["params"]
             result = {"serverInfo": {"name": "companion"}}
         elif data["method"] == "tools/list":
             result = {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}
@@ -157,6 +160,9 @@ async def test_legacy_http_companion_contract_and_rpc_errors():
         assert (await client.call_tool("echo", {}))["success"] is False
         await client.disconnect()
     assert requests == [("http://companion/", method) for method in ["initialize", "tools/list", "tools/call"]]
+    assert initialize_params["capabilities"]["extensions"]["io.modelcontextprotocol/ui"] == {
+        "mimeTypes": ["text/html;profile=mcp-app"],
+    }
     assert http.is_closed
 
 
