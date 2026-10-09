@@ -128,8 +128,12 @@ async def _extract_candidates_for_lane(transcript: str, lane: str) -> list[dict[
     prompt = _EXTRACTION_PROMPTS.get(lane)
     if not prompt:
         return []
+    model = _extraction_model()
+    from app.agent.local_model_lifecycle import track_local_model_use
+
+    track_local_model_use(model)
     response = await litellm.acompletion(
-        model=_extraction_model(),
+        model=model,
         messages=[{"role": "user", "content": prompt + transcript}],
         max_tokens=1200,
     )

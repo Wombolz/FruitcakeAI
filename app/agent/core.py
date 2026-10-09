@@ -633,6 +633,9 @@ def _litellm_kwargs(model: str | None = None, *, is_incognito: bool = False) -> 
     selected_model = str(model or settings.llm_model or "")
     provider = resolve_provider_capabilities(selected_model)
     if provider.is_local:
+        from app.agent.local_model_lifecycle import track_local_model_use
+
+        track_local_model_use(selected_model)
         kwargs["api_base"] = _normalized_local_api_base()
         keep_alive = provider.runtime_keep_alive or str(settings.local_model_keep_alive or "").strip()
         if keep_alive and not is_incognito:

@@ -15,7 +15,12 @@ API_PIDS="$(pgrep -f "uvicorn app.main:app" || true)"
 if [[ -n "$API_PIDS" ]]; then
   # shellcheck disable=SC2086
   kill $API_PIDS 2>/dev/null || true
-  sleep 1
+  # Allow FastAPI lifespan cleanup to release MCP clients and warmed models.
+  for _ in {1..15}; do
+    STILL_RUNNING="$(pgrep -f "uvicorn app.main:app" || true)"
+    [[ -z "$STILL_RUNNING" ]] && break
+    sleep 1
+  done
   STILL_RUNNING="$(pgrep -f "uvicorn app.main:app" || true)"
   if [[ -n "$STILL_RUNNING" ]]; then
     echo "  Forcing API shutdown..."

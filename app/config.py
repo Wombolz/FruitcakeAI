@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     local_api_key: str = "sk-local"
     local_model: str = "qwen2.5:32b"
     local_model_keep_alive: str = "15m"
+    local_model_release_on_shutdown: bool = True
     document_summary_model: str = ""
     # Task-stage routing (Phase 5.4.x)
     task_small_model: str = "ollama_chat/qwen2.5:14b"

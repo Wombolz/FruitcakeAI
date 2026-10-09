@@ -69,8 +69,16 @@ async def lifespan(app: FastAPI):
     from app.rag.job_runner import shutdown_document_ingest_runner
     shutdown_scheduler()
     shutdown_document_ingest_runner()
-    await get_mcp_registry().shutdown()
-    await engine.dispose()
+    try:
+        await get_mcp_registry().shutdown()
+    finally:
+        try:
+            if settings.local_model_release_on_shutdown:
+                from app.agent.local_model_lifecycle import release_tracked_local_models
+
+                await release_tracked_local_models()
+        finally:
+            await engine.dispose()
 
 
 def create_app() -> FastAPI:
