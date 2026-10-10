@@ -166,6 +166,7 @@ def create_app() -> FastAPI:
     from app.api.model_profiles import router as model_profiles_router
     from app.api.integrations import router as integrations_router
     from app.api.artifacts import router as artifacts_router
+    from app.api.projects import router as projects_router
 
     app.include_router(auth_router, prefix="/auth", tags=["auth"])
     app.include_router(admin_router, prefix="/admin", tags=["admin"])
@@ -184,6 +185,7 @@ def create_app() -> FastAPI:
     app.include_router(model_profiles_router, prefix="/admin", tags=["admin"])
     app.include_router(integrations_router, prefix="/integrations", tags=["integrations"])
     app.include_router(artifacts_router, prefix="/artifacts", tags=["artifacts"])
+    app.include_router(projects_router, tags=["projects"])
 
     return app
 
