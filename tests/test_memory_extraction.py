@@ -524,6 +524,32 @@ def test_merge_folds_paraphrased_candidates_but_not_distinct_facts():
 
 
 @pytest.mark.asyncio
+async def test_review_api_payload_has_keys_the_native_client_requires(client):
+    headers = await _headers(client, "extractclientcompat")
+    async with TestSessionLocal() as db:
+        user = (await db.execute(select(User).where(User.username == "extractclientcompat"))).scalar_one()
+        proposal = MemoryProposal(
+            proposal_key="extract-client-compat",
+            user_id=user.id,
+            proposal_type="flat_memory_create",
+            source_type="nightly_extraction",
+            status="pending",
+            content="Joey is allergic to tree nuts.",
+            confidence=0.9,
+        )
+        # extraction-style payload: no topic / supporting_urls / source_names
+        proposal.proposal_payload = {"kind": "fact", "content": "Joey is allergic to tree nuts.", "subject": None}
+        db.add(proposal)
+        await db.commit()
+
+    resp = await client.get("/memories/review", headers=headers)
+    assert resp.status_code == 200
+    payload = resp.json()[0]["proposal"]
+    assert payload["supporting_urls"] == []
+    assert payload["source_names"] == []
+    assert payload["memory_type"] == "semantic"
+    assert payload["content"] == "Joey is allergic to tree nuts."
+
 async def test_sensitive_candidates_never_auto_approve():
     user_id = await _seed_user_with_chat("extractsensitive")
     flagged = dict(CANDIDATES[0], content="Joey is allergic to tree nuts and Sam upset him about it.",

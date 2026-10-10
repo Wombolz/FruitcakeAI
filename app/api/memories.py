@@ -783,6 +783,25 @@ async def _get_owned_memory_proposal(
     return proposal
 
 
+def _client_proposal_payload(proposal: MemoryProposal) -> Dict[str, Any]:
+    """Payload with the keys the native client decodes as non-optional.
+
+    Topic-watcher proposals always carried topic/supporting_urls/source_names;
+    extraction proposals do not, and the Swift model fails with "data is
+    missing" on any proposal lacking them.
+    """
+    payload = dict(decode_proposal_payload(proposal.proposal_json))
+    if not isinstance(payload.get("supporting_urls"), list):
+        payload["supporting_urls"] = []
+    if not isinstance(payload.get("source_names"), list):
+        payload["source_names"] = []
+    if not payload.get("memory_type"):
+        payload["memory_type"] = "semantic"
+    if not payload.get("content"):
+        payload["content"] = proposal.content
+    return payload
+
+
 def _memory_proposal_out(proposal: MemoryProposal) -> MemoryProposalOut:
     return MemoryProposalOut(
         id=proposal.id,
@@ -798,7 +817,7 @@ def _memory_proposal_out(proposal: MemoryProposal) -> MemoryProposalOut:
         resolved_at=proposal.resolved_at,
         resolved_by_user_id=proposal.resolved_by_user_id,
         approved_memory_id=proposal.approved_memory_id,
-        proposal=decode_proposal_payload(proposal.proposal_json),
+        proposal=_client_proposal_payload(proposal),
     )
 
 
