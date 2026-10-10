@@ -242,6 +242,26 @@ async def _eval_store(size: int, budget: int, probe_count: int, rng: random.Rand
         "legacy_mean_tokens": round(sum(legacy_tokens) / max(1, len(legacy_tokens)), 1),
     })
 
+    # --- off-topic probes: nothing but directives/profile may ride along ---
+    off_topic_queries = [
+        "write a python function to sort a list",
+        "what's the weather going to be like on Saturday",
+        "open the dashboard",
+        "tell me a joke about cats",
+        "convert 12 miles to kilometers",
+    ]
+    off_topic_non_directive: list[int] = []
+    async with session_factory() as db:
+        for query in off_topic_queries:
+            results = await svc.retrieve_for_context(db, user_id, query=query, token_budget=budget)
+            off_topic_non_directive.append(sum(1 for m in results if m.kind != "directive"))
+    records.append({
+        "store_size": seeded["total"], "metric": "off_topic",
+        "queries": len(off_topic_queries),
+        "mean_non_directive_injected": round(sum(off_topic_non_directive) / len(off_topic_queries), 2),
+        "max_non_directive_injected": max(off_topic_non_directive),
+    })
+
     # --- dedup probes: re-assert existing facts ---
     dedup_targets = probe_items[: min(10, len(probe_items))]
     new_rows = 0
@@ -327,6 +347,11 @@ async def main() -> None:
                 f"injected={record['mean_injected']:.0f} tokens={record['mean_tokens']:.0f} "
                 f"(legacy: injected={record['legacy_mean_injected']:.0f} tokens={record['legacy_mean_tokens']:.0f}) "
                 f"budget_violations={record['budget_violations']}"
+            )
+        elif record["metric"] == "off_topic":
+            print(
+                f"store={record['store_size']:5d} off_topic: mean_injected={record['mean_non_directive_injected']} "
+                f"max={record['max_non_directive_injected']}"
             )
         elif record["metric"] == "dedup":
             print(f"store={record['store_size']:5d} dedup: reasserted={record['reasserted']} new_rows={record['new_rows_created']}")

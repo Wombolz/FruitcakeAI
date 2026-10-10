@@ -124,6 +124,17 @@ class Settings(BaseSettings):
     memory_context_token_budget: int = 1200
     memory_directive_cap: int = 15
     memory_dedup_similarity_threshold: float = 0.92
+    # Relevance gating: the budget is a cap, relevance decides what qualifies.
+    # bge-small cosine is compressed (unrelated ~0.45-0.55, related >=0.6).
+    memory_min_vector_similarity: float = 0.60
+    memory_min_lexical_relevance: float = 0.30
+    memory_sensitive_min_vector_similarity: float = 0.72
+    memory_sensitive_min_lexical_relevance: float = 0.60
+    # a single distinctive query term (a name, a place) is enough to qualify
+    # when its IDF is at least this fraction of the pool's most specific term
+    memory_rare_term_ratio: float = 0.6
+    memory_max_relevant: int = 6        # facts/journal injected by relevance
+    memory_profile_cap: int = 6         # always-visible "profile" facts
     # Local-model tool-calling investigation toggles
     local_tool_investigation_enabled: bool = False
     local_tool_investigation_drop_browser_tools: bool = False

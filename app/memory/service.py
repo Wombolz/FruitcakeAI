@@ -6,8 +6,12 @@ grow without bound; what enters the prompt each turn is small, ranked, and
 budgeted (memory_context_token_budget):
 
 - directive: standing rules, always injected, small by construction (capped)
-- fact:      durable subject-keyed facts, ranked by relevance x importance
-- journal:   time-bound events, additionally decayed by age
+- profile:   facts tagged "profile" (household basics), always injected, capped
+- fact:      durable subject-keyed facts, injected only when relevant to the
+             query (relevance gate), ranked by relevance x importance
+- journal:   time-bound events, relevance-gated and decayed by age
+- sensitive: conflict/legal/medical-type memories are never injected
+             unprompted; only a strong match to the query admits them
 
 Only heads are retrievable (is_active, not superseded). Writes flow through
 one enforced pipeline (propose_write): exclusions, near-dup, supersede, caps.
@@ -96,7 +100,67 @@ _WORD_RE = re.compile(r"[a-z0-9]+")
 # vocabulary mismatch rather than a true irrelevance (SQLite deployments have
 # no embeddings). The floor keeps high-importance facts able to compete for
 # leftover budget while real matches rank far above them.
-FACT_RELEVANCE_FLOOR = 0.15
+PROFILE_TAG = "profile"
+SENSITIVE_TAGS = frozenset(
+    {"sensitive", "legal", "custody", "incident", "co-parent", "co-parenting"}
+)
+SENSITIVE_CONTENT_RE = re.compile(
+    r"\b(harass\w*|defam\w*|stalk\w*|abus\w*|assault\w*|restraining order|"
+    r"lawsuit|sued|police|arrest\w*|custody|divorce|diagnos\w*|"
+    r"threat\w*|blocked (?:him|her|them)|accus\w*)\b",
+    re.IGNORECASE,
+)
+
+# Words that carry no retrieval signal; kept out of lexical relevance so
+# "what is my name" does not match everything containing "is" and "my".
+_STOPWORDS = frozenset(
+    "a an and are as at be but by can did do does for from had has have how i "
+    "if in into is it its me my of on or our so than that the their them then "
+    "there these they this to us was we were what when where which who why "
+    "will with would you your about tell show give please".split()
+)
+
+
+GLOBAL_DIRECTIVE_TAGS = frozenset({"always", "global"})
+_TRIGGER_RE = re.compile(
+    r"^\s*(?:when(?:ever)?|if|while|during|before|after|for|on|in)\b\s+(?P<clause>[^,;:\n]+)",
+    re.IGNORECASE,
+)
+
+
+def directive_trigger(memory: Memory) -> str | None:
+    """The situation a directive applies to, or None when it is global.
+
+    Directives phrased "When <situation>, <rule>" (also if/while/for/during...)
+    are scoped: they are injected only when the query matches the situation.
+    Unconditional rules ("Respond in English.") and any directive tagged
+    "always"/"global" stay always-on.
+    """
+    if (memory.kind or "") != "directive":
+        return None
+    tags = {str(t).strip().lower() for t in (memory.tags_list or [])}
+    if tags & GLOBAL_DIRECTIVE_TAGS:
+        return None
+    match = _TRIGGER_RE.match(memory.content or "")
+    if not match:
+        return None
+    clause = match.group("clause").strip()
+    return clause if len(_content_terms(clause)) >= 2 else None
+
+
+def is_sensitive_text(content: str) -> bool:
+    return bool(SENSITIVE_CONTENT_RE.search(content or ""))
+
+
+def is_sensitive_memory(memory: Memory) -> bool:
+    """Sensitive memories are only injected on a strong match to the query."""
+    tags = {str(t).strip().lower() for t in (memory.tags_list or [])}
+    return bool(tags & SENSITIVE_TAGS) or is_sensitive_text(memory.content)
+
+
+def is_profile_memory(memory: Memory) -> bool:
+    tags = {str(t).strip().lower() for t in (memory.tags_list or [])}
+    return PROFILE_TAG in tags and (memory.kind or "") == "fact" and not is_sensitive_memory(memory)
 
 
 def _stem(word: str) -> str:
@@ -117,6 +181,14 @@ def _tokenize(text: str) -> set[str]:
     }
 
 
+def _content_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in (_stem(w) for w in _WORD_RE.findall(str(text or "").lower()) if w not in _STOPWORDS)
+        if len(token) > 1
+    }
+
+
 def _build_idf(token_sets: list[set[str]]) -> dict[str, float]:
     """Inverse document frequency over the candidate pool. Rare terms (names,
     specific values) discriminate; terms shared across the store ("school",
@@ -133,16 +205,33 @@ def _build_idf(token_sets: list[set[str]]) -> dict[str, float]:
 
 
 def _weighted_relevance(query_tokens: set[str], content_tokens: set[str], idf: dict[str, float]) -> float:
-    if not query_tokens or not content_tokens:
+    """IDF-weighted share of the query's content terms found in the memory.
+
+    Query terms absent from the whole pool still count (at rare-term weight),
+    so a single shared word in a long query is a weak match, not a full one.
+    """
+    if not query_tokens or not content_tokens or not idf:
         return 0.0
-    matchable = [t for t in query_tokens if t in idf]
-    if not matchable:
-        return 0.0
-    denom = sum(idf[t] for t in matchable)
+    unknown_weight = max(idf.values())
+    denom = sum(idf.get(t, unknown_weight) for t in query_tokens)
     if denom <= 0:
         return 0.0
-    hit = sum(idf[t] for t in query_tokens & content_tokens)
+    hit = sum(idf.get(t, 0.0) for t in query_tokens & content_tokens)
     return hit / denom
+
+
+def _rare_term_hit(
+    query_tokens: set[str], content_tokens: set[str], idf: dict[str, float]
+) -> float:
+    """Best shared term's specificity as a fraction of the most specific term
+    in the pool (0.0 when nothing is shared). A name or place in the query
+    that appears in few memories anchors them even when the rest of the
+    question is phrased differently ("allergy" vs "allergic to nuts")."""
+    if not idf:
+        return 0.0
+    top = max(idf.values())
+    shared = [idf[t] for t in query_tokens & content_tokens if t in idf]
+    return (max(shared) / top) if shared and top > 0 else 0.0
 
 
 def _journal_decay(created_at: datetime | None, now: datetime) -> float:
@@ -232,22 +321,18 @@ class MemoryService:
             (Memory.expires_at == None) | (Memory.expires_at > now),
         )
 
-        directives_result = await db.execute(
+        pool_rows = await db.execute(
             select(Memory)
-            .where(and_(head_conditions, Memory.kind == "directive"))
-            .order_by(Memory.importance.desc(), Memory.created_at.desc())
+            .where(head_conditions)
+            .order_by(Memory.created_at.desc())
+            .limit(CANDIDATE_POOL_LIMIT + 50)
         )
-        directives = list(directives_result.scalars().all())
-        results: list[Memory] = list(directives)
-        seen_ids = {m.id for m in directives}
-
-        directive_tokens = sum(_estimate_tokens(m.content) for m in directives)
-        remaining_budget = max(DIRECTIVE_BUDGET_FLOOR, budget - directive_tokens)
-
-        # --- candidate pool: facts + journal heads ---
-        scored: dict[int, tuple[float, Memory]] = {}
+        heads = list(pool_rows.scalars().all())
+        by_id = {m.id: m for m in heads}
         query_text = str(query or "").strip()
 
+        # --- vector similarity for the nearest heads (pgvector only) ---
+        vector_sim: dict[int, float] = {}
         if query_text and _USE_PGVECTOR:
             embedding = await _embed(query_text)
             if embedding is not None:
@@ -255,53 +340,98 @@ class MemoryService:
                     distance = Memory.embedding.cosine_distance(embedding).label("distance")
                     vector_rows = await db.execute(
                         select(Memory, distance)
-                        .where(
-                            and_(
-                                head_conditions,
-                                Memory.kind.in_(["fact", "journal"]),
-                                Memory.embedding.isnot(None),
-                            )
-                        )
+                        .where(and_(head_conditions, Memory.embedding.isnot(None)))
                         .order_by(distance)
                         .limit(VECTOR_CANDIDATE_LIMIT)
                     )
                     for memory, dist in vector_rows.all():
-                        relevance = max(0.0, 1.0 - float(dist if dist is not None else 1.0))
-                        scored[memory.id] = (_memory_score(memory, relevance, now), memory)
+                        by_id.setdefault(memory.id, memory)
+                        vector_sim[memory.id] = max(0.0, 1.0 - float(dist if dist is not None else 1.0))
                 except Exception:
                     log.warning("memory.vector_candidates_failed", exc_info=True)
 
-        pool = await db.execute(
-            select(Memory)
-            .where(and_(head_conditions, Memory.kind.in_(["fact", "journal"])))
-            .order_by(Memory.created_at.desc())
-            .limit(CANDIDATE_POOL_LIMIT)
-        )
-        pool_memories = [m for m in pool.scalars().all() if m.id not in scored]
-        content_tokens = {m.id: _tokenize(m.content) for m in pool_memories}
-        idf = _build_idf(list(content_tokens.values()))
-        query_tokens = _tokenize(query_text) if query_text else set()
-        for memory in pool_memories:
-            relevance = (
-                _weighted_relevance(query_tokens, content_tokens[memory.id], idf)
-                if query_text
-                else NO_QUERY_NEUTRAL_RELEVANCE
-            )
-            if (memory.kind or "") == "fact":
-                relevance = max(relevance, FACT_RELEVANCE_FLOOR)
-            score = _memory_score(memory, relevance, now)
-            if score > 0.0:
-                scored[memory.id] = (score, memory)
+        # --- lexical relevance (IDF-weighted, stopwords removed) ---
+        lexical: dict[int, float] = {}
+        rare_hit: dict[int, float] = {}
+        if query_text:
+            # scoped directives match on their trigger clause only, so the
+            # instruction half ("...use web_context") cannot create matches
+            content_tokens = {
+                mid: _content_terms(directive_trigger(m) or m.content) for mid, m in by_id.items()
+            }
+            idf = _build_idf(list(content_tokens.values()))
+            query_tokens = _content_terms(query_text)
+            for mid, tokens in content_tokens.items():
+                lexical[mid] = _weighted_relevance(query_tokens, tokens, idf)
+                rare_hit[mid] = _rare_term_hit(query_tokens, tokens, idf)
 
-        # --- greedy budget fill in rank order ---
-        used_tokens = 0
-        for score, memory in sorted(scored.values(), key=lambda pair: pair[0], reverse=True):
-            if memory.id in seen_ids:
+        min_vec = settings.memory_min_vector_similarity
+        min_lex = settings.memory_min_lexical_relevance
+        min_vec_sens = settings.memory_sensitive_min_vector_similarity
+        min_lex_sens = settings.memory_sensitive_min_lexical_relevance
+
+        # --- tier 1: global directives (always) + profile ---
+        results: list[Memory] = []
+        seen_ids: set[int] = set()
+        directives = sorted(
+            (m for m in by_id.values() if m.kind == "directive"),
+            key=lambda m: (m.importance or 0.0, m.created_at or now),
+            reverse=True,
+        )
+        for memory in directives:
+            if is_sensitive_memory(memory) or directive_trigger(memory):
+                continue  # scoped/sensitive: qualifies below on a query match
+            results.append(memory)
+            seen_ids.add(memory.id)
+        directive_tokens = sum(_estimate_tokens(m.content) for m in results)
+
+        profile = sorted(
+            (m for m in by_id.values() if is_profile_memory(m)),
+            key=lambda m: (m.importance or 0.0, m.created_at or now),
+            reverse=True,
+        )[: settings.memory_profile_cap]
+        for memory in profile:
+            results.append(memory)
+            seen_ids.add(memory.id)
+        always_tokens = directive_tokens + sum(_estimate_tokens(m.content) for m in profile)
+        remaining_budget = max(DIRECTIVE_BUDGET_FLOOR, budget - always_tokens)
+
+        # --- tier 2: relevance-gated facts / journal / sensitive items ---
+        scored: list[tuple[float, Memory]] = []
+        for mid, memory in by_id.items():
+            if mid in seen_ids:
                 continue
+            vec = vector_sim.get(mid, 0.0)
+            lex = lexical.get(mid, 0.0)
+            sensitive = is_sensitive_memory(memory)
+            # a scoped sensitive directive is a behavior rule already keyed to
+            # a specific trigger; matching its trigger is the "request"
+            strict = sensitive and memory.kind != "directive"
+            vec_gate = min_vec_sens if strict else min_vec
+            lex_gate = min_lex_sens if strict else min_lex
+            rare = rare_hit.get(mid, 0.0)
+            rare_ok = (not sensitive) and rare >= settings.memory_rare_term_ratio
+            if not (vec >= vec_gate or lex >= lex_gate or rare_ok):
+                continue
+            relevance = max(
+                lex,
+                (vec - 0.5) * 2.0 if vec >= vec_gate else 0.0,
+                rare * 0.5 if rare_ok else 0.0,
+            )
+            score = _memory_score(memory, max(relevance, 0.01), now)
+            if score > 0.0:
+                scored.append((score, memory))
+
+        used_tokens = 0
+        relevant_count = 0
+        for score, memory in sorted(scored, key=lambda pair: pair[0], reverse=True):
+            if relevant_count >= settings.memory_max_relevant:
+                break
             cost = _estimate_tokens(memory.content)
             if used_tokens + cost > remaining_budget:
                 continue
             used_tokens += cost
+            relevant_count += 1
             seen_ids.add(memory.id)
             results.append(memory)
 

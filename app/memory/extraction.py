@@ -47,7 +47,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.models import ChatMessage, ChatSession, Memory, MemoryProposal
 from app.memory.review_service import encode_proposal_payload
-from app.memory.service import VALID_KINDS, _normalize_subject_key, get_memory_service
+from app.memory.service import (
+    VALID_KINDS,
+    _normalize_subject_key,
+    get_memory_service,
+    is_sensitive_text as _is_sensitive_text,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -91,6 +96,8 @@ state, implementation details, or secrets/credentials.
 harassment, accusation, legal, medical or financial trouble, or anything \
 about a named person outside the household that they would not expect to be \
 stored silently. Otherwise false.
+- Phrase situational directives as "When <situation>, <rule>" so they only \
+apply when relevant; write unconditional rules plainly ("Respond in English.").
 - Prefer returning nothing over returning something doubtful. Return \
 {"memories": []} when nothing qualifies.
 """
@@ -180,20 +187,6 @@ _EPHEMERAL_CONTENT_RE = re.compile(
     r"score(?:d|s)?\b|dashboard (?:shows|is open)|devices found)\b",
     re.IGNORECASE,
 )
-
-
-# Backstop for the model's own "sensitive" flag: incident/conflict language
-# never auto-approves, whatever the model said.
-_SENSITIVE_CONTENT_RE = re.compile(
-    r"\b(harass\w*|defam\w*|stalk\w*|abus\w*|assault\w*|restraining order|"
-    r"lawsuit|sued|police|arrest\w*|custody|divorce|diagnos\w*|"
-    r"threat\w*|blocked (?:him|her|them)|accus\w*)\b",
-    re.IGNORECASE,
-)
-
-
-def _is_sensitive_text(content: str) -> bool:
-    return bool(_SENSITIVE_CONTENT_RE.search(content or ""))
 
 
 def _extraction_model() -> str:
@@ -439,6 +432,8 @@ def _merge_lane_candidates(lane_results: list[tuple[str, list[dict[str, Any]]]])
 
 def _candidate_tags(candidate: dict[str, Any]) -> list[str]:
     tags = ["nightly_extraction"]
+    if candidate.get("sensitive"):
+        tags.append("sensitive")  # keeps it out of unprompted context injection
     for lane in sorted(str(lane).strip() for lane in (candidate.get("lanes") or set()) if str(lane).strip()):
         tags.append(f"lane:{lane}")
     return tags
