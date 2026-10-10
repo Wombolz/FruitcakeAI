@@ -245,6 +245,21 @@ async def start_scheduler() -> None:
         id="task_dispatcher",
         replace_existing=True,
     )
+    if settings.memory_idle_extraction_enabled:
+        from app.memory.idle_extraction import run_idle_memory_extraction
+
+        _scheduler.add_job(
+            run_idle_memory_extraction,
+            "interval",
+            minutes=max(1, int(settings.memory_idle_check_minutes)),
+            id="memory_idle_extraction",
+            replace_existing=True,
+        )
+    else:
+        try:
+            _scheduler.remove_job("memory_idle_extraction")
+        except Exception:
+            pass
     _scheduler.start()
     recovered = await recover_stale_running_tasks()
     if recovered:
