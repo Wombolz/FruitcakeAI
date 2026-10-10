@@ -549,3 +549,40 @@ async def test_review_api_payload_has_keys_the_native_client_requires(client):
     assert payload["source_names"] == []
     assert payload["memory_type"] == "semantic"
     assert payload["content"] == "Joey is allergic to tree nuts."
+
+async def test_sensitive_candidates_never_auto_approve():
+    user_id = await _seed_user_with_chat("extractsensitive")
+    flagged = dict(CANDIDATES[0], content="Joey is allergic to tree nuts and Sam upset him about it.",
+                   attribute="incident", sensitive=True)
+    regex_only = {"kind": "journal", "content": "Neighbor Pat accused the family of harassment on Sept 30.",
+                  "evidence": "Joey is allergic to tree nuts", "importance": 0.8, "confidence": 0.95}
+    clean = dict(CANDIDATES[0], sensitive=False)
+    payload = json.dumps({"memories": [flagged, regex_only, clean]})
+    with patch("app.memory.extraction.litellm.acompletion", new=_fake_raw(payload, '{"memories": []}')):
+        async with TestSessionLocal() as db:
+            stats = await run_memory_extraction_for_user(db, user_id)
+            await db.commit()
+    assert stats["auto_approved"] == 1
+    assert stats["queued"] == 2
+    async with TestSessionLocal() as db:
+        rows = (await db.execute(select(MemoryProposal).where(MemoryProposal.user_id == user_id))).scalars().all()
+    pending = [r for r in rows if r.status == "pending"]
+    assert len(pending) == 2
+    assert all("sensitive" in (r.reason or "").lower() for r in pending)
+
+
+@pytest.mark.asyncio
+async def test_journal_candidates_always_queue_for_review():
+    user_id = await _seed_user_with_chat("extractjournal")
+    journal = {"kind": "journal", "content": "In-laws are visiting the family on July 12th.",
+               "evidence": "Joey is allergic to tree nuts", "importance": 0.7, "confidence": 0.99}
+    with patch("app.memory.extraction.litellm.acompletion", new=_fake_raw(json.dumps({"memories": [journal]}), '{"memories": []}')):
+        async with TestSessionLocal() as db:
+            stats = await run_memory_extraction_for_user(db, user_id)
+            await db.commit()
+    assert stats["auto_approved"] == 0
+    assert stats["queued"] == 1
+    async with TestSessionLocal() as db:
+        proposal = (await db.execute(select(MemoryProposal).where(MemoryProposal.user_id == user_id))).scalars().one()
+    assert proposal.status == "pending"
+    assert "journal" in (proposal.reason or "").lower()
