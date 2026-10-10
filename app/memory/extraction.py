@@ -4,6 +4,17 @@ Reviews the last day of non-incognito chat activity per user, asks a model
 to extract durable memory candidates, and routes every candidate into the
 existing MemoryProposal review queue (source_type="nightly_extraction").
 
+Extraction is deliberately conservative about *what* it reads and *what* it
+accepts:
+- the transcript is user-led: user turns in full, assistant turns clipped to
+  a short context snippet (assistant output is mostly tool/news payload)
+- sessions are extracted separately, packed into bounded chunks
+- the model sees the user's already-known memories so it only returns new or
+  changed facts
+- every candidate must quote the user ("evidence") and that quote must be
+  found in the user's own words; ungrounded and ephemeral (weather/news/
+  prices) candidates are dropped and counted
+
 Auto-approval is deliberately narrow — the trust surface is the point:
 - auto-approved: confidence >= threshold, kind in {fact, journal}, and no
   existing head for the same subject_key (nothing is silently superseded)
@@ -13,6 +24,11 @@ Auto-approval is deliberately narrow — the trust surface is the point:
 Approved candidates are written through the one enforced pipeline
 (MemoryService.propose_write), so extraction gets the same dedup, conflict,
 exclusion, and cap discipline as every other writer.
+
+Failures must be loud: an empty or unparseable model response is counted
+separately from "nothing worth saving" and the system job fails when every
+model call was unusable (a thinking model once exhausted its token budget on
+reasoning and silently returned nothing for months).
 """
 
 from __future__ import annotations
@@ -36,73 +52,178 @@ log = structlog.get_logger(__name__)
 
 EXTRACTION_SOURCE_TYPE = "nightly_extraction"
 EXTRACTION_PROPOSAL_TYPE = "flat_memory_create"
+_STAT_KEYS = (
+    "candidates", "queued", "auto_approved", "skipped_duplicates",
+    "llm_calls", "empty_responses", "parse_failures", "ungrounded", "filtered",
+)
 AUTO_APPROVE_CONFIDENCE = 0.75
 MAX_CANDIDATES_PER_USER = 12
 MAX_TRANSCRIPT_CHARS = 24_000
+MAX_CHUNK_CHARS = 8_000
+MAX_CHUNKS_PER_USER = 6
+USER_TURN_CHAR_CAP = 1_500
+ASSISTANT_TURN_CHAR_CAP = 240
+KNOWN_MEMORY_TOKEN_BUDGET = 500
+# Room for reasoning plus the answer; a thinking model that ignores think=False
+# must still be able to finish. One retry doubles it on an empty response.
+EXTRACTION_MAX_TOKENS = 2_500
+EVIDENCE_MIN_TOKEN_OVERLAP = 0.7
 
-_EXTRACTION_PROMPTS: dict[str, str] = {
-    "household": """You review one day of a household assistant's chat \
-transcripts and extract durable memories worth keeping about the user and \
-their household.
-
-Return ONLY a JSON array (no prose). Each item:
+_SHARED_RULES = """Return ONLY a JSON object: {"memories": [ ... ]}. Each item:
 {"kind": "fact|journal|directive", "content": "<self-contained statement>", \
 "subject": "<who/what, for facts>", "attribute": "<which property, for facts>", \
+"evidence": "<short verbatim quote from a USER line that supports this>", \
 "importance": 0.0-1.0, "confidence": 0.0-1.0}
+
+Rules:
+- Only the user's own statements count. Lines starting "assistant:" are context \
+only; never extract something just because the assistant said it.
+- "evidence" must be words the user actually wrote. If you cannot quote the \
+user, do not return the item.
+- Skip anything already listed under ALREADY KNOWN. If a known fact has \
+clearly changed, return the new value with the same subject and attribute.
+- Never extract: weather, news, headlines, prices, sports scores, search or \
+research results, one-off requests ("open the dashboard"), tool/dashboard \
+state, implementation details, or secrets/credentials.
+- Prefer returning nothing over returning something doubtful. Return \
+{"memories": []} when nothing qualifies.
+"""
+
+_EXTRACTION_PROMPTS: dict[str, str] = {
+    "household": """You review chat transcripts of a household assistant and \
+extract durable memories worth keeping about the user and their household.
 
 Extract only:
 - durable household facts (people, preferences, allergies, schools, routines)
 - standing behavioral instructions the user clearly stated (kind=directive)
-- meaningful near-term events (kind=journal)
+- meaningful near-term personal events (kind=journal)
 
-Never extract: project/work state, one-off chatter, anything the assistant said
-without user confirmation, implementation details, or secrets/credentials.
-Return [] when nothing qualifies.
-
-Transcript:
+""" + _SHARED_RULES + """
+Example transcript:
+user: Joey is allergic to tree nuts, so none of that in the meal plan.
+assistant: Got it, here is a nut-free plan...
+user: what's the weather Saturday?
+assistant: Heavy rain and gusts up to 30 mph expected...
+Example output:
+{"memories": [{"kind": "fact", "content": "Joey is allergic to tree nuts.", \
+"subject": "Joey", "attribute": "allergy", "evidence": "Joey is allergic to \
+tree nuts", "importance": 0.9, "confidence": 0.95}]}
+(The weather answer is ignored: it is news about the world, not the user.)
 """,
-    "project": """You review one day of a technical assistant's chat \
-transcripts and extract durable project or workflow memories worth keeping.
-
-Return ONLY a JSON array (no prose). Each item:
-{"kind": "fact|journal|directive", "content": "<self-contained statement>", \
-"subject": "<who/what, for facts>", "attribute": "<which property, for facts>", \
-"importance": 0.0-1.0, "confidence": 0.0-1.0}
+    "project": """You review chat transcripts of a technical assistant and \
+extract durable project or workflow memories worth keeping.
 
 Extract only:
 - durable project facts or environment constraints the user clearly confirmed
 - stable workflow preferences, operating rules, or standing instructions \
-  (kind=directive)
-- meaningful project events that are likely to matter in the near term \
-  (kind=journal)
+(kind=directive)
+- meaningful project events likely to matter in the near term (kind=journal)
 
-Never extract: ordinary question/answer chatter, speculative assistant advice, \
-one-off execution details, secrets/credentials, or web/news content unless the \
-user clearly confirmed it as part of their enduring workflow or project state.
 Use self-contained wording like "The Fruitcake repo root is ..." or \
 "Use Docs/_internal for local planning notes."
-Return [] when nothing qualifies.
 
-Transcript:
+""" + _SHARED_RULES + """
+Example transcript:
+user: From now on put planning notes in Docs/_internal and keep them out of git.
+assistant: Understood.
+user: run the tests
+Example output:
+{"memories": [{"kind": "directive", "content": "Put planning notes in \
+Docs/_internal and keep them out of git.", "evidence": "put planning notes in \
+Docs/_internal and keep them out of git", "importance": 0.8, "confidence": \
+0.9}]}
+(\"run the tests\" is a one-off request, not a memory.)
 """,
 }
+
+_EXTRACTION_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "memory_candidates",
+        "strict": False,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["fact", "journal", "directive"]},
+                            "content": {"type": "string"},
+                            "subject": {"type": "string"},
+                            "attribute": {"type": "string"},
+                            "evidence": {"type": "string"},
+                            "importance": {"type": "number"},
+                            "confidence": {"type": "number"},
+                        },
+                        "required": ["kind", "content", "evidence"],
+                    },
+                }
+            },
+            "required": ["memories"],
+        },
+    },
+}
+
+# Content that is world-news/ephemeral state even when the user mentioned it.
+_EPHEMERAL_CONTENT_RE = re.compile(
+    r"\b(forecast|weather|hurricane|tornado|headline|breaking news|"
+    r"share price|stock price|trading at|market (?:is|closed|opened)|"
+    r"score(?:d|s)?\b|dashboard (?:shows|is open)|devices found)\b",
+    re.IGNORECASE,
+)
 
 
 def _extraction_model() -> str:
     return settings.document_summary_model or settings.task_small_model or settings.llm_model
 
 
-def _parse_candidates(raw: str) -> list[dict[str, Any]]:
-    text = str(raw or "").strip()
-    match = re.search(r"\[.*\]", text, flags=re.DOTALL)
-    if not match:
-        return []
+def _completion_kwargs(model: str) -> dict[str, Any]:
+    """Extra litellm kwargs. Local thinking models must not spend the budget
+    on reasoning; response_format is dropped by litellm where unsupported."""
+    kwargs: dict[str, Any] = {"response_format": _EXTRACTION_RESPONSE_FORMAT, "drop_params": True}
+    if str(model).startswith("ollama"):
+        kwargs["think"] = False
+    return kwargs
+
+
+def _coerce_score(value: Any, default: float = 0.5) -> float:
     try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return []
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, number))
+
+
+def _try_parse(raw: str) -> list[dict[str, Any]] | None:
+    """Parse a model response. None means unparseable (distinct from [])."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    parsed: Any = None
+    # Prefer whichever bracket opens first, so a bare array of objects is not
+    # mistaken for a single object.
+    first_obj, first_arr = text.find("{"), text.find("[")
+    patterns = [r"\{.*\}", r"\[.*\]"]
+    if first_arr != -1 and (first_obj == -1 or first_arr < first_obj):
+        patterns.reverse()
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if not match:
+            continue
+        try:
+            candidate = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            candidate = candidate.get("memories")
+        if isinstance(candidate, list):
+            parsed = candidate
+            break
     if not isinstance(parsed, list):
-        return []
+        return None
     out: list[dict[str, Any]] = []
     for item in parsed:
         if not isinstance(item, dict):
@@ -117,27 +238,126 @@ def _parse_candidates(raw: str) -> list[dict[str, Any]]:
                 "content": content,
                 "subject": str(item.get("subject") or "").strip() or None,
                 "attribute": str(item.get("attribute") or "").strip() or None,
-                "importance": max(0.0, min(1.0, float(item.get("importance") or 0.5))),
-                "confidence": max(0.0, min(1.0, float(item.get("confidence") or 0.5))),
+                "evidence": str(item.get("evidence") or "").strip(),
+                "importance": _coerce_score(item.get("importance")),
+                "confidence": _coerce_score(item.get("confidence")),
             }
         )
     return out[:MAX_CANDIDATES_PER_USER]
 
 
-async def _extract_candidates_for_lane(transcript: str, lane: str) -> list[dict[str, Any]]:
-    prompt = _EXTRACTION_PROMPTS.get(lane)
-    if not prompt:
-        return []
+def _parse_candidates(raw: str) -> list[dict[str, Any]]:
+    return _try_parse(raw) or []
+
+
+def _norm_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", str(text or "").lower())
+
+
+def _user_text(chunk: str) -> str:
+    return "\n".join(line[len("user:"):].strip() for line in chunk.splitlines() if line.startswith("user:"))
+
+
+def _is_grounded(evidence: str, user_text: str) -> bool:
+    words = _norm_words(evidence)
+    if len(words) < 2:
+        return False
+    haystack = " ".join(_norm_words(user_text))
+    if " ".join(words) in haystack:
+        return True
+    user_words = set(_norm_words(user_text))
+    overlap = sum(1 for w in words if w in user_words) / len(words)
+    return overlap >= EVIDENCE_MIN_TOKEN_OVERLAP
+
+
+class _CallStats:
+    def __init__(self) -> None:
+        self.llm_calls = 0
+        self.empty_responses = 0
+        self.parse_failures = 0
+        self.ungrounded = 0
+        self.filtered = 0
+
+
+async def _known_memories_block(db: AsyncSession | None, user_id: int | None, chunk: str) -> str:
+    if db is None or user_id is None:
+        return "(none)"
+    try:
+        memories = await get_memory_service().retrieve_for_context(
+            db, user_id, _user_text(chunk)[:600] or None, token_budget=KNOWN_MEMORY_TOKEN_BUDGET
+        )
+    except Exception:
+        log.warning("memory.extraction_known_lookup_failed", user_id=user_id, exc_info=True)
+        return "(none)"
+    lines = [f"- {m.content}" for m in memories]
+    return "\n".join(lines) if lines else "(none)"
+
+
+async def _call_model(prompt: str, stats: _CallStats) -> list[dict[str, Any]]:
     model = _extraction_model()
     from app.agent.local_model_lifecycle import track_local_model_use
 
     track_local_model_use(model)
-    response = await litellm.acompletion(
-        model=model,
-        messages=[{"role": "user", "content": prompt + transcript}],
-        max_tokens=1200,
-    )
-    return _parse_candidates(response.choices[0].message.content or "")
+    max_tokens = EXTRACTION_MAX_TOKENS
+    for attempt in (1, 2):
+        stats.llm_calls += 1
+        response = await litellm.acompletion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            **_completion_kwargs(model),
+        )
+        raw = response.choices[0].message.content or ""
+        if raw.strip():
+            parsed = _try_parse(raw)
+            if parsed is None:
+                stats.parse_failures += 1
+                log.warning("memory.extraction_unparseable", model=model, preview=raw[:200])
+                return []
+            return parsed
+        stats.empty_responses += 1
+        log.warning("memory.extraction_empty_response", model=model, attempt=attempt, max_tokens=max_tokens)
+        max_tokens *= 2
+    return []
+
+
+async def _extract_candidates_for_lane(
+    transcript: str,
+    lane: str,
+    *,
+    stats: _CallStats | None = None,
+    db: AsyncSession | None = None,
+    user_id: int | None = None,
+) -> list[dict[str, Any]]:
+    prompt = _EXTRACTION_PROMPTS.get(lane)
+    if not prompt:
+        return []
+    stats = stats or _CallStats()
+    known = await _known_memories_block(db, user_id, transcript)
+    full_prompt = f"{prompt}\nALREADY KNOWN:\n{known}\n\nTranscript:\n{transcript}"
+    candidates = await _call_model(full_prompt, stats)
+
+    user_text = _user_text(transcript)
+    kept: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not _is_grounded(candidate.get("evidence", ""), user_text):
+            stats.ungrounded += 1
+            continue
+        if _EPHEMERAL_CONTENT_RE.search(candidate["content"]):
+            stats.filtered += 1
+            continue
+        kept.append(candidate)
+    return kept
+
+
+def _near_duplicate(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Cheap paraphrase check for candidates from the same run (the write
+    pipeline's embedding dedup only sees what is already stored)."""
+    wa = {w for w in _norm_words(a.get("content", "")) if len(w) > 2}
+    wb = {w for w in _norm_words(b.get("content", "")) if len(w) > 2}
+    if min(len(wa), len(wb)) < 6:
+        return False
+    return len(wa & wb) / min(len(wa), len(wb)) >= 0.75
 
 
 def _merge_lane_candidates(lane_results: list[tuple[str, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
@@ -170,7 +390,19 @@ def _merge_lane_candidates(lane_results: list[tuple[str, list[dict[str, Any]]]])
             if candidate_confidence > existing_confidence:
                 existing["kind"] = candidate.get("kind") or existing.get("kind")
 
-    ordered = [merged[key] for key in order]
+    ordered: list[dict[str, Any]] = []
+    for key in order:
+        candidate = merged[key]
+        twin = next((kept for kept in ordered if _near_duplicate(kept, candidate)), None)
+        if twin is None:
+            ordered.append(candidate)
+            continue
+        # paraphrase of something already kept: fold into the stronger one
+        twin["lanes"] |= candidate["lanes"]
+        twin["importance"] = max(twin["importance"], candidate["importance"])
+        if candidate["confidence"] > twin["confidence"]:
+            twin.update({k: candidate[k] for k in ("kind", "content", "subject", "attribute", "evidence")})
+            twin["confidence"] = candidate["confidence"]
     ordered.sort(
         key=lambda item: (
             float(item.get("importance") or 0.0),
@@ -188,9 +420,19 @@ def _candidate_tags(candidate: dict[str, Any]) -> list[str]:
     return tags
 
 
-async def _recent_transcript(db: AsyncSession, user_id: int, since: datetime) -> str:
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+async def _recent_session_transcripts(db: AsyncSession, user_id: int, since: datetime) -> list[str]:
+    """One user-led transcript per session, oldest session first.
+
+    User turns are kept (capped); assistant turns are clipped to a short
+    context snippet. Sessions without any user turn are skipped.
+    """
     rows = await db.execute(
-        select(ChatMessage.role, ChatMessage.content)
+        select(ChatMessage.session_id, ChatMessage.role, ChatMessage.content)
         .join(ChatSession, ChatSession.id == ChatMessage.session_id)
         .where(
             and_(
@@ -201,10 +443,41 @@ async def _recent_transcript(db: AsyncSession, user_id: int, since: datetime) ->
                 ChatMessage.role.in_(["user", "assistant"]),
             )
         )
-        .order_by(ChatMessage.created_at.asc())
+        .order_by(ChatMessage.session_id.asc(), ChatMessage.created_at.asc(), ChatMessage.id.asc())
     )
-    lines = [f"{role}: {content}" for role, content in rows.all() if str(content or "").strip()]
-    transcript = "\n".join(lines)
+    by_session: dict[int, list[str]] = {}
+    has_user: set[int] = set()
+    for session_id, role, content in rows.all():
+        if not str(content or "").strip():
+            continue
+        if role == "user":
+            has_user.add(session_id)
+            by_session.setdefault(session_id, []).append(f"user: {_clip(content, USER_TURN_CHAR_CAP)}")
+        else:
+            by_session.setdefault(session_id, []).append(
+                f"assistant: {_clip(content, ASSISTANT_TURN_CHAR_CAP)}"
+            )
+    return ["\n".join(by_session[sid]) for sid in sorted(by_session) if sid in has_user]
+
+
+def _pack_chunks(session_transcripts: list[str]) -> list[str]:
+    """Pack whole sessions into chunks up to MAX_CHUNK_CHARS; an oversized
+    session keeps its most recent tail. Newest chunks win the chunk cap."""
+    chunks: list[str] = []
+    current = ""
+    for transcript in session_transcripts:
+        transcript = transcript[-MAX_CHUNK_CHARS:]
+        if current and len(current) + len(transcript) + 2 > MAX_CHUNK_CHARS:
+            chunks.append(current)
+            current = ""
+        current = f"{current}\n\n{transcript}" if current else transcript
+    if current:
+        chunks.append(current)
+    return chunks[-MAX_CHUNKS_PER_USER:]
+
+
+async def _recent_transcript(db: AsyncSession, user_id: int, since: datetime) -> str:
+    transcript = "\n\n".join(await _recent_session_transcripts(db, user_id, since))
     return transcript[-MAX_TRANSCRIPT_CHARS:]
 
 
@@ -246,18 +519,30 @@ async def run_memory_extraction_for_user(
 ) -> dict[str, int]:
     """Extract, queue, and (narrowly) auto-approve memory candidates for one
     user. Returns counters for observability. Caller commits."""
-    stats = {"candidates": 0, "queued": 0, "auto_approved": 0, "skipped_duplicates": 0}
+    stats = {key: 0 for key in _STAT_KEYS}
     since = datetime.now(timezone.utc) - timedelta(hours=since_hours)
-    transcript = await _recent_transcript(db, user_id, since)
-    if not transcript.strip():
+    chunks = _pack_chunks(await _recent_session_transcripts(db, user_id, since))
+    if not chunks:
         return stats
 
+    call_stats = _CallStats()
     lane_results: list[tuple[str, list[dict[str, Any]]]] = []
-    for lane in ("household", "project"):
-        lane_results.append((lane, await _extract_candidates_for_lane(transcript, lane)))
+    for chunk in chunks:
+        for lane in ("household", "project"):
+            lane_results.append(
+                (
+                    lane,
+                    await _extract_candidates_for_lane(
+                        chunk, lane, stats=call_stats, db=db, user_id=user_id
+                    ),
+                )
+            )
     candidates = _merge_lane_candidates(lane_results)
     stats["candidates"] = len(candidates)
+    for key in ("llm_calls", "empty_responses", "parse_failures", "ungrounded", "filtered"):
+        stats[key] = getattr(call_stats, key)
     if not candidates:
+        log.info("memory.extraction_completed", user_id=user_id, **stats)
         return stats
 
     svc = get_memory_service()
@@ -348,14 +633,33 @@ async def run_nightly_memory_extraction(db: AsyncSession, *, since_hours: int = 
         )
         .distinct()
     )
-    totals = {"users": 0, "candidates": 0, "queued": 0, "auto_approved": 0, "skipped_duplicates": 0}
+    totals = {key: 0 for key in _STAT_KEYS}
+    totals["users"] = 0
+    totals["failed_users"] = 0
     for (user_id,) in users.all():
         try:
             stats = await run_memory_extraction_for_user(db, int(user_id), since_hours=since_hours)
         except Exception:
+            totals["failed_users"] += 1
             log.warning("memory.extraction_failed", user_id=user_id, exc_info=True)
             continue
         totals["users"] += 1
-        for key in ("candidates", "queued", "auto_approved", "skipped_duplicates"):
+        for key in _STAT_KEYS:
             totals[key] += stats[key]
     return totals
+
+
+def extraction_totals_unusable(totals: dict[str, int]) -> str | None:
+    """Reason string when a run produced no usable model output at all, so the
+    caller can fail loudly instead of reporting a quiet "0 candidates"."""
+    if totals.get("failed_users") and not totals.get("users"):
+        return f"memory extraction failed for all {totals['failed_users']} user(s)"
+    calls = int(totals.get("llm_calls") or 0)
+    bad = int(totals.get("empty_responses") or 0) + int(totals.get("parse_failures") or 0)
+    if calls and bad >= calls:
+        return (
+            f"memory extraction model returned no usable output "
+            f"({totals.get('empty_responses', 0)} empty, {totals.get('parse_failures', 0)} unparseable "
+            f"of {calls} calls); check the extraction model and token budget"
+        )
+    return None
