@@ -76,11 +76,13 @@ async def _seed_user_with_chat(username: str, *, incognito: bool = False) -> int
 
 CANDIDATES = [
     {"kind": "fact", "content": "Joey is allergic to tree nuts.", "subject": "Joey",
-     "attribute": "allergy", "importance": 0.9, "confidence": 0.9},
+     "attribute": "allergy", "evidence": "Joey is allergic to tree nuts",
+     "importance": 0.9, "confidence": 0.9},
     {"kind": "directive", "content": "Always avoid tree nuts in meal plans.",
-     "importance": 0.8, "confidence": 0.9},
+     "evidence": "Joey is allergic to tree nuts, remember that", "importance": 0.8, "confidence": 0.9},
     {"kind": "fact", "content": "Emma attends Lincoln Elementary now.", "subject": "Emma",
-     "attribute": "school", "importance": 0.7, "confidence": 0.4},
+     "attribute": "school", "evidence": "Joey is allergic to tree nuts",
+     "importance": 0.7, "confidence": 0.4},
 ]
 
 PROJECT_CANDIDATES = [
@@ -89,12 +91,14 @@ PROJECT_CANDIDATES = [
         "content": "The Fruitcake repo root is /Users/jwomble/Development/fruitcake_v5.",
         "subject": "Fruitcake repo",
         "attribute": "root",
+        "evidence": "Our Fruitcake repo lives at /Users/jwomble/Development/fruitcake_v5",
         "importance": 0.9,
         "confidence": 0.92,
     },
     {
         "kind": "directive",
         "content": "Use Docs/_internal for local planning notes and keep them out of git.",
+        "evidence": "Docs/_internal is for local planning only",
         "importance": 0.82,
         "confidence": 0.88,
     },
@@ -179,7 +183,7 @@ async def test_extraction_never_reads_incognito_sessions():
         async with TestSessionLocal() as db:
             stats = await run_memory_extraction_for_user(db, user_id)
 
-    assert stats == {"candidates": 0, "queued": 0, "auto_approved": 0, "skipped_duplicates": 0}
+    assert stats["candidates"] == 0 and stats["llm_calls"] == 0
     fake.assert_not_awaited()  # no transcript -> the model is never called
 
 
@@ -398,3 +402,122 @@ async def test_pending_extraction_supersede_approval_replaces_existing_head(clie
         assert old_head.superseded_by_id == new_head.id
         assert new_head.subject_key == "joey:allergy"
         assert new_head.source == "extraction"
+
+
+def _fake_raw(*raws):
+    def _resp(raw):
+        class _Msg:
+            content = raw
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    return AsyncMock(side_effect=[_resp(r) for r in raws])
+
+
+@pytest.mark.asyncio
+async def test_empty_model_response_is_counted_and_retried():
+    user_id = await _seed_user_with_chat("extractempty2")
+    # household: empty, retry succeeds; project: empty, empty
+    ok = json.dumps({"memories": [CANDIDATES[0]]})
+    fake = _fake_raw("", ok, "", "")
+    with patch("app.memory.extraction.litellm.acompletion", new=fake):
+        async with TestSessionLocal() as db:
+            stats = await run_memory_extraction_for_user(db, user_id)
+            await db.commit()
+    assert stats["llm_calls"] == 4
+    assert stats["empty_responses"] == 3
+    assert stats["candidates"] == 1
+    # the retry doubled the token budget
+    budgets = [c.kwargs["max_tokens"] for c in fake.await_args_list]
+    assert budgets[1] == budgets[0] * 2
+
+
+@pytest.mark.asyncio
+async def test_all_empty_run_is_flagged_unusable():
+    from app.memory.extraction import extraction_totals_unusable
+
+    await _seed_user_with_chat("extractallempty")
+    with patch("app.memory.extraction.litellm.acompletion", new=_fake_raw("", "", "", "")):
+        async with TestSessionLocal() as db:
+            totals = await run_nightly_memory_extraction(db)
+    assert totals["candidates"] == 0
+    assert totals["empty_responses"] == totals["llm_calls"] > 0
+    assert "no usable output" in (extraction_totals_unusable(totals) or "")
+    assert extraction_totals_unusable({"users": 1, "llm_calls": 2, "empty_responses": 0, "parse_failures": 0}) is None
+
+
+@pytest.mark.asyncio
+async def test_ungrounded_and_ephemeral_candidates_are_dropped():
+    user_id = await _seed_user_with_chat("extractgrounding")
+    junk = [
+        # quote does not appear in anything the user said
+        {"kind": "fact", "content": "User holds 264 shares of KO.", "subject": "user",
+         "attribute": "holdings", "evidence": "I own 264 shares of Coca-Cola",
+         "importance": 0.5, "confidence": 0.95},
+        # grounded but ephemeral
+        {"kind": "journal", "content": "A hurricane forecast threatens the area this weekend.",
+         "evidence": "Joey is allergic to tree nuts", "importance": 0.9, "confidence": 0.9},
+        CANDIDATES[0],
+    ]
+    with patch("app.memory.extraction.litellm.acompletion", new=_fake_raw(json.dumps({"memories": junk}), "{\"memories\": []}")):
+        async with TestSessionLocal() as db:
+            stats = await run_memory_extraction_for_user(db, user_id)
+            await db.commit()
+    assert stats["candidates"] == 1
+    assert stats["ungrounded"] == 1
+    assert stats["filtered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_is_user_led_and_includes_known_memories_and_think_off():
+    async with TestSessionLocal() as db:
+        user = User(username="extractprompt", email="extractprompt@example.com", hashed_password="x", role="parent")
+        db.add(user)
+        await db.flush()
+        session = ChatSession(user_id=user.id, title="t", is_incognito=False)
+        db.add(session)
+        await db.flush()
+        db.add_all([
+            ChatMessage(session_id=session.id, role="user", content="Emma starts piano lessons on Tuesdays."),
+            ChatMessage(session_id=session.id, role="assistant", content="BULKYTOOLPAYLOAD " * 100),
+        ])
+        db.add(Memory(
+            user_id=user.id, memory_type="semantic", kind="fact", subject_key="joey:allergy",
+            content="Joey is allergic to tree nuts.", importance=0.9, tags="[]", source="manual",
+        ))
+        await db.commit()
+        user_id = user.id
+
+    fake = _fake_raw('{"memories": []}', '{"memories": []}')
+    with patch("app.memory.extraction.settings") as cfg, patch("app.memory.extraction.litellm.acompletion", new=fake):
+        cfg.document_summary_model = "ollama_chat/qwen3.6:35b"
+        async with TestSessionLocal() as db:
+            await run_memory_extraction_for_user(db, user_id)
+
+    call = fake.await_args_list[0]
+    prompt = call.kwargs["messages"][0]["content"]
+    assert "ALREADY KNOWN" in prompt and "Joey is allergic to tree nuts." in prompt
+    assert "Emma starts piano lessons on Tuesdays." in prompt
+    assert prompt.count("BULKYTOOLPAYLOAD") < 40  # assistant turn was clipped
+    assert call.kwargs["think"] is False
+    assert call.kwargs["response_format"]["type"] == "json_schema"
+
+
+def test_merge_folds_paraphrased_candidates_but_not_distinct_facts():
+    from app.memory.extraction import _merge_lane_candidates
+
+    base = {"kind": "fact", "subject": None, "attribute": None, "evidence": "x y", "importance": 0.5}
+    a = dict(base, content="The children Arui and Evie attend Garden Class at the Georgia Southern Botanic Gardens.", confidence=0.8)
+    b = dict(base, content="Children Arui, Evie, Dean and Sam attend the Garden Class at the Georgia Southern Botanic Gardens.", confidence=0.9)
+    c = dict(base, content="Joey is allergic to tree nuts.", confidence=0.9)
+    d = dict(base, content="Joey is allergic to peanuts.", confidence=0.9)
+    merged = _merge_lane_candidates([("household", [a, c]), ("project", [b, d])])
+    contents = [m["content"] for m in merged]
+    assert len(merged) == 3  # a/b folded; short distinct facts untouched
+    assert any("Dean" in c for c in contents)  # stronger paraphrase kept

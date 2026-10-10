@@ -138,16 +138,22 @@ class SystemJobExecutionProfile(TaskExecutionProfile):
         since_hours = _clamp_since_hours(config.get("since_hours"))
         now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         if job_name == "nightly_memory_extraction":
-            from app.memory.extraction import run_nightly_memory_extraction
+            from app.memory.extraction import extraction_totals_unusable, run_nightly_memory_extraction
 
             totals = await run_nightly_memory_extraction(db, since_hours=since_hours)
+            unusable = extraction_totals_unusable(totals)
+            if unusable:
+                raise RuntimeError(unusable)
             result = (
                 f"Nightly memory extraction completed at {now}.\n"
                 f"- Users scanned: {int(totals.get('users') or 0)}\n"
                 f"- Candidates: {int(totals.get('candidates') or 0)}\n"
                 f"- Queued for review: {int(totals.get('queued') or 0)}\n"
                 f"- Auto-approved: {int(totals.get('auto_approved') or 0)}\n"
-                f"- Skipped duplicates: {int(totals.get('skipped_duplicates') or 0)}"
+                f"- Skipped duplicates: {int(totals.get('skipped_duplicates') or 0)}\n"
+                f"- Dropped (ungrounded/ephemeral): {int(totals.get('ungrounded') or 0)}/{int(totals.get('filtered') or 0)}\n"
+                f"- Model calls: {int(totals.get('llm_calls') or 0)} "
+                f"(empty {int(totals.get('empty_responses') or 0)}, unparseable {int(totals.get('parse_failures') or 0)})"
             )
             run_debug = {
                 "profile": self.name,
