@@ -97,7 +97,7 @@ async def test_chat_rest_injects_memory_context_before_agent_execution(client):
     with patch("app.api.chat.run_agent", new=AsyncMock(side_effect=_fake_run_agent)):
         resp = await client.post(
             f"/chat/sessions/{session_id}/messages",
-            json={"content": "How should you respond to me?"},
+            json={"content": "Do I like bullet summaries?"},
             headers=headers,
         )
 
@@ -132,7 +132,7 @@ async def test_chat_rest_does_not_mark_memory_access_when_turn_fails(client):
     with patch("app.api.chat.run_agent", new=AsyncMock(side_effect=RuntimeError("boom"))):
         resp = await client.post(
             f"/chat/sessions/{session_id}/messages",
-            json={"content": "How should you respond to me if this turn fails?"},
+            json={"content": "Do I like bullet summaries if this turn fails?"},
             headers=headers,
         )
 
@@ -182,7 +182,7 @@ async def test_chat_websocket_marks_recalled_memory_accessed_on_success(client):
                 db=db,
                 current_user=user,
                 session=session,
-                user_message="How should you respond to me?",
+                user_message="Do I like bullet summaries?",
                 client_send_id="ws-memory-1",
                 allowed_tools=None,
                 blocked_tools=None,
@@ -207,7 +207,7 @@ async def test_successful_task_marks_recalled_memories_accessed(client):
         "/tasks",
         json={
             "title": "Memory-aware task",
-            "instruction": "Use what you know about the user and reply briefly",
+            "instruction": "Use my preferred summary style and reply briefly",
             "task_type": "one_shot",
             "deliver": False,
         },
