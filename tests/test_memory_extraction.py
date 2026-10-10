@@ -521,3 +521,25 @@ def test_merge_folds_paraphrased_candidates_but_not_distinct_facts():
     contents = [m["content"] for m in merged]
     assert len(merged) == 3  # a/b folded; short distinct facts untouched
     assert any("Dean" in c for c in contents)  # stronger paraphrase kept
+
+
+@pytest.mark.asyncio
+async def test_sensitive_candidates_never_auto_approve():
+    user_id = await _seed_user_with_chat("extractsensitive")
+    flagged = dict(CANDIDATES[0], content="Joey is allergic to tree nuts and Sam upset him about it.",
+                   attribute="incident", sensitive=True)
+    regex_only = {"kind": "journal", "content": "Neighbor Pat accused the family of harassment on Sept 30.",
+                  "evidence": "Joey is allergic to tree nuts", "importance": 0.8, "confidence": 0.95}
+    clean = dict(CANDIDATES[0], sensitive=False)
+    payload = json.dumps({"memories": [flagged, regex_only, clean]})
+    with patch("app.memory.extraction.litellm.acompletion", new=_fake_raw(payload, '{"memories": []}')):
+        async with TestSessionLocal() as db:
+            stats = await run_memory_extraction_for_user(db, user_id)
+            await db.commit()
+    assert stats["auto_approved"] == 1
+    assert stats["queued"] == 2
+    async with TestSessionLocal() as db:
+        rows = (await db.execute(select(MemoryProposal).where(MemoryProposal.user_id == user_id))).scalars().all()
+    pending = [r for r in rows if r.status == "pending"]
+    assert len(pending) == 2
+    assert all("sensitive" in (r.reason or "").lower() for r in pending)
