@@ -16,10 +16,11 @@ accepts:
   prices) candidates are dropped and counted
 
 Auto-approval is deliberately narrow — the trust surface is the point:
-- auto-approved: confidence >= threshold, kind in {fact, journal}, and no
+- auto-approved: confidence >= threshold, kind == fact, not sensitive, and no
   existing head for the same subject_key (nothing is silently superseded)
-- everything else stays pending for operator review: directives, low
-  confidence, and any candidate that would replace an existing memory
+- everything else stays pending for operator review: directives, journal
+  entries (the noisiest kind), sensitive content, low confidence, and any
+  candidate that would replace an existing memory
 
 Approved candidates are written through the one enforced pipeline
 (MemoryService.propose_write), so extraction gets the same dedup, conflict,
@@ -73,6 +74,7 @@ _SHARED_RULES = """Return ONLY a JSON object: {"memories": [ ... ]}. Each item:
 {"kind": "fact|journal|directive", "content": "<self-contained statement>", \
 "subject": "<who/what, for facts>", "attribute": "<which property, for facts>", \
 "evidence": "<short verbatim quote from a USER line that supports this>", \
+"sensitive": true|false, \
 "importance": 0.0-1.0, "confidence": 0.0-1.0}
 
 Rules:
@@ -85,6 +87,10 @@ clearly changed, return the new value with the same subject and attribute.
 - Never extract: weather, news, headlines, prices, sports scores, search or \
 research results, one-off requests ("open the dashboard"), tool/dashboard \
 state, implementation details, or secrets/credentials.
+- Set "sensitive": true when the item describes a conflict, dispute, \
+harassment, accusation, legal, medical or financial trouble, or anything \
+about a named person outside the household that they would not expect to be \
+stored silently. Otherwise false.
 - Prefer returning nothing over returning something doubtful. Return \
 {"memories": []} when nothing qualifies.
 """
@@ -154,6 +160,7 @@ _EXTRACTION_RESPONSE_FORMAT: dict[str, Any] = {
                             "subject": {"type": "string"},
                             "attribute": {"type": "string"},
                             "evidence": {"type": "string"},
+                            "sensitive": {"type": "boolean"},
                             "importance": {"type": "number"},
                             "confidence": {"type": "number"},
                         },
@@ -173,6 +180,20 @@ _EPHEMERAL_CONTENT_RE = re.compile(
     r"score(?:d|s)?\b|dashboard (?:shows|is open)|devices found)\b",
     re.IGNORECASE,
 )
+
+
+# Backstop for the model's own "sensitive" flag: incident/conflict language
+# never auto-approves, whatever the model said.
+_SENSITIVE_CONTENT_RE = re.compile(
+    r"\b(harass\w*|defam\w*|stalk\w*|abus\w*|assault\w*|restraining order|"
+    r"lawsuit|sued|police|arrest\w*|custody|divorce|diagnos\w*|"
+    r"threat\w*|blocked (?:him|her|them)|accus\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_sensitive_text(content: str) -> bool:
+    return bool(_SENSITIVE_CONTENT_RE.search(content or ""))
 
 
 def _extraction_model() -> str:
@@ -239,6 +260,7 @@ def _try_parse(raw: str) -> list[dict[str, Any]] | None:
                 "subject": str(item.get("subject") or "").strip() or None,
                 "attribute": str(item.get("attribute") or "").strip() or None,
                 "evidence": str(item.get("evidence") or "").strip(),
+                "sensitive": bool(item.get("sensitive")) or _is_sensitive_text(content),
                 "importance": _coerce_score(item.get("importance")),
                 "confidence": _coerce_score(item.get("confidence")),
             }
@@ -382,6 +404,7 @@ def _merge_lane_candidates(lane_results: list[tuple[str, list[dict[str, Any]]]])
                 existing["attribute"] = candidate["attribute"]
             existing_confidence = float(existing.get("confidence") or 0.0)
             candidate_confidence = float(candidate.get("confidence") or 0.0)
+            existing["sensitive"] = bool(existing.get("sensitive") or candidate.get("sensitive"))
             existing["importance"] = max(
                 float(existing.get("importance") or 0.0),
                 float(candidate.get("importance") or 0.0),
@@ -399,6 +422,7 @@ def _merge_lane_candidates(lane_results: list[tuple[str, list[dict[str, Any]]]])
             continue
         # paraphrase of something already kept: fold into the stronger one
         twin["lanes"] |= candidate["lanes"]
+        twin["sensitive"] = bool(twin.get("sensitive") or candidate.get("sensitive"))
         twin["importance"] = max(twin["importance"], candidate["importance"])
         if candidate["confidence"] > twin["confidence"]:
             twin.update({k: candidate[k] for k in ("kind", "content", "subject", "attribute", "evidence")})
@@ -557,8 +581,9 @@ async def run_memory_extraction_for_user(
         would_supersede = await _has_conflicting_head(db, user_id, subject_key)
         auto_approvable = (
             candidate["confidence"] >= AUTO_APPROVE_CONFIDENCE
-            and candidate["kind"] in {"fact", "journal"}
+            and candidate["kind"] == "fact"
             and not would_supersede
+            and not candidate.get("sensitive")
         )
         tags = _candidate_tags(candidate)
 
@@ -572,7 +597,10 @@ async def run_memory_extraction_for_user(
             confidence=candidate["confidence"],
             reason=(
                 "Would replace an existing memory" if would_supersede
-                else ("Standing directive — operator review required" if candidate["kind"] == "directive" else "")
+                else "Sensitive content — operator review required" if candidate.get("sensitive")
+                else "Standing directive — operator review required" if candidate["kind"] == "directive"
+                else "Journal entry — operator review required" if candidate["kind"] == "journal"
+                else ""
             ) or None,
             proposal_json=encode_proposal_payload(
                 {
@@ -584,6 +612,7 @@ async def run_memory_extraction_for_user(
                     "importance": candidate["importance"],
                     "tags": tags,
                     "lanes": sorted(candidate.get("lanes") or []),
+                    "sensitive": bool(candidate.get("sensitive")),
                 }
             ),
         )
