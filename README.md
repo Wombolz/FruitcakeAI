@@ -40,7 +40,7 @@ FruitcakeAI is not a chat UI wrapper. It's an agent platform with a full working
 - The **chat layer** can now create, inspect, and update real persistent tasks instead of only acting as a one-shot Q&A surface
 - The **visual chat path** can upload and serve workspace images, inspect them with an optional local vision model, and retain generated-image artifacts in conversation history
 - The **structured chat path** turns grounded tables, charts, news, metrics, timelines, files, places, and code into durable native content instead of flattening everything into prose
-- The **artifact layer** validates versioned rich results and hosts sandboxed MCP Apps while preserving safe text fallbacks for clients without interactive UI support
+- The **artifact layer** validates versioned rich results and hosts sandboxed MCP Apps with native approval for consequential actions while preserving safe text fallbacks for clients without interactive UI support
 - The **memory system** persists what matters across sessions, with 3-tier retrieval and semantic search
 - The **RAG pipeline** ingests your documents and makes them queryable with hybrid BM25 + vector retrieval
 - The **MCP layer** lets you drop in any tool server via a config file — no code changes required

@@ -57,15 +57,17 @@ mcp_servers:
       writes_disk: true
 
   fieldkit:
-    type: http
-    url: http://localhost:47834
+    type: streamable_http
+    url: http://127.0.0.1:47834/mcp
+    headers_from_env:
+      Authorization: FIELDKIT_MCP_AUTHORIZATION
     enabled: true
-    timeout: 30
+    timeout: 60
     classification: first_class_mcp
     shipping_default: false
     trust_boundary:
       first_party: true
-      uses_network: false
+      uses_network: true       # fieldkit_run_discovery sends traffic on the local network
       shell_execution: false
       writes_disk: false
 
