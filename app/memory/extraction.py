@@ -16,10 +16,11 @@ accepts:
   prices) candidates are dropped and counted
 
 Auto-approval is deliberately narrow — the trust surface is the point:
-- auto-approved: confidence >= threshold, kind in {fact, journal}, and no
+- auto-approved: confidence >= threshold, kind == fact, not sensitive, and no
   existing head for the same subject_key (nothing is silently superseded)
-- everything else stays pending for operator review: directives, low
-  confidence, and any candidate that would replace an existing memory
+- everything else stays pending for operator review: directives, journal
+  entries (the noisiest kind), sensitive content, low confidence, and any
+  candidate that would replace an existing memory
 
 Approved candidates are written through the one enforced pipeline
 (MemoryService.propose_write), so extraction gets the same dedup, conflict,
@@ -580,7 +581,7 @@ async def run_memory_extraction_for_user(
         would_supersede = await _has_conflicting_head(db, user_id, subject_key)
         auto_approvable = (
             candidate["confidence"] >= AUTO_APPROVE_CONFIDENCE
-            and candidate["kind"] in {"fact", "journal"}
+            and candidate["kind"] == "fact"
             and not would_supersede
             and not candidate.get("sensitive")
         )
@@ -597,7 +598,9 @@ async def run_memory_extraction_for_user(
             reason=(
                 "Would replace an existing memory" if would_supersede
                 else "Sensitive content — operator review required" if candidate.get("sensitive")
-                else ("Standing directive — operator review required" if candidate["kind"] == "directive" else "")
+                else "Standing directive — operator review required" if candidate["kind"] == "directive"
+                else "Journal entry — operator review required" if candidate["kind"] == "journal"
+                else ""
             ) or None,
             proposal_json=encode_proposal_payload(
                 {
