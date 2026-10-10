@@ -126,6 +126,20 @@ def _tool_is_model_visible(tool: Dict[str, Any]) -> bool:
     return isinstance(visibility, list) and "model" in visibility
 
 
+class MCPAppApprovalRequired(PermissionError):
+    """A linked app-only mutation needs an explicit host approval decision."""
+
+    def __init__(self, tool_name: str, definition: Dict[str, Any]):
+        super().__init__("MCP App tool requires explicit approval")
+        self.tool_name = tool_name
+        self.title = str(definition.get("title") or tool_name.replace("_", " ").title())[:200]
+        self.description = str(definition.get("description") or "This app action changes external state.")[:600]
+        annotations = definition.get("annotations")
+        self.destructive = bool(
+            isinstance(annotations, dict) and annotations.get("destructiveHint") is True
+        )
+
+
 def _bounded_json_value(value: Any, max_bytes: int) -> Any:
     """Return JSON-safe data when it fits; otherwise return a compact marker."""
     try:
@@ -538,8 +552,9 @@ class MCPRegistry:
         tool_name: str,
         arguments: Dict[str, Any],
         user_context: Any = None,
+        approved: bool = False,
     ) -> Dict[str, Any]:
-        """Call one same-server app-only tool after enforcing read-only policy."""
+        """Call one linked app-only tool after enforcing host policy."""
         if not resource_uri.startswith("ui://"):
             raise ValueError("MCP App resources must use the ui:// scheme")
         if resource_uri not in self._ui_resources.get(server_name, set()):
@@ -551,13 +566,13 @@ class MCPRegistry:
         ui = _tool_ui_metadata(definition) or {}
         if ui.get("resourceUri") != resource_uri:
             raise PermissionError("MCP App tool is not linked to this UI resource")
-        annotations = definition.get("annotations")
-        if not isinstance(annotations, dict) or annotations.get("readOnlyHint") is not True:
-            raise PermissionError("MCP App tool is not declared read-only")
         config = self._server_configs.get(server_name, {})
         trust_boundary = config.get("trust_boundary")
         if not isinstance(trust_boundary, dict) or trust_boundary.get("first_party") is not True:
             raise PermissionError("MCP App tool requires approval for a non-first-party server")
+
+        annotations = definition.get("annotations")
+        is_read_only = isinstance(annotations, dict) and annotations.get("readOnlyHint") is True
 
         encoded_arguments = json.dumps(
             arguments,
@@ -574,6 +589,9 @@ class MCPRegistry:
             raise ValueError("MCP App tool has an invalid input schema") from exc
         except ValidationError as exc:
             raise ValueError(f"MCP App tool arguments are invalid: {exc.message}") from exc
+
+        if not is_read_only and not approved:
+            raise MCPAppApprovalRequired(tool_name, definition)
 
         client = self._clients.get(server_name)
         if client is None:

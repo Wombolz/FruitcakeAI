@@ -25,6 +25,7 @@ import pytest
 import yaml
 
 from app.mcp.registry import (
+    MCPAppApprovalRequired,
     MCPRegistry,
     _extract_text,
     _find_invalid_schema_field,
@@ -207,7 +208,7 @@ async def test_registry_calls_linked_read_only_app_tool():
 
 
 @pytest.mark.asyncio
-async def test_registry_rejects_mutating_app_tool():
+async def test_registry_requires_approval_for_mutating_app_tool():
     registry = MCPRegistry()
     registry._set_server_tools("weather", "streamable_http", [{
         "name": "delete_station",
@@ -220,14 +221,57 @@ async def test_registry_rejects_mutating_app_tool():
             },
         },
     }])
+    registry._server_configs["weather"] = {"trust_boundary": {"first_party": True}}
 
-    with pytest.raises(PermissionError, match="not declared read-only"):
+    with pytest.raises(MCPAppApprovalRequired, match="requires explicit approval"):
         await registry.call_mcp_app_tool(
             server_name="weather",
             resource_uri="ui://weather/dashboard.html",
             tool_name="delete_station",
             arguments={},
         )
+
+
+@pytest.mark.asyncio
+async def test_registry_executes_exact_mutating_app_tool_after_host_approval():
+    registry = MCPRegistry()
+    registry._set_server_tools("fieldkit", "streamable_http", [{
+        "name": "fieldkit_app_run_discovery",
+        "title": "Run Discovery",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"save": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+        "_meta": {
+            "ui": {
+                "resourceUri": "ui://fieldkit/dashboard.html",
+                "visibility": ["app"],
+            },
+        },
+    }])
+    registry._server_configs["fieldkit"] = {"trust_boundary": {"first_party": True}}
+    client = MagicMock()
+    client.call_tool = AsyncMock(return_value={
+        "success": True,
+        "result": {"structuredContent": {"started": True}},
+    })
+    registry._clients["fieldkit"] = client
+
+    response = await registry.call_mcp_app_tool(
+        server_name="fieldkit",
+        resource_uri="ui://fieldkit/dashboard.html",
+        tool_name="fieldkit_app_run_discovery",
+        arguments={"save": False},
+        approved=True,
+    )
+
+    assert response["result"]["structuredContent"]["started"] is True
+    client.call_tool.assert_awaited_once_with(
+        "fieldkit_app_run_discovery",
+        {"save": False},
+    )
 
 
 @pytest.mark.asyncio

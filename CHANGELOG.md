@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.42
+
+- Added host-owned approval for app-originated MCP mutations with durable exact-intent replay, denial handling, and audit state.
+- Preserved same-server linkage, first-party trust, schema validation, and one-shot execution across approved MCP App actions.
+- Added the authenticated FieldKit streamable HTTP configuration as the reference interactive discovery extension.
+- Updated the MCP Extension contract for approval-aware app mutations and portable host safety boundaries.
+
 ## v0.7.41
 
 - Added a versioned, bounded artifact registry with compatibility adapters for existing rich-chat content and safe fallback behavior for unsupported types.
