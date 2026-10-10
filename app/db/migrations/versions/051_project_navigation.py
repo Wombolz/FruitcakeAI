@@ -1,7 +1,7 @@
 """add user projects and chat organization
 
-Revision ID: 050_project_navigation
-Revises: 049_model_context_budgets
+Revision ID: 051_project_navigation
+Revises: 050_session_memory_extracted
 Create Date: 2026-10-10
 """
 
@@ -11,8 +11,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision = "050_project_navigation"
-down_revision = "049_model_context_budgets"
+revision = "051_project_navigation"
+down_revision = "050_session_memory_extracted"
 branch_labels = None
 depends_on = None
 
