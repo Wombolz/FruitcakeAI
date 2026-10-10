@@ -121,6 +121,33 @@ _STOPWORDS = frozenset(
 )
 
 
+GLOBAL_DIRECTIVE_TAGS = frozenset({"always", "global"})
+_TRIGGER_RE = re.compile(
+    r"^\s*(?:when(?:ever)?|if|while|during|before|after|for|on|in)\b\s+(?P<clause>[^,;:\n]+)",
+    re.IGNORECASE,
+)
+
+
+def directive_trigger(memory: Memory) -> str | None:
+    """The situation a directive applies to, or None when it is global.
+
+    Directives phrased "When <situation>, <rule>" (also if/while/for/during...)
+    are scoped: they are injected only when the query matches the situation.
+    Unconditional rules ("Respond in English.") and any directive tagged
+    "always"/"global" stay always-on.
+    """
+    if (memory.kind or "") != "directive":
+        return None
+    tags = {str(t).strip().lower() for t in (memory.tags_list or [])}
+    if tags & GLOBAL_DIRECTIVE_TAGS:
+        return None
+    match = _TRIGGER_RE.match(memory.content or "")
+    if not match:
+        return None
+    clause = match.group("clause").strip()
+    return clause if len(_content_terms(clause)) >= 2 else None
+
+
 def is_sensitive_text(content: str) -> bool:
     return bool(SENSITIVE_CONTENT_RE.search(content or ""))
 
@@ -327,7 +354,11 @@ class MemoryService:
         lexical: dict[int, float] = {}
         rare_hit: dict[int, float] = {}
         if query_text:
-            content_tokens = {mid: _content_terms(m.content) for mid, m in by_id.items()}
+            # scoped directives match on their trigger clause only, so the
+            # instruction half ("...use web_context") cannot create matches
+            content_tokens = {
+                mid: _content_terms(directive_trigger(m) or m.content) for mid, m in by_id.items()
+            }
             idf = _build_idf(list(content_tokens.values()))
             query_tokens = _content_terms(query_text)
             for mid, tokens in content_tokens.items():
@@ -339,7 +370,7 @@ class MemoryService:
         min_vec_sens = settings.memory_sensitive_min_vector_similarity
         min_lex_sens = settings.memory_sensitive_min_lexical_relevance
 
-        # --- tier 1: directives (always, unless sensitive) + profile ---
+        # --- tier 1: global directives (always) + profile ---
         results: list[Memory] = []
         seen_ids: set[int] = set()
         directives = sorted(
@@ -348,8 +379,8 @@ class MemoryService:
             reverse=True,
         )
         for memory in directives:
-            if is_sensitive_memory(memory):
-                continue  # may still qualify below on a strong query match
+            if is_sensitive_memory(memory) or directive_trigger(memory):
+                continue  # scoped/sensitive: qualifies below on a query match
             results.append(memory)
             seen_ids.add(memory.id)
         directive_tokens = sum(_estimate_tokens(m.content) for m in results)
@@ -373,8 +404,11 @@ class MemoryService:
             vec = vector_sim.get(mid, 0.0)
             lex = lexical.get(mid, 0.0)
             sensitive = is_sensitive_memory(memory)
-            vec_gate = min_vec_sens if sensitive else min_vec
-            lex_gate = min_lex_sens if sensitive else min_lex
+            # a scoped sensitive directive is a behavior rule already keyed to
+            # a specific trigger; matching its trigger is the "request"
+            strict = sensitive and memory.kind != "directive"
+            vec_gate = min_vec_sens if strict else min_vec
+            lex_gate = min_lex_sens if strict else min_lex
             rare = rare_hit.get(mid, 0.0)
             rare_ok = (not sensitive) and rare >= settings.memory_rare_term_ratio
             if not (vec >= vec_gate or lex >= lex_gate or rare_ok):

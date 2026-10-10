@@ -107,3 +107,53 @@ async def test_sensitivity_detection_uses_tags_and_content():
     assert is_sensitive_memory(Memory(content="Plain fact.", tags=json.dumps(["legal"]), kind="fact"))
     assert is_sensitive_memory(Memory(content="They filed for custody.", tags="[]", kind="fact"))
     assert not is_sensitive_memory(Memory(content="Emma likes piano.", tags="[]", kind="fact"))
+
+
+@pytest.mark.asyncio
+async def test_scoped_directives_apply_only_when_their_situation_matches():
+    from app.memory.service import directive_trigger
+
+    rows = [
+        {"key": "global", "kind": "directive", "content": "Respond in English."},
+        {"key": "haiku", "kind": "directive",
+         "content": "When creating a haiku based on news, gather recent articles first."},
+        {"key": "spacex", "kind": "directive",
+         "content": "When researching SpaceX launches visible from home, filter for Florida launches."},
+        {"key": "forced", "kind": "directive", "tags": ["always"],
+         "content": "When answering, keep it concise and friendly."},
+    ]
+    user_id = await _user("gate_directives")
+    ids = await _seed(user_id, rows)
+    inverse = {v: k for k, v in ids.items()}
+
+    async def got(query):
+        async with TestSessionLocal() as db:
+            return {inverse[m.id] for m in await MemoryService().retrieve_for_context(db, user_id, query=query)}
+
+    assert await got("write a python function to sort a list") == {"global", "forced"}
+    assert await got(None) == {"global", "forced"}
+    assert await got("write a haiku about the news") == {"global", "forced", "haiku"}
+    assert await got("which SpaceX launches can I see tonight") == {"global", "forced", "spacex"}
+
+    async with TestSessionLocal() as db:
+        by_key = {k: await db.get(Memory, i) for k, i in ids.items()}
+    assert directive_trigger(by_key["global"]) is None
+    assert directive_trigger(by_key["forced"]) is None
+    assert "haiku" in directive_trigger(by_key["haiku"])
+
+
+@pytest.mark.asyncio
+async def test_sensitive_scoped_directive_needs_a_strong_match():
+    rows = [
+        {"key": "draft", "kind": "directive", "tags": ["co-parent"],
+         "content": "When drafting co-parent messages to Pat, keep them brief and factual."},
+    ]
+    user_id = await _user("gate_sens_directive")
+    ids = await _seed(user_id, rows)
+
+    async def got(query):
+        async with TestSessionLocal() as db:
+            return {m.id for m in await MemoryService().retrieve_for_context(db, user_id, query=query)}
+
+    assert await got("draft a message to Pat") == {ids["draft"]}
+    assert await got("draft an email about the quarterly report") == set()

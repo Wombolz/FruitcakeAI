@@ -96,6 +96,8 @@ state, implementation details, or secrets/credentials.
 harassment, accusation, legal, medical or financial trouble, or anything \
 about a named person outside the household that they would not expect to be \
 stored silently. Otherwise false.
+- Phrase situational directives as "When <situation>, <rule>" so they only \
+apply when relevant; write unconditional rules plainly ("Respond in English.").
 - Prefer returning nothing over returning something doubtful. Return \
 {"memories": []} when nothing qualifies.
 """
