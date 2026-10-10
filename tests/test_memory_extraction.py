@@ -193,12 +193,17 @@ async def test_rerun_does_not_duplicate_proposals():
     with patch(
         "app.memory.extraction.litellm.acompletion",
         new=_fake_llm_sequence([CANDIDATES[1]], [], [CANDIDATES[1]], []),
-    ):
+    ) as fake:
         async with TestSessionLocal() as db:
             await run_memory_extraction_for_user(db, user_id)
             await db.commit()
+        # default rerun: the session marker means nothing is re-read
         async with TestSessionLocal() as db:
-            stats = await run_memory_extraction_for_user(db, user_id)
+            idle = await run_memory_extraction_for_user(db, user_id)
+        assert idle["llm_calls"] == 0 and fake.await_count == 2
+        # a forced re-read (manual backfill) still dedupes at the proposal level
+        async with TestSessionLocal() as db:
+            stats = await run_memory_extraction_for_user(db, user_id, respect_markers=False)
             await db.commit()
 
     assert stats["skipped_duplicates"] == 1
@@ -586,3 +591,99 @@ async def test_journal_candidates_always_queue_for_review():
         proposal = (await db.execute(select(MemoryProposal).where(MemoryProposal.user_id == user_id))).scalars().one()
     assert proposal.status == "pending"
     assert "journal" in (proposal.reason or "").lower()
+
+
+# ── idle-session extraction ───────────────────────────────────────────────
+
+
+async def _seed_session(username: str, texts: list[str], *, minutes_ago: int, marker=None, incognito=False):
+    now = datetime.now(timezone.utc)
+    async with TestSessionLocal() as db:
+        user = User(username=username, email=f"{username}@example.com", hashed_password="x", role="parent")
+        db.add(user)
+        await db.flush()
+        session = ChatSession(user_id=user.id, title="t", is_incognito=incognito, memory_extracted_at=marker)
+        db.add(session)
+        await db.flush()
+        for i, text in enumerate(texts):
+            db.add(ChatMessage(
+                session_id=session.id, role="user", content=text,
+                created_at=now - timedelta(minutes=minutes_ago, seconds=-i),
+            ))
+        await db.commit()
+        return user.id, session.id
+
+
+@pytest.mark.asyncio
+async def test_find_idle_sessions_respects_idle_window_marker_and_incognito():
+    from app.memory.idle_extraction import find_idle_sessions
+
+    _, quiet = await _seed_session("idlequiet", ["Joey is allergic to tree nuts, remember that."], minutes_ago=45)
+    await _seed_session("idlerecent", ["Joey is allergic to tree nuts, remember that."], minutes_ago=2)
+    await _seed_session("idleincog", ["Joey is allergic to tree nuts, remember that."], minutes_ago=45, incognito=True)
+    _, done = await _seed_session(
+        "idledone", ["Emma starts piano lessons on Tuesdays, remember that."],
+        minutes_ago=45, marker=datetime.now(timezone.utc),
+    )
+    async with TestSessionLocal() as db:
+        found = {sid for _, sid in await find_idle_sessions(db)}
+    assert quiet in found
+    assert done not in found
+    assert len(found) == 1  # recent + incognito excluded
+
+
+@pytest.mark.asyncio
+async def test_idle_extraction_runs_once_marks_session_and_skips_rerun():
+    from app.memory import idle_extraction
+
+    user_id, session_id = await _seed_session(
+        "idleonce", ["Joey is allergic to tree nuts, remember that."], minutes_ago=45
+    )
+    fake = _fake_raw(json.dumps({"memories": [CANDIDATES[0]]}), '{"memories": []}')
+    with patch("app.memory.extraction.litellm.acompletion", new=fake), \
+         patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+        first = await idle_extraction.run_idle_memory_extraction()
+        second = await idle_extraction.run_idle_memory_extraction()
+
+    assert first["sessions"] == 1 and first["auto_approved"] == 1
+    assert second.get("llm_calls", 0) == 0  # marker prevents a second pass
+    async with TestSessionLocal() as db:
+        session = await db.get(ChatSession, session_id)
+        assert session.memory_extracted_at is not None
+    assert fake.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_resumed_session_only_extracts_new_messages_and_nightly_respects_marker():
+    user_id, session_id = await _seed_session(
+        "idleresume", ["Our quokka is named Biscuit, remember that."], minutes_ago=90,
+        marker=datetime.now(timezone.utc) - timedelta(minutes=60),
+    )
+    async with TestSessionLocal() as db:
+        db.add(ChatMessage(session_id=session_id, role="user",
+                           content="Our pickleball group meets on Fridays, remember that.",
+                           created_at=datetime.now(timezone.utc) - timedelta(minutes=30)))
+        await db.commit()
+
+    fake = _fake_raw('{"memories": []}', '{"memories": []}')
+    with patch("app.memory.extraction.litellm.acompletion", new=fake):
+        async with TestSessionLocal() as db:
+            await run_nightly_memory_extraction(db)
+            await db.commit()
+    prompt = fake.await_args_list[0].kwargs["messages"][0]["content"]
+    assert "pickleball" in prompt
+    assert "quokka" not in prompt  # already extracted before the marker
+
+
+@pytest.mark.asyncio
+async def test_trivial_sessions_are_marked_without_calling_the_model():
+    from app.memory import idle_extraction
+
+    _, session_id = await _seed_session("idletrivial", ["open the dashboard"], minutes_ago=45)
+    fake = _fake_raw()
+    with patch("app.memory.extraction.litellm.acompletion", new=fake), \
+         patch("app.db.session.AsyncSessionLocal", new=TestSessionLocal):
+        await idle_extraction.run_idle_memory_extraction()
+    fake.assert_not_awaited()
+    async with TestSessionLocal() as db:
+        assert (await db.get(ChatSession, session_id)).memory_extracted_at is not None

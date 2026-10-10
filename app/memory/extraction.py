@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import json
 import re
+import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import litellm
 import structlog
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -61,12 +63,15 @@ EXTRACTION_PROPOSAL_TYPE = "flat_memory_create"
 _STAT_KEYS = (
     "candidates", "queued", "auto_approved", "skipped_duplicates",
     "llm_calls", "empty_responses", "parse_failures", "ungrounded", "filtered",
+    "sessions",
 )
 AUTO_APPROVE_CONFIDENCE = 0.75
 MAX_CANDIDATES_PER_USER = 12
 MAX_TRANSCRIPT_CHARS = 24_000
 MAX_CHUNK_CHARS = 8_000
 MAX_CHUNKS_PER_USER = 6
+MIN_USER_CHARS = 30  # skip slices like "open the dashboard"
+_run_lock: asyncio.Lock | None = None
 USER_TURN_CHAR_CAP = 1_500
 ASSISTANT_TURN_CHAR_CAP = 240
 KNOWN_MEMORY_TOKEN_BUDGET = 500
@@ -444,39 +449,93 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-async def _recent_session_transcripts(db: AsyncSession, user_id: int, since: datetime) -> list[str]:
-    """One user-led transcript per session, oldest session first.
+@dataclass
+class _SessionSlice:
+    session_id: int
+    transcript: str
+    user_chars: int
+    last_at: datetime | None
+
+
+async def _collect_session_slices(
+    db: AsyncSession,
+    user_id: int,
+    since: datetime,
+    *,
+    session_ids: list[int] | None = None,
+    respect_markers: bool = True,
+) -> list[_SessionSlice]:
+    """One user-led slice per session, oldest session first.
 
     User turns are kept (capped); assistant turns are clipped to a short
-    context snippet. Sessions without any user turn are skipped.
+    context snippet. Sessions without any user turn are skipped. With
+    respect_markers, only messages newer than the session's extraction
+    high-water mark are included, so nothing is extracted twice.
     """
-    rows = await db.execute(
-        select(ChatMessage.session_id, ChatMessage.role, ChatMessage.content)
-        .join(ChatSession, ChatSession.id == ChatMessage.session_id)
-        .where(
-            and_(
-                ChatSession.user_id == user_id,
-                ChatSession.is_incognito == False,  # never read incognito sessions
-                ChatSession.is_task_session == False,
-                ChatMessage.created_at >= since,
-                ChatMessage.role.in_(["user", "assistant"]),
+    conditions = [
+        ChatSession.user_id == user_id,
+        ChatSession.is_incognito == False,  # never read incognito sessions
+        ChatSession.is_task_session == False,
+        ChatMessage.created_at >= since,
+        ChatMessage.role.in_(["user", "assistant"]),
+    ]
+    if session_ids is not None:
+        conditions.append(ChatSession.id.in_(session_ids))
+    if respect_markers:
+        conditions.append(
+            or_(
+                ChatSession.memory_extracted_at.is_(None),
+                ChatMessage.created_at > ChatSession.memory_extracted_at,
             )
         )
+    rows = await db.execute(
+        select(ChatMessage.session_id, ChatMessage.role, ChatMessage.content, ChatMessage.created_at)
+        .join(ChatSession, ChatSession.id == ChatMessage.session_id)
+        .where(and_(*conditions))
         .order_by(ChatMessage.session_id.asc(), ChatMessage.created_at.asc(), ChatMessage.id.asc())
     )
-    by_session: dict[int, list[str]] = {}
-    has_user: set[int] = set()
-    for session_id, role, content in rows.all():
+    lines: dict[int, list[str]] = {}
+    user_chars: dict[int, int] = {}
+    last_at: dict[int, datetime] = {}
+    for session_id, role, content, created_at in rows.all():
         if not str(content or "").strip():
             continue
+        if created_at is not None:
+            last_at[session_id] = max(last_at.get(session_id, created_at), created_at)
         if role == "user":
-            has_user.add(session_id)
-            by_session.setdefault(session_id, []).append(f"user: {_clip(content, USER_TURN_CHAR_CAP)}")
+            user_chars[session_id] = user_chars.get(session_id, 0) + len(str(content).strip())
+            lines.setdefault(session_id, []).append(f"user: {_clip(content, USER_TURN_CHAR_CAP)}")
         else:
-            by_session.setdefault(session_id, []).append(
+            lines.setdefault(session_id, []).append(
                 f"assistant: {_clip(content, ASSISTANT_TURN_CHAR_CAP)}"
             )
-    return ["\n".join(by_session[sid]) for sid in sorted(by_session) if sid in has_user]
+    return [
+        _SessionSlice(sid, "\n".join(lines[sid]), user_chars[sid], last_at.get(sid))
+        for sid in sorted(lines)
+        if sid in user_chars
+    ]
+
+
+async def _recent_session_transcripts(db: AsyncSession, user_id: int, since: datetime) -> list[str]:
+    slices = await _collect_session_slices(db, user_id, since, respect_markers=False)
+    return [s.transcript for s in slices]
+
+
+async def _mark_sessions_extracted(db: AsyncSession, slices: list[_SessionSlice]) -> None:
+    for item in slices:
+        if item.last_at is None:
+            continue
+        await db.execute(
+            update(ChatSession)
+            .where(
+                ChatSession.id == item.session_id,
+                or_(
+                    ChatSession.memory_extracted_at.is_(None),
+                    ChatSession.memory_extracted_at < item.last_at,
+                ),
+            )
+            .values(memory_extracted_at=item.last_at)
+        )
 
 
 def _pack_chunks(session_transcripts: list[str]) -> list[str]:
@@ -535,14 +594,44 @@ async def run_memory_extraction_for_user(
     user_id: int,
     *,
     since_hours: int = 24,
+    session_ids: list[int] | None = None,
+    respect_markers: bool = True,
 ) -> dict[str, int]:
     """Extract, queue, and (narrowly) auto-approve memory candidates for one
-    user. Returns counters for observability. Caller commits."""
+    user. Returns counters for observability. Caller commits.
+
+    Serialized process-wide so idle-session and nightly runs never extract
+    (or write proposals for) the same content concurrently."""
+    global _run_lock
+    if _run_lock is None:
+        _run_lock = asyncio.Lock()
+    async with _run_lock:
+        return await _run_memory_extraction_for_user(
+            db, user_id, since_hours=since_hours, session_ids=session_ids, respect_markers=respect_markers
+        )
+
+
+async def _run_memory_extraction_for_user(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    since_hours: int,
+    session_ids: list[int] | None,
+    respect_markers: bool,
+) -> dict[str, int]:
     stats = {key: 0 for key in _STAT_KEYS}
     since = datetime.now(timezone.utc) - timedelta(hours=since_hours)
-    chunks = _pack_chunks(await _recent_session_transcripts(db, user_id, since))
-    if not chunks:
+    slices = await _collect_session_slices(
+        db, user_id, since, session_ids=session_ids, respect_markers=respect_markers
+    )
+    substantive = [s for s in slices if s.user_chars >= MIN_USER_CHARS]
+    trivial = [s for s in slices if s.user_chars < MIN_USER_CHARS]
+    if trivial:
+        await _mark_sessions_extracted(db, trivial)  # nothing to learn; don't rescan
+    if not substantive:
+        stats["sessions"] = len(slices)
         return stats
+    chunks = _pack_chunks([s.transcript for s in substantive])
 
     call_stats = _CallStats()
     lane_results: list[tuple[str, list[dict[str, Any]]]] = []
@@ -558,8 +647,14 @@ async def run_memory_extraction_for_user(
             )
     candidates = _merge_lane_candidates(lane_results)
     stats["candidates"] = len(candidates)
+    stats["sessions"] = len(slices)
     for key in ("llm_calls", "empty_responses", "parse_failures", "ungrounded", "filtered"):
         stats[key] = getattr(call_stats, key)
+    unusable = call_stats.llm_calls and (
+        call_stats.empty_responses + call_stats.parse_failures >= call_stats.llm_calls
+    )
+    if not unusable:
+        await _mark_sessions_extracted(db, substantive)
     if not candidates:
         log.info("memory.extraction_completed", user_id=user_id, **stats)
         return stats
@@ -642,7 +737,9 @@ async def run_memory_extraction_for_user(
     return stats
 
 
-async def run_nightly_memory_extraction(db: AsyncSession, *, since_hours: int = 24) -> dict[str, int]:
+async def run_nightly_memory_extraction(
+    db: AsyncSession, *, since_hours: int = 24, respect_markers: bool = True
+) -> dict[str, int]:
     """Run extraction for every user with recent, non-incognito chat activity."""
     since = datetime.now(timezone.utc) - timedelta(hours=since_hours)
     users = await db.execute(
@@ -662,7 +759,9 @@ async def run_nightly_memory_extraction(db: AsyncSession, *, since_hours: int = 
     totals["failed_users"] = 0
     for (user_id,) in users.all():
         try:
-            stats = await run_memory_extraction_for_user(db, int(user_id), since_hours=since_hours)
+            stats = await run_memory_extraction_for_user(
+                db, int(user_id), since_hours=since_hours, respect_markers=respect_markers
+            )
         except Exception:
             totals["failed_users"] += 1
             log.warning("memory.extraction_failed", user_id=user_id, exc_info=True)

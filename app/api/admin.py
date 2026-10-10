@@ -1826,6 +1826,8 @@ async def trigger_memory_extraction(
     """
     from app.memory.extraction import run_nightly_memory_extraction
 
-    totals = await run_nightly_memory_extraction(db, since_hours=max(1, min(168, since_hours)))
+    totals = await run_nightly_memory_extraction(
+        db, since_hours=max(1, min(336, since_hours)), respect_markers=False
+    )
     await db.commit()
     return {"status": "completed", **totals}

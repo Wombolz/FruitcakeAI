@@ -569,6 +569,10 @@ class ChatSession(Base):
     # decision — this is "easy to clean up", not a no-write ephemeral mode).
     is_incognito = Column(Boolean, default=False, nullable=False)
 
+    # Memory extraction high-water mark: messages at or before this instant
+    # have already been considered (idle-session or nightly extraction).
+    memory_extracted_at = Column(DateTime(timezone=True), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

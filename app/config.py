@@ -124,6 +124,11 @@ class Settings(BaseSettings):
     memory_context_token_budget: int = 1200
     memory_directive_cap: int = 15
     memory_dedup_similarity_threshold: float = 0.92
+    # Idle-session extraction: extract a session shortly after it goes quiet
+    memory_idle_extraction_enabled: bool = True
+    memory_idle_minutes: int = 20
+    memory_idle_check_minutes: int = 10
+    memory_idle_max_sessions_per_tick: int = 4
     # Relevance gating: the budget is a cap, relevance decides what qualifies.
     # bge-small cosine is compressed (unrelated ~0.45-0.55, related >=0.6).
     memory_min_vector_similarity: float = 0.60
