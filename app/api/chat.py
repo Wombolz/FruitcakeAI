@@ -78,7 +78,7 @@ from app.agent.runtime import AgentEvent, AgentEventEmitter, AgentEventType
 from app.autonomy.approval import ApprovalRequired, _approval_armed
 from app.auth.dependencies import get_current_user
 from app.config import settings
-from app.db.models import ChatMessage, ChatRun, ChatSession, Task, User
+from app.db.models import ChatMessage, ChatRun, ChatSession, Task, User, UserProject
 from app.db.session import get_db
 from app.chat_runtime import (
     apply_chat_run_event,
@@ -195,6 +195,7 @@ class RecentWorkspaceArtifactContext:
 class CreateSessionRequest(BaseModel):
     title: Optional[str] = None
     is_incognito: bool = False
+    project_id: Optional[int] = None
 
 
 class SendMessageRequest(BaseModel):
@@ -290,6 +291,8 @@ class SessionOut(BaseModel):
     llm_model: Optional[str]
     sort_order: Optional[int]
     is_incognito: bool = False
+    project_id: Optional[int] = None
+    is_pinned: bool = False
 
     class Config:
         from_attributes = True
@@ -413,8 +416,21 @@ async def create_session(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No chat model is available for your account. Ask an administrator to update model access.",
         )
+    if body.project_id is not None:
+        project = (
+            await db.execute(
+                select(UserProject).where(
+                    UserProject.id == body.project_id,
+                    UserProject.user_id == current_user.id,
+                    UserProject.archived_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
     session = ChatSession(
         user_id=current_user.id,
+        project_id=body.project_id,
         title=body.title or ("Incognito session" if body.is_incognito else "New conversation"),
         persona=current_user.persona or "family_assistant",
         llm_model=str(default_model),
@@ -486,6 +502,8 @@ async def get_session(
         "title": session.title,
         "persona": session.persona,
         "llm_model": session.llm_model,
+        "project_id": session.project_id,
+        "is_pinned": session.is_pinned,
         "compaction_events": compaction_events,
         "messages": [
             _session_message_payload(m)

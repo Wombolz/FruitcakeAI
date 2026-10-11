@@ -75,6 +75,7 @@ class User(Base):
 
     # Relationships
     documents = relationship("Document", back_populates="owner", cascade="all, delete-orphan")
+    projects = relationship("UserProject", back_populates="user", cascade="all, delete-orphan")
     chat_sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
     chat_runs = relationship("ChatRun", back_populates="user", cascade="all, delete-orphan")
     audit_logs = relationship("AuditLog", back_populates="user", cascade="all, delete-orphan")
@@ -546,11 +547,44 @@ class DocumentChunk(Base):
         return f"<DocumentChunk(doc_id={self.document_id}, idx={self.chunk_index})>"
 
 
+class UserProject(Base):
+    """User-owned organizational container; not a filesystem permission boundary."""
+
+    __tablename__ = "user_projects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    public_id = Column(
+        String(36),
+        unique=True,
+        index=True,
+        nullable=False,
+        default=lambda: str(uuid.uuid4()),
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(120), nullable=False)
+    description = Column(String(500))
+    color = Column(String(20))
+    icon = Column(String(100))
+    sort_index = Column(Integer, nullable=False, default=0, server_default="0", index=True)
+    archived_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", back_populates="projects")
+    chat_sessions = relationship("ChatSession", back_populates="project")
+
+
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    project_id = Column(
+        Integer,
+        ForeignKey("user_projects.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     title = Column(String(255))
     is_active = Column(Boolean, default=True)
@@ -562,6 +596,7 @@ class ChatSession(Base):
     # Phase 4: task sessions are hidden from the chat UI session list
     is_task_session = Column(Boolean, default=False, nullable=False)
     sort_order = Column(Integer, nullable=True, index=True)
+    is_pinned = Column(Boolean, default=False, server_default=text("false"), nullable=False)
 
     # Admin-only easy-cleanup sessions: persistent side effects are blocked
     # while active, and deleting the session hard-removes all of its content.
@@ -577,6 +612,7 @@ class ChatSession(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     user = relationship("User", back_populates="chat_sessions")
+    project = relationship("UserProject", back_populates="chat_sessions")
     messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
     runs = relationship("ChatRun", back_populates="session", cascade="all, delete-orphan")
 
