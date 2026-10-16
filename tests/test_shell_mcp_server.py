@@ -14,6 +14,7 @@ from mcp_shell_server.server import (
     detect_blocked_command,
     execute_command,
     resolve_execution_dir,
+    resolve_working_directory,
 )
 
 
@@ -26,8 +27,12 @@ def test_detect_blocked_command_rejects_network_tool():
 def test_shell_tool_description_instructs_tool_level_refusal():
     description = TOOL_SCHEMA["description"].lower()
     command_desc = TOOL_SCHEMA["inputSchema"]["properties"]["command"]["description"].lower()
-    assert "report the tool's refusal result" in description
-    assert "blocked-command" in command_desc
+    assert "local tests" in description
+    assert "stable status" in description
+    assert "network" in command_desc
+    assert TOOL_SCHEMA["inputSchema"]["additionalProperties"] is False
+    assert "working_directory" in TOOL_SCHEMA["inputSchema"]["properties"]
+    assert "timeout_seconds" in TOOL_SCHEMA["inputSchema"]["properties"]
 
 
 def test_resolve_execution_dir_uses_user_scoped_workspace(tmp_path):
@@ -37,10 +42,23 @@ def test_resolve_execution_dir_uses_user_scoped_workspace(tmp_path):
     assert target.is_dir()
 
 
+def test_resolve_working_directory_stays_inside_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    nested = workspace / "src"
+    nested.mkdir(parents=True)
+    assert resolve_working_directory(workspace, "src") == nested.resolve()
+    with pytest.raises(ValueError, match="escaped"):
+        resolve_working_directory(workspace, "../outside")
+    with pytest.raises(ValueError, match="does not exist"):
+        resolve_working_directory(workspace, "missing")
+
+
 @pytest.mark.asyncio
 async def test_execute_command_succeeds_in_allowed_workspace(tmp_path):
     config = ShellServerConfig(allowed_paths=[tmp_path / "workspace"], timeout_seconds=5, output_limit_bytes=1024)
     result = await execute_command("pwd", config=config, user_context={"user_id": 7})
+    assert result["ok"] is True
+    assert result["status"] == "completed"
     assert result["exit_code"] == 0
     assert result["stdout"].strip().endswith("/7")
 
@@ -50,6 +68,7 @@ async def test_execute_command_refuses_blocked_command(tmp_path):
     config = ShellServerConfig(allowed_paths=[tmp_path / "workspace"], timeout_seconds=5, output_limit_bytes=1024)
     result = await execute_command("curl https://example.com", config=config, user_context={"user_id": 7})
     assert result["exit_code"] == 126
+    assert result["status"] == "refused"
     assert result["refused"] is True
 
 
@@ -58,7 +77,33 @@ async def test_execute_command_times_out(tmp_path):
     config = ShellServerConfig(allowed_paths=[tmp_path / "workspace"], timeout_seconds=1, output_limit_bytes=1024)
     result = await execute_command("sleep 2", config=config, user_context={"user_id": 7})
     assert result["exit_code"] == 124
+    assert result["status"] == "timed_out"
     assert result["timed_out"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_command_uses_relative_working_directory_and_bounded_timeout(tmp_path):
+    workspace = tmp_path / "workspace"
+    (workspace / "9" / "src").mkdir(parents=True)
+    config = ShellServerConfig(allowed_paths=[workspace], timeout_seconds=5, output_limit_bytes=1024)
+    result = await execute_command(
+        "pwd",
+        config=config,
+        user_context={"user_id": 9},
+        working_directory="src",
+        timeout_seconds=2,
+    )
+    assert result["status"] == "completed"
+    assert result["stdout"].strip().endswith("/9/src")
+
+    invalid = await execute_command(
+        "pwd",
+        config=config,
+        user_context={"user_id": 9},
+        timeout_seconds="later",
+    )
+    assert invalid["status"] == "invalid_arguments"
+    assert invalid["exit_code"] == 2
 
 
 @pytest.mark.asyncio

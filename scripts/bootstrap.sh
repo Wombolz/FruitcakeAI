@@ -56,5 +56,5 @@ exec uvicorn app.main:app \
   --host 0.0.0.0 \
   --port "$APP_PORT" \
   --reload \
-  --reload-exclude 'workspace/*' \
-  --reload-exclude 'storage/*'
+  --reload-exclude "$ROOT/workspace" \
+  --reload-exclude "$ROOT/storage"

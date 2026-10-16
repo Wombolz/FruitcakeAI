@@ -72,7 +72,7 @@ mcp_servers:
       writes_disk: false
 
   stocks:
-    type: http
+    type: streamable_http
     url: http://localhost:47832
     enabled: true
     timeout: 30
@@ -123,7 +123,7 @@ mcp_servers:
   shell:
     type: docker_stdio
     image: fruitcake/mcp-shell
-    enabled: false
+    enabled: true
     timeout: 30
     classification: developer_only
     shipping_default: false

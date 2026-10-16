@@ -859,7 +859,7 @@ def test_default_mcp_config_defines_shell_server_contract():
     shell = cfg["mcp_servers"]["shell"]
 
     assert shell["type"] == "docker_stdio"
-    assert shell["enabled"] is False
+    assert shell["enabled"] is True
     assert shell["timeout"] == 30
     assert shell["pass_user_context"] is True
     assert shell["docker_run_args"] == ["--network", "none", "-v", "./workspace:/workspace"]
