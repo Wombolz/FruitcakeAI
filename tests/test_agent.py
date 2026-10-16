@@ -34,6 +34,7 @@ from app.agent.core import (
     _is_rss_owned_headline_prompt,
     _rewrite_headline_rss_tool_calls,
     _rewrite_web_context_tool_calls,
+    _should_force_web_context_first_turn,
     _sanitize_history_tool_chains,
     _content_fingerprint,
     _rss_evidence_summary,
@@ -1253,6 +1254,20 @@ def test_web_context_first_turn_policy_forces_only_context_then_restores_tools()
     assert first_choice == {"type": "function", "function": {"name": "web_context"}}
     assert later_tools == tools
     assert later_choice == "auto"
+
+
+def test_web_context_first_turn_is_never_forced_for_task_prompts():
+    task_prompt = [{
+        "role": "user",
+        "content": (
+            "[Task: Coke Stock Tracker]\n"
+            "Update the local report using the latest provider values.\n"
+            "Memory context: analyze evidence before changing stored data."
+        ),
+    }]
+
+    assert _should_force_web_context_first_turn(task_prompt, mode="task") is False
+    assert _should_force_web_context_first_turn(task_prompt, mode="chat_orchestrated") is True
 
 
 def test_rewrite_web_context_tool_call_uses_deep_mode_and_preserves_query():

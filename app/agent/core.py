@@ -1889,6 +1889,20 @@ def _prompt_benefits_from_web_context(messages: List[Dict[str, Any]]) -> bool:
     return bool(text and any(marker in text for marker in WEB_CONTEXT_RESEARCH_MARKERS))
 
 
+def _should_force_web_context_first_turn(
+    messages: List[Dict[str, Any]],
+    *,
+    mode: str,
+) -> bool:
+    """Force provider context only for interactive chat research requests.
+
+    Task prompts include generated profile, memory, and runtime context. Those
+    additions can contain research markers even when the task itself is local,
+    so task execution must retain normal tool choice.
+    """
+    return mode in {"chat", "chat_orchestrated"} and _prompt_benefits_from_web_context(messages)
+
+
 def _web_context_depth_for_prompt(messages: List[Dict[str, Any]]) -> str:
     text = _latest_user_message_text(messages).casefold()
     return "deep" if any(marker in text for marker in WEB_CONTEXT_DEEP_MARKERS) else "standard"
@@ -3138,7 +3152,7 @@ def _initialize_agent_loop(
         user_context=user_context,
     )
     web_context_first = bool(
-        _prompt_benefits_from_web_context(messages)
+        _should_force_web_context_first_turn(messages, mode=mode)
         and any(
             str(((tool.get("function") or {}).get("name") or "")).strip() == "web_context"
             for tool in tools

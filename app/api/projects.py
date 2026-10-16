@@ -46,6 +46,17 @@ class ChatPinPatch(BaseModel):
     pinned: bool
 
 
+class SidebarSessionLayout(BaseModel):
+    session_id: int
+    project_id: Optional[int] = None
+    is_pinned: bool
+
+
+class SidebarLayoutPatch(BaseModel):
+    project_ids: list[int]
+    sessions: list[SidebarSessionLayout]
+
+
 class ProjectOut(BaseModel):
     id: int
     public_id: str
@@ -171,6 +182,71 @@ async def reorder_projects(
     for project_id in body.project_ids:
         await db.refresh(by_id[project_id])
     return [by_id[project_id] for project_id in body.project_ids]
+
+
+@router.patch("/chat/sidebar-layout", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+async def update_sidebar_layout(
+    body: SidebarLayoutPatch,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Response:
+    projects = list(
+        (
+            await db.execute(
+                select(UserProject).where(UserProject.user_id == current_user.id)
+            )
+        ).scalars().all()
+    )
+    active_projects = [project for project in projects if project.archived_at is None]
+    active_project_ids = [project.id for project in active_projects]
+    if (
+        len(body.project_ids) != len(set(body.project_ids))
+        or sorted(active_project_ids) != sorted(body.project_ids)
+    ):
+        raise HTTPException(status_code=422, detail="Project IDs must match active projects exactly")
+
+    sessions = list(
+        (
+            await db.execute(
+                select(ChatSession).where(
+                    ChatSession.user_id == current_user.id,
+                    ChatSession.is_active == True,
+                    ChatSession.is_task_session == False,
+                )
+            )
+        ).scalars().all()
+    )
+    requested_session_ids = [item.session_id for item in body.sessions]
+    current_session_ids = [session.id for session in sessions]
+    if (
+        len(requested_session_ids) != len(set(requested_session_ids))
+        or sorted(current_session_ids) != sorted(requested_session_ids)
+    ):
+        raise HTTPException(status_code=422, detail="Session IDs must match active chats exactly")
+
+    projects_by_id = {project.id: project for project in projects}
+    sessions_by_id = {session.id: session for session in sessions}
+    for item in body.sessions:
+        if item.project_id is None:
+            continue
+        project = projects_by_id.get(item.project_id)
+        if project is None:
+            raise HTTPException(status_code=422, detail="Chat references an unknown project")
+        if project.archived_at is not None and sessions_by_id[item.session_id].project_id != project.id:
+            raise HTTPException(status_code=409, detail="Cannot move a chat into an archived project")
+
+    active_by_id = {project.id: project for project in active_projects}
+    for index, project_id in enumerate(body.project_ids):
+        active_by_id[project_id].sort_index = index
+
+    for index, item in enumerate(body.sessions):
+        session = sessions_by_id[item.session_id]
+        session.sort_order = index
+        session.project_id = item.project_id
+        session.is_pinned = item.is_pinned
+
+    await db.flush()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.patch("/projects/{project_id:int}", response_model=ProjectOut)

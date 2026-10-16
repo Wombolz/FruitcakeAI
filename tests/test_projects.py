@@ -176,3 +176,86 @@ async def test_project_reorder_requires_exact_active_project_set(client):
         headers=headers,
     )
     assert invalid.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_sidebar_layout_atomically_reorders_projects_and_moves_chats(client):
+    token = await _token(client, "sidebarlayout")
+    headers = _headers(token)
+    first_project = (await client.post("/projects", json={"name": "First"}, headers=headers)).json()
+    second_project = (await client.post("/projects", json={"name": "Second"}, headers=headers)).json()
+    first_chat = (await client.post("/chat/sessions", json={"title": "One"}, headers=headers)).json()
+    second_chat = (await client.post("/chat/sessions", json={"title": "Two"}, headers=headers)).json()
+    third_chat = (await client.post("/chat/sessions", json={"title": "Three"}, headers=headers)).json()
+
+    response = await client.patch(
+        "/chat/sidebar-layout",
+        json={
+            "project_ids": [first_project["id"], second_project["id"]],
+            "sessions": [
+                {
+                    "session_id": first_chat["id"],
+                    "project_id": second_project["id"],
+                    "is_pinned": True,
+                },
+                {
+                    "session_id": third_chat["id"],
+                    "project_id": first_project["id"],
+                    "is_pinned": False,
+                },
+                {
+                    "session_id": second_chat["id"],
+                    "is_pinned": False,
+                },
+            ],
+        },
+        headers=headers,
+    )
+    assert response.status_code == 204
+
+    projects = (await client.get("/projects", headers=headers)).json()
+    assert [project["id"] for project in projects] == [first_project["id"], second_project["id"]]
+    sessions = (await client.get("/chat/sessions", headers=headers)).json()
+    assert [session["id"] for session in sessions] == [
+        first_chat["id"],
+        third_chat["id"],
+        second_chat["id"],
+    ]
+    assert sessions[0]["project_id"] == second_project["id"]
+    assert sessions[0]["is_pinned"] is True
+    assert sessions[1]["project_id"] == first_project["id"]
+    assert sessions[2]["project_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_sidebar_layout_rejects_partial_or_archived_destinations(client):
+    token = await _token(client, "sidebarlayoutreject")
+    headers = _headers(token)
+    project = (await client.post("/projects", json={"name": "Archived"}, headers=headers)).json()
+    chat = (await client.post("/chat/sessions", json={"title": "Loose"}, headers=headers)).json()
+    await client.patch(
+        f"/projects/{project['id']}",
+        json={"archived": True},
+        headers=headers,
+    )
+
+    archived_destination = await client.patch(
+        "/chat/sidebar-layout",
+        json={
+            "project_ids": [],
+            "sessions": [{
+                "session_id": chat["id"],
+                "project_id": project["id"],
+                "is_pinned": False,
+            }],
+        },
+        headers=headers,
+    )
+    assert archived_destination.status_code == 409
+
+    partial = await client.patch(
+        "/chat/sidebar-layout",
+        json={"project_ids": [], "sessions": []},
+        headers=headers,
+    )
+    assert partial.status_code == 422
