@@ -146,10 +146,17 @@ upgrade its interpreter. Preserve the old environment and create the replacement
 at its final `.venv` path after upgrading Python. Do not bump the Python minor
 series as part of a security patch rollout without a separate compatibility pass.
 
-The PostgreSQL 16 Bookworm image is pinned to an explicitly tested pgvector tag
-and manifest digest in `docker-compose.yml`. Port 5432 is published only on
+The PostgreSQL 16 Bookworm runtime is built locally from the reviewed recipe in
+`containers/postgres/Dockerfile`, with digest-pinned upstream inputs and a signed
+Debian snapshot. Compose uses a versioned first-party local tag and never pulls
+that name from a registry. Bootstrap builds it if missing; subsequent starts
+reuse it. Explicit refreshes use `docker compose build postgres` after review.
+The local output tag is not an immutable upstream digest: record the actual
+image identity during rollout. Port 5432 is published only on
 `127.0.0.1`. The Python `pgvector` package is a client adapter, not the installed
 server extension. Replacing the image does not update existing extension catalogs.
+See [container maintenance](container_maintenance.md) for the OS/gosu rebuild,
+runtime scan results and retained rollback images.
 For each existing database, after backup and restore validation, run:
 
 ```sql

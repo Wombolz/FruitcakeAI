@@ -18,6 +18,12 @@ per-file attribution, rollback checkpoints, or proof that a test was sufficient.
 ## Operator Setup And Test
 
 1. Keep Docker running. The existing `fruitcake/mcp-shell` image is the default.
+
+   The reviewed stdlib-only image intentionally contains no pip, setuptools,
+   wheel or ensurepip. Python/unittest and GNU timeout remain available. Package
+   installation is not supported inside these offline command containers; use a
+   separately reviewed prebuilt command image if a project needs dependencies.
+   See [container maintenance](container_maintenance.md).
    Its Python-based Linux environment is suitable for a first smoke test, not a
    promise that Node, project packages, macOS frameworks, or host tools exist.
    `CODING_COMMAND_IMAGE` selects an operator-installed image; empty disables the

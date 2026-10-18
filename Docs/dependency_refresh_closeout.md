@@ -44,7 +44,21 @@ instances, no skipped symlinks. Historical caches and unused npm installations
 are outside that result. Node has [announced October 21 security releases](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases);
 the installed 24.22.0 release does not contain those future fixes.
 
-## Container Findings: Priority Follow-Up
+## Container Findings: Remediation Follow-Up Completed
+
+The initial scan below triggered the additional
+[container and CI maintenance slice](container_maintenance.md), completed locally
+on 2026-10-18. The patched effective database filesystem now reports zero critical
+and ten unfixed high findings; the patched shell reports zero critical and one
+unfixed high. All available critical/high fixes were applied. The layered database
+scan still includes the overwritten upstream gosu binary; the linked report
+explains the raw/effective distinction and retains both inventories.
+
+Both images were promoted after logical restore, cold rollback and Docker boundary
+tests. All 51 database table counts are preserved and the backend is running.
+CI actions now use reviewed Node 24 pins on Ubuntu 24.04, with container build and
+behavior tests added. Separate application/maintenance DB roles and review of
+unfixed upstream advisories remain open. The following is the **pre-fix** scan.
 
 Docker Scout 1.26.0 scanned the local images, not their mounted data volumes.
 Counts are scanner findings, not confirmed reachable application exploits.
@@ -61,13 +75,13 @@ are split between Debian Perl and the Go standard library embedded in
 critical SQL/network vulnerabilities. Applicability requires review of the
 actual component entry points and container configuration.
 
-The shell image's two fixable high findings are `wheel` 0.45.1 and
+The original shell image's two fixable high findings were `wheel` 0.45.1 and
 `jaraco.context` 5.3.0 vendored inside setuptools. Installing standalone copies
 does not replace those vendored packages. Its remaining high finding concerns
-Debian zlib and has no listed fix. The image currently uses a floating
+Debian zlib and has no listed fix. The original image used a floating
 `python:3.11-slim` base and has no pinned, reproducible package-refresh pipeline.
 
-The next focused security slice should:
+That follow-up slice addressed items 1-4 below; item 5 remains separate work:
 
 1. Rebuild/rebase the runtime images with supported current OS packages and
    minimal runtime/build-tool contents; audit `gosu` independently of package
@@ -83,8 +97,8 @@ The next focused security slice should:
    password rotation and localhost-only publication.
 
 Raw local logs and SARIF reports are Git-ignored under
-`storage/.branch-closeout-20261018-210119/`. No image replacement was performed
-as part of these final scans.
+`storage/.branch-closeout-20261018-210119/`. Replacement and restore verification
+reports are under `storage/.container-maintenance-20261018-215334/`.
 
 ## Operational Warnings
 

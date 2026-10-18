@@ -1,7 +1,12 @@
 services:
   postgres:
-    # PostgreSQL 16.15 + pgvector 0.8.7; update only after backup/restore testing.
-    image: pgvector/pgvector:0.8.7-pg16-bookworm@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
+    # Locally built OS/gosu refresh; upstream inputs are digest-pinned in the recipe.
+    # Never pull this first-party name from a public registry.
+    image: fruitcake/postgres-vector:16.15-pgvector0.8.7-20261018-r1
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: containers/postgres/Dockerfile
     environment:
       POSTGRES_DB: fruitcake_v5
       POSTGRES_USER: fruitcake

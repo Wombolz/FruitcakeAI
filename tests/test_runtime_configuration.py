@@ -6,10 +6,12 @@ import re
 import yaml
 
 
-def test_database_image_is_versioned_and_digest_pinned():
+def test_database_image_uses_versioned_local_build_without_registry_fallback():
     compose = yaml.safe_load(Path("docker-compose.yml").read_text())
-    image = compose["services"]["postgres"]["image"]
-    assert re.fullmatch(r"pgvector/pgvector:0\.8\.\d+-pg16-bookworm@sha256:[0-9a-f]{64}", image)
+    database = compose["services"]["postgres"]
+    assert re.fullmatch(r"fruitcake/postgres-vector:16\.\d+-pgvector0\.8\.\d+-\d{8}-r\d+", database["image"])
+    assert database["pull_policy"] == "never"
+    assert database["build"] == {"context": ".", "dockerfile": "containers/postgres/Dockerfile"}
 
 
 def test_database_only_publishes_to_ipv4_loopback():

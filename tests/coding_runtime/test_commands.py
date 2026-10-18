@@ -302,7 +302,7 @@ async def test_unavailable_command_interactions_cannot_fall_back_to_generic_appr
 @pytest.mark.skipif(os.environ.get("FRUITCAKE_TEST_DOCKER") != "1", reason="Opt-in Docker fixture test")
 async def test_real_docker_enforces_mount_network_and_process_boundaries(tmp_path, monkeypatch):
     monkeypatch.setenv("FRUITCAKE_TEST_SECRET", "fixture-secret-not-for-container")
-    runner = commands.DockerCommandRunner()
+    runner = commands.DockerCommandRunner(image=os.environ.get("FRUITCAKE_TEST_DOCKER_IMAGE", "fruitcake/mcp-shell"))
     image = await runner.image_id()
     root = tmp_path / "checkout"
     root.mkdir()
@@ -341,7 +341,7 @@ print('ISOLATION_OK')
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.environ.get("FRUITCAKE_TEST_DOCKER") != "1", reason="Opt-in Docker fixture test")
 async def test_container_watchdog_stops_command_without_attached_host_runner(tmp_path):
-    runner = commands.DockerCommandRunner()
+    runner = commands.DockerCommandRunner(image=os.environ.get("FRUITCAKE_TEST_DOCKER_IMAGE", "fruitcake/mcp-shell"))
     root = tmp_path / "checkout"
     root.mkdir()
     (root / ".git").write_text("gitdir: /not-mounted\n")
@@ -365,7 +365,7 @@ async def test_container_watchdog_stops_command_without_attached_host_runner(tmp
 @pytest.mark.parametrize("mode", ["timeout", "cancel", "output_limit"])
 @pytest.mark.skipif(os.environ.get("FRUITCAKE_TEST_DOCKER") != "1", reason="Opt-in Docker fixture test")
 async def test_real_docker_bounds_output_and_removes_processes_on_timeout_or_cancel(tmp_path, mode):
-    runner = commands.DockerCommandRunner()
+    runner = commands.DockerCommandRunner(image=os.environ.get("FRUITCAKE_TEST_DOCKER_IMAGE", "fruitcake/mcp-shell"))
     root = tmp_path / "checkout"
     root.mkdir()
     (root / ".git").write_text("gitdir: /not-mounted\n")

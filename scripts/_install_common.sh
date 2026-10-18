@@ -226,7 +226,12 @@ ensure_models() {
 }
 
 start_postgres() {
-  docker compose up -d postgres
+  local image
+  image="$(docker compose config --images postgres)"
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    docker compose build postgres
+  fi
+  docker compose up --no-build -d postgres
 }
 
 wait_for_postgres() {

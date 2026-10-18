@@ -5,6 +5,8 @@ import hashlib
 import os
 import subprocess
 
+import pytest
+
 def _bootstrap(tmp_path, *, retired=False, check_failure=False, stamped=False):
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -69,3 +71,28 @@ def test_unchanged_baseline_does_not_reinstall(tmp_path):
     assert result.returncode == 0, result.stderr
     assert stamp.exists()
     assert calls == ""
+
+
+@pytest.mark.parametrize("missing,build_failure", [(False, False), (True, False), (True, True)])
+def test_database_bootstrap_builds_only_missing_local_images_and_fails_closed(tmp_path, missing, build_failure):
+    log = tmp_path / "docker-calls"
+    script = '''
+source scripts/_install_common.sh
+docker() {
+  printf '%s\\n' "$*" >> "$CALL_LOG"
+  case "$*" in
+    'compose config --images postgres') echo 'fruitcake/postgres-vector:fixture' ;;
+    'image inspect fruitcake/postgres-vector:fixture') return "$IMAGE_MISSING" ;;
+    'compose build postgres') return "$BUILD_FAILURE" ;;
+  esac
+}
+start_postgres
+'''
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env={
+        **os.environ, "CALL_LOG": str(log), "IMAGE_MISSING": str(int(missing)),
+        "BUILD_FAILURE": str(int(build_failure)),
+    })
+    calls = log.read_text().splitlines()
+    assert ("compose build postgres" in calls) == missing
+    assert (result.returncode != 0) == build_failure
+    assert ("compose up --no-build -d postgres" in calls) != build_failure
