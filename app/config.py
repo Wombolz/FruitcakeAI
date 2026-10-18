@@ -74,6 +74,14 @@ class Settings(BaseSettings):
     local_model: str = "qwen2.5:32b"
     local_model_keep_alive: str = "15m"
     local_model_release_on_shutdown: bool = True
+    # Optional coding backend. Pi is operator-installed and launched on demand.
+    coding_runtime_enabled: bool = False
+    coding_runtime_executable: str = ""
+    coding_max_active_sessions: int = 2
+    coding_runtime_idle_seconds: int = 300
+    coding_run_timeout_seconds: int = 1800
+    coding_command_image: str = "fruitcake/mcp-shell"
+    coding_require_read_approval: bool = False
     document_summary_model: str = ""
     # Task-stage routing (Phase 5.4.x)
     task_small_model: str = "ollama_chat/qwen2.5:14b"

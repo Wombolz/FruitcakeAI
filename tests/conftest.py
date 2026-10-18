@@ -47,12 +47,18 @@ async def setup_db():
     from app.model_profiles import get_model_profile_service
 
     get_model_profile_service().clear()
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    get_model_profile_service().clear()
+    try:
+        async with test_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        yield
+    finally:
+        try:
+            async with test_engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
+        finally:
+            # StaticPool retains aiosqlite's worker until the engine is disposed.
+            await test_engine.dispose()
+            get_model_profile_service().clear()
 
 
 @pytest.fixture
