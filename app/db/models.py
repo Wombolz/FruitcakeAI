@@ -574,6 +574,150 @@ class UserProject(Base):
     chat_sessions = relationship("ChatSession", back_populates="project")
 
 
+class CodingWorkspace(Base):
+    """An explicit repository grant; project membership never creates this grant."""
+
+    __tablename__ = "coding_workspaces"
+    __table_args__ = (UniqueConstraint("user_id", "canonical_path", name="uq_coding_workspace_owner_path"),)
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    canonical_path = Column(Text, nullable=False)
+    approved_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class CodingSession(Base):
+    __tablename__ = "coding_sessions"
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_id = Column(String(64), ForeignKey("coding_workspaces.id", ondelete="RESTRICT"), nullable=False)
+    project_id = Column(Integer, ForeignKey("user_projects.id", ondelete="SET NULL"), nullable=True)
+    model_profile_id = Column(Integer, ForeignKey("model_profiles.id", ondelete="SET NULL"), nullable=True)
+    title = Column(String(255), nullable=False)
+    persona = Column(String(100), nullable=False)
+    runtime_kind = Column(String(50), nullable=False)
+    status = Column(String(30), default="idle", nullable=False)
+    context_generation = Column(Integer, default=0, nullable=False)
+    edit_mode = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    command_mode = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    archived_at = Column(DateTime(timezone=True), nullable=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class CodingCheckout(Base):
+    """Owner-scoped worktree; session_id records its creation provenance."""
+
+    __tablename__ = "coding_checkouts"
+    __table_args__ = (UniqueConstraint("session_id", name="uq_coding_checkout_session"),)
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String(64), ForeignKey("coding_sessions.id", ondelete="RESTRICT"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+    canonical_path = Column(Text, nullable=False, unique=True)
+    baseline_commit = Column(String(64), nullable=True)
+    workspace_id = Column(String(64), ForeignKey("coding_workspaces.id", ondelete="RESTRICT"), nullable=True)
+    head_commit = Column(String(64), nullable=True)
+    branch_name = Column(String(100), nullable=True)
+    status = Column(String(30), nullable=False, default="creating")
+    error_code = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class CodingCheckoutAttachment(Base):
+    """A conversation's execution root, independent of checkout creation provenance."""
+    __tablename__ = "coding_checkout_attachments"
+    session_id = Column(String(64), ForeignKey("coding_sessions.id", ondelete="CASCADE"), primary_key=True)
+    checkout_id = Column(String(64), ForeignKey("coding_checkouts.id", ondelete="RESTRICT"), nullable=False, index=True)
+
+
+class CodingRun(Base):
+    __tablename__ = "coding_runs"
+    __table_args__ = (
+        UniqueConstraint("session_id", "client_request_id", name="uq_coding_run_client_request"),
+        Index("uq_coding_run_active_session", "session_id", unique=True,
+              postgresql_where=text("status IN ('starting','running','waiting_approval','stopping')"),
+              sqlite_where=text("status IN ('starting','running','waiting_approval','stopping')")),
+    )
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String(64), ForeignKey("coding_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    client_request_id = Column(String(100), nullable=True)
+    status = Column(String(30), nullable=False, default="starting")
+    prompt = Column(Text, nullable=False)
+    response_text = Column(Text, nullable=False, default="")
+    context_generation = Column(Integer, nullable=False, default=0)
+    model_profile_id = Column(Integer, ForeignKey("model_profiles.id", ondelete="SET NULL"), nullable=True)
+    model_id = Column(String(255), nullable=True)
+    last_event_sequence = Column(Integer, nullable=False, default=0)
+    error_code = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class CodingRunEvent(Base):
+    __tablename__ = "coding_run_events"
+    __table_args__ = (UniqueConstraint("run_id", "sequence", name="uq_coding_event_sequence"),)
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String(64), ForeignKey("coding_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    sequence = Column(Integer, nullable=False)
+    schema_version = Column(Integer, nullable=False, default=1)
+    event_type = Column(String(50), nullable=False)
+    payload_json = Column(Text, nullable=False, default="{}")
+    occurred_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    @property
+    def payload(self):
+        return json.loads(self.payload_json)
+
+
+class CodingApproval(Base):
+    __tablename__ = "coding_approvals"
+    __table_args__ = (UniqueConstraint("run_id", "runtime_request_id", name="uq_coding_approval_request"),)
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_id = Column(String(64), ForeignKey("coding_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    runtime_request_id = Column(String(100), nullable=False)
+    status = Column(String(30), nullable=False, default="pending")
+    payload_json = Column(Text, nullable=False, default="{}")
+    resolved_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+    @property
+    def change(self):
+        return json.loads(self.payload_json).get("change")
+
+
+class CodingChange(Base):
+    """Immutable approved content and host-observed outcome, not model testimony."""
+
+    __tablename__ = "coding_changes"
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_id = Column(String(64), ForeignKey("coding_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    approval_id = Column(String(64), ForeignKey("coding_approvals.id", ondelete="CASCADE"), nullable=False, unique=True)
+    checkout_id = Column(String(64), ForeignKey("coding_checkouts.id", ondelete="RESTRICT"), nullable=False)
+    path = Column(Text, nullable=False)
+    tool = Column(String(40), nullable=False)
+    before_text = Column(Text, nullable=True)
+    after_text = Column(Text, nullable=False)
+    before_hash = Column(String(64), nullable=True)
+    after_hash = Column(String(64), nullable=False)
+    diff = Column(Text, nullable=False)
+    status = Column(String(30), nullable=False, default="proposed")
+    error_code = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    applied_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 

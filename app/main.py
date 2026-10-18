@@ -62,23 +62,34 @@ async def lifespan(app: FastAPI):
     from app.autonomy.scheduler import start_scheduler
     await start_scheduler()
 
-    yield
-
-    log.info("FruitcakeAI v5 shutting down")
-    from app.autonomy.scheduler import shutdown_scheduler
-    from app.rag.job_runner import shutdown_document_ingest_runner
-    shutdown_scheduler()
-    shutdown_document_ingest_runner()
+    from app.coding_runtime.bootstrap import get_coding_session_service
+    coding_service = None
     try:
-        await get_mcp_registry().shutdown()
+        coding_service = get_coding_session_service()
+        app.state.coding_sessions = coding_service
+        if coding_service is not None:
+            interrupted = await coding_service.startup()
+            log.info("Coding session service ready", recovered_runs=interrupted)
+        yield
     finally:
+        log.info("FruitcakeAI v5 shutting down")
+        from app.autonomy.scheduler import shutdown_scheduler
+        from app.rag.job_runner import shutdown_document_ingest_runner
+        shutdown_scheduler()
+        shutdown_document_ingest_runner()
         try:
-            if settings.local_model_release_on_shutdown:
-                from app.agent.local_model_lifecycle import release_tracked_local_models
-
-                await release_tracked_local_models()
+            if coding_service is not None:
+                await coding_service.shutdown()
         finally:
-            await engine.dispose()
+            try:
+                await get_mcp_registry().shutdown()
+            finally:
+                try:
+                    if settings.local_model_release_on_shutdown:
+                        from app.agent.local_model_lifecycle import release_tracked_local_models
+                        await release_tracked_local_models()
+                finally:
+                    await engine.dispose()
 
 
 def create_app() -> FastAPI:
@@ -167,6 +178,7 @@ def create_app() -> FastAPI:
     from app.api.integrations import router as integrations_router
     from app.api.artifacts import router as artifacts_router
     from app.api.projects import router as projects_router
+    from app.api.coding import router as coding_router
 
     app.include_router(auth_router, prefix="/auth", tags=["auth"])
     app.include_router(admin_router, prefix="/admin", tags=["admin"])
@@ -186,6 +198,7 @@ def create_app() -> FastAPI:
     app.include_router(integrations_router, prefix="/integrations", tags=["integrations"])
     app.include_router(artifacts_router, prefix="/artifacts", tags=["artifacts"])
     app.include_router(projects_router, tags=["projects"])
+    app.include_router(coding_router, prefix="/coding", tags=["coding"])
 
     return app
 
