@@ -2,6 +2,9 @@
 
 New tools are added via `config/mcp_config.yaml` — no Python code changes required.
 
+For a new standalone MCP server or interactive companion application, start
+with [Fruitcake MCP Companion App Onboarding](MCP_COMPANION_APP_ONBOARDING.md).
+
 Alpha shipping policy:
 - only clearly necessary first-party/internal MCPs ship enabled by default
 - Docker/third-party MCPs are optional and should be left disabled unless the operator explicitly needs them
