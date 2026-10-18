@@ -49,11 +49,16 @@ async def override_get_db():
 @pytest.fixture(autouse=True)
 async def setup_db():
     """Create tables before each test, drop after."""
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+    try:
+        async with test_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        yield
+    finally:
+        try:
+            async with test_engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
+        finally:
+            await test_engine.dispose()
 
 
 @pytest.fixture

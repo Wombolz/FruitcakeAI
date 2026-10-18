@@ -39,6 +39,12 @@ The last Mac pass includes actual hidden-window scroll-view growth, resize,
 reading-position, resume-following, and new-submission checks. Rendered prompts,
 approval cards, Git confirmation banners, and diff panels were visually inspected.
 
+Closeout also fixes the shared test fixture's aiosqlite teardown: dispose its
+StaticPool engine after each test so worker threads cannot keep a passing pytest
+process alive. A subprocess regression exercises the workflow's auth smoke command
+and requires a clean exit. This is test infrastructure, not a production behavior
+change.
+
 The operator reported working approvals/Stop, interrupted-session recovery,
 navigation/inspector geometry, approved editing/testing, model switching and review,
 and end-to-end AV Inventory and RoomCheck exercises. Source delivery was verified
