@@ -175,7 +175,24 @@ ensure_venv() {
   fi
 
   if [[ "$current_hash" != "$existing_hash" ]]; then
-    pip install -q -r "$ROOT/requirements.txt"
+    if python - <<'PY'
+from importlib.metadata import PackageNotFoundError, version
+for package in ("python-jose", "passlib"):
+    try:
+        version(package)
+    except PackageNotFoundError:
+        continue
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
+      echo "ERROR: This .venv contains retired authentication packages." >&2
+      echo "Stop Fruitcake, preserve the old .venv, and create a fresh environment." >&2
+      echo "See Docs/dependencies.md. An in-place pip install would leave vulnerable packages installed." >&2
+      return 1
+    fi
+    python -m pip install -q --require-hashes --only-binary=:all: -r "$REQUIREMENTS_FILE"
+    python -m pip check
     printf '%s\n' "$current_hash" > "$REQUIREMENTS_STAMP"
   fi
 }

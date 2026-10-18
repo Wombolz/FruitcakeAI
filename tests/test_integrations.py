@@ -6,7 +6,7 @@ import base64
 import hashlib
 
 import pytest
-from jose import jwt
+import jwt
 from sqlalchemy import select
 
 from app.config import settings

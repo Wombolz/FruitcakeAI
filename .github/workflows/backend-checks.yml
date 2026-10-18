@@ -6,6 +6,8 @@ on:
     branches:
       - main
   workflow_dispatch:
+  schedule:
+    - cron: "23 9 * * 1"
 
 permissions:
   contents: read
@@ -22,13 +24,16 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version-file: ".python-version"
           cache: "pip"
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-dev.txt
+          python -m pip check
+
+      - name: Audit installed dependencies
+        run: ./scripts/audit_dependencies.sh
 
       - name: Compile Python sources
         run: |
@@ -46,3 +51,13 @@ jobs:
       - name: Run focused smoke tests
         run: |
           pytest -q tests/test_auth.py -k "create_and_list_sessions or order"
+
+      - name: Check dependency-sensitive integrations
+        env:
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          HF_HUB_OFFLINE: "1"
+        run: |
+          python -m pytest -q tests/test_auth_crypto.py tests/test_credential_hardening.py tests/test_integrations.py \
+            tests/test_rag.py tests/test_mcp_transports.py tests/test_model_stream.py \
+            tests/test_dependency_baseline.py tests/test_dependency_bootstrap.py \
+            tests/test_runtime_configuration.py

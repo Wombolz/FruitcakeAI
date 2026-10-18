@@ -8,7 +8,7 @@ import pytest
 def test_coding_routes_are_registered_in_application():
     from app.main import app
 
-    paths = {route.path for route in app.routes}
+    paths = set(app.openapi()["paths"])
     assert {"/coding/status", "/coding/sessions", "/coding/runs/{run_id}/events",
             "/coding/sessions/{session_id}/checkout", "/coding/sessions/{session_id}/checkout/remove"} <= paths
 

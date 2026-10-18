@@ -214,7 +214,8 @@ iPhone / Mac app  →  FastAPI backend  →  Ollama (local LLM)
 - macOS with [Homebrew](https://brew.sh)
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - [Ollama](https://ollama.ai) — `brew install ollama`
-- Python 3.11+
+- Python 3.11.17 (the tested backend interpreter; see `.python-version`)
+- Tesseract 5.5.3 for optional scanned-PDF OCR
 
 Optional later:
 - [Xcode 16+](https://developer.apple.com/xcode/) — for the iOS/macOS Swift app after backend setup succeeds
@@ -242,6 +243,9 @@ Bootstrap does the following:
 - seeds default users
 - starts the API on `http://localhost:30417`
 
+Dependency inputs, hashed runtime/development baselines, and the one-time clean
+environment upgrade procedure are documented in [Dependency Maintenance](Docs/dependencies.md).
+
 RAM-aware defaults:
 - systems with **less than 64 GB RAM** default to all-`14b`
 - systems with **64 GB RAM or more** default to mixed `14b/32b`
@@ -265,14 +269,21 @@ Health semantics:
 - `DEGRADED`: backend is usable, but optional components are missing
 - `FAIL`: one or more required backend dependencies are not ready
 
-Default users — **change these passwords before running on a shared network:**
+Initial accounts (`admin`, `parent`, `restricted`, `guest`) receive unique random
+passwords. Bootstrap prints the path to an owner-only JSON file under
+`storage/.bootstrap_credentials/`, not the passwords. Store the credentials in
+your password manager. Subsequent startups never reset existing account passwords.
+Account creation is admin-only through Settings > Users & Access; `/auth/register`
+is also admin-only, not a public signup endpoint.
 
-| Username | Password | Role |
-|----------|----------|------|
-| admin | changeme123 | admin |
-| parent | changeme123 | parent |
-| restricted | changeme123 | restricted |
-| guest | changeme123 | guest |
+For a local password reset, stop the backend and run:
+
+```bash
+.venv/bin/python scripts/manage_passwords.py --username admin
+```
+
+The command prompts privately. A password reset alone does not revoke existing
+JWTs; see [credential maintenance](Docs/SECURITY_BASELINE.md#credential-maintenance).
 
 ### 4. Put it behind HTTPS before other people log in
 

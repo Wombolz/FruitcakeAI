@@ -1,11 +1,11 @@
 # FruitcakeAI v5 — Default seed users
 # Used by scripts/seed.py to populate a fresh database.
-# Change passwords before deploying!
+# New accounts receive unique generated passwords in storage/.bootstrap_credentials/.
+# Existing account passwords are never changed by seeding.
 
 users:
   - username: admin
     email: admin@fruitcake.local
-    password: changeme123
     full_name: Administrator
     role: admin
     persona: family_assistant
@@ -14,7 +14,6 @@ users:
 
   - username: parent
     email: parent@fruitcake.local
-    password: changeme123
     full_name: Parent User
     role: parent
     persona: family_assistant
@@ -23,7 +22,6 @@ users:
 
   - username: restricted
     email: restricted@fruitcake.local
-    password: changeme123
     full_name: Restricted User
     role: restricted
     persona: restricted_assistant
@@ -32,7 +30,6 @@ users:
 
   - username: guest
     email: guest@fruitcake.local
-    password: changeme123
     full_name: Guest User
     role: guest
     persona: family_assistant

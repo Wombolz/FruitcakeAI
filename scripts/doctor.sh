@@ -123,16 +123,29 @@ else
 fi
 
 if [[ "$health_status" == *'"status":"ok"'* ]]; then
-  admin_user="${FRUITCAKE_ADMIN_USERNAME:-admin}"
-  admin_password="${FRUITCAKE_ADMIN_PASSWORD:-changeme123}"
-  token_response="$(curl -sf -X POST "http://localhost:${APP_PORT}/auth/login" \
-    -H "Content-Type: application/json" \
-    -d "{\"username\":\"${admin_user}\",\"password\":\"${admin_password}\"}" 2>/dev/null || true)"
-  admin_token="$(printf '%s' "$token_response" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')"
-  if [[ -n "$admin_token" ]]; then
-    admin_health="$(curl -sf "http://localhost:${APP_PORT}/admin/health" \
-      -H "Authorization: Bearer ${admin_token}" 2>/dev/null || true)"
-    if [[ "$admin_health" == *'"status":"ok"'* || "$admin_health" == *'"status":"degraded"'* ]]; then
+  if [[ -n "${FRUITCAKE_ADMIN_PASSWORD:-}" ]]; then
+    # Keep passwords and bearer tokens out of subprocess argument lists/output.
+    admin_health="$(python3.11 - <<'PY'
+import json
+import os
+from urllib.request import Request, ProxyHandler, build_opener
+
+base = 'http://127.0.0.1:' + os.environ.get('APP_PORT', '30417')
+opener = build_opener(ProxyHandler({}))
+try:
+    payload = json.dumps({'username': os.environ.get('FRUITCAKE_ADMIN_USERNAME', 'admin'),
+                          'password': os.environ['FRUITCAKE_ADMIN_PASSWORD']}).encode()
+    request = Request(base + '/auth/login', data=payload, headers={'Content-Type': 'application/json'})
+    with opener.open(request, timeout=10) as response:
+        token = json.load(response)['access_token']
+    request = Request(base + '/admin/health', headers={'Authorization': 'Bearer ' + token})
+    with opener.open(request, timeout=10) as response:
+        print(json.dumps({'status': json.load(response).get('status')}))
+except Exception:
+    print('{}')
+PY
+)"
+    if [[ "$admin_health" == *'"status": "ok"'* || "$admin_health" == *'"status": "degraded"'* ]]; then
       pass "Admin /admin/health is reachable"
     else
       degraded "Admin /admin/health did not return a healthy payload" "Log in as an admin user and inspect /admin/health manually"

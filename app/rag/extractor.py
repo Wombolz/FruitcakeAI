@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz
 
     HAS_PYMUPDF = True
 except ImportError:  # pragma: no cover - optional dependency

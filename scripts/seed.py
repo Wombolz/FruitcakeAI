@@ -9,6 +9,7 @@ Usage (from project root with venv active):
 
 import asyncio
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -21,15 +22,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.db.session import AsyncSessionLocal
 from app.db.models import User
 from app.auth.jwt import hash_password
+from app.auth.password_admin import generated_password, write_private_credentials
+
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "users.yaml"
+CREDENTIALS_DIR = Path(__file__).parent.parent / "storage" / ".bootstrap_credentials"
 
 
 async def seed():
-    config_path = Path(__file__).parent.parent / "config" / "users.yaml"
-    users_config = yaml.safe_load(config_path.read_text())
+    users_config = yaml.safe_load(CONFIG_PATH.read_text())
 
     async with AsyncSessionLocal() as db:
         created = 0
         skipped = 0
+        credentials = {}
 
         for u in users_config["users"]:
             result = await db.execute(select(User).where(User.username == u["username"]))
@@ -40,10 +45,12 @@ async def seed():
                 skipped += 1
                 continue
 
+            password = generated_password()
+            credentials[u["username"]] = password
             user = User(
                 username=u["username"],
                 email=u["email"],
-                hashed_password=hash_password(u["password"]),
+                hashed_password=hash_password(password),
                 full_name=u.get("full_name"),
                 role=u["role"],
                 persona=u.get("persona", "family_assistant"),
@@ -53,7 +60,13 @@ async def seed():
             print(f"  create {u['username']} ({u['role']})")
             created += 1
 
+        if credentials:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+            output = CREDENTIALS_DIR / f"initial-logins-{stamp}.json"
+            write_private_credentials(output, credentials)
         await db.commit()
+        if credentials:
+            print(f"Initial passwords saved privately: {output}")
         print(f"\nDone — {created} created, {skipped} skipped.")
 
 
