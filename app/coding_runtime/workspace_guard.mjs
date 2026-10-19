@@ -3,6 +3,7 @@ import { relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { EDIT_TOOLS, registerEditTools } from "./edit_tools.mjs";
 import { COMMAND_TOOL, registerCommandTool } from "./command_tools.mjs";
+import { REVIEW_TOOL, registerReviewTool } from "./review_read_tools.mjs";
 
 export const GUARD_PROTOCOL = "fruitcake.workspace_guard.v1";
 const READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
@@ -70,6 +71,9 @@ export default function workspaceGuard(pi) {
   let root;
   const edits = JSON.parse(process.env.FRUITCAKE_PI_EDIT_TOOLS || "[]");
   const commands = JSON.parse(process.env.FRUITCAKE_PI_COMMAND_TOOLS || "[]");
+  const review = process.env.FRUITCAKE_PI_REVIEW_MODE === "1";
+  if (review && (edits.length || commands.length)) throw new Error("Reviews cannot edit or execute commands");
+  if (review) registerReviewTool(pi);
   if (!Array.isArray(commands) || commands.some(name => name !== COMMAND_TOOL) || commands.length > 1) throw new Error("Invalid command-tool policy");
   if (commands.length) registerCommandTool(pi);
   if (!Array.isArray(edits) || edits.some(name => !EDIT_TOOLS.has(name))) throw new Error("Invalid edit-tool policy");
@@ -85,7 +89,7 @@ export default function workspaceGuard(pi) {
       throw new Error("Pi working directory does not match the authorized workspace");
     }
     const enabled = JSON.parse(process.env.FRUITCAKE_PI_READ_TOOLS || "[]");
-    if (!Array.isArray(enabled) || enabled.some((name) => !READ_TOOLS.has(name))) {
+    if (!Array.isArray(enabled) || enabled.some((name) => !(review ? name === REVIEW_TOOL : READ_TOOLS.has(name)))) {
       throw new Error("Invalid Fruitcake read-tool policy");
     }
     pi.setActiveTools([...enabled, ...edits, ...commands]);
@@ -99,6 +103,10 @@ export default function workspaceGuard(pi) {
   pi.on("tool_call", async (event, ctx) => {
     try {
       if (!root) throw new Error("Workspace guard is not ready");
+      if (review) {
+        if (event.toolName !== REVIEW_TOOL) throw new Error("Reviews can only read capture content through the host");
+        return;
+      }
       if (edits.includes(event.toolName) || commands.includes(event.toolName)) return;
       event.input.path = await authorizeRead(root, event.toolName, event.input);
       if (process.env.FRUITCAKE_PI_CONFIRM_READS === "1") {

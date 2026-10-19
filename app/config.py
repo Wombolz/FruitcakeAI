@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     # ── Application ──────────────────────────────────────────────────────────
     app_name: str = "FruitcakeAI"
-    app_version: str = "0.7.42"
+    app_version: str = "0.7.43"
     debug: bool = False
     log_level: str = "INFO"
     app_port: int = 30417
@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     # Optional coding backend. Pi is operator-installed and launched on demand.
     coding_runtime_enabled: bool = False
     coding_review_capture_enabled: bool = False
+    coding_review_enabled: bool = False
     coding_runtime_executable: str = ""
     coding_max_active_sessions: int = 2
     coding_runtime_idle_seconds: int = 300

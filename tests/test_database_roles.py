@@ -230,11 +230,11 @@ def test_real_role_permissions_default_grants_and_alembic(tmp_path):
         import app.db.models  # noqa: F401
         engine = create_engine(migrator_url)
         Base.metadata.create_all(engine, tables=[table for table in Base.metadata.sorted_tables
-            if table.name not in {"coding_review_captures", "coding_checkout_reservations"}])
+            if table.name not in {"coding_review_captures", "coding_checkout_reservations", "coding_reviews", "coding_review_events", "coding_review_findings", "coding_review_approvals"}])
         assert admin.migrate(env, directory, ["stamp", "056_coding_workspace_lifecycle"]) == 0
         assert admin.migrate(env, directory, ["upgrade", "head"]) == 0
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "058_coding_review_captures"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "059_coding_reviews"
             assert connection.scalar(text("SELECT pg_get_userbyid(extowner) FROM pg_extension WHERE extname='vector'")) == admin.ADMIN_ROLE
             protect_migration_ledger(connection)
             connection.commit()
@@ -242,7 +242,7 @@ def test_real_role_permissions_default_grants_and_alembic(tmp_path):
         with admin.connect(url, admin.APP_ROLE, credentials["app_password"]) as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT version_num FROM alembic_version")
-                assert cursor.fetchone()[0] == "058_coding_review_captures"
+                assert cursor.fetchone()[0] == "059_coding_reviews"
                 with pytest.raises(psycopg2.errors.InsufficientPrivilege):
                     cursor.execute("UPDATE alembic_version SET version_num='corrupt'")
 
@@ -251,7 +251,7 @@ def test_real_role_permissions_default_grants_and_alembic(tmp_path):
             engine = create_async_engine(runtime_url.set(drivername="postgresql+asyncpg"))
             async with engine.connect() as connection:
                 await check_database(connection, separated=True)
-                for table in ("coding_checkout_reservations", "coding_review_captures"):
+                for table in ("coding_checkout_reservations", "coding_review_captures", "coding_reviews", "coding_review_events", "coding_review_findings", "coding_review_approvals"):
                     for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
                         assert await connection.scalar(text("SELECT has_table_privilege(current_user, :table, :privilege)"),
                                                        {"table": table, "privilege": privilege})

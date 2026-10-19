@@ -65,7 +65,10 @@ class ReviewCaptureService:
         row = await db.get(CodingCheckoutReservation, checkout_id)
         return row is not None and row.service_epoch == self._capture_epoch and row.holder_kind == kind and row.holder_id == holder_id and (token is None or row.token == token)
 
-    async def _capture_context(self, db, user_id, session_id, *, starting=False):
+    def _active_capture_count(self):
+        return len(self._capture_jobs) + sum(slot.phase == "capturing" for slot in self._reviews.values())
+
+    async def _capture_context(self, db, user_id, session_id, *, starting=False, check_model=True):
         user = await self._require_user(db, user_id)
         session = await self._session(db, user_id, session_id)
         workspace = await self._workspace(db, user_id, session.workspace_id)
@@ -76,7 +79,8 @@ class ReviewCaptureService:
             if session.status not in {"idle", "interrupted"} or self._closing:
                 raise failure("checkout_busy", "Finish the current run before capturing a review")
             await self._assert_checkout_idle(db, checkout)
-            await self._model(db, user_id, session.model_profile_id)
+            if check_model:
+                await self._model(db, user_id, session.model_profile_id)
         return user, session, workspace, checkout
 
     async def review_options(self, *, user_id, session_id, scope="checkout_changes"):
@@ -100,7 +104,19 @@ class ReviewCaptureService:
             raise failure("capture_unavailable", "Repository options could not be observed safely") from None
         async with self._db_lock, self._sessions() as db:
             await self._capture_context(db, user_id, session_id)
-        return {**result, "captures_enabled": True, "ai_reviews": False, "reasoning_efforts": [],
+            profiles = []
+            if self.supports_ai_reviews:
+                from app.coding_runtime.review_runtime import effort_choices
+                from app.db.models import ModelProfile
+                for profile in (await db.execute(select(ModelProfile).where(ModelProfile.enabled.is_(True)).order_by(ModelProfile.id).limit(100))).scalars():
+                    try:
+                        await self._review_model(db, user_id, profile.id, "default")
+                    except Exception:
+                        continue
+                    profiles.append({"id": profile.id, "label": profile.display_name, "model_id": profile.model_id,
+                                     "reasoning_efforts": effort_choices(profile)})
+        return {**result, "captures_enabled": True, "ai_reviews": self.supports_ai_reviews, "reasoning_efforts": [],
+                "reviewer_profiles": profiles,
                 "busy": busy, "content_retention_days": 30}
 
     async def create_review_capture(self, *, user_id, session_id, scope, paths, client_request_id):
@@ -123,7 +139,7 @@ class ReviewCaptureService:
                     raise failure("request_conflict", "Capture request key was used for different inputs")
                 return self._capture_metadata(previous)
             _, session, workspace, checkout = await self._capture_context(db, user_id, session_id, starting=True)
-            if len(self._capture_jobs) >= 2:
+            if self._active_capture_count() >= 2:
                 raise failure("capacity_reached", "Capture workers are busy; no work was queued")
             count = await db.scalar(select(func.count()).select_from(CodingReviewCapture).where(
                 CodingReviewCapture.checkout_id == checkout.id,
@@ -146,7 +162,7 @@ class ReviewCaptureService:
         task.add_done_callback(lambda completed: self._capture_jobs.pop(capture.id, None))
         return self._capture_metadata(capture)
 
-    async def _make_capture(self, capture, root, baseline, source, checkout, paths, token):
+    async def _make_capture(self, capture, root, baseline, source, checkout, paths, token, review_id=None):
         status, error_code, stored_bytes, manifest_hash, summary = "failed", "capture_unavailable", 0, None, {}
         publish = None
         try:
@@ -187,7 +203,8 @@ class ReviewCaptureService:
                     row.status, row.error_code, row.finished_at = status, error_code, now()
                     row.stored_bytes, row.manifest_hash = stored_bytes, manifest_hash
                     row.summary_json = json.dumps(summary)
-                    await self._release_checkout(db, "capture", capture.id, token)
+                    if review_id is None:
+                        await self._release_checkout(db, "capture", capture.id, token)
 
     def _capture_metadata(self, row):
         return {"id": row.id, "session_id": row.session_id, "checkout_id": row.checkout_id,
@@ -210,7 +227,7 @@ class ReviewCaptureService:
             row = await self._authorized_capture(db, user_id, capture_id)
         if row.status != "ready":
             raise failure("capture_expired" if row.status == "expired" else "capture_unavailable", "Retained capture content is unavailable")
-        if utc(row.expires_at) <= now():
+        if utc(row.expires_at) <= now() and not await self._capture_is_pinned(capture_id):
             raise failure("capture_expired", "Retained capture content has expired")
         try:
             manifest = await asyncio.to_thread(self._capture_storage.load, user_id, capture_id, row.manifest_hash)
@@ -306,6 +323,8 @@ class ReviewCaptureService:
                 CodingReviewCapture.expires_at <= now(), CodingReviewCapture.status != "capturing",
                 (CodingReviewCapture.status != "expired") | (CodingReviewCapture.stored_bytes > 0)).limit(50))).scalars())
         for row in rows:
+            if await self._capture_is_pinned(row.id):
+                continue
             try:
                 await asyncio.to_thread(self._capture_storage.purge, row.user_id, row.id)
             except (OSError, RepositoryError):

@@ -664,6 +664,70 @@ class CodingReviewCapture(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class CodingReview(Base):
+    __tablename__ = "coding_reviews"
+    __table_args__ = (UniqueConstraint("session_id", "client_request_id", name="uq_coding_review_request"),)
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+    session_id = Column(String(64), ForeignKey("coding_sessions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    checkout_id = Column(String(64), ForeignKey("coding_checkouts.id", ondelete="RESTRICT"), nullable=False)
+    capture_id = Column(String(64), ForeignKey("coding_review_captures.id", ondelete="RESTRICT"), nullable=False, unique=True)
+    client_request_id = Column(String(100), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    model_profile_id = Column(Integer, ForeignKey("model_profiles.id", ondelete="SET NULL"), nullable=True)
+    model_json = Column(Text, nullable=False)
+    reasoning_json = Column(Text, nullable=False)
+    coverage_json = Column(Text, nullable=False, default="{}")
+    limitations_json = Column(Text, nullable=False, default="[]")
+    summary = Column(Text, nullable=False, default="")
+    status = Column(String(25), nullable=False, default="capturing")
+    error_code = Column(String(50), nullable=True)
+    last_event_sequence = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class CodingReviewFinding(Base):
+    __tablename__ = "coding_review_findings"
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    review_id = Column(String(64), ForeignKey("coding_reviews.id", ondelete="RESTRICT"), nullable=False, index=True)
+    capture_id = Column(String(64), ForeignKey("coding_review_captures.id", ondelete="RESTRICT"), nullable=False)
+    severity = Column(String(20), nullable=False)
+    title = Column(String(200), nullable=False)
+    body = Column(Text, nullable=False)
+    path = Column(String(1024), nullable=False)
+    side = Column(String(10), nullable=False)
+    line_start = Column(Integer, nullable=False)
+    line_end = Column(Integer, nullable=False)
+    evidence = Column(Text, nullable=False)
+    disposition = Column(String(20), nullable=False, default="open")
+    reason = Column(String(2000), nullable=True)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class CodingReviewEvent(Base):
+    __tablename__ = "coding_review_events"
+    review_id = Column(String(64), ForeignKey("coding_reviews.id", ondelete="RESTRICT"), primary_key=True)
+    sequence = Column(Integer, primary_key=True)
+    event_type = Column(String(50), nullable=False)
+    payload_json = Column(Text, nullable=False)
+    schema_version = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class CodingReviewApproval(Base):
+    __tablename__ = "coding_review_approvals"
+    __table_args__ = (UniqueConstraint("review_id", "runtime_request_id", name="uq_coding_review_approval"),)
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    review_id = Column(String(64), ForeignKey("coding_reviews.id", ondelete="RESTRICT"), nullable=False, index=True)
+    runtime_request_id = Column(String(100), nullable=False)
+    payload_json = Column(Text, nullable=False)
+    status = Column(String(20), nullable=False, default="pending")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class CodingCheckoutAttachment(Base):
     """A conversation's execution root, independent of checkout creation provenance."""
     __tablename__ = "coding_checkout_attachments"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
+from datetime import datetime
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -204,10 +205,13 @@ async def test_sse_replay_reconnect_and_cursor_validation(tmp_path):
         assert [int(frame["id"]) for frame in events] == [event.sequence for event in stored]
         assert events[-1]["event"] == "run.completed"
         assert events[-1]["data"]["run_id"] == submitted.id
+        assert all(event.occurred_at is not None for event in stored)
+        assert [datetime.fromisoformat(frame["data"]["occurred_at"]) for frame in events] == [event.occurred_at for event in stored]
         assert "DO_NOT_PERSIST" not in response.text
         cursor = events[-2]["id"]
         replay = await client.get(path + "?after=1&follow=false", headers={"Last-Event-ID": cursor})
         assert len(frames(replay.text)) == 1
+        assert frames(replay.text)[0]["data"]["occurred_at"] == events[-1]["data"]["occurred_at"]
         assert (await client.get(path, headers={"Last-Event-ID": events[-1]["id"]})).text == ""
         for invalid in ["-1", "wat", "1.0", "9" * 30]:
             assert (await client.get(path, headers={"Last-Event-ID": invalid})).status_code == 422

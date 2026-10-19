@@ -14,6 +14,7 @@ class PiModelProfile:
     api_key: str = field(default="local", repr=False)
     context_window: int = 32768
     max_tokens: int = 4096
+    reasoning: bool = False
 
     def __post_init__(self) -> None:
         endpoint = urlsplit(self.base_url)
@@ -34,7 +35,7 @@ class PiModelProfile:
                     "models": [{
                         "id": self.model,
                         "name": self.model,
-                        "reasoning": False,
+                        "reasoning": self.reasoning,
                         "input": ["text"],
                         "contextWindow": self.context_window,
                         "maxTokens": self.max_tokens,

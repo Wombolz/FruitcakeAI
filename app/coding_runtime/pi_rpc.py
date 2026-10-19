@@ -64,6 +64,7 @@ class PiRpcConfig:
     isolate_resources: bool = True
     workspace_guard: bool = True
     require_read_approval: bool = False
+    review_mode: bool = False
     approval_timeout_seconds: float | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
     inherit_environment: bool = False
@@ -74,6 +75,9 @@ class PiRpcConfig:
     event_limit_records: int = 256
 
     def __post_init__(self) -> None:
+        if self.review_mode and (not self.workspace_guard or not self.isolate_resources or self.inherit_environment
+                                 or self.tool_allowlist != ("fruitcake_review_read",) or self.edit_tools or self.command_tools):
+            raise ValueError("Reviews require isolated capture-only read tools")
         if self.command_tools not in {(), ("fruitcake_run",)} or (self.command_tools and not self.workspace_guard):
             raise ValueError("Container commands require the Fruitcake guard")
         if any(tool not in {"fruitcake_edit", "fruitcake_write"} for tool in self.edit_tools) or (self.edit_tools and not self.workspace_guard):
@@ -187,6 +191,7 @@ class PiRpcClient:
         env["FRUITCAKE_PI_READ_TOOLS"] = json.dumps(self.config.tool_allowlist)
         env["FRUITCAKE_PI_EDIT_TOOLS"] = json.dumps(self.config.edit_tools)
         env["FRUITCAKE_PI_COMMAND_TOOLS"] = json.dumps(self.config.command_tools)
+        env["FRUITCAKE_PI_REVIEW_MODE"] = "1" if self.config.review_mode else "0"
         return env
 
     @property
@@ -363,6 +368,8 @@ class PiRpcClient:
             raise PiRpcError("Timed out waiting for Pi to become settled") from exc
 
     async def send_command(self, command: str, **fields: Any) -> dict[str, Any]:
+        if self.config.review_mode and command not in {"get_state", "prompt", "abort", "clear_queue", "get_available_thinking_levels", "set_thinking_level"}:
+            raise PiRpcCommandError("Command is unavailable in the capture-only reviewer")
         if self.config.workspace_guard and command in {"bash", "export_html", "switch_session", "new_session", "fork", "clone"}:
             raise PiRpcCommandError(f"Command {command!r} is unavailable in the read-only spike")
         process = self._require_running_process()
@@ -552,7 +559,10 @@ class PiRpcClient:
                 )
         if record["type"] == "extension_ui_request" and record.get("method") == "confirm":
             self._interactions[str(record["id"])] = "confirm"
-        if record["type"] == "extension_ui_request" and record.get("method") == "input" and record.get("title") == "Approve container command?" and self.config.command_tools:
+        if record["type"] == "extension_ui_request" and record.get("method") == "input" and (
+            (record.get("title") == "Approve container command?" and self.config.command_tools)
+            or (record.get("title") == "Read captured review file?" and self.config.review_mode)
+        ):
             self._interactions[str(record["id"])] = "input"
         if record["type"] == "agent_settled":
             if not isinstance(record.get("aborted"), bool):

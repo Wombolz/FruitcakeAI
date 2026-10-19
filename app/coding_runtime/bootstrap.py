@@ -15,6 +15,7 @@ def get_coding_session_service() -> CodingSessionService | None:
         return None
     if _service is None:
         from app.coding_runtime.pi_runtime import PiCodingRuntime
+        from app.coding_runtime.review_runtime import PiReviewRuntime
         from app.coding_runtime.container_commands import DockerCommandRunner
         from app.db.session import AsyncSessionLocal
 
@@ -33,7 +34,10 @@ def get_coding_session_service() -> CodingSessionService | None:
             ),
             admin_roles=tuple(settings.admin_roles),
             checkout_root=Path(settings.storage_dir) / "coding_checkouts",
-            review_capture_root=Path(settings.storage_dir) / ".coding_review_captures" if settings.coding_review_capture_enabled else None,
+            review_capture_root=Path(settings.storage_dir) / ".coding_review_captures" if settings.coding_review_capture_enabled or settings.coding_review_enabled else None,
+            review_runtime_factory=(lambda: PiReviewRuntime(executable=settings.coding_runtime_executable,
+                base_url=settings.local_api_base, api_key=settings.local_api_key)) if settings.coding_review_enabled else None,
+            review_require_read_approval=settings.coding_require_read_approval,
             command_runner=DockerCommandRunner(settings.coding_command_image) if settings.coding_command_image else None,
         )
     return _service

@@ -31,6 +31,10 @@ from app.coding_runtime.container_commands import DockerCommandRunner
 from app.coding_runtime.run_deadline import RunDeadline
 from app.db.models import CodingChange
 from app.coding_runtime.review_service import ReviewCaptureService
+from app.coding_runtime.review_supervisor import ReviewSupervisor
+from app.coding_runtime.review_access import ReviewAccess
+from app.coding_runtime.file_browser import CheckoutFileBrowser
+from app.coding_runtime.explorer_service import CheckoutExplorerService
 
 
 ACTIVE_STATUSES = frozenset({"starting", "running", "waiting_approval", "stopping"})
@@ -67,6 +71,7 @@ class StoredCodingEvent:
     kind: str
     payload: dict
     schema_version: int = 1
+    occurred_at: datetime | None = None
 
 
 @dataclass
@@ -87,7 +92,7 @@ class _RuntimeSlot:
     deadline: RunDeadline | None = None
 
 
-class CodingSessionService(ReviewCaptureService, WorkspaceLifecycleService, ContainerCommandService):
+class CodingSessionService(CheckoutExplorerService, ReviewAccess, ReviewSupervisor, ReviewCaptureService, WorkspaceLifecycleService, ContainerCommandService):
     """Single-backend-process supervisor with durable, user-scoped run state."""
 
     def __init__(
@@ -101,6 +106,8 @@ class CodingSessionService(ReviewCaptureService, WorkspaceLifecycleService, Cont
         checkout_root: Path | None = None,
         command_runner: DockerCommandRunner | None = None,
         review_capture_root: Path | None = None,
+        review_runtime_factory=None,
+        review_require_read_approval: bool = False,
     ):
         self._sessions = sessions
         self._factory = runtime_factory
@@ -113,12 +120,14 @@ class CodingSessionService(ReviewCaptureService, WorkspaceLifecycleService, Cont
         self._closing = False
         self._maintenance: asyncio.Task | None = None
         self._repository = RepositoryInspector()
+        self._file_browser = CheckoutFileBrowser()
         self._checkouts = CheckoutManager(checkout_root.resolve()) if checkout_root is not None else None
         self._checkout_jobs: dict[str, asyncio.Task] = {}
         self._commands = command_runner
         self._command_jobs: dict[str, tuple[str, asyncio.Task]] = {}
         self._command_cleanup_failed = False
         self._init_captures(review_capture_root)
+        self._init_reviews(review_runtime_factory, review_require_read_approval)
 
     @property
     def supports_managed_checkouts(self) -> bool:
@@ -156,6 +165,7 @@ class CodingSessionService(ReviewCaptureService, WorkspaceLifecycleService, Cont
                     self._command_cleanup_failed = True
             async with self._db_lock, self._sessions() as db, db.begin():
                 await self._capture_fence.check()
+                await self._recover_reviews(db)
                 await self._recover_captures(db)
                 runs = (await db.execute(select(CodingRun).where(CodingRun.status.in_(ACTIVE_STATUSES)))).scalars().all()
                 for run in runs:
@@ -634,9 +644,9 @@ class CodingSessionService(ReviewCaptureService, WorkspaceLifecycleService, Cont
                 slot = None
             new_process = slot is None
             if slot is None:
-                if len(self._slots) >= self.limits.max_active_sessions:
+                if len(self._slots) + len(self._reviews) >= self.limits.max_active_sessions:
                     idle = [(key, item) for key, item in self._slots.items() if item.task is None]
-                    if idle:
+                    if idle and len(self._reviews) < self.limits.max_active_sessions:
                         key, item = min(idle, key=lambda pair: pair[1].last_used)
                         await self._evict(key, item)
                     else:
@@ -846,7 +856,7 @@ class CodingSessionService(ReviewCaptureService, WorkspaceLifecycleService, Cont
                 status = run.status
             for row in rows:
                 after = row.sequence
-                yield StoredCodingEvent(row.sequence, row.event_type, row.payload, row.schema_version)
+                yield StoredCodingEvent(row.sequence, row.event_type, row.payload, row.schema_version, _utc(row.occurred_at))
             if rows:
                 continue
             if not follow or status in TERMINAL_STATUSES:
@@ -903,6 +913,7 @@ class CodingSessionService(ReviewCaptureService, WorkspaceLifecycleService, Cont
                     tasks.append(slot.task)
         if maintenance is not None:
             await asyncio.gather(maintenance, return_exceptions=True)
+        await self._shutdown_reviews()
         await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.gather(*checkout_tasks, return_exceptions=True)
         await asyncio.gather(*capture_tasks, return_exceptions=True)

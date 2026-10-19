@@ -136,6 +136,64 @@ async def test_installed_pi_reasoning_levels_are_runtime_readback_not_provider_c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("level", ["off", "low", "high"])
+async def test_installed_reviewer_only_uses_host_reads_and_maps_effort_without_provider_claims(tmp_path, level):
+    from app.coding_runtime.review_runtime import PiReviewRuntime, ReviewRuntimeStart
+    from app.coding_runtime.pi_rpc import PiRpcCommandError
+    from app.coding_runtime.review_supervisor import READ_PROTOCOL
+    summary = json.dumps({"type": "summary", "summary": "No findings reported", "limitations": []})
+    with model_server([{"tool": "fruitcake_review_read", "arguments": {"path": "file.txt", "side": "after"}},
+                       {"text": summary}]) as (endpoint, requests):
+        runtime = PiReviewRuntime(executable=PI_EXECUTABLE, base_url=endpoint, api_key="fixture")
+        try:
+            await runtime.start(ReviewRuntimeStart(tmp_path, CodingModel(1, "scripted-model", "local", True), True, level))
+            for command in ("bash", "set_active_tools", "switch_session", "steer", "follow_up", "export_html"):
+                with pytest.raises(PiRpcCommandError):
+                    await runtime._client.send_command(command)
+            async for event in runtime.run(CodingPrompt("Inspect only the immutable capture using fruitcake_review_read, then report JSONL.")):
+                if event.kind == "interaction.requested":
+                    proposal = json.loads(event.payload["placeholder"])
+                    await runtime.answer_read(event.payload["id"], {"protocol": READ_PROTOCOL, "operation_id": proposal["operation_id"],
+                        "status": "completed", "text": "HOST_CAPTURE_ONLY_CONTENT"})
+            assert runtime.provenance["runtime_readback"] == level
+            assert runtime.provenance["provider_confirmation"] is None
+        finally:
+            await runtime.close()
+        assert {tool["function"]["name"] for tool in requests[0]["tools"]} == {"fruitcake_review_read"}
+        system = "\n".join(item.get("content", "") for item in requests[0]["messages"] if item["role"] in {"system", "developer"})
+        assert "You are a reviewer, not the general coding assistant" in system
+        assert "You are an expert coding assistant operating inside pi" not in system
+        assert requests[0].get("reasoning_effort") == (None if level == "off" else level)
+        assert "HOST_CAPTURE_ONLY_CONTENT" in str(requests[1]["messages"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("require_approval", [False, True])
+async def test_installed_reviewer_supervisor_uses_frozen_reads_and_structured_findings(tmp_path, require_approval):
+    from app.coding_runtime.review_runtime import PiReviewRuntime
+    from test_reviews import setup, start, done, wait_status, FINDING, SUMMARY
+    from test_service import harness
+    text = json.dumps(FINDING) + "\n" + json.dumps(SUMMARY) + "\n"
+    with model_server([{"tool": "fruitcake_review_read", "arguments": {"path": "file.txt", "side": "after"}},
+                       {"text": text}]) as (endpoint, requests):
+        factory = lambda: PiReviewRuntime(executable=PI_EXECUTABLE, base_url=endpoint, api_key="fixture")
+        async with harness(tmp_path, reviewer=factory, read_approval=require_approval) as (service, sessions, builder, _, session):
+            await setup(service, session, tmp_path)
+            review = await start(service, session)
+            if require_approval:
+                await wait_status(service, review["id"], "waiting_approval")
+                approval = (await service.list_review_approvals(user_id=2, review_id=review["id"]))[0]
+                await service.resolve_review_approval(user_id=2, review_id=review["id"], approval_id=approval["id"], approved=True)
+            result = await done(service, review)
+            assert result["status"] == "completed", result
+            assert result["reasoning"]["runtime_version"] == "1.3.0"
+            assert result["reasoning"]["provider_confirmation"] is None
+            assert result["coverage"]["successful_captured_reads"] == 1
+            assert len(result["findings"]) == 1 and not builder.instances
+        assert "return None" in str(requests[1]["messages"])
+
+
+@pytest.mark.asyncio
 async def test_installed_pi_model_selection_stream_and_workspace_read(tmp_path):
     (tmp_path / "hello.txt").write_text("authorized fixture content")
     with model_server([{"tool": "read", "arguments": {"path": "hello.txt"}}, {"text": "Read complete."}]) as (endpoint, requests):

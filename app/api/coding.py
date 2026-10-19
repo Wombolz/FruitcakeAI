@@ -39,6 +39,9 @@ ERROR_STATUS = {
     "checkout_busy": 409, "coding_owner_busy": 503, "coding_owner_lost": 503,
     "capture_unsupported": 409, "capture_changed": 409, "capture_limit": 413,
     "capture_unavailable": 409, "capture_corrupt": 409, "capture_expired": 410,
+    "unsupported_effort": 422, "authorization_changed": 403, "cursor_ahead": 409,
+    "review_event_limit": 413,
+    "explorer_unavailable": 409, "file_denied": 403, "file_missing": 404, "file_changed": 409,
 }
 
 
@@ -269,6 +272,40 @@ class CaptureDiffOut(Output):
     truncated: bool
 
 
+class ReviewCreate(CaptureCreate):
+    model_profile_id: int = Field(gt=0)
+    effort: Literal["default", "none", "off", "minimal", "low", "medium", "high"] = "default"
+
+
+class FindingDisposition(Input):
+    disposition: Literal["open", "dismissed"]
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class ReviewApprovalDecision(Input):
+    approved: bool
+
+
+class ReviewOut(Output):
+    id: str
+    session_id: str
+    checkout_id: str
+    capture_id: str
+    model_profile_id: int | None
+    model: dict
+    reasoning: dict
+    coverage: dict
+    limitations: list[str]
+    summary: str
+    status: Literal["capturing", "starting", "running", "waiting_approval", "stopping", "completed", "failed", "cancelled", "interrupted"]
+    error_code: str | None
+    last_event_sequence: int
+    created_at: datetime
+    finished_at: datetime | None
+    findings: list[dict] | None = None
+    capture: CaptureOut | None = None
+
+
 class ModelOut(Output):
     id: int
     label: str
@@ -300,6 +337,46 @@ class RepositoryDiffOut(Output):
     observed_at: datetime
     path: str
     sections: list[DiffSectionOut]
+
+
+class ExplorerRootOut(Output):
+    provider: Literal["coding_checkout"]
+    root_id: str
+    session_id: str
+    label: str
+    read_only: Literal[True]
+    byte_limit: int
+    line_limit: int
+    entry_limit: int
+
+
+class ExplorerEntryOut(Output):
+    name: str
+    path: str
+    kind: Literal["directory", "file"]
+    size_bytes: int | None
+
+
+class ExplorerDirectoryOut(Output):
+    root: ExplorerRootOut
+    basis: Literal["current_worktree"]
+    observed_at: datetime
+    path: str
+    version: str
+    entries: list[ExplorerEntryOut]
+    next_offset: int | None
+
+
+class ExplorerFileOut(Output):
+    root: ExplorerRootOut
+    basis: Literal["current_worktree"]
+    observed_at: datetime
+    path: str
+    status: Literal["text", "binary", "oversized"]
+    byte_count: int
+    version: str | None
+    text: str | None
+    line_count: int | None
 
 
 class CheckoutOut(Output):
@@ -340,11 +417,14 @@ async def status(request: Request, user: Owner):
     return StatusOut(enabled=service is not None, managed_checkouts=service is not None and service.supports_managed_checkouts,
                      approved_edits=service is not None and service.supports_managed_checkouts,
                      container_commands=service is not None and service.supports_container_commands,
-                     review_captures=service is not None and service.supports_review_captures)
+                     review_captures=service is not None and service.supports_review_captures,
+                     ai_reviews=service is not None and service.supports_ai_reviews)
 
 
 @router.get("/sessions/{session_id}/review-options")
-async def review_options(session_id: Identifier, user: Owner, service: Service, scope: ReviewScope = "checkout_changes"):
+async def review_options(session_id: Identifier, user: Owner, service: Service,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")], scope: ReviewScope = "checkout_changes"):
+    await db.close()
     return await service.review_options(user_id=user.id, session_id=session_id, scope=scope)
 
 
@@ -354,14 +434,58 @@ async def create_review_capture(session_id: Identifier, body: CaptureCreate, use
 
 
 @router.get("/review-captures/{capture_id}", response_model=CaptureOut)
-async def review_capture(capture_id: Identifier, user: Owner, service: Service):
+async def review_capture(capture_id: Identifier, user: Owner, service: Service,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")]):
+    await db.close()
     return await service.get_review_capture(user_id=user.id, capture_id=capture_id)
 
 
 @router.get("/review-captures/{capture_id}/diff", response_model=CaptureDiffOut)
 async def review_capture_diff(capture_id: Identifier, user: Owner, service: Service,
-                              path: Annotated[str, Query(min_length=1, max_length=1024)]):
+                              path: Annotated[str, Query(min_length=1, max_length=1024)],
+                              db: Annotated[AsyncSession, Depends(get_db, scope="function")]):
+    await db.close()
     return await service.review_capture_diff(user_id=user.id, capture_id=capture_id, path=path)
+
+
+@router.post("/sessions/{session_id}/reviews", response_model=ReviewOut, status_code=202)
+async def start_review(session_id: Identifier, body: ReviewCreate, user: Owner, service: Service):
+    return await service.start_review(user_id=user.id, session_id=session_id, **body.model_dump())
+
+
+@router.get("/sessions/{session_id}/reviews", response_model=list[ReviewOut])
+async def reviews(session_id: Identifier, user: Owner, service: Service, limit: PageLimit = 50, offset: PageOffset = 0):
+    return await service.list_reviews(user_id=user.id, session_id=session_id, limit=limit, offset=offset)
+
+
+@router.get("/reviews/{review_id}", response_model=ReviewOut)
+async def review(review_id: Identifier, user: Owner, service: Service,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")]):
+    await db.close()
+    return await service.get_review(user_id=user.id, review_id=review_id)
+
+
+@router.post("/reviews/{review_id}/stop", response_model=StopOut)
+async def stop_review(review_id: Identifier, user: Owner, service: Service,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")]):
+    await db.close()
+    return StopOut(stop_requested=await service.stop_review(user_id=user.id, review_id=review_id))
+
+
+@router.patch("/reviews/{review_id}/findings/{finding_id}")
+async def finding_disposition(review_id: Identifier, finding_id: Identifier, body: FindingDisposition, user: Owner, service: Service):
+    return await service.set_finding_disposition(user_id=user.id, review_id=review_id, finding_id=finding_id, **body.model_dump())
+
+
+@router.get("/reviews/{review_id}/approvals")
+async def review_approvals(review_id: Identifier, user: Owner, service: Service):
+    return await service.list_review_approvals(user_id=user.id, review_id=review_id)
+
+
+@router.post("/reviews/{review_id}/approvals/{approval_id}/resolve", status_code=204)
+async def resolve_review_approval(review_id: Identifier, approval_id: Identifier, body: ReviewApprovalDecision, user: Owner, service: Service):
+    await service.resolve_review_approval(user_id=user.id, review_id=review_id, approval_id=approval_id, approved=body.approved)
+    return Response(status_code=204)
 
 
 @router.get("/models", response_model=list[ModelOut])
@@ -504,6 +628,43 @@ async def repository_diff(
     return await service.inspect_repository(user_id=user_id, session_id=session_id, path=path)
 
 
+@router.get("/sessions/{session_id}/explorer", response_model=ExplorerRootOut)
+async def explorer_root(
+    session_id: Identifier, user: Owner, service: Service,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
+):
+    user_id = user.id
+    await db.close()
+    return await service.explorer_root(user_id=user_id, session_id=session_id)
+
+
+@router.get("/sessions/{session_id}/explorer/directory", response_model=ExplorerDirectoryOut)
+async def explorer_directory(
+    session_id: Identifier, user: Owner, service: Service,
+    root_id: Annotated[str, Query(min_length=1, max_length=64)],
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
+    path: Annotated[str, Query(max_length=1024)] = "",
+    offset: Annotated[int, Query(ge=0, le=4096)] = 0,
+    version: Annotated[str | None, Query(pattern=r"^[a-f0-9]{64}$")] = None,
+):
+    user_id = user.id
+    await db.close()
+    return await service.inspect_source(user_id=user_id, session_id=session_id, root_id=root_id,
+                                        path=path, offset=offset, version=version)
+
+
+@router.get("/sessions/{session_id}/explorer/file", response_model=ExplorerFileOut)
+async def explorer_file(
+    session_id: Identifier, user: Owner, service: Service,
+    root_id: Annotated[str, Query(min_length=1, max_length=64)],
+    path: Annotated[str, Query(min_length=1, max_length=1024)],
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
+):
+    user_id = user.id
+    await db.close()
+    return await service.inspect_source(user_id=user_id, session_id=session_id, root_id=root_id, path=path, file=True)
+
+
 @router.get("/sessions/{session_id}/runs", response_model=list[RunOut])
 async def runs(session_id: Identifier, user: Owner, service: Service, limit: PageLimit = 50, offset: PageOffset = 0):
     return await service.list_runs(user_id=user.id, session_id=session_id, limit=limit, offset=offset)
@@ -564,8 +725,9 @@ def _cursor(after: int, last_event_id: str | None) -> int:
     return max(after, cursor)
 
 
-async def _event_stream(service: CodingSessionService, *, user_id: int, run_id: str, after: int, follow: bool):
-    events = service.events(user_id=user_id, run_id=run_id, after=after, follow=follow)
+async def _event_stream(service: CodingSessionService, *, user_id: int, run_id: str, after: int, follow: bool, review=False):
+    events = (service.review_events(user_id=user_id, review_id=run_id, after=after, follow=follow) if review else
+              service.events(user_id=user_id, run_id=run_id, after=after, follow=follow))
     pending = None
     try:
         while True:
@@ -581,10 +743,13 @@ async def _event_stream(service: CodingSessionService, *, user_id: int, run_id: 
                 return
             finally:
                 pending = None
-            data = json.dumps({
-                "schema_version": event.schema_version, "run_id": run_id,
+            envelope = {
+                "schema_version": event.schema_version, "review_id" if review else "run_id": run_id,
                 "sequence": event.sequence, "kind": event.kind, "payload": event.payload,
-            }, ensure_ascii=False, separators=(",", ":"))
+            }
+            if (occurred_at := getattr(event, "occurred_at", None)) is not None:
+                envelope["occurred_at"] = occurred_at.isoformat()
+            data = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
             yield f"id: {event.sequence}\nevent: {event.kind}\ndata: {data}\n\n"
     except CodingServiceError as exc:
         yield f'event: stream.error\ndata: {json.dumps({"code": exc.code, "message": str(exc)})}\n\n'
@@ -618,3 +783,15 @@ async def events(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+@router.get("/reviews/{review_id}/events", response_class=StreamingResponse)
+async def review_events(review_id: Identifier, user: Owner, service: Service,
+    after: Annotated[int, Query(ge=0, le=MAX_CURSOR)] = 0, follow: bool = True,
+    last_event_id: Annotated[str | None, Header()] = None):
+    cursor = _cursor(after, last_event_id)
+    current = await service.get_review(user_id=user.id, review_id=review_id, include_content=False)
+    if cursor > current["last_event_sequence"]:
+        raise CodingServiceError("cursor_ahead", "Review event cursor is ahead of saved history")
+    return StreamingResponse(_event_stream(service, user_id=user.id, run_id=review_id, after=cursor, follow=follow, review=True),
+        media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})

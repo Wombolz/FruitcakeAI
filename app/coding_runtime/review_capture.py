@@ -17,14 +17,12 @@ from uuid import UUID, uuid4
 
 from app.coding_runtime import changes
 from app.coding_runtime.repository import RepositoryError, RepositoryInspector
+from app.coding_runtime.path_policy import DENIED_PARTS, path_allowed
 
 PROTOCOL = "fruitcake.review_capture.v1"
 SCOPES = {"checkout_changes", "uncommitted"}
 SHA = re.compile(r"^[a-f0-9]{40}(?:[a-f0-9]{24})?$")
 HASH = re.compile(r"^[a-f0-9]{64}$")
-DENIED_PARTS = {".git", ".pi", ".codex", ".claude", ".agents", ".ssh", ".aws", ".gnupg",
-    "node_modules", "vendor", "__pycache__", ".venv", "venv", "storage", "workspace", ".pytest_cache",
-    "build", "dist", ".build", "deriveddata", "credentials", "secrets", "model_cache"}
 
 
 def fail(code, message):
@@ -51,18 +49,6 @@ def retained_patch(path, before, after, before_mode, after_mode):
         fromfile="a/" + path if before is not None else "/dev/null",
         tofile="b/" + path if after is not None else "/dev/null", n=changes.FILE_BYTES)
     return header + "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in lines)
-
-
-def path_allowed(path):
-    if not isinstance(path, str) or len(path.encode("utf-8")) > 1024 or any(ord(c) < 32 for c in path) or any(c in path for c in ('"', "\\")):
-        return False
-    parts = path.split("/")
-    if any(not part or part in {".", ".."} or part.startswith(".") or part.casefold() in DENIED_PARTS for part in parts):
-        return False
-    name = parts[-1].casefold()
-    return not (name.endswith((".pem", ".key", ".p12", ".pfx", ".keystore", ".sqlite", ".sqlite3", ".db"))
-                or any(word in name for word in ("credential", "secret", "id_rsa", "id_ed25519"))
-                or name in {"env", "config.json", "token.json", "tokens.json"})
 
 
 @dataclass(frozen=True)
