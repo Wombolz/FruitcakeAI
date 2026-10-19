@@ -149,7 +149,8 @@ class RepositoryInspector:
 
     async def _git(self, root: Path, *args: str, limit: int | None = None,
                    preview: bool = False, allowed: tuple[int, ...] = (0,),
-                   _config_only: bool = False, _index: str | None = None) -> tuple[bytes, bool]:
+                   _config_only: bool = False, _index: str | None = None,
+                   _literal_paths: bool = True) -> tuple[bytes, bool]:
         filters = []
         if not _config_only:
             names, _ = await self._git(root, "config", "--null", "--name-only", "--get-regexp",
@@ -163,8 +164,11 @@ class RepositoryInspector:
         environment = {
             "PATH": os.defpath, "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
-            "GIT_NO_LAZY_FETCH": "1", "GIT_LITERAL_PATHSPECS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
         }
+        if _literal_paths:
+            environment["GIT_LITERAL_PATHSPECS"] = "1"
         if _index is not None:
             environment["GIT_INDEX_FILE"] = _index
         spawning = asyncio.create_task(asyncio.create_subprocess_exec(

@@ -120,7 +120,7 @@ class Factory:
 
 
 @asynccontextmanager
-async def harness(tmp_path, **limit_values):
+async def harness(tmp_path, *, review=False, **limit_values):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'coding.sqlite'}")
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
@@ -134,7 +134,8 @@ async def harness(tmp_path, **limit_values):
         ])
     factory = Factory()
     limits = CodingServiceLimits(**limit_values)
-    service = CodingSessionService(sessions, factory, runtime_kind="fixture", limits=limits, checkout_root=tmp_path / "managed")
+    service = CodingSessionService(sessions, factory, runtime_kind="fixture", limits=limits, checkout_root=tmp_path / "managed",
+                                  review_capture_root=tmp_path / "captures" if review else None)
     await service.startup()
     repository = tmp_path / "repo"
     repository.mkdir()

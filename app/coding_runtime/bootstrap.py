@@ -33,6 +33,7 @@ def get_coding_session_service() -> CodingSessionService | None:
             ),
             admin_roles=tuple(settings.admin_roles),
             checkout_root=Path(settings.storage_dir) / "coding_checkouts",
+            review_capture_root=Path(settings.storage_dir) / ".coding_review_captures" if settings.coding_review_capture_enabled else None,
             command_runner=DockerCommandRunner(settings.coding_command_image) if settings.coding_command_image else None,
         )
     return _service

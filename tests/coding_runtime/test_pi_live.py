@@ -108,6 +108,34 @@ async def run_with_events(client, prompt="Inspect the fixture"):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reasoning", [False, True])
+async def test_installed_pi_reasoning_levels_are_runtime_readback_not_provider_confirmation(tmp_path, reasoning, monkeypatch):
+    # Exercise the installed protocol without changing production model profiles.
+    original = PiModelProfile.models_document
+    def document(profile):
+        result = original(profile)
+        result["providers"][profile.provider]["models"][0]["reasoning"] = reasoning
+        return result
+    monkeypatch.setattr(PiModelProfile, "models_document", document)
+    with model_server([]) as (endpoint, requests):
+        async with PiRpcClient(live_config(tmp_path, endpoint)) as client:
+            response = await client.send_command("get_available_thinking_levels")
+            levels = response["data"]["levels"]
+            if reasoning:
+                assert "high" in levels
+                await client.send_command("set_thinking_level", level="high")
+                assert (await client.get_state())["thinkingLevel"] == "high"
+                await client.send_command("set_thinking_level", level="off")
+                assert (await client.get_state())["thinkingLevel"] == "off"
+            else:
+                assert levels == ["off"]
+                await client.send_command("set_thinking_level", level="high")
+                assert (await client.get_state())["thinkingLevel"] == "off"
+    # No prompt, inference, provider confirmation, or live reasoning UI claim.
+    assert requests == []
+
+
+@pytest.mark.asyncio
 async def test_installed_pi_model_selection_stream_and_workspace_read(tmp_path):
     (tmp_path / "hello.txt").write_text("authorized fixture content")
     with model_server([{"tool": "read", "arguments": {"path": "hello.txt"}}, {"text": "Read complete."}]) as (endpoint, requests):

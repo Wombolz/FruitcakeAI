@@ -629,6 +629,41 @@ class CodingCheckout(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class CodingCheckoutReservation(Base):
+    """Exclusive, fenced checkout operation; never an execution queue."""
+
+    __tablename__ = "coding_checkout_reservations"
+    checkout_id = Column(String(64), ForeignKey("coding_checkouts.id", ondelete="RESTRICT"), primary_key=True)
+    holder_kind = Column(String(20), nullable=False)
+    holder_id = Column(String(64), nullable=False)
+    token = Column(String(64), nullable=False, unique=True)
+    service_epoch = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class CodingReviewCapture(Base):
+    """Owner-scoped retained content, independent of live files and model claims."""
+
+    __tablename__ = "coding_review_captures"
+    __table_args__ = (UniqueConstraint("session_id", "client_request_id", name="uq_coding_capture_request"),)
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+    session_id = Column(String(64), ForeignKey("coding_sessions.id", ondelete="RESTRICT"), nullable=False)
+    checkout_id = Column(String(64), ForeignKey("coding_checkouts.id", ondelete="RESTRICT"), nullable=False, index=True)
+    workspace_id = Column(String(64), ForeignKey("coding_workspaces.id", ondelete="RESTRICT"), nullable=False)
+    client_request_id = Column(String(100), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    scope = Column(String(30), nullable=False)
+    status = Column(String(20), nullable=False, default="capturing")
+    manifest_hash = Column(String(64), nullable=True)
+    stored_bytes = Column(Integer, nullable=False, default=0)
+    summary_json = Column(Text, nullable=False, default="{}")
+    error_code = Column(String(50), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class CodingCheckoutAttachment(Base):
     """A conversation's execution root, independent of checkout creation provenance."""
     __tablename__ = "coding_checkout_attachments"

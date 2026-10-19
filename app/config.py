@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     local_model_release_on_shutdown: bool = True
     # Optional coding backend. Pi is operator-installed and launched on demand.
     coding_runtime_enabled: bool = False
+    coding_review_capture_enabled: bool = False
     coding_runtime_executable: str = ""
     coding_max_active_sessions: int = 2
     coding_runtime_idle_seconds: int = 300

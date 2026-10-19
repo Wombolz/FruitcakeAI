@@ -81,6 +81,7 @@ async def test_auth_disabled_and_role_checks(tmp_path):
         assert (await client.get("/coding/status", headers=refresh)).status_code == 401
         assert (await client.get("/coding/status")).json() == {
             "enabled": False, "mode": "read_only", "event_schema_version": 1, "managed_checkouts": False, "approved_edits": False, "container_commands": False,
+            "review_captures": False, "ai_reviews": False,
         }
         disabled = await client.get("/coding/sessions")
         assert disabled.status_code == 503

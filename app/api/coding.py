@@ -36,6 +36,9 @@ ERROR_STATUS = {
     "checkout_conflict": 409, "checkout_unavailable": 409, "checkout_invalid": 409,
     "change_review_required": 409,
     "repository_creation_failed": 409,
+    "checkout_busy": 409, "coding_owner_busy": 503, "coding_owner_lost": 503,
+    "capture_unsupported": 409, "capture_changed": 409, "capture_limit": 413,
+    "capture_unavailable": 409, "capture_corrupt": 409, "capture_expired": 410,
 }
 
 
@@ -214,6 +217,56 @@ class StatusOut(Output):
     managed_checkouts: bool = False
     approved_edits: bool = False
     container_commands: bool = False
+    review_captures: bool = False
+    ai_reviews: bool = False
+
+
+ReviewScope = Literal["checkout_changes", "uncommitted"]
+
+
+class CaptureCreate(Input):
+    scope: ReviewScope = "checkout_changes"
+    paths: list[Annotated[str, Field(min_length=1, max_length=1024)]] = Field(min_length=1, max_length=128)
+    client_request_id: str = Field(min_length=1, max_length=100)
+
+
+class CaptureOut(Output):
+    id: str
+    session_id: str
+    checkout_id: str
+    scope: ReviewScope
+    status: Literal["capturing", "ready", "failed", "interrupted", "expired"]
+    error_code: str | None
+    created_at: datetime
+    expires_at: datetime
+    finished_at: datetime | None
+    stored_bytes: int
+    ai_reviews: bool = False
+    base: str | None = None
+    head: str | None = None
+    fingerprint: str | None = None
+    limited: bool | None = None
+    omission_counts: dict[str, int] | None = None
+    files_in_scope: int | None = None
+    context_files: int | None = None
+    content_status: Literal["available", "unavailable", "expired"] | None = None
+    applicability: Literal["current", "stale", "unknown"] | None = None
+    applicability_observed_at: datetime | None = None
+    files: list[dict] | None = None
+    context: list[dict] | None = None
+    exclusions: list[dict] | None = None
+
+
+class CaptureDiffOut(Output):
+    basis: Literal["review_capture"]
+    capture_id: str
+    scope: ReviewScope
+    base: str
+    head: str
+    path: str
+    captured_at: datetime
+    patch: str
+    truncated: bool
 
 
 class ModelOut(Output):
@@ -286,7 +339,29 @@ async def status(request: Request, user: Owner):
     service = getattr(request.app.state, "coding_sessions", None)
     return StatusOut(enabled=service is not None, managed_checkouts=service is not None and service.supports_managed_checkouts,
                      approved_edits=service is not None and service.supports_managed_checkouts,
-                     container_commands=service is not None and service.supports_container_commands)
+                     container_commands=service is not None and service.supports_container_commands,
+                     review_captures=service is not None and service.supports_review_captures)
+
+
+@router.get("/sessions/{session_id}/review-options")
+async def review_options(session_id: Identifier, user: Owner, service: Service, scope: ReviewScope = "checkout_changes"):
+    return await service.review_options(user_id=user.id, session_id=session_id, scope=scope)
+
+
+@router.post("/sessions/{session_id}/review-captures", response_model=CaptureOut, status_code=202)
+async def create_review_capture(session_id: Identifier, body: CaptureCreate, user: Owner, service: Service):
+    return await service.create_review_capture(user_id=user.id, session_id=session_id, **body.model_dump())
+
+
+@router.get("/review-captures/{capture_id}", response_model=CaptureOut)
+async def review_capture(capture_id: Identifier, user: Owner, service: Service):
+    return await service.get_review_capture(user_id=user.id, capture_id=capture_id)
+
+
+@router.get("/review-captures/{capture_id}/diff", response_model=CaptureDiffOut)
+async def review_capture_diff(capture_id: Identifier, user: Owner, service: Service,
+                              path: Annotated[str, Query(min_length=1, max_length=1024)]):
+    return await service.review_capture_diff(user_id=user.id, capture_id=capture_id, path=path)
 
 
 @router.get("/models", response_model=list[ModelOut])

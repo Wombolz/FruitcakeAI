@@ -14,7 +14,7 @@ import psycopg2
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db.security import check_database, migration_url, protect_migration_ledger
 from scripts import database_admin as admin
@@ -176,7 +176,7 @@ def postgres_container(tmp_path):
     ], check=True, capture_output=True)
     try:
         for _ in range(90):
-            if subprocess.run(["docker", "exec", name, "pg_isready", "-U", "fruitcake", "-d", "role_test"], capture_output=True).returncode == 0:
+            if subprocess.run(["docker", "exec", name, "pg_isready", "-h", "127.0.0.1", "-U", "fruitcake", "-d", "role_test"], capture_output=True).returncode == 0:
                 break
             time.sleep(1)
         port = subprocess.check_output(["docker", "port", name, "5432/tcp"], text=True).strip().rsplit(":", 1)[1]
@@ -229,11 +229,12 @@ def test_real_role_permissions_default_grants_and_alembic(tmp_path):
         from app.db.session import Base
         import app.db.models  # noqa: F401
         engine = create_engine(migrator_url)
-        Base.metadata.create_all(engine)
+        Base.metadata.create_all(engine, tables=[table for table in Base.metadata.sorted_tables
+            if table.name not in {"coding_review_captures", "coding_checkout_reservations"}])
         assert admin.migrate(env, directory, ["stamp", "056_coding_workspace_lifecycle"]) == 0
         assert admin.migrate(env, directory, ["upgrade", "head"]) == 0
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "057_coding_approval_wait"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "058_coding_review_captures"
             assert connection.scalar(text("SELECT pg_get_userbyid(extowner) FROM pg_extension WHERE extname='vector'")) == admin.ADMIN_ROLE
             protect_migration_ledger(connection)
             connection.commit()
@@ -241,14 +242,25 @@ def test_real_role_permissions_default_grants_and_alembic(tmp_path):
         with admin.connect(url, admin.APP_ROLE, credentials["app_password"]) as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT version_num FROM alembic_version")
-                assert cursor.fetchone()[0] == "057_coding_approval_wait"
+                assert cursor.fetchone()[0] == "058_coding_review_captures"
                 with pytest.raises(psycopg2.errors.InsufficientPrivilege):
                     cursor.execute("UPDATE alembic_version SET version_num='corrupt'")
 
         async def check():
+            from app.coding_runtime.review_admission import SupervisorFence
             engine = create_async_engine(runtime_url.set(drivername="postgresql+asyncpg"))
             async with engine.connect() as connection:
                 await check_database(connection, separated=True)
+                for table in ("coding_checkout_reservations", "coding_review_captures"):
+                    for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                        assert await connection.scalar(text("SELECT has_table_privilege(current_user, :table, :privilege)"),
+                                                       {"table": table, "privilege": privilege})
+            fence = SupervisorFence(async_sessionmaker(engine))
+            try:
+                await fence.acquire()
+                await fence.check()
+            finally:
+                await fence.close()
             await engine.dispose()
         asyncio.run(check())
 

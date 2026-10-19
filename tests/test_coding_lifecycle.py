@@ -10,6 +10,8 @@ def test_coding_routes_are_registered_in_application():
 
     paths = set(app.openapi()["paths"])
     assert {"/coding/status", "/coding/sessions", "/coding/runs/{run_id}/events",
+            "/coding/sessions/{session_id}/review-options", "/coding/sessions/{session_id}/review-captures",
+            "/coding/review-captures/{capture_id}", "/coding/review-captures/{capture_id}/diff",
             "/coding/sessions/{session_id}/checkout", "/coding/sessions/{session_id}/checkout/remove"} <= paths
 
 

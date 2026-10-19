@@ -65,6 +65,8 @@ def _allowed_linked_source_roots() -> list[Path]:
 
 
 def _ensure_path_within_allowed_roots(path: Path, *, kind: str = "folder") -> None:
+    if ".coding_review_captures" in path.resolve().parts:
+        raise ValueError("Private coding review evidence cannot be linked or ingested.")
     allowed_roots = _allowed_linked_source_roots()
     if not allowed_roots:
         raise ValueError(
@@ -129,10 +131,12 @@ def _relative_path_str(root: Path, target: Path) -> str:
 
 
 def _should_skip_dir(path: Path) -> bool:
-    return path.name in _SKIP_DIR_NAMES
+    return path.name in _SKIP_DIR_NAMES or ".coding_review_captures" in path.resolve().parts
 
 
 def _is_sensitive_file(path: Path) -> bool:
+    if ".coding_review_captures" in path.resolve().parts:
+        return True
     name = path.name
     return any(name == prefix or name.startswith(prefix + ".") for prefix in _SENSITIVE_FILE_PREFIXES)
 
