@@ -1,10 +1,11 @@
 """Conversation controls and owner-scoped reusable checkout coordination."""
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import or_, select
 
-from app.db.models import CodingCheckout, CodingCheckoutAttachment, CodingSession, CodingWorkspace
+from app.db.models import CodingCheckout, CodingCheckoutAttachment, CodingSession, CodingWorkspace, CodingCheckoutReservation
 from app.coding_runtime import git_delivery
 from app.coding_runtime.repository import RepositoryError
 import asyncio
@@ -34,8 +35,12 @@ class WorkspaceLifecycleService:
         )))).scalars())
 
     async def _assert_checkout_idle(self, db, checkout, *, allow_failed=False):
+        if self._capture_storage is not None and checkout.status in {"creating", "removing", "committing", "applying"}:
+            raise error("checkout_busy", "Another checkout operation is in progress")
         if checkout.status not in ({"ready", "failed"} if allow_failed else {"ready"}):
             raise error("checkout_unavailable", "Checkout is not ready; the source repository will not be used as a fallback")
+        if self._capture_storage is not None and await db.get(CodingCheckoutReservation, checkout.id) is not None:
+            raise error("checkout_busy", "Another run or capture is using this checkout")
         for session in await self._attached_sessions(db, checkout):
             slot = self._slots.get(session.id)
             if session.status in {"starting", "running", "waiting_approval", "stopping"} or (slot and slot.task is not None):
@@ -132,6 +137,8 @@ class WorkspaceLifecycleService:
                 row = await db.get(CodingCheckout, checkout.id)
                 row.status = "committing" if action == "commit" else "applying"
                 row.error_code = None
+                delivery_id = str(uuid4())
+                delivery_token = await self._claim_checkout(db, checkout.id, "delivery", delivery_id)
         mutated = False
         try:
             async with asyncio.timeout(60):
@@ -154,6 +161,8 @@ class WorkspaceLifecycleService:
                 if action == "commit":
                     new_head = await git_delivery.create_commit(self._checkouts, root, plan)
                     async with self._db_lock, self._sessions() as db, db.begin():
+                        if not await self._owns_checkout_reservation(db, checkout.id, "delivery", delivery_id, delivery_token):
+                            raise error("coding_owner_lost", "Checkout delivery ownership was lost; inspect Git state")
                         row = await db.get(CodingCheckout, checkout.id)
                         row.head_commit, row.branch_name = new_head, plan["branch"]
                 else:
@@ -169,6 +178,8 @@ class WorkspaceLifecycleService:
             import sys
             failed = sys.exc_info()[0] is not None
             async with self._db_lock, self._sessions() as db, db.begin():
-                row = await db.get(CodingCheckout, checkout.id)
-                row.status = "failed" if failed and mutated else "ready"
-                row.error_code = "delivery_uncertain" if failed and mutated else None
+                if await self._owns_checkout_reservation(db, checkout.id, "delivery", delivery_id, delivery_token):
+                    row = await db.get(CodingCheckout, checkout.id)
+                    row.status = "failed" if failed and mutated else "ready"
+                    row.error_code = "delivery_uncertain" if failed and mutated else None
+                    await self._release_checkout(db, "delivery", delivery_id, delivery_token)

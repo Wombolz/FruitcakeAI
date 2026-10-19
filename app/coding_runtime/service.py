@@ -30,6 +30,11 @@ from app.coding_runtime.workspace_lifecycle import WorkspaceLifecycleService
 from app.coding_runtime.container_commands import DockerCommandRunner
 from app.coding_runtime.run_deadline import RunDeadline
 from app.db.models import CodingChange
+from app.coding_runtime.review_service import ReviewCaptureService
+from app.coding_runtime.review_supervisor import ReviewSupervisor
+from app.coding_runtime.review_access import ReviewAccess
+from app.coding_runtime.file_browser import CheckoutFileBrowser
+from app.coding_runtime.explorer_service import CheckoutExplorerService
 
 
 ACTIVE_STATUSES = frozenset({"starting", "running", "waiting_approval", "stopping"})
@@ -66,6 +71,7 @@ class StoredCodingEvent:
     kind: str
     payload: dict
     schema_version: int = 1
+    occurred_at: datetime | None = None
 
 
 @dataclass
@@ -86,7 +92,7 @@ class _RuntimeSlot:
     deadline: RunDeadline | None = None
 
 
-class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
+class CodingSessionService(CheckoutExplorerService, ReviewAccess, ReviewSupervisor, ReviewCaptureService, WorkspaceLifecycleService, ContainerCommandService):
     """Single-backend-process supervisor with durable, user-scoped run state."""
 
     def __init__(
@@ -99,6 +105,9 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
         admin_roles: tuple[str, ...] = ("admin", "super_admin"),
         checkout_root: Path | None = None,
         command_runner: DockerCommandRunner | None = None,
+        review_capture_root: Path | None = None,
+        review_runtime_factory=None,
+        review_require_read_approval: bool = False,
     ):
         self._sessions = sessions
         self._factory = runtime_factory
@@ -111,17 +120,39 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
         self._closing = False
         self._maintenance: asyncio.Task | None = None
         self._repository = RepositoryInspector()
+        self._file_browser = CheckoutFileBrowser()
         self._checkouts = CheckoutManager(checkout_root.resolve()) if checkout_root is not None else None
         self._checkout_jobs: dict[str, asyncio.Task] = {}
         self._commands = command_runner
         self._command_jobs: dict[str, tuple[str, asyncio.Task]] = {}
         self._command_cleanup_failed = False
+        self._init_captures(review_capture_root)
+        self._init_reviews(review_runtime_factory, review_require_read_approval)
 
     @property
     def supports_managed_checkouts(self) -> bool:
         return self._checkouts is not None
 
     async def startup(self) -> int:
+        async with self._supervisor_start_lock:
+            return await self._start_supervisor()
+
+    async def _start_supervisor(self) -> int:
+        if self._supervisor_started:
+            raise CodingServiceError("already_started", "Coding service has already started")
+        if self._capture_fence is not None:
+            await self._capture_fence.acquire()
+        try:
+            result = await self._startup()
+            self._supervisor_started = True
+            self._capture_started = self._capture_storage is not None
+            return result
+        except BaseException:
+            if self._capture_fence is not None:
+                await self._capture_fence.close()
+            raise
+
+    async def _startup(self) -> int:
         """Recover durable state after the sole backend process restarts."""
         async with self._lock:
             if self._slots or self._maintenance is not None:
@@ -133,6 +164,9 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
                 except Exception:
                     self._command_cleanup_failed = True
             async with self._db_lock, self._sessions() as db, db.begin():
+                await self._capture_fence.check()
+                await self._recover_reviews(db)
+                await self._recover_captures(db)
                 runs = (await db.execute(select(CodingRun).where(CodingRun.status.in_(ACTIVE_STATUSES)))).scalars().all()
                 for run in runs:
                     run.status = "interrupted"
@@ -387,6 +421,7 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
                     raise CodingServiceError("capacity_reached", "Managed checkout operations are busy")
                 checkout.status = "removing"
                 checkout.error_code = None
+                await self._claim_checkout(db, checkout.id, "remove", checkout.id)
             self._start_checkout_job(checkout.id, removing=True)
             return checkout
 
@@ -407,6 +442,8 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
             await db.execute(update(CodingCheckout).where(
                 CodingCheckout.id.in_(checkout_ids), CodingCheckout.status.in_(("creating", "removing")),
             ).values(status="failed", error_code=reason))
+            for checkout_id in checkout_ids:
+                await self._release_checkout(db, "remove", checkout_id)
 
     async def _manage_checkout(self, checkout_id: str, *, removing: bool) -> None:
         status, error_code = "failed", "checkout_failed"
@@ -447,8 +484,10 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
             pass  # Never expose Git diagnostics/provider paths through error text.
         finally:
             async with self._db_lock, self._sessions() as db, db.begin():
-                checkout = await db.get(CodingCheckout, checkout_id)
-                checkout.status, checkout.error_code = status, error_code
+                if not removing or await self._owns_checkout_reservation(db, checkout_id, "remove", checkout_id):
+                    checkout = await db.get(CodingCheckout, checkout_id)
+                    checkout.status, checkout.error_code = status, error_code
+                    await self._release_checkout(db, "remove", checkout_id)
 
     async def _checkout(self, db: AsyncSession, session_id: str) -> CodingCheckout | None:
         attachment = await db.get(CodingCheckoutAttachment, session_id)
@@ -605,9 +644,9 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
                 slot = None
             new_process = slot is None
             if slot is None:
-                if len(self._slots) >= self.limits.max_active_sessions:
+                if len(self._slots) + len(self._reviews) >= self.limits.max_active_sessions:
                     idle = [(key, item) for key, item in self._slots.items() if item.task is None]
-                    if idle:
+                    if idle and len(self._reviews) < self.limits.max_active_sessions:
                         key, item = min(idle, key=lambda pair: pair[1].last_used)
                         await self._evict(key, item)
                     else:
@@ -640,6 +679,8 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
                     )
                     db.add(run)
                     await db.flush()
+                    if checkout is not None:
+                        await self._claim_checkout(db, checkout.id, "builder", run.id)
                     self._add_event(db, run, "run.accepted", {"context_generation": run.context_generation})
                     history = await self._history(db, session_id) if new_process else ()
             except BaseException:
@@ -815,7 +856,7 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
                 status = run.status
             for row in rows:
                 after = row.sequence
-                yield StoredCodingEvent(row.sequence, row.event_type, row.payload, row.schema_version)
+                yield StoredCodingEvent(row.sequence, row.event_type, row.payload, row.schema_version, _utc(row.occurred_at))
             if rows:
                 continue
             if not follow or status in TERMINAL_STATUSES:
@@ -857,6 +898,9 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
             if maintenance is not None:
                 maintenance.cancel()
             tasks = []
+            capture_tasks = list(self._capture_jobs.values())
+            for task in capture_tasks:
+                task.cancel()
             checkout_ids = list(self._checkout_jobs)
             checkout_tasks = list(self._checkout_jobs.values())
             for task in checkout_tasks:
@@ -869,8 +913,11 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
                     tasks.append(slot.task)
         if maintenance is not None:
             await asyncio.gather(maintenance, return_exceptions=True)
+        await self._shutdown_reviews()
         await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.gather(*checkout_tasks, return_exceptions=True)
+        await asyncio.gather(*capture_tasks, return_exceptions=True)
+        await self._interrupt_capture_jobs()
         await self._interrupt_checkouts(checkout_ids, "backend_shutdown")
         async with self._lock:
             results = await asyncio.gather(
@@ -879,6 +926,10 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
             )
             if any(isinstance(result, BaseException) for result in results):
                 raise CodingServiceError("cleanup_failed", "One or more coding runtimes could not be closed")
+        if self._capture_fence is not None:
+            await self._capture_fence.close()
+        self._capture_started = False
+        self._supervisor_started = False
 
     async def _execute(self, session_id: str, slot: _RuntimeSlot, run_id: str, prompt: CodingPrompt) -> None:
         status, error_code = "failed", "incomplete_stream"
@@ -1091,6 +1142,7 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
                     return
             raise CodingRuntimeError("event_payload_limit", "Coding event metadata exceeded its byte limit")
         async with self._db_lock, self._sessions() as db, db.begin():
+            await self._capture_fence.check()
             run = await db.get(CodingRun, run_id)
             if run.last_event_sequence >= self.limits.max_run_events:
                 raise CodingRuntimeError("event_limit", "Coding event count exceeded its limit")
@@ -1113,6 +1165,7 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
 
     async def _set_running(self, run_id: str) -> None:
         async with self._db_lock, self._sessions() as db, db.begin():
+            await self._capture_fence.check()
             run = await db.get(CodingRun, run_id)
             if run.status != "stopping":
                 run.status = "running"
@@ -1133,6 +1186,7 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
             await self._resolve_pending(db, run_id)
             await self._recover_command_records(db, run_id, reason=error_code or status)
             self._add_event(db, run, f"run.{status}", {"error_code": error_code})
+            await self._release_checkout(db, "builder", run.id)
 
     async def _resolve_pending(self, db: AsyncSession, run_id: str, *, operation_id: str | None = None) -> None:
         approvals = (await db.execute(select(CodingApproval).where(
@@ -1182,6 +1236,8 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
             await asyncio.sleep(min(self.limits.idle_seconds, 30))
             with suppress(Exception):
                 await self.expire_idle()
+            with suppress(Exception):
+                await self.expire_captures()
 
     async def _history(self, db: AsyncSession, session_id: str) -> tuple[tuple[str, str], ...]:
         runs = list((await db.execute(select(CodingRun).where(
@@ -1209,6 +1265,8 @@ class CodingSessionService(WorkspaceLifecycleService, ContainerCommandService):
             raise CodingServiceError("invalid_request", "Coding prompt is empty or too large")
 
     async def _require_user(self, db: AsyncSession, user_id: int) -> User:
+        if self._supervisor_started:
+            await self._capture_fence.check()
         user = await db.get(User, user_id)
         if user is None or not user.is_active or user.role in {"guest", "restricted"}:
             raise CodingServiceError("access_denied", "Coding access is unavailable for this user")

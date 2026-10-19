@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.43
+
+- Added independent, read-only coding reviews with durable findings, explicit read approvals, reasoning provenance and recoverable review history.
+- Preserved complete captured source and validated finding evidence, with bounded review execution, Stop and interrupted-run recovery.
+- Added owner-scoped, read-only checkout Explorer APIs with bounded directory pages and complete source-file reads.
+- Added persisted message timestamps for the paired client's Chat-aligned coding transcript.
+
 ## Unreleased
 
 - Replaced historical Python pins with generated, hash-verified runtime/development baselines, dependency audits and safer bootstrap checks.

@@ -25,7 +25,7 @@ async def test_reuse_checkout_keeps_files_and_serializes_sessions(tmp_path):
         other = await service.create_session(user_id=2, workspace_id=grant.id, model_profile_id=1, checkout_id=checkout.id)
         assert not other.edit_mode and not other.command_mode
         assert await service._execution_root(user_id=2, session_id=other.id) == root
-        factory.mode = 'block'
+        factory.mode = 'blocked'
         await service.set_edit_mode(user_id=2, session_id=session.id, enabled=False)
         run = await service.submit(user_id=2, session_id=session.id, message='Inspect')
         await wait_for_status(service, run.id, 'running')

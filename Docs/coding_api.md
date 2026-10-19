@@ -1,5 +1,11 @@
 # Read-Only Coding API
 
+Follow-on: [bounded checkout Explorer](coding_explorer.md) adds owner/root-bound
+directory pages and complete read-only text-file views for the shared native
+inspector. Restart the backend and rebuild the client; no migration or new
+environment setting is required. Chat directory grants and HTML testing remain
+unimplemented; project membership never grants filesystem access.
+
 Approval-wait follow-on: migration 057 makes approval `expires_at` nullable in REST
 and SSE. Null means no expiry; finite legacy deadlines are still enforced. Human
 wait time is excluded from the run's execution budget. Rebuild the native client
@@ -121,11 +127,12 @@ See [repository review](coding_repository_review.md) for limits, unsupported fil
 ```text
 id: 4
 event: assistant.text_delta
-data: {"schema_version":1,"run_id":"<run-id>","sequence":4,"kind":"assistant.text_delta","payload":{"delta":"Inspecting"}}
+data: {"schema_version":1,"run_id":"<run-id>","sequence":4,"kind":"assistant.text_delta","payload":{"delta":"Inspecting"},"occurred_at":"2026-10-19T16:00:00+00:00"}
 
 ```
 
 - Sequence numbers are positive, monotonically increasing, and scoped to one run. Persist the last successfully applied event ID separately for each run.
+- `occurred_at` is an additive UTC timestamp from the persisted run event, not the time it was fetched. Live delivery and replay preserve that value. It is optional for compatibility with older servers/fixtures; clients must not invent a message time when absent. Sequence, not timestamp, remains the ordering/deduplication authority. No schema migration is needed: `coding_run_events.occurred_at` already exists.
 - Reconnect with `Last-Event-ID: <sequence>` or `after=<sequence>`. If both are provided, replay starts after their maximum. Malformed/negative cursors return 422; a cursor ahead of the run's committed sequence returns 409 `cursor_ahead`.
 - Events strictly after the cursor are replayed before following live work. `follow=false` gives a finite SSE replay of currently committed events, not a JSON array.
 - The stream ends after terminal state and all committed events are delivered. Reconnecting at the terminal cursor yields an empty stream. Do not treat ordinary EOF as run success; reconcile with the durable run status.
