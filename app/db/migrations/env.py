@@ -12,6 +12,7 @@ from alembic import context
 # Import all models so Alembic can detect schema changes
 from app.db.session import Base
 from app.config import settings
+from app.db.security import migration_url, protect_migration_ledger
 import app.db.models  # noqa: F401 — registers models with Base
 
 config = context.config
@@ -22,7 +23,7 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    url = settings.database_url
+    url = migration_url(settings)
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -37,13 +38,15 @@ def do_run_migrations(connection: Connection) -> None:
     context.configure(connection=connection, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()
+        if settings.database_roles_separated:
+            protect_migration_ledger(connection)
 
 
 async def run_async_migrations() -> None:
-    # Use the same credentials as the application, not the historical INI default.
+    # Maintenance credentials are injected only into the migration subprocess.
     # A plain mapping also avoids ConfigParser interpolation of URL-encoded '%'.
     configuration = dict(config.get_section(config.config_ini_section, {}))
-    configuration["sqlalchemy.url"] = settings.database_url
+    configuration["sqlalchemy.url"] = migration_url(settings)
     connectable = async_engine_from_config(
         configuration,
         prefix="sqlalchemy.",

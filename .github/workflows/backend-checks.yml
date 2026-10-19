@@ -60,7 +60,8 @@ jobs:
           python -m pytest -q tests/test_auth_crypto.py tests/test_credential_hardening.py tests/test_integrations.py \
             tests/test_rag.py tests/test_mcp_transports.py tests/test_model_stream.py \
             tests/test_dependency_baseline.py tests/test_dependency_bootstrap.py \
-            tests/test_runtime_configuration.py tests/test_container_baseline.py
+            tests/test_runtime_configuration.py tests/test_container_baseline.py tests/test_database_roles.py \
+            tests/test_coding_lifecycle.py
 
       - name: Build reviewed container recipes
         run: |
@@ -86,3 +87,11 @@ jobs:
           FRUITCAKE_TEST_DOCKER_IMAGE: fruitcake/mcp-shell:ci
           LITELLM_LOCAL_MODEL_COST_MAP: "True"
         run: python -m pytest -q tests/test_shell_mcp_server.py tests/coding_runtime/test_commands.py
+
+      - name: Check database role boundaries and maintenance migrations
+        env:
+          FRUITCAKE_TEST_DOCKER: "1"
+          FRUITCAKE_TEST_POSTGRES_IMAGE: fruitcake/postgres-vector:ci
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          HF_HUB_OFFLINE: "1"
+        run: python -m pytest -q tests/test_database_roles.py

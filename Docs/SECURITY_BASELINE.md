@@ -294,11 +294,15 @@ by password reset alone: rotate `JWT_SECRET_KEY` and restart when all existing
 logins must be invalidated. JWT rotation also invalidates pending OAuth state;
 restart any in-progress account connection flow and renew saved MCP auth tokens.
 
-For database rotation, change the PostgreSQL role password **and** update
-`DB_PASSWORD`, `DATABASE_URL` and `DATABASE_URL_SYNC` together. Verify a new TCP
-connection succeeds and the old password fails. `POSTGRES_PASSWORD` only initializes
-new data volumes; changing Compose environment values alone does not rotate an
-existing database role. Never remove the data volume for password maintenance.
+For enrolled installations, use the [database-role maintenance contract](database_roles.md):
+the API uses `fruitcake_app`, Alembic uses `fruitcake_migrator`, and the retained
+`fruitcake` administrator is operator-only. `DB_PASSWORD` no longer belongs in
+normal API configuration. Coordinate password changes with the protected role
+files and runtime URLs while the backend is stopped; verify a new TCP connection
+succeeds and the old password fails. `POSTGRES_PASSWORD_FILE` initializes only new
+data volumes; changing Compose secrets alone does not rotate an existing role.
+Never remove the data volume for password maintenance. Legacy installations must
+explicitly enroll; installing this code does not silently change their roles.
 
 Do not casually replace `SECRETS_MASTER_KEY`: existing integration credentials
 are encrypted with it. Keep it separate from `JWT_SECRET_KEY`, retain it securely,

@@ -87,10 +87,10 @@ fi
 if [[ -d "$ROOT/.venv" ]]; then
   # shellcheck disable=SC1091
   source "$ROOT/.venv/bin/activate"
-  if alembic current 2>/dev/null | grep -q '(head)'; then
+  if python "$ROOT/scripts/database_admin.py" migrate current 2>/dev/null | grep -q '(head)'; then
     pass "Alembic is at head"
   else
-    fail "Alembic is not at head" "Run ./scripts/bootstrap.sh or 'alembic upgrade head'"
+    fail "Alembic is not at head" "Run ./scripts/bootstrap.sh or 'python scripts/database_admin.py migrate upgrade head'"
   fi
 fi
 

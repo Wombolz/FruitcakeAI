@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://fruitcake:fruitcake@localhost:5432/fruitcake_v5"
     # Sync URL is only used by Alembic migrations
     database_url_sync: str = "postgresql+psycopg2://fruitcake:fruitcake@localhost:5432/fruitcake_v5"
+    database_roles_separated: bool = False
 
     # ── Auth ──────────────────────────────────────────────────────────────────
     jwt_secret_key: str = "change-me-in-production"

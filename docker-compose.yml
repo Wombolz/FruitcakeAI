@@ -10,7 +10,9 @@ services:
     environment:
       POSTGRES_DB: fruitcake_v5
       POSTGRES_USER: fruitcake
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-fruitcake}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+    secrets:
+      - postgres_admin_password
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
@@ -34,3 +36,7 @@ services:
 volumes:
   pgdata:
   # redisdata:
+
+secrets:
+  postgres_admin_password:
+    file: ./storage/.database_credentials/postgres-admin-password

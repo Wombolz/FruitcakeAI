@@ -25,7 +25,8 @@ done
 
 echo "▶ Running migrations..."
 source .venv/bin/activate
-alembic upgrade head
+python scripts/database_admin.py provision
+python scripts/database_admin.py migrate upgrade head
 
 echo "▶ Seeding default users..."
 python scripts/seed.py

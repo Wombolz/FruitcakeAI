@@ -26,9 +26,10 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
     log.info("FruitcakeAI v5 starting up", version=settings.app_version)
 
-    # Keep startup schema-safe; Alembic owns table creation/migration.
+    # Runtime startup never installs extensions or changes the schema.
+    from app.db.security import check_database
     async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        await check_database(conn, separated=settings.database_roles_separated)
 
     log.info("Database extension check complete")
 

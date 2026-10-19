@@ -34,6 +34,9 @@ fi
 print_header "Preparing Python environment"
 ensure_venv
 
+print_header "Preparing private database credentials"
+python "$ROOT/scripts/database_admin.py" prepare
+
 print_header "Ensuring required local models"
 ensure_models
 
@@ -43,6 +46,10 @@ start_postgres
 print_header "Waiting for database readiness"
 wait_for_postgres
 echo "  Database ready."
+
+print_header "Checking database role enrollment"
+python "$ROOT/scripts/database_admin.py" bootstrap
+load_env_file
 
 print_header "Running migrations"
 run_migrations

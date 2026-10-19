@@ -49,6 +49,7 @@ async def test_app_closes_coding_before_mcp_models_and_database(monkeypatch, ena
     from app.autonomy import scheduler
     from app.coding_runtime import bootstrap
     from app.db import session as database
+    from app.db import security as database_security
     from app import model_profiles
     from app.mcp import registry
     from app.rag import job_runner, service as rag
@@ -76,6 +77,8 @@ async def test_app_closes_coding_before_mcp_models_and_database(monkeypatch, ena
         closed.append("database")
 
     monkeypatch.setattr(main, "engine", SimpleNamespace(begin=connection, dispose=dispose_database))
+    database_check = AsyncMock()
+    monkeypatch.setattr(database_security, "check_database", database_check)
     monkeypatch.setattr(database, "AsyncSessionLocal", db_session)
     monkeypatch.setattr(model_profiles, "get_model_profile_service", lambda: SimpleNamespace(ensure_seeded=AsyncMock(), profile_count=0))
     monkeypatch.setattr(rag, "get_rag_service", lambda: SimpleNamespace(startup=AsyncMock()))
@@ -103,4 +106,5 @@ async def test_app_closes_coding_before_mcp_models_and_database(monkeypatch, ena
             await run_context()
     else:
         await run_context()
+    database_check.assert_awaited_once()
     assert closed == (["coding"] if enabled else []) + ["mcp", "models", "database"]

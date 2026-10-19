@@ -90,6 +90,7 @@ ensure_env_file() {
   total_ram="$(ram_gb)"
 
   cp "$ENV_TEMPLATE" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
 
   if [[ "$tier" == "high" ]]; then
     perl -0pi -e 's/LLM_MODEL=ollama_chat\/qwen2\.5:32b/LLM_MODEL=ollama_chat\/qwen2.5:32b/' "$ENV_FILE"
@@ -120,6 +121,8 @@ load_env_file() {
     source "$ENV_FILE"
     set +a
   fi
+  # Never pass maintenance credentials to the API or its MCP subprocesses.
+  unset DB_PASSWORD DATABASE_MIGRATION_URL
 }
 
 configured_llm_backend() {
@@ -241,7 +244,7 @@ wait_for_postgres() {
 }
 
 run_migrations() {
-  alembic upgrade head
+  python "$ROOT/scripts/database_admin.py" migrate upgrade head
 }
 
 seed_default_users() {

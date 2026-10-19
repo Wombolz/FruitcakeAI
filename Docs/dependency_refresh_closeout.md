@@ -19,6 +19,9 @@ for rollout, compatibility and private rollback details.
   its 1.3.0 contract, and compatible Elgato MCP SDK selection.
 - Credential rotation and verification on this development machine. Credentials,
   database dumps, generated passwords and old environments are not part of Git.
+- Separate runtime/migrator/administrator PostgreSQL roles, private file-based
+  maintenance credentials, read-only startup privilege checks and Docker-backed
+  permission/migration regression tests. See [database roles](database_roles.md).
 - Evidence-backed news presentation, bounded same-chat RSS reuse, answer-only
   validation repair and corrected selected-model usage-provider labels.
 
@@ -57,8 +60,9 @@ explains the raw/effective distinction and retains both inventories.
 Both images were promoted after logical restore, cold rollback and Docker boundary
 tests. All 51 database table counts are preserved and the backend is running.
 CI actions now use reviewed Node 24 pins on Ubuntu 24.04, with container build and
-behavior tests added. Separate application/maintenance DB roles and review of
-unfixed upstream advisories remain open. The following is the **pre-fix** scan.
+behavior tests added. Database role separation is also completed below; review of
+unfixed upstream advisories remains a bounded maintenance follow-up. The following
+is the **pre-fix** scan.
 
 Docker Scout 1.26.0 scanned the local images, not their mounted data volumes.
 Counts are scanner findings, not confirmed reachable application exploits.
@@ -81,7 +85,7 @@ does not replace those vendored packages. Its remaining high finding concerns
 Debian zlib and has no listed fix. The original image used a floating
 `python:3.11-slim` base and has no pinned, reproducible package-refresh pipeline.
 
-That follow-up slice addressed items 1-4 below; item 5 remains separate work:
+The container slice addressed items 1-4 below; the final role slice addressed item 5:
 
 1. Rebuild/rebase the runtime images with supported current OS packages and
    minimal runtime/build-tool contents; audit `gosu` independently of package
@@ -92,13 +96,45 @@ That follow-up slice addressed items 1-4 below; item 5 remains separate work:
    before replacing the live container. Never remove the database volume.
 4. Exercise shell protocol, offline/network controls, resource limits, approvals
    and coding-container execution before promoting a rebuilt shell image.
-5. Introduce separate application and migration/maintenance database roles. The
-   current application still uses the bootstrap superuser role, despite its
-   password rotation and localhost-only publication.
+5. Introduce separate application and migration/maintenance database roles,
+   replacing the API's bootstrap-superuser connection.
 
 Raw local logs and SARIF reports are Git-ignored under
 `storage/.branch-closeout-20261018-210119/`. Replacement and restore verification
 reports are under `storage/.container-maintenance-20261018-215334/`.
+
+## Database Roles: Final Implementation Item Completed
+
+On October 18 the backend/reloader were stopped for fresh logical/global and
+configuration backups. Enrollment was first verified against a restored copy.
+All **51 table counts** matched before/after enrollment on both the restored and
+live databases. App account passwords/roles, JWT/encryption keys and other
+non-database settings are unchanged; all three stored integration secrets still
+decrypt. Private backups/reports remain under
+`storage/.database-role-maintenance-20261019-011526/` (UTC directory timestamp).
+
+Normal `./scripts/start.sh` now uses `fruitcake_app`; schema ownership and Alembic
+are handled by `fruitcake_migrator`. The retained `fruitcake` superuser owns the
+database/pgvector and is operator-only. Normal API/MCP environments do not receive
+maintenance URLs/passwords. Docker metadata references a file secret rather than
+containing the administrator password. These are SQL privilege controls, not an
+OS-level sandbox against a fully compromised process sharing the operator UID.
+
+Live health, password login, temporary chat create/delete, task/memory/coding/
+library reads and an actual semantic RAG query pass. Real PostgreSQL tests verify
+CRUD, sequences, vector queries, future-object grants, ledger protection, an
+actual migration and denied DDL/TEMP/TRUNCATE/role/file/program operations. They
+also cover repeat enrollment and failure without taking over mismatched role
+credentials. The final Docker-backed role suite passes **24 tests**. The final
+dependency-sensitive focused suite, including the lifecycle startup/shutdown
+tests updated for the new database check, passes **150 tests**, with one opt-in
+skip and 21 retained warnings.
+
+Legacy installations must explicitly enroll; they are not silently upgraded by
+installation alone. The older migration chain's dependency on an existing core
+schema remains an empty-database onboarding limitation, not a live enrollment
+failure. The integration fixture establishes that base explicitly. Recovery and
+those limitations are documented in the role runbook.
 
 ## Operational Warnings
 
@@ -116,10 +152,12 @@ warning output rather than suppressing it to make the branch appear cleaner.
 
 ## Merge Caveats
 
-The focused credential/auth/access/integration/bootstrap suite passed 195 tests;
-installed-Pi verification passed 298 with six skips. The final broad run reports
+The earlier focused credential/auth/access/integration/bootstrap suite passed 195 tests;
+installed-Pi verification passed 298 with six skips. The pre-enrollment broad run reports
 **1,379 passed, 55 skipped, 10 failed and 24 warnings** in 287 seconds. Its failures
-match the previously reproduced baseline set below. The previously intermittent
+match the previously reproduced baseline set below. The latest role/lifecycle
+acceptance is recorded above; the PR closeout records the repeat broad-run result.
+The previously intermittent
 checkout-serialization test passes in this run; that does not prove it cannot
 recur. Focused passes do not establish a green broad suite.
 

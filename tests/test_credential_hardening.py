@@ -190,6 +190,8 @@ def test_migrations_use_configured_database_url_without_ini_interpolation(monkey
 
     url = "postgresql+asyncpg://operator:encoded%25password@localhost/example"
     monkeypatch.setattr(settings, "database_url", url)
+    monkeypatch.setattr(settings, "database_roles_separated", False)
+    monkeypatch.delenv("DATABASE_MIGRATION_URL", raising=False)
     config = Config()
     config.set_main_option("sqlalchemy.url", "postgresql+asyncpg://wrong:wrong@localhost/wrong")
     monkeypatch.setattr(context, "config", config, raising=False)
