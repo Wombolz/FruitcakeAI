@@ -11,7 +11,7 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, require_admin
 from app.auth.jwt import (
     create_access_token,
     create_refresh_token,
@@ -32,7 +32,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     full_name: Optional[str] = None
-    role: str = settings.default_user_role
+    role: Literal["admin", "parent", "restricted", "guest"] = settings.default_user_role
 
 
 class LoginRequest(BaseModel):
@@ -68,9 +68,18 @@ class UpdatePreferencesRequest(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+async def require_registration_admin(user: User = Depends(require_admin)) -> User:
+    """Keep the legacy registration URL admin-only, like /admin/users."""
+    return user
+
+
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    """Create a new user account."""
+async def register(
+    body: RegisterRequest,
+    db: AsyncSession = Depends(get_db),
+    administrator: User = Depends(require_registration_admin),
+):
+    """Create a user as an authenticated administrator; never public signup."""
     result = await db.execute(
         select(User).where(
             (User.username == body.username) | (User.email == body.email)

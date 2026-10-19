@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Replaced historical Python pins with generated, hash-verified runtime/development baselines, dependency audits and safer bootstrap checks.
+- Replaced python-jose/Passlib with PyJWT and Argon2id while preserving existing token formats and legacy bcrypt verification.
+- Made account registration admin-only, generated unique initial passwords, and added private local password maintenance.
+- Updated the PostgreSQL/pgvector image baseline and restricted its published port to localhost; migrations now use configured database credentials.
+- Pinned Elgato's compatible patched MCP SDK and documented native-runtime, Node/npm and credential rollout verification.
+- Preserved complete sourced news cards and bounded follow-up evidence; answer repairs no longer rerun completed tool actions.
+
 ## v0.7.42
 
 - Added host-owned approval for app-originated MCP mutations with durable exact-intent replay, denial handling, and audit state.

@@ -6,13 +6,15 @@ Ported from v4, adapted for v5 role model (admin | parent | restricted | guest).
 from datetime import datetime, timedelta
 from typing import Any, Dict
 
-from jose import JWTError, jwt
+import bcrypt
+import jwt
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError
 from fastapi import HTTPException, status
-from passlib.context import CryptContext
 
 from app.config import settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+password_hasher = PasswordHasher()
 
 
 def create_access_token(user_id: int, username: str, role: str) -> str:
@@ -46,13 +48,20 @@ def decode_token(token: str, expected_type: str = "access") -> Dict[str, Any]:
         if payload.get("type") != expected_type:
             raise credentials_exc
         return payload
-    except JWTError:
+    except jwt.InvalidTokenError:
         raise credentials_exc
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return password_hasher.hash(password)
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    try:
+        if hashed.startswith(("$2a$", "$2b$", "$2y$")):
+            # Passlib's legacy bcrypt truncated UTF-8 bytes at 72, even mid-codepoint.
+            # Only legacy verification retains that behavior; new hashes use Argon2id.
+            return bcrypt.checkpw(plain.encode("utf-8")[:72], hashed.encode("ascii"))
+        return password_hasher.verify(hashed, plain)
+    except (InvalidHashError, VerificationError, ValueError, UnicodeError):
+        return False

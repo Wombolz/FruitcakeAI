@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from app.config import settings
+from app.auth.router import require_registration_admin
 from app.db.session import Base, get_db
 from app.main import app
 
@@ -65,6 +66,9 @@ async def setup_db():
 async def client():
     """Async HTTP client wired to the FastAPI app with the test database."""
     app.dependency_overrides[get_db] = override_get_db
+    # Legacy fixtures use registration to seed identities. Override only this
+    # guard, never require_admin on the endpoints whose authorization we test.
+    app.dependency_overrides[require_registration_admin] = lambda: None
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
     app.dependency_overrides.clear()

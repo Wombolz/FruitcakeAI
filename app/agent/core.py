@@ -3628,6 +3628,7 @@ async def _run_agent_chunks(
     provisional_text_callback: Callable[[str, str], Awaitable[None]] | None = None,
     event_emitter: AgentEventEmitter | None = None,
     streaming: bool = False,
+    allow_tool_execution: bool = True,
 ) -> AsyncGenerator[str, None]:
     """Run the canonical agent loop and yield final committed text chunks."""
     if streaming or mode == "chat":
@@ -3644,6 +3645,9 @@ async def _run_agent_chunks(
         reasoning_effort_override=reasoning_effort_override,
         stage=stage,
     )
+    if not allow_tool_execution:
+        setup.tools = []
+        setup.web_context_first = False
     history = setup.history
     max_turns = setup.max_turns
     selected_model = setup.selected_model
@@ -3815,6 +3819,9 @@ async def _run_agent_chunks(
             message = native_turn
 
         if message.tool_calls:
+            if not allow_tool_execution:
+                yield "I couldn't repair the answer from the saved evidence. No additional tools were run."
+                return
             if provisional_text_active and provisional_text_callback is not None:
                 await provisional_text_callback("reset", "")
                 provisional_text_active = False
@@ -3941,6 +3948,7 @@ async def run_agent(
     runtime_message_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     pre_tool_callback: Callable[[List[Dict[str, Any]]], Awaitable[None]] | None = None,
     event_emitter: AgentEventEmitter | None = None,
+    allow_tool_execution: bool = True,
 ) -> str:
     """Run the non-streaming loop and emit one ordered lifecycle stream."""
     selected_model = model_override or settings.llm_model
@@ -3969,6 +3977,7 @@ async def run_agent(
                     pre_tool_callback=pre_tool_callback,
                     event_emitter=emitter,
                     streaming=False,
+                    allow_tool_execution=allow_tool_execution,
                 )
             ]
         )

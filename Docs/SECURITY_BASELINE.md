@@ -28,6 +28,8 @@ This baseline assumes a trusted local network or a deliberately hardened reverse
 ### Authentication and authorization
 
 - JWT-based authentication for API access.
+- Account creation, including the legacy `/auth/register` URL, requires an
+  authenticated administrator. There is no public self-registration.
 - Role-based authorization with current roles:
   - `admin`
   - `parent`
@@ -93,10 +95,21 @@ This baseline assumes a trusted local network or a deliberately hardened reverse
 
 These are mandatory for any deployment beyond personal local testing.
 
+### Dependency maintenance status (2026-10-18)
+
+The refreshed Python baseline and native runtime/Node rollouts are documented in
+[dependencies.md](dependencies.md), including validation, private rollback
+artifacts, the temporary unpatched NLTK exception and the announced October 21
+Node security release. Active npm/Pi/Elgato package trees were checked against
+npm advisories; this does not cover container OS packages, embedded bundle code,
+unused historical installs or credentials. Database/seed credentials and JWT
+secret hardening are separate operator responsibilities, not completed merely
+by upgrading dependencies. The subsequent local rollout is recorded below.
+
 ### Required before shared-network use
 
 1. Change all default seeded passwords from `config/users.yaml`.
-2. Change `SECRET_KEY` / `jwt_secret_key` to a unique, strong value.
+2. Set `JWT_SECRET_KEY` to a unique, strong value; `SECRET_KEY` is not the setting name.
 3. Keep PostgreSQL bound to trusted interfaces only, or place it behind host-level firewall rules.
 4. Do not expose the API directly to the public internet without TLS and an authenticated reverse proxy.
 5. Restrict filesystem access to `.env`, APNs keys, and any calendar credentials.
@@ -201,7 +214,9 @@ Current practice in the repo:
 
 Recommended ongoing hygiene:
 
-1. Run `pip-audit` periodically.
+1. Run `scripts/audit_dependencies.sh` against the installed environment; CI also
+   runs weekly. The dated NLTK exception and baseline update procedure are in
+   [Dependency Maintenance](dependencies.md).
 2. Re-run `pip check` after dependency changes.
 3. Review MCP server updates before enabling new images or configs.
 4. Revisit this baseline whenever a new public integration surface is added.
@@ -240,7 +255,7 @@ Incognito creation is limited to `admin_roles`.
 
 ## Minimum Deployment Checklist
 
-- [ ] `SECRET_KEY` changed
+- [ ] `JWT_SECRET_KEY` changed
 - [ ] seeded passwords changed or seed users removed
 - [ ] `.env` not committed
 - [ ] database not exposed publicly
@@ -251,6 +266,89 @@ Incognito creation is limited to `admin_roles`.
 - [ ] APNs/calendar credentials stored outside the repo
 - [ ] admin accounts reviewed
 - [ ] backup/restore plan for PostgreSQL and uploaded files documented
+
+## Credential Maintenance
+
+Stop the backend, including its reloader, before coordinated credential changes.
+Leave PostgreSQL running. Back up `.env`, database role definitions and the
+database into an owner-only directory excluded from Git. These backups contain
+secrets and must receive the same protection as the live configuration.
+
+`.env` should be mode `0600`. Use a password manager for login passwords, and
+never put plaintext credentials in command arguments, committed YAML, tickets,
+logs or chat messages. The local operator reset command is:
+
+```bash
+.venv/bin/python scripts/manage_passwords.py --username admin
+```
+
+It requires a working terminal for hidden input and confirmation and at least
+16 characters. An intentional generated reset can instead use `--output-file`
+with a **new** private JSON path. `--rotate-defaults --output-file NEW_PATH`
+changes only accounts still matching the historical seeded default; existing
+nondefault passwords, account IDs, permissions, activity flags and owned data
+are preserved. Recovery files use exclusive creation and mode `0600` and are
+written before the database commit. If the command reports failure, the file is
+not proof that the password transaction committed. Existing JWTs are not revoked
+by password reset alone: rotate `JWT_SECRET_KEY` and restart when all existing
+logins must be invalidated. JWT rotation also invalidates pending OAuth state;
+restart any in-progress account connection flow and renew saved MCP auth tokens.
+
+For enrolled installations, use the [database-role maintenance contract](database_roles.md):
+the API uses `fruitcake_app`, Alembic uses `fruitcake_migrator`, and the retained
+`fruitcake` administrator is operator-only. `DB_PASSWORD` no longer belongs in
+normal API configuration. Coordinate password changes with the protected role
+files and runtime URLs while the backend is stopped; verify a new TCP connection
+succeeds and the old password fails. `POSTGRES_PASSWORD_FILE` initializes only new
+data volumes; changing Compose secrets alone does not rotate an existing role.
+Never remove the data volume for password maintenance. Legacy installations must
+explicitly enroll; installing this code does not silently change their roles.
+
+Do not casually replace `SECRETS_MASTER_KEY`: existing integration credentials
+are encrypted with it. Keep it separate from `JWT_SECRET_KEY`, retain it securely,
+and use a deliberate decrypt/re-encrypt migration for any future rotation.
+
+New seeded accounts receive independent generated passwords saved privately in
+`storage/.bootstrap_credentials/`. The directory is hidden so linked-folder
+ingestion skips it. Keep operator recovery files outside linked-source roots or
+in hidden directories as well: Git exclusion and mode `0600` alone do not prevent
+the application, running as the same OS user, from reading them.
+Seeding skips existing accounts without resetting
+them. Suspend unused accounts through Settings > Users & Access after reviewing
+which identities own tasks and data; do not delete identities just to remove
+their default passwords.
+
+### Local Rollout (2026-10-18)
+
+The backend was stopped for fresh database, role and configuration backups under
+the Git-ignored, owner-only directory `storage/.credential-hardening-20261018-195804/`.
+Five accounts (`admin`, `guest`, `kid`, `parent`, `restricted`) received independent
+generated passwords in `new-login-passwords.json` in that directory. The two
+accounts already using nondefault passwords were unchanged. No accounts were
+deleted or suspended and no roles or ownership IDs changed.
+
+The PostgreSQL role password and all three matching `.env` database settings
+were rotated together; a new connection succeeded and the old password failed.
+`JWT_SECRET_KEY` was independently rotated; old-key access and refresh signatures
+are rejected. `.env` remains mode `0600`. `SECRETS_MASTER_KEY` and all three
+encrypted secret records were unchanged and each saved credential still decrypted.
+All 51 public-table row counts matched before normal backend activity resumed.
+No newly created recovery files were indexed into the document library.
+
+Normal startup initially exposed a historical hardcoded database URL in Alembic.
+Migrations now use the application's configured async `DATABASE_URL` in online
+and offline modes, without ConfigParser interpolation of encoded passwords.
+The committed INI no longer contains database credentials. Normal `start.sh`
+then passed migrations, skipped existing seed accounts and completed startup;
+the PostgreSQL container environment now matches the rotated password.
+
+Live HTTP checks passed health, new admin login, authenticated account access,
+default-password rejection and anonymous-registration rejection. The focused
+credential/auth/access/integration/bootstrap suite passed 195 tests. Real
+registration authorization is tested without the legacy test fixtures' narrow
+registration-only dependency override. No fully green broad-suite claim is made.
+All existing clients must sign in again; stored Fruitcake MCP bearer tokens must
+also be renewed. FieldKit remains unavailable as in the earlier runtime rollout.
 
 ## Status
 

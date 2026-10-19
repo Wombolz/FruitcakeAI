@@ -101,11 +101,17 @@ mcp_servers:
       writes_disk: true
 
   # Explicitly enabled local integration. Requires Node and Stream Deck's MCP
-  # Actions profile. Pin the bridge version used for compatibility verification.
+  # Actions profile. Pin the tested bridge and its compatible patched SDK.
+  # Explicit packages avoid reusing an older single-package npx cache.
   elgato:
     type: stdio
     command: npx
-    args: ["--yes", "@elgato/mcp-server@0.1.7"]
+    args:
+      - "--yes"
+      - "--ignore-scripts"
+      - "--package=@elgato/mcp-server@0.1.7"
+      - "--package=@modelcontextprotocol/sdk@1.31.0"
+      - "elgato-mcp-server"
     enabled: true
     timeout: 60
     classification: optional

@@ -6,6 +6,8 @@ on:
     branches:
       - main
   workflow_dispatch:
+  schedule:
+    - cron: "23 9 * * 1"
 
 permissions:
   contents: read
@@ -13,22 +15,25 @@ permissions:
 jobs:
   backend-checks:
     name: Python Compile + Smoke Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, Node 24
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0, Node 24
         with:
-          python-version: "3.11"
+          python-version-file: ".python-version"
           cache: "pip"
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-dev.txt
+          python -m pip check
+
+      - name: Audit installed dependencies
+        run: ./scripts/audit_dependencies.sh
 
       - name: Compile Python sources
         run: |
@@ -46,3 +51,47 @@ jobs:
       - name: Run focused smoke tests
         run: |
           pytest -q tests/test_auth.py -k "create_and_list_sessions or order"
+
+      - name: Check dependency-sensitive integrations
+        env:
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          HF_HUB_OFFLINE: "1"
+        run: |
+          python -m pytest -q tests/test_auth_crypto.py tests/test_credential_hardening.py tests/test_integrations.py \
+            tests/test_rag.py tests/test_mcp_transports.py tests/test_model_stream.py \
+            tests/test_dependency_baseline.py tests/test_dependency_bootstrap.py \
+            tests/test_runtime_configuration.py tests/test_container_baseline.py tests/test_database_roles.py \
+            tests/test_coding_lifecycle.py
+
+      - name: Build reviewed container recipes
+        run: |
+          docker build -t fruitcake/postgres-vector:ci -f containers/postgres/Dockerfile .
+          docker build -t fruitcake/mcp-shell:ci -f mcp_shell_server/Dockerfile .
+
+      - name: Check database initialization and vector extension
+        run: |
+          trap 'docker rm -f -v fruitcake-postgres-ci >/dev/null 2>&1 || true' EXIT
+          docker run -d --name fruitcake-postgres-ci --network none \
+            -e POSTGRES_USER=fruitcake -e POSTGRES_DB=fruitcake_v5 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust fruitcake/postgres-vector:ci
+          for attempt in $(seq 1 60); do
+            docker exec fruitcake-postgres-ci pg_isready -U fruitcake -d fruitcake_v5 && break
+            sleep 1
+          done
+          docker exec fruitcake-postgres-ci psql -X -v ON_ERROR_STOP=1 -U fruitcake -d fruitcake_v5 \
+            -c "CREATE EXTENSION vector; SELECT '[1,2,3]'::vector <-> '[1,2,4]'::vector;"
+
+      - name: Check shell protocol and offline command boundaries
+        env:
+          FRUITCAKE_TEST_DOCKER: "1"
+          FRUITCAKE_TEST_DOCKER_IMAGE: fruitcake/mcp-shell:ci
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+        run: python -m pytest -q tests/test_shell_mcp_server.py tests/coding_runtime/test_commands.py
+
+      - name: Check database role boundaries and maintenance migrations
+        env:
+          FRUITCAKE_TEST_DOCKER: "1"
+          FRUITCAKE_TEST_POSTGRES_IMAGE: fruitcake/postgres-vector:ci
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          HF_HUB_OFFLINE: "1"
+        run: python -m pytest -q tests/test_database_roles.py

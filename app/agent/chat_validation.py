@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from urllib.parse import urlparse
 from typing import Any
+
+from app.artifacts.compat import artifact_envelopes_from_tool_records
 
 
 RESEARCH_KEYWORDS = {
@@ -175,6 +178,27 @@ TASK_UPDATE_SUCCESS_PATTERNS = (
 )
 
 
+class _ArtifactLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.urls: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "a":
+            self.urls.extend(value for name, value in attrs if name == "href" and value)
+
+
+def _visible_artifact_urls(records: list[dict[str, Any]]) -> list[str]:
+    successful = [record for record in records if isinstance(record, dict) and not record.get("is_error")]
+    urls: set[str] = set()
+    for artifact in artifact_envelopes_from_tool_records(successful):
+        if artifact.type == "core.html":
+            parser = _ArtifactLinkParser()
+            parser.feed(str((artifact.payload or {}).get("content") or ""))
+            urls.update(url for url in parser.urls if _is_valid_public_url(url))
+    return sorted(urls)
+
+
 @dataclass
 class ChatValidationResult:
     is_research_style: bool
@@ -211,6 +235,7 @@ def validate_chat_response(
     urls = _extract_urls(text)
     valid_urls = [u for u in urls if _is_valid_public_url(u)]
     invalid_urls = [u for u in urls if u not in valid_urls]
+    valid_urls = sorted(set(valid_urls + _visible_artifact_urls(executed_tools or [])))
     cleaned = _strip_invalid_links(text, invalid_urls)
     empty_result = len(cleaned.strip()) < 40
 

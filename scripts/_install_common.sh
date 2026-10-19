@@ -90,6 +90,7 @@ ensure_env_file() {
   total_ram="$(ram_gb)"
 
   cp "$ENV_TEMPLATE" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
 
   if [[ "$tier" == "high" ]]; then
     perl -0pi -e 's/LLM_MODEL=ollama_chat\/qwen2\.5:32b/LLM_MODEL=ollama_chat\/qwen2.5:32b/' "$ENV_FILE"
@@ -120,6 +121,8 @@ load_env_file() {
     source "$ENV_FILE"
     set +a
   fi
+  # Never pass maintenance credentials to the API or its MCP subprocesses.
+  unset DB_PASSWORD DATABASE_MIGRATION_URL
 }
 
 configured_llm_backend() {
@@ -175,7 +178,24 @@ ensure_venv() {
   fi
 
   if [[ "$current_hash" != "$existing_hash" ]]; then
-    pip install -q -r "$ROOT/requirements.txt"
+    if python - <<'PY'
+from importlib.metadata import PackageNotFoundError, version
+for package in ("python-jose", "passlib"):
+    try:
+        version(package)
+    except PackageNotFoundError:
+        continue
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
+      echo "ERROR: This .venv contains retired authentication packages." >&2
+      echo "Stop Fruitcake, preserve the old .venv, and create a fresh environment." >&2
+      echo "See Docs/dependencies.md. An in-place pip install would leave vulnerable packages installed." >&2
+      return 1
+    fi
+    python -m pip install -q --require-hashes --only-binary=:all: -r "$REQUIREMENTS_FILE"
+    python -m pip check
     printf '%s\n' "$current_hash" > "$REQUIREMENTS_STAMP"
   fi
 }
@@ -209,7 +229,12 @@ ensure_models() {
 }
 
 start_postgres() {
-  docker compose up -d postgres
+  local image
+  image="$(docker compose config --images postgres)"
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    docker compose build postgres
+  fi
+  docker compose up --no-build -d postgres
 }
 
 wait_for_postgres() {
@@ -219,7 +244,7 @@ wait_for_postgres() {
 }
 
 run_migrations() {
-  alembic upgrade head
+  python "$ROOT/scripts/database_admin.py" migrate upgrade head
 }
 
 seed_default_users() {

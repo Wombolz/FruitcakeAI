@@ -30,6 +30,19 @@ def get_llm_usage_context() -> dict[str, Any]:
     return dict(_usage_context.get() or {})
 
 
+def _resolve_usage_provider(model: str, provider: str | None, context: dict[str, Any]) -> str:
+    if provider:
+        return provider
+    if is_local_ollama_model(model):
+        return "ollama"
+    prefix, separator, _ = model.partition("/")
+    if separator and prefix in litellm.provider_list:
+        return prefix
+    if is_native_openai_model(model):
+        return "openai"
+    return str(context.get("provider") or settings.llm_backend)
+
+
 def _extract_usage_counts(response: Any) -> tuple[int, int, int] | None:
     usage = getattr(response, "usage", None)
     if usage is None and isinstance(response, dict):
@@ -193,7 +206,7 @@ async def record_llm_usage_event(
     if resolved_user_id <= 0:
         return
 
-    resolved_model = str(getattr(response, "model", None) or model or context.get("model") or "")
+    resolved_model = str(_value(response, "model") or model or context.get("model") or "")
     if not resolved_model:
         return
 
@@ -231,7 +244,7 @@ async def record_llm_usage_event(
         source=str(source or context.get("source") or "llm_call"),
         stage=stage if stage is not None else context.get("stage"),
         model=resolved_model,
-        provider=str(provider or context.get("provider") or settings.llm_backend),
+        provider=_resolve_usage_provider(str(model or context.get("model") or resolved_model), provider, context),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,

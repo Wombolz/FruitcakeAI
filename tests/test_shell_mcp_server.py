@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,33 @@ from mcp_shell_server.server import (
     resolve_execution_dir,
     resolve_working_directory,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.environ.get("FRUITCAKE_TEST_DOCKER") != "1", reason="Opt-in Docker protocol test")
+async def test_candidate_container_serves_shell_tools_over_real_mcp(tmp_path):
+    from app.mcp.client import MCPClient
+
+    image = os.environ.get("FRUITCAKE_TEST_DOCKER_IMAGE", "fruitcake/mcp-shell")
+    client = MCPClient("shell-container-fixture", command="docker", args=[
+        "run", "--rm", "-i", "--network", "none", "--read-only", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges", "--pids-limit", "128", "--memory", "256m",
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "--mount", f"type=bind,src={tmp_path},dst=/workspace",
+        image, "--allowed-paths", "/workspace",
+    ])
+    try:
+        assert await client.connect(), client.get_status()
+        assert [tool["name"] for tool in client.get_tools()] == ["shell_exec"]
+        response = await client.call_tool("shell_exec", {"command": "python --version"})
+        assert response["success"], response
+        result = json.loads(response["result"]["content"][0]["text"])
+        assert result["status"] == "completed" and "Python 3.11.17" in result["stdout"]
+        refused = await client.call_tool("shell_exec", {"command": "curl https://example.com"})
+        result = json.loads(refused["result"]["content"][0]["text"])
+        assert result["status"] == "refused" and result["exit_code"] == 126
+    finally:
+        await client.disconnect()
 
 
 def test_detect_blocked_command_rejects_network_tool():

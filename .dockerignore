@@ -1,0 +1,8 @@
+# Allowlist build inputs; never send .env, Git history, backups or workspaces.
+**
+!mcp_shell_server/
+!mcp_shell_server/**
+!containers/
+!containers/**
+**/__pycache__/
+**/*.pyc

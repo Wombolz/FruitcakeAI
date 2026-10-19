@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from jose import JWTError, jwt
+import jwt
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -175,7 +175,7 @@ async def google_callback(
             settings.jwt_secret_key,
             algorithms=[settings.jwt_algorithm],
         )
-    except JWTError as exc:
+    except jwt.InvalidTokenError as exc:
         raise HTTPException(status_code=400, detail="Google OAuth state is invalid or expired") from exc
     if (
         state_payload.get("purpose") != "google_calendar_oauth"

@@ -1,14 +1,22 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    # Locally built OS/gosu refresh; upstream inputs are digest-pinned in the recipe.
+    # Never pull this first-party name from a public registry.
+    image: fruitcake/postgres-vector:16.15-pgvector0.8.7-20261018-r1
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: containers/postgres/Dockerfile
     environment:
       POSTGRES_DB: fruitcake_v5
       POSTGRES_USER: fruitcake
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-fruitcake}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+    secrets:
+      - postgres_admin_password
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fruitcake -d fruitcake_v5"]
       interval: 5s
@@ -28,3 +36,7 @@ services:
 volumes:
   pgdata:
   # redisdata:
+
+secrets:
+  postgres_admin_password:
+    file: ./storage/.database_credentials/postgres-admin-password

@@ -13,7 +13,7 @@ CONTENT_BLOCK_LIMIT = 8
 
 _NEWS_SOURCE_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 _NEWS_SECTION_RE = re.compile(r"^\s*#{2,4}\s+(.+?)\s*$")
-_NEWS_ITEM_RE = re.compile(r"^\s*[-*]\s+\*\*(.+?)\*\*(?:\s+(.+?))?\s*$")
+_NEWS_ITEM_RE = re.compile(r"^\s*[-*]\s+\*\*(.+?)\*\*(?:(?:\s+|(?=[:;]))(.+?))?\s*$")
 _BARE_SOURCE_URL_RE = re.compile(r"https?://[^\s)>]+")
 _MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,4}\s+(.+?)\s*$")
 _STAT_ITEM_RE = re.compile(r"^\s*[-*]?\s*\*\*([^*:\n]{1,80}):\*\*\s*(.+?)\s*$")
@@ -381,11 +381,20 @@ def _build_news_block(content: str) -> dict[str, Any] | None:
             item_title = headline.group(1).strip()[:240]
             source_label_hint = ""
             trailing = str(headline.group(2) or "").strip().strip("* _()")
-            if trailing:
+            inline_summary = ""
+            if trailing.startswith((":", ";", "-", "\u2014", "\u2013")):
+                inline_summary = trailing.lstrip(":;-\u2014\u2013 ")
+            elif trailing:
                 source_label_hint = trailing.split(",", 1)[0].strip()[:100]
             index += 1
             summary_lines: list[str] = []
             sources: list[dict[str, str]] = []
+            if inline_summary:
+                sources.extend(
+                    {"label": label.strip()[:100], "url": url.strip()[:2_000]}
+                    for label, url in _NEWS_SOURCE_LINK_RE.findall(inline_summary)[:4]
+                )
+                summary_lines.append(_NEWS_SOURCE_LINK_RE.sub("", inline_summary).strip())
 
             while index < len(lines):
                 if _NEWS_SECTION_RE.match(lines[index]) or _NEWS_ITEM_RE.match(lines[index]):
@@ -431,6 +440,33 @@ def _build_news_block(content: str) -> dict[str, Any] | None:
         "title": "News Briefing",
         "sections": sections,
     }
+
+
+def news_evidence_from_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reuse bounded, paired RSS tool results, never user-supplied source claims."""
+    pending: dict[str, str] = {}
+    evidence: list[dict[str, Any]] = []
+    for message in history[-100:]:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") or {}
+                if isinstance(function, dict) and call.get("id"):
+                    pending[str(call["id"])] = str(function.get("name") or "")
+        elif message.get("role") == "tool":
+            tool = pending.pop(str(message.get("tool_call_id") or ""), "")
+            content = str(message.get("content") or "")
+            if tool in _NEWS_TOOL_NAMES and content and not message.get("is_error"):
+                evidence.append({"tool": tool, "result_summary": content[:32_000]})
+    selected: list[dict[str, Any]] = []
+    size = 0
+    for record in reversed(evidence):
+        size += len(record["result_summary"])
+        if size > 96_000 or len(selected) >= 4:
+            break
+        selected.append(record)
+    return list(reversed(selected))
 
 
 def _rss_items_from_result_text(result_summary: str) -> list[dict[str, Any]]:
@@ -1050,6 +1086,8 @@ def _blocks_overlap(content: str, lhs: str, rhs: str) -> bool:
 def build_assistant_content_blocks(
     content: str,
     executed_tools: list[dict[str, Any]] | None = None,
+    *,
+    prior_news_evidence: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Extract bounded structured blocks while preserving exact fallback Markdown."""
     lines = str(content or "").splitlines()
@@ -1116,10 +1154,20 @@ def build_assistant_content_blocks(
             ]
             blocks.append(place_block)
     if executed_tool_names & _NEWS_TOOL_NAMES and len(blocks) < CONTENT_BLOCK_LIMIT:
-        news_block = _build_news_block(content) or _build_news_block_from_rss_evidence(
-            content,
-            executed_tools or [],
+        candidates = [
+            _build_news_block(content),
+            _build_news_block_from_rss_evidence(content, executed_tools or []),
+        ]
+        # Mixed Markdown formats must not hide stories inside the replaced span.
+        news_block = max(
+            (candidate for candidate in candidates if candidate),
+            key=lambda candidate: sum(len(section["items"]) for section in candidate["sections"]),
+            default=None,
         )
+        if news_block:
+            blocks.append(news_block)
+    elif prior_news_evidence and len(blocks) < CONTENT_BLOCK_LIMIT:
+        news_block = _build_news_block_from_rss_evidence(content, prior_news_evidence)
         if news_block:
             blocks.append(news_block)
     if len(blocks) < CONTENT_BLOCK_LIMIT:

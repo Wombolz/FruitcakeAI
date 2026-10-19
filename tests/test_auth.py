@@ -20,6 +20,7 @@ from app.api.chat import _execute_chat_turn, _run_websocket_message, chat_websoc
 from app.agent.context import UserContext
 from app.chat_runtime import get_chat_run_manager
 from app.config import settings
+from app.auth.router import require_registration_admin
 from app.db.session import Base, get_db
 from app.db.models import ChatMessage, ChatSession, User
 from app.main import app
@@ -64,6 +65,7 @@ async def setup_db():
 @pytest.fixture
 async def client():
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[require_registration_admin] = lambda: None
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
     app.dependency_overrides.clear()
