@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.44
+
+- Added authenticated My Workspace browsing with lazy directory pages and complete, bounded text-file inspection.
+- Added bounded file downloads for native save dialogs and image/PDF previews without serving executable HTML.
+- Kept user workspaces separate from coding checkout grants, with owner/root validation and post-read account checks.
+
 ## v0.7.43
 
 - Added independent, read-only coding reviews with durable findings, explicit read approvals, reasoning provenance and recoverable review history.

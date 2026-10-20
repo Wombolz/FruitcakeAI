@@ -24,10 +24,10 @@ def fail(code, message):
     raise RepositoryError(code, message)
 
 
-def validate_path(path, *, directory=False):
+def validate_path(path, *, directory=False, policy=path_allowed):
     if directory and path == "":
         return []
-    if not path_allowed(path) or len(path.split("/")) > 32:
+    if not policy(path) or len(path.split("/")) > 32:
         fail("file_denied", "This relative path is excluded from source inspection.")
     return path.split("/")
 
@@ -58,6 +58,8 @@ def verify_directory(root, parts, metadata):
 
 
 class CheckoutFileBrowser:
+    path_policy = staticmethod(path_allowed)
+
     def __init__(self):
         self.git = RepositoryInspector(status_limit=256 * 1024)
         self._capacity = asyncio.Semaphore(2)
@@ -91,7 +93,7 @@ class CheckoutFileBrowser:
         return ignored
 
     async def inspect(self, root: Path, *, path: str, file=False, offset=0, version=None):
-        validate_path(path, directory=not file)
+        validate_path(path, directory=not file, policy=self.path_policy)
         if type(offset) is not int or not 0 <= offset <= DIRECTORY_SCAN:
             fail("invalid_request", "Invalid directory offset.")
         try:
@@ -124,18 +126,18 @@ class CheckoutFileBrowser:
         except (OSError, UnicodeError) as exc:
             raise RepositoryError("file_denied", "The path could not be inspected without following links or special files.") from exc
 
-    @staticmethod
-    def _validate_target(root, path, file):
-        parts = validate_path(path, directory=not file)
+    @classmethod
+    def _validate_target(cls, root, path, file):
+        parts = validate_path(path, directory=not file, policy=cls.path_policy)
         with directory_at(root, parts[:-1] if file else parts) as directory:
             if file:
                 metadata = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                     fail("file_denied", "Only regular files without symbolic or hard links are displayed.")
 
-    @staticmethod
-    def _list(root, path):
-        parts = validate_path(path, directory=True)
+    @classmethod
+    def _list(cls, root, path):
+        parts = validate_path(path, directory=True, policy=cls.path_policy)
         entries = []
         with directory_at(root, parts) as directory:
             before = os.fstat(directory)
@@ -144,7 +146,7 @@ class CheckoutFileBrowser:
                     if index >= DIRECTORY_SCAN:
                         fail("repository_limit", "This directory exceeds the 4,096-entry inspection bound.")
                     relative = path + "/" + entry.name if path else entry.name
-                    if not path_allowed(relative) or len(relative.split("/")) > 32:
+                    if not cls.path_policy(relative) or len(relative.split("/")) > 32:
                         continue
                     metadata = entry.stat(follow_symlinks=False)
                     if stat.S_ISDIR(metadata.st_mode):
@@ -160,9 +162,9 @@ class CheckoutFileBrowser:
         entries.sort(key=lambda entry: (entry["kind"] != "directory", entry["name"].casefold(), entry["name"]))
         return entries, signature
 
-    @staticmethod
-    def _read(root, path):
-        parts = validate_path(path)
+    @classmethod
+    def _read(cls, root, path):
+        parts = validate_path(path, policy=cls.path_policy)
         with directory_at(root, parts[:-1]) as directory:
             parent = os.fstat(directory)
             descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
