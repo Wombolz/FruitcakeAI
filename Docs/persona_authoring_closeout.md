@@ -74,6 +74,17 @@ MCP-transport/model-stream checks passed. The overlay audit found no unexcepted
 vulnerabilities (the one pre-existing NLTK exception remains). Additional logs:
 `/private/tmp/fruitcake-persona-certifi-{checks,audit}.log`.
 
+The next hosted run passed the audit and application checks, then exposed a stale
+disposable PostgreSQL role fixture: it created current persona tables before
+stamping revision 056, so upgrading attempted to create them twice. The fixture
+now excludes all post-056 tables from its seed schema, expects head 061, and checks
+runtime CRUD grants for the persona tables as well as coding-review tables.
+The corrected disposable PostgreSQL role/migration and coding-reservation checks
+passed locally: 25 tests. This verifies actual PostgreSQL migration/default-grant
+behavior, not persona-specific concurrent editor/delete races. Production
+PostgreSQL was not modified. Log:
+`/private/tmp/fruitcake-persona-closeout-postgres.log`.
+
 ## Explicit Follow-Ups And Residual Checks
 
 - Image-generation handoff/test portraits remain disabled. Coordinate generic,
