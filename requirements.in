@@ -44,6 +44,7 @@ jsonschema>=4.20,<5
 filelock>=3.20.3,<4
 
 # HTTP clients and official MCP transport
+certifi>=2026.10.19
 httpx[http2]>=0.28.1,<1
 mcp>=2.3,<3
 mcp-types>=2.3,<3

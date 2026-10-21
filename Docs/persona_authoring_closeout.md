@@ -52,6 +52,28 @@ part of closeout verification.
 Logs: `/private/tmp/fruitcake-persona-deletion-regressions.log` and
 `/private/tmp/fruitcake-persona-closeout-native.log`.
 
+## Closeout CI Security Gate
+
+The first backend PR run stopped at its dependency audit, before persona tests:
+`certifi 2026.7.22 / PYSEC-2026-4320`, fixed by `2026.10.19`. The runtime input now
+declares that security floor, and both hash-verified baselines were regenerated
+with uv 0.13.1 using `--upgrade-package certifi==2026.10.19`. No other package
+versions changed; this is a targeted CI blocker repair, not a new dependency
+refresh sprint or another audit exception. Upstream release:
+https://github.com/certifi/python-certifi/releases/tag/2026.10.19.
+
+The working virtualenv was not modified. Normal bootstrap/install must consume
+the new baselines after adopting this branch to deploy the certificate update.
+The existing NLTK exception/review deadline remains unchanged; GitHub reports it
+once per requirements file, not as two distinct persona findings.
+
+Validation used a temporary certifi-only package overlay, not an installation into
+the operator environment: hash-verified wheel installation and TLS CA-bundle
+loading passed, `pip check` passed, and 60 dependency-baseline/auth/integration/
+MCP-transport/model-stream checks passed. The overlay audit found no unexcepted
+vulnerabilities (the one pre-existing NLTK exception remains). Additional logs:
+`/private/tmp/fruitcake-persona-certifi-{checks,audit}.log`.
+
 ## Explicit Follow-Ups And Residual Checks
 
 - Image-generation handoff/test portraits remain disabled. Coordinate generic,

@@ -15,6 +15,7 @@
 
 ## Unreleased
 
+- Raised the certifi security floor to 2026.10.19 and regenerated only that package's hashed runtime/development pins after the closeout CI audit flagged PYSEC-2026-4320.
 - Added a Settings persona editor with Neutral/custom personalities, immutable revisions, explicit chat selection, personal defaults, preview and fresh test conversations in the paired native client.
 - Separated editable personality from current account policy and enforced tool restrictions at dispatch and approval replay.
 - Added private revision-pinned portrait/turnaround assets and confirmed persona deletion that preserves messages and resets affected chats to Assistant; image-generation handoff remains deferred.
