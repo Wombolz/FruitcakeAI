@@ -61,7 +61,8 @@ jobs:
             tests/test_rag.py tests/test_mcp_transports.py tests/test_model_stream.py \
             tests/test_dependency_baseline.py tests/test_dependency_bootstrap.py \
             tests/test_runtime_configuration.py tests/test_container_baseline.py tests/test_database_roles.py \
-            tests/test_coding_lifecycle.py tests/test_coding_review_privacy.py
+            tests/test_coding_lifecycle.py tests/test_coding_review_privacy.py tests/test_persona_policy_api.py \
+            tests/test_persona_revisions_api.py tests/test_persona_editor_api.py tests/test_persona_deletion_api.py tests/test_persona_routing.py
 
       - name: Check coding runtime and frozen review captures
         env:
@@ -74,6 +75,12 @@ jobs:
           LITELLM_LOCAL_MODEL_COST_MAP: "True"
           HF_HUB_OFFLINE: "1"
         run: python -m pytest -q --confcutdir=tests/workspace_browser tests/workspace_browser
+
+      - name: Check persona prompt and dispatch foundations
+        env:
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          HF_HUB_OFFLINE: "1"
+        run: python -m pytest -q --confcutdir=tests/persona_authoring tests/persona_authoring
 
       - name: Build reviewed container recipes
         run: |

@@ -53,7 +53,9 @@ def test_resolve_execution_profile_prefers_explicit_task_persona():
     assert profile.allowed_tools == ["create_task_plan", "search_library"]
 
 
-def test_resolve_execution_profile_falls_back_to_family_assistant_when_missing():
+def test_resolve_execution_profile_rejects_missing_account_policy():
+    import pytest
+    from app.agent.persona_policy import PersonaPolicyError
     user = _make_user(persona="does_not_exist")
     task = Task(
         user_id=1,
@@ -65,10 +67,8 @@ def test_resolve_execution_profile_falls_back_to_family_assistant_when_missing()
 
     fake_tools = [{"type": "function", "function": {"name": "search_library"}}]
     with patch("app.autonomy.execution_profile.get_tools_for_user", return_value=fake_tools):
-        profile = resolve_execution_profile(task, user)
-
-    assert profile.persona == "family_assistant"
-    assert profile.allowed_tools == ["search_library"]
+        with pytest.raises(PersonaPolicyError, match="Unknown persona"):
+            resolve_execution_profile(task, user)
 
 
 def test_resolve_agent_behavior_persona_maps_known_agent_role():

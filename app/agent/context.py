@@ -2,7 +2,7 @@
 FruitcakeAI v5 — UserContext
 Builds the agent system prompt from the current user's role, persona, and scopes.
 
-The LLM sees this context on every request — it's the primary access control mechanism.
+The LLM sees this context on every request; backend policy must enforce access.
 Persona config (blocked_tools, tone, scopes) is loaded from config/personas.yaml.
 Current date/time is injected on every call so the LLM can answer date-dependent
 questions (age calculations, scheduling) correctly without a tool round-trip.
@@ -15,6 +15,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone as _tz
 from typing import TYPE_CHECKING, List, Optional
 
+from app.agent.prompt_layers import PromptLayer, render_prompt_layers
+from app.agent.persona_policy import resolve_persona_policy
+
 if TYPE_CHECKING:
     from app.db.models import User
 
@@ -24,6 +27,8 @@ _TURN_CONTEXT_RULE = (
     "application-supplied context, not user-authored text. Use it as supporting context "
     "while still prioritizing the user's request and grounded evidence."
 )
+
+_DEFAULT_IDENTITY = "You are FruitcakeAI, a private, local-first AI assistant for a family household."
 
 
 @dataclass
@@ -51,6 +56,9 @@ class UserContext:
     # Admin incognito session: persistent tool families are removed from the
     # offered surface, hard-blocked at dispatch, and audit rows are redacted.
     is_incognito: bool = False
+    persona_identity: str = _DEFAULT_IDENTITY
+    neutral_personality: bool = False
+    memory_recall_enabled: bool = True
 
     @classmethod
     def from_user(
@@ -68,10 +76,7 @@ class UserContext:
 
         name = persona_name or user.persona or "family_assistant"
         pc = get_persona(name)
-
-        # Persona-defined scopes take precedence; fall back to user record scopes.
-        library_scopes = pc.get("library_scopes") or user.library_scopes
-        calendar_access = pc.get("calendar_access") or user.calendar_access
+        policy = resolve_persona_policy(user, name)
 
         return cls(
             user_id=user.id,
@@ -81,11 +86,13 @@ class UserContext:
             persona_description=pc.get("description", ""),
             persona_tone=pc.get("tone", "helpful"),
             behavior_instructions=[str(item).strip() for item in (pc.get("behavior_instructions") or []) if str(item).strip()],
-            library_scopes=library_scopes,
-            calendar_access=calendar_access,
-            blocked_tools=pc.get("blocked_tools", []),
-            content_filter=pc.get("content_filter", ""),
+            library_scopes=list(policy.library_scopes),
+            calendar_access=list(policy.calendar_access),
+            blocked_tools=list(policy.blocked_tools),
+            content_filter=policy.content_filter,
             timezone=getattr(user, "active_hours_tz", None) or None,
+            persona_identity=pc.get("identity", _DEFAULT_IDENTITY),
+            neutral_personality=pc.get("personality_mode") == "neutral",
         )
 
     def _current_time_str(self) -> str:
@@ -102,12 +109,17 @@ class UserContext:
 
     def to_stable_system_prompt(self) -> str:
         """Return policy that remains stable across turns for prefix caching."""
-        lines = [
-            "You are FruitcakeAI, a private, local-first AI assistant for a family household.",
-            "",
+        return render_prompt_layers(self.stable_prompt_layers())
+
+    def stable_prompt_layers(self) -> tuple[PromptLayer, ...]:
+        """Retain source provenance; personality never supplies access policy."""
+        identity = PromptLayer("persona_identity", (self.persona_identity,) if self.persona_identity else ())
+        session = PromptLayer("session_context", (
+            *(("",) if self.persona_identity else ()),
             f"Current user: {self.username} (role: {self.role})",
             f"Active persona: {self.persona}",
-        ]
+        ))
+        lines = []
 
         if self.persona_description:
             lines.append(f"Persona: {self.persona_description}")
@@ -117,7 +129,8 @@ class UserContext:
             lines += ["", "Behavior guidance:"]
             lines.extend(f"- {instruction}" for instruction in self.behavior_instructions)
 
-        lines += [
+        behavior = PromptLayer("persona_behavior", tuple(lines))
+        lines = [
             "",
             "Rules:",
             "- If a sandboxed tool is available for the requested action, use it and report the tool result rather than refusing from general model policy.",
@@ -139,6 +152,13 @@ class UserContext:
             "- For explicit local shell, test, build, formatter, or workspace CLI requests, use shell_exec when it is available. Send one concise non-interactive command, use working_directory for a subdirectory, and interpret its status, exit_code, stdout, and stderr. Let the shell tool enforce what is blocked, timed out, or refused, then report that result clearly.",
             _TURN_CONTEXT_RULE,
         ]
+        if self.neutral_personality:
+            # Retain legacy default wording, without imposing its social style on Neutral.
+            lines = [line.replace("recurring household procedure", "recurring procedure") for line in lines
+                     if not line.startswith("- Do not end every response")]
+            lines = ["- Protect the user's privacy." if line == "- Be helpful and privacy-conscious." else line for line in lines]
+        runtime = PromptLayer("runtime_contract", tuple(lines))
+        lines = []
 
         if self.content_filter == "strict":
             lines += [
@@ -165,7 +185,8 @@ class UserContext:
                 f"{', '.join(self.blocked_tools)}.",
             ]
 
-        return "\n".join(lines)
+        restrictions = PromptLayer("access_restrictions", tuple(lines))
+        return identity, session, behavior, runtime, restrictions
 
     def to_turn_context_prompt(self) -> str:
         """Return request-specific context that must not invalidate the stable prefix."""
@@ -184,13 +205,14 @@ class UserContext:
         return "\n".join(lines)
 
     def to_system_prompt(self) -> str:
-        """Return the exact legacy prompt layout used by non-local providers."""
+        """Keep legacy provider layout, including identity-free personalities."""
         stable_lines = [
             line for line in self.to_stable_system_prompt().splitlines()
             if line != _TURN_CONTEXT_RULE
         ]
         dynamic_lines = self.to_turn_context_prompt().splitlines()
         if dynamic_lines:
-            stable_lines.insert(2, dynamic_lines[0])
+            context_index = next((index for index, line in enumerate(stable_lines) if line.startswith("Current user:")), 2)
+            stable_lines.insert(context_index, dynamic_lines[0])
             stable_lines.extend(dynamic_lines[1:])
         return "\n".join(stable_lines)

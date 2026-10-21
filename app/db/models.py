@@ -16,6 +16,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -1812,3 +1813,60 @@ class RSSUserState(Base):
 
     def __repr__(self):
         return f"<RSSUserState(user_id={self.user_id}, cursor={self.last_list_recent_cursor_at})>"
+
+
+class PersonaDefinition(Base):
+    __tablename__ = "persona_definitions"
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    head_version = Column(Integer, nullable=False, default=1)
+    archived_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PersonaRevision(Base):
+    __tablename__ = "persona_revisions"
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    persona_id = Column(String(64), ForeignKey("persona_definitions.id", ondelete="CASCADE"), nullable=False)
+    version = Column(Integer, nullable=False)
+    payload_json = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    __table_args__ = (UniqueConstraint("persona_id", "version", name="uq_persona_revision_version"),)
+
+
+class PersonaSelection(Base):
+    __tablename__ = "persona_selections"
+    session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), primary_key=True)
+    snapshot_json = Column(Text, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+
+
+class UserPersonaDefault(Base):
+    __tablename__ = "user_persona_defaults"
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    snapshot_json = Column(Text, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+
+
+class ChatRunPersonaSnapshot(Base):
+    __tablename__ = "chat_run_persona_snapshots"
+    run_id = Column(String(64), ForeignKey("chat_runs.id", ondelete="CASCADE"), primary_key=True)
+    snapshot_json = Column(Text, nullable=False)
+
+
+class PersonaVisualAsset(Base):
+    __tablename__ = "persona_visual_assets"
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    sha256 = Column(String(64), nullable=False)
+    width = Column(Integer, nullable=False)
+    height = Column(Integer, nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    data = Column(LargeBinary, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PersonaTestOptions(Base):
+    __tablename__ = "persona_test_options"
+    session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), primary_key=True)
+    memory_recall_enabled = Column(Boolean, nullable=False, default=False)

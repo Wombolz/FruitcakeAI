@@ -33,6 +33,7 @@ import structlog
 
 from app.artifacts import artifact_envelopes_from_tool_records, normalize_artifact_envelopes
 from app.agent.context import UserContext
+from app.personas import service as persona_service
 from app.agent.chat_intents import (
     is_library_detail_or_excerpt_intent,
     is_library_lookup_intent,
@@ -249,6 +250,8 @@ class RenameSessionRequest(BaseModel):
 
 class UpdateSessionPersonaRequest(BaseModel):
     persona: str = Field(min_length=1, max_length=100)
+    revision: int | None = Field(default=None, ge=1)
+    expected_version: int | None = Field(default=None, ge=0)
 
 
 class UpdateSessionModelRequest(BaseModel):
@@ -323,6 +326,7 @@ async def list_personas() -> Dict[str, Any]:
             "tone": cfg.get("tone", ""),
             "blocked_tools": cfg.get("blocked_tools", []),
             "content_filter": cfg.get("content_filter", ""),
+            "personality_mode": cfg.get("personality_mode", "default"),
         }
         for name, cfg in personas.items()
     }
@@ -373,18 +377,29 @@ async def list_agents() -> Dict[str, Any]:
 
 @router.get("/tools")
 async def list_tools(
-    persona: Optional[str] = Query(None, description="Optional persona override"),
+    persona: Optional[str] = Query(None, min_length=1, max_length=100, description="Optional persona override"),
+    revision: int | None = Query(None, ge=1),
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     """Return available tool names for the current user/persona."""
     from app.agent.tools import get_tools_for_user
-    user_context = UserContext.from_user(current_user, persona_name=persona)
+    if persona is None:
+        if revision is not None:
+            raise HTTPException(422, "A revision requires a persona reference.")
+        value = (await persona_service.get_default(db, current_user))["selection"]
+    else:
+        value = await persona_service.resolve_reference(
+            db, current_user, persona_service.PersonaReference(persona=persona, revision=revision),
+        )
+    user_context = persona_service.context_from_snapshot(current_user, value)
     tools = get_tools_for_user(user_context)
     names = sorted({tool["function"]["name"] for tool in tools})
     return {
         "persona": user_context.persona,
         "tools": names,
         "blocked_tools": sorted(set(user_context.blocked_tools)),
+        "content_filter": user_context.content_filter,
     }
 
 
@@ -440,6 +455,7 @@ async def create_session(
     )
     db.add(session)
     await db.flush()
+    await persona_service.initialize_session(db, current_user, session)
     await db.execute(
         sa.update(ChatSession)
         .where(
@@ -505,6 +521,7 @@ async def get_session(
         "llm_model": session.llm_model,
         "project_id": session.project_id,
         "is_pinned": session.is_pinned,
+        "persona_selection": await persona_service.session_selection(db, current_user, session_id) if session.is_active else None,
         "compaction_events": compaction_events,
         "messages": [
             _session_message_payload(m)
@@ -677,17 +694,20 @@ async def update_session_persona(
     current_user: User = Depends(get_current_user),
 ) -> ChatSession:
     """Update the active persona for a session (owner only)."""
-    from app.agent.persona_loader import persona_exists
-
     persona_name = body.persona.strip().lower().replace(" ", "_")
-    if not persona_exists(persona_name):
-        raise HTTPException(status_code=400, detail=f"Unknown persona '{persona_name}'")
+    if not persona_name:
+        raise HTTPException(422, "Persona must not be blank.")
+    return await persona_service.select_session(
+        db, current_user, session_id,
+        persona_service.PersonaReference(persona=persona_name, revision=body.revision), body.expected_version,
+    )
 
-    session = await _get_session_or_404(session_id, current_user.id, db)
-    session.persona = persona_name
-    await db.flush()
-    await db.refresh(session)
-    return session
+
+@router.get("/sessions/{session_id:int}/persona")
+async def session_persona_selection(
+    session_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    return await persona_service.session_selection(db, current_user, session_id)
 
 
 @router.patch("/sessions/{session_id:int}/model", response_model=SessionOut)
@@ -845,7 +865,7 @@ async def send_message(
     history.append({"role": "user", "content": body.content})
 
     # Build context from the session's current persona (may differ from user default)
-    user_context = UserContext.from_user(current_user, persona_name=session.persona)
+    user_context, persona_snapshot = await persona_service.session_context(db, current_user, session)
     _apply_tool_overrides(
         user_context,
         allowed_tools=body.allowed_tools,
@@ -862,7 +882,7 @@ async def send_message(
         db,
         current_user.id,
         body.content,
-    )
+    ) if user_context.memory_recall_enabled else (history, [])
     _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
     workspace_followup = _is_recent_workspace_followup_prompt(body.content, workspace_context)
     history = _apply_workspace_followup_grounding(
@@ -949,6 +969,7 @@ async def send_message(
         mode=execution_mode,
         stage=run_stage,
     )
+    persona_service.save_run_snapshot(db, chat_run, persona_snapshot)
     await db.commit()
 
     async def _record_run_event(event: AgentEvent) -> None:
@@ -1402,7 +1423,7 @@ async def decide_chat_run_approval(
         starting_sequence=int(run.last_event_sequence or 0),
     )
     try:
-        user_context = UserContext.from_user(current_user, persona_name=session.persona)
+        user_context = await persona_service.resume_context(db, current_user, session, run)
         effective_user_settings = await get_user_settings_resolver().resolve(db, current_user)
         reasoning_effort = reasoning_effort_for_model(
             run.model,
@@ -1692,7 +1713,7 @@ async def _run_websocket_message(
             session.llm_model,
             effective_user_settings.value("reasoning_effort"),
         )
-        user_context = UserContext.from_user(current_user, persona_name=session.persona)
+        user_context, persona_snapshot = await persona_service.session_context(db, current_user, session)
         _apply_tool_overrides(
             user_context,
             allowed_tools=allowed_tools,
@@ -1709,7 +1730,7 @@ async def _run_websocket_message(
             db,
             current_user.id,
             user_message,
-        )
+        ) if user_context.memory_recall_enabled else (history, [])
         _record_chat_stage_timing(stage_timings_ms, "memory_context", stage_started)
         workspace_followup = _is_recent_workspace_followup_prompt(user_message, workspace_context)
         history = _apply_workspace_followup_grounding(
@@ -1791,6 +1812,7 @@ async def _run_websocket_message(
             mode=execution_mode,
             stage=run_stage,
         )
+        persona_service.save_run_snapshot(db, chat_run, persona_snapshot)
         await db.commit()
         await _send_json_if_open(
             {
@@ -2278,9 +2300,12 @@ async def chat_websocket(
                     }
                 )
                 return
-            # The socket can outlive preference updates made through the HTTP API.
-            # Refresh the narrow mutable field instead of forcing a reconnect.
-            await db.refresh(current_user, attribute_names=["chat_routing_preference"])
+            # The socket can outlive account-policy changes through the HTTP API.
+            # Freeze fresh account columns into the next turn's context.
+            await db.refresh(current_user)
+            if not current_user.is_active:
+                await websocket.send_json({"type": "error", "content": "Account is no longer active."})
+                return
             sr = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
             session = sr.scalar_one_or_none() or session
             if not await model_id_is_allowed(db, current_user.id, session.llm_model):
@@ -2450,14 +2475,24 @@ async def _switch_persona(
             "session_id": session_id,
         }
 
-    # Persist to DB
-    session.persona = persona_name
+    user = await db.get(User, session.user_id)
+    if user is not None:
+        await db.refresh(user)
+    if user is None or not user.is_active:
+        return {"role": "assistant", "content": "The account is unavailable.", "session_id": session_id}
+    try:
+        await persona_service.select_session(
+            db, user, session_id, persona_service.PersonaReference(persona=persona_name),
+        )
+        effective = persona_service.context_from_snapshot(user, persona_service.builtin_snapshot(persona_name))
+    except HTTPException as exc:
+        return {"role": "assistant", "content": str(exc.detail), "session_id": session_id}
     await db.commit()
 
     pc = get_persona(persona_name)
     description = pc.get("description", "")
     tone = pc.get("tone", "")
-    blocked = pc.get("blocked_tools", [])
+    blocked = effective.blocked_tools
 
     parts = [f"Switched to persona: **{persona_name}**"]
     if description:

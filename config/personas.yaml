@@ -3,6 +3,16 @@
 # Changes here take effect on next server restart (file is cached at startup).
 
 personas:
+  neutral:
+    display_name: Neutral
+    description: Tool-capable assistant without a prescribed personality
+    personality_mode: neutral
+    identity: ""
+    tone: ""
+    behavior_instructions: []
+    # No access overrides or intent keywords: inherit account ceilings and
+    # remain explicitly selected, never inferred from task wording.
+
   family_assistant:
     display_name: Personal Assistant
     description: General family assistant with access to all shared resources
