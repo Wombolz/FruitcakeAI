@@ -540,6 +540,13 @@ async def test_approved_append_file_replays_exact_waiting_tool_call_and_advances
     from app.autonomy.runner import TaskRunner
     from app.mcp.servers.filesystem import _append_file as filesystem_append_file
 
+    # The runtime cap is derived from the offered tools. The fixture must expose
+    # append_file, not only mock its implementation after policy resolution.
+    from types import SimpleNamespace
+    registry = SimpleNamespace(_is_ready=True, get_tools_for_agent=lambda: [{"type": "function", "function": {
+        "name": "append_file", "description": "Append fixture file", "parameters": {"type": "object", "properties": {}}}}])
+    monkeypatch.setattr("app.mcp.registry.get_mcp_registry", lambda: registry)
+
     monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
     headers = await _headers(client, "approvalappendresumeowner")
     created = await client.post(

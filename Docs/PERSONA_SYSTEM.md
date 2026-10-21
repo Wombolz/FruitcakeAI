@@ -1,8 +1,37 @@
 # Persona System
 
-Personas customize how the assistant behaves for different family members.
-They control tone, tool access, content filtering, and document scope — all
-from a single YAML file.
+Personas customize assistant identity, tone and behavioral guidance. Server-owned
+definitions currently live in YAML and may narrow account policy; selecting a
+personality cannot expand the account's grants or remove mandatory restrictions.
+
+## Persona Authoring Branch
+
+The current persona-authoring branch adds **Neutral**, a tool-capable starting
+point with no inherited household identity or tone. Its metadata is discovered
+by the existing native persona picker; no new client build is required for this
+preset. Owner-scoped revision APIs and pinned chat/run snapshots are implemented
+locally, with unapplied migrations 060/061. The native Settings creator/editor,
+bounded prompt preview, fresh test chats and portrait/turnaround attachments are
+implemented locally and await signed-in operator acceptance. See
+[Persona Authoring Foundation](persona_authoring.md) for status and test paths.
+
+Account grants and the administrator-assigned legacy persona form a policy
+ceiling, with an additional protected floor for restricted-role accounts.
+Selecting a different personality can narrow that ceiling, not replace it.
+Explicit empty scope lists mean no access, not fallback to the user's grants.
+Blocked tools are accumulated and strict content guidance cannot be disabled by
+selecting Neutral. Tool dispatch, aliases and approval replay enforce tool caps.
+
+Legacy library topic labels and calendar categories are not a new per-document
+or provider-calendar ACL. Existing ownership/integration checks remain in force;
+this slice narrows context scope lists and disables library/calendar tool families
+when their effective list is empty. Do not interpret a topic label as a new
+resource grant or as proof of fine-grained filtering by each legacy adapter.
+
+Existing built-in prompt wording is retained where account grants already cover
+the selected persona. Previously overbroad scope context is intentionally narrowed.
+Missing account/task persona definitions now fail explicitly rather than silently
+falling back to Personal Assistant. Administrators must repair invalid references.
 
 ---
 
@@ -43,16 +72,20 @@ Changes take effect on the next server restart (personas are cached at startup).
 |-------|------|--------|
 | `description` | string | Shown to the LLM as the persona's identity; appears in the Swift persona picker |
 | `tone` | string | Appended to the system prompt: "be {tone}" |
-| `library_scopes` | list | Documents the LLM is allowed to surface when using `search_library` |
-| `calendar_access` | list | Calendar categories the assistant can read/write |
+| `library_scopes` | list | Legacy context labels, intersected with account/baseline policy; empty disables library tools, not a new per-document ACL |
+| `calendar_access` | list | Category hints intersected with account/baseline policy; empty disables calendar tools, not a provider-calendar ACL |
 | `content_filter` | `"strict"` or `""` | `"strict"` adds restricted-access content restrictions to the system prompt |
 | `blocked_tools` | list | Tool function names removed from the LLM's schema — model never sees them |
+| `identity` | string | Optional identity text; explicitly empty omits the inherited household identity |
+| `personality_mode` | `default` or `neutral` | Neutral removes generic inherited response-style guidance, not runtime/access rules |
 
 ---
 
 ## How tool blocking works
 
-`blocked_tools` filters tools **before** they reach the LLM. The model's function-calling schema simply doesn't include blocked tools — this is stronger than a prompt instruction because the model has no way to call a tool it can't see.
+`blocked_tools` filters tools **before** they reach the LLM. Dispatch also checks
+the effective policy, including resolved aliases and approval replay: omission
+from the offered schema is not itself an authorization boundary.
 
 ```
 get_tools_for_user(user_context)
@@ -66,7 +99,10 @@ get_tools_for_user(user_context)
 
 ## Default persona per user
 
-Each user record has a `persona` field. Set it at registration or update it via the admin API:
+Each user record has an administrator-managed `persona` policy baseline. It is
+also the fallback personality until a separate personal default is selected.
+Do not rewrite this field when saving a user-owned personality. Administrators
+can manage the baseline via the admin API:
 
 ```bash
 # Update user 3's persona to restricted_assistant
@@ -87,8 +123,10 @@ chat message starting with `/persona`:
 /persona work_assistant
 ```
 
-The switch is persisted to the session record in the database. Subsequent
-messages in that session use the new persona's tool set, tone, and scopes.
+The switch is persisted with a frozen personality snapshot. Subsequent turns use
+that style with current account-bounded permissions. Switching is rejected while
+a turn or approval is pending. Custom revisions require explicit API selection;
+`/persona` retains bundled-key compatibility.
 
 Switching back:
 ```
@@ -114,12 +152,12 @@ No code changes required.
 
 ## Swift app integration
 
-The iOS/macOS app fetches personas from `GET /chat/personas` and displays
-them in the **Settings → Persona** picker. Each persona shows:
-- Description
-- Tone badge
-- Filtered-access badge (if `content_filter: strict`)
-- Restricted-tools badge (if `blocked_tools` is non-empty)
+The authoring client uses authenticated `GET /personas` in **Settings > Personas**
+to browse bundled and owner-created personalities. Its editor supports versioned
+saves, defaults, archive/history, private visual-reference attachments, bounded
+prompt/tool preview and fresh test chats. The public `GET /chat/personas` endpoint
+remains available to older clients for bundled discovery.
 
-The selected persona is stored in `UserDefaults` and sent as part of the
-session creation payload when a new conversation starts.
+The server is authoritative for the personal default and per-chat selection.
+The native authoring surface uses authenticated `/personas` APIs rather
+than treating client `UserDefaults` as a persona definition or permission grant.

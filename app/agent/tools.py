@@ -1078,8 +1078,26 @@ async def replay_waiting_approval_tool(
         raise ValueError("Waiting approval payload is missing tool_name")
     if not isinstance(arguments, dict):
         raise ValueError("Waiting approval payload is missing tool arguments")
+    if denial := _tool_policy_error(tool_name, user_context):
+        # A revoked approval must fail the resumed step, not look like a
+        # successful tool result and advance the task without doing the work.
+        raise PermissionError(denial)
     result_content = await _execute_tool_call(tool_name, arguments, user_context)
     return result_content, {"tool_name": tool_name, "arguments": arguments}
+
+
+def _tool_policy_error(name: str, user_context: UserContext) -> str | None:
+    names = {name}
+    if name == "search":
+        from app.mcp.registry import get_mcp_registry
+        if get_mcp_registry().knows_tool("web_search"):
+            names.add("web_search")
+    for target in sorted(names):
+        if target in user_context.blocked_tools or (
+            user_context.allowed_tool_cap and target not in user_context.allowed_tool_cap
+        ) or (user_context.is_incognito and is_incognito_blocked_tool(target)):
+            return f"Tool '{target}' is not permitted by the current tool policy."
+    return None
 
 
 async def _execute_tool_call(
@@ -1102,6 +1120,13 @@ async def _execute_tool_call(
             "Persistent actions (memories, tasks, calendar, sources, file writes) "
             "are blocked; use a normal session for durable work."
         )
+
+    if denial := _tool_policy_error(tool_name, user_context):
+        # Schema omission is guidance, not enforcement. Recheck at dispatch and
+        # approval replay so stale or fabricated model calls cannot bypass it.
+        log.info("Tool call denied by current policy", tool=tool_name,
+                 user_id=user_context.user_id, session_id=user_context.session_id)
+        return denial
 
     recorded_arguments = _tool_arguments_for_recording(tool_name, arguments)
     if user_context.is_incognito:
