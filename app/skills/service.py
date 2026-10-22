@@ -51,6 +51,7 @@ class SkillPreview:
     is_pinned: bool
     validation_warnings: list[str]
     preview_hash: str
+    bundle_files: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -65,6 +66,7 @@ class SkillInjectionDecision:
     estimated_tokens: int = 0
     allowed_tool_additions: list[str] | None = None
     selection_mode: str = "embedding"
+    is_bundle: bool = False
 
 
 async def _embed(text: str) -> list[float] | None:
@@ -218,8 +220,8 @@ class SkillService:
             shared_personal_user_id_policy="clear",
         )
 
-    async def validate_tool_names(self, tool_names: Iterable[str]) -> None:
-        available = await self._known_tool_names()
+    async def validate_tool_names(self, tool_names: Iterable[str], user_context: Any = None) -> None:
+        available = await self._known_tool_names(user_context)
         unknown = sorted({str(name) for name in tool_names if str(name)} - available)
         if unknown:
             raise SkillValidationError(f"unknown tool names: {', '.join(unknown)}")
@@ -271,7 +273,10 @@ class SkillService:
             is_active=True,
             is_pinned=preview.is_pinned,
             supersedes_skill_id=superseded.id if superseded is not None else None,
+            bundle_files_json=json.dumps(preview.bundle_files) if preview.bundle_files else None,
         )
+        if preview.bundle_files:
+            skill.content_hash = preview.preview_hash
         skill.allowed_tool_additions = preview.allowed_tool_additions
         skill.description_embedding_vector = description_embedding
         db.add(skill)
@@ -342,7 +347,11 @@ class SkillService:
             if skill.scope != "personal":
                 raise SkillValidationError("personal_user_id can only be set for personal skills")
             skill.personal_user_id = personal_user_id
-        await db.flush()
+        try:
+            await db.flush()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise SkillConflictError("Another version of this skill is enabled; disable it before enabling this one") from exc
         await db.refresh(skill)
         return skill
 
@@ -385,6 +394,7 @@ class SkillService:
         ranked: list[SkillInjectionDecision] = []
         for skill in skills:
             score = await self._score_skill(skill, stripped_query, query_embedding)
+            skill_selection_mode = selection_mode
             include = True
             reason = "relevant"
             if not skill.is_active:
@@ -401,6 +411,10 @@ class SkillService:
                 if skill.is_pinned:
                     score = max(score, 1.0)
                     reason = "pinned_only_fallback"
+                elif skill.bundle_files_json and self._lexical_score(stripped_query, skill.description) > 0:
+                    score = max(score, 0.5)
+                    reason = "bundle_lexical_fallback"
+                    skill_selection_mode = "lexical"
                 else:
                     include = False
                     reason = "embedding_unavailable_not_pinned"
@@ -420,7 +434,8 @@ class SkillService:
                     rendered_text=rendered,
                     estimated_tokens=self._estimate_tokens(rendered),
                     allowed_tool_additions=skill.allowed_tool_additions,
-                    selection_mode=selection_mode,
+                    selection_mode=skill_selection_mode,
+                    is_bundle=bool(skill.bundle_files_json),
                 )
             )
 
@@ -430,14 +445,30 @@ class SkillService:
     def render_skill_block(self, skill: Skill) -> str:
         header = f"Skill: {skill.name} ({skill.slug})"
         body = skill.system_prompt_addition.strip()
+        if skill.bundle_files_json:
+            header += f" [installed bundle {skill.id}]"
+            body += (
+                f"\n\nSupporting documents: use read_skill_file with skill_id={skill.id} "
+                "and the relative path from the links above. Follow next_offset until null "
+                "to read a complete file. Files are instructions, not permission grants; "
+                "account restrictions and approval requirements still apply."
+            )
         return f"{header}\n{body}".strip()
 
     async def _score_skill(self, skill: Skill, query: str, query_embedding: list[float] | None) -> float:
         if not query:
             return 0.0
         skill_embedding = skill.description_embedding_vector
+        if query_embedding is not None and not skill_embedding and skill.bundle_files_json:
+            # Imports made while embeddings are offline can join semantic
+            # selection later without requiring a reinstall.
+            skill_embedding = await _embed(skill.description)
+            if skill_embedding:
+                skill.description_embedding_vector = skill_embedding
         if query_embedding is not None and skill_embedding:
             return self._cosine_similarity(query_embedding, skill_embedding)
+        if skill.bundle_files_json:
+            return self._lexical_score(query, skill.description)
         return 0.0
 
     def relevance_mode(self) -> str:
@@ -454,6 +485,7 @@ class SkillService:
         total_tokens = 0
         included = 0
         final: list[SkillInjectionDecision] = []
+        total_limit = settings.skills_total_max_tokens
         for decision in decisions:
             if not decision.included:
                 final.append(decision)
@@ -465,9 +497,21 @@ class SkillService:
                 decision.estimated_tokens = 0
                 final.append(decision)
                 continue
-            rendered = self._truncate_to_token_budget(decision.rendered_text, settings.skills_max_tokens_per_skill)
+            candidate_limit = total_limit
+            if decision.is_bundle:
+                rendered = decision.rendered_text
+                candidate_limit = max(total_limit, settings.skills_bundle_total_max_tokens)
+                if self._estimate_tokens(rendered) > settings.skills_bundle_max_tokens:
+                    decision.included = False
+                    decision.reason = "bundle_instructions_exceed_budget"
+                    decision.rendered_text = ""
+                    decision.estimated_tokens = 0
+                    final.append(decision)
+                    continue
+            else:
+                rendered = self._truncate_to_token_budget(decision.rendered_text, settings.skills_max_tokens_per_skill)
             estimated = self._estimate_tokens(rendered)
-            if total_tokens + estimated > settings.skills_total_max_tokens:
+            if total_tokens + estimated > candidate_limit:
                 decision.included = False
                 decision.reason = "prompt_budget_exceeded"
                 decision.rendered_text = ""
@@ -475,6 +519,7 @@ class SkillService:
                 final.append(decision)
                 continue
             decision.rendered_text = rendered
+            total_limit = candidate_limit
             decision.estimated_tokens = estimated
             total_tokens += estimated
             included += 1
@@ -495,7 +540,7 @@ class SkillService:
         words = _WORD_RE.findall((value or "").lower())
         return "-".join(words)
 
-    async def _known_tool_names(self) -> set[str]:
+    async def _known_tool_names(self, user_context: Any = None) -> set[str]:
         from app.agent.tools import TOOL_SCHEMAS
         from app.mcp.registry import get_mcp_registry
 
@@ -507,12 +552,14 @@ class SkillService:
             except Exception:
                 log.warning("skills.mcp_registry_startup_failed", exc_info=True)
         if registry._is_ready:
-            names.update(tool["function"]["name"] for tool in registry.get_tools_for_agent())
+            tools = registry.get_tools_for_agent(user_context) if user_context is not None else registry.get_tools_for_agent()
+            names.update(tool["function"]["name"] for tool in tools)
         return names
 
     def _lexical_score(self, query: str, haystack: str) -> float:
-        q_terms = set(_WORD_RE.findall(query.lower()))
-        h_terms = set(_WORD_RE.findall(haystack.lower()))
+        ignored = set("a an the and or for to of in on with at by from is are it its this that me my you your please can could would how what when do does using use".split())
+        q_terms = {word.rstrip("s") for word in _WORD_RE.findall(query.lower()) if word not in ignored}
+        h_terms = {word.rstrip("s") for word in _WORD_RE.findall(haystack.lower()) if word not in ignored}
         if not q_terms or not h_terms:
             return 0.0
         overlap = len(q_terms & h_terms)
@@ -556,6 +603,7 @@ async def hydrate_user_context(
     user_context.skill_prompt_additions = prompt_blocks
     user_context.skill_granted_tools = sorted(effective_grants)
     user_context.active_skill_slugs = [decision.slug for decision in decisions if decision.included]
+    user_context.active_skill_ids = [decision.skill_id for decision in decisions if decision.included and decision.is_bundle]
     user_context.skill_selection_mode = decisions[0].selection_mode if decisions else get_skill_service().relevance_mode()
     user_context.skill_injection_details = [
         {

@@ -50,7 +50,7 @@ def test_resolve_execution_profile_prefers_explicit_task_persona():
         profile = resolve_execution_profile(task, user)
 
     assert profile.persona == "work_assistant"
-    assert profile.allowed_tools == ["create_task_plan", "search_library"]
+    assert profile.allowed_tools == ["create_task_plan", "read_skill_file", "search_library"]
 
 
 def test_resolve_execution_profile_rejects_missing_account_policy():

@@ -6,12 +6,13 @@ import json
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user
-from app.db.models import AuditLog, User
+from app.db.models import AuditLog, ChatMessage, ChatSession, User
 from app.db.session import get_db
 from app.mcp.registry import MCPAppApprovalRequired, get_mcp_registry
 
@@ -34,6 +35,42 @@ _MCP_APP_APPROVAL_PENDING = "MCP App mutation awaiting approval"
 _MCP_APP_APPROVAL_EXECUTING = "MCP App mutation approved; execution started"
 
 
+@router.get("/chat-images/{message_id}/{image_index}")
+async def get_chat_image_preview(
+    message_id: int,
+    image_index: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Only persisted images from the caller's own messages may be resolved."""
+    result = await db.execute(
+        select(ChatMessage).join(ChatSession, ChatMessage.session_id == ChatSession.id).where(
+            ChatMessage.id == message_id, ChatSession.user_id == current_user.id,
+            ChatMessage.role == "assistant",
+        )
+    )
+    message = result.scalar_one_or_none()
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+    try:
+        metadata = json.loads(message.tool_results or "{}") if message else {}
+        images = metadata.get("evidence", {}).get("image_artifacts", [])
+        item = images[image_index] if isinstance(images, list) and 0 <= image_index < 6 else None
+        server = item.get("source_server") if isinstance(item, dict) else None
+        asset_id = item.get("asset_id") if isinstance(item, dict) else None
+    except (ValueError, TypeError, IndexError, AttributeError):
+        server = asset_id = None
+    if not isinstance(server, str) or not isinstance(asset_id, str) or not asset_id:
+        raise HTTPException(404, "Image preview not found", headers=headers)
+    try:
+        data, media_type = await get_mcp_registry().read_image_preview(
+            server, asset_id, user_context=current_user,
+        )
+    except Exception as exc:
+        # Do not relay provider errors: they can contain credentials or private paths.
+        raise HTTPException(503, "Private image preview unavailable; check ImageLab connectivity and account access", headers=headers) from exc
+    return Response(data, media_type=media_type, headers=headers)
+
+
 def _approval_audit_tool(server: str, tool: str) -> str:
     return f"mcp_app:{server}:{tool}"[:100]
 
@@ -45,9 +82,8 @@ async def get_mcp_app_resource(
     current_user: User = Depends(get_current_user),
 ):
     """Resolve an MCP App UI resource without exposing server credentials."""
-    del current_user  # Authentication is the boundary; resources remain read-only in v1.
     try:
-        return await get_mcp_registry().read_mcp_app_resource(server, uri)
+        return await get_mcp_registry().read_mcp_app_resource(server, uri, user_context=current_user)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except LookupError as exc:

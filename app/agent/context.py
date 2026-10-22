@@ -47,6 +47,7 @@ class UserContext:
     skill_prompt_additions: List[str] = field(default_factory=list)
     skill_granted_tools: List[str] = field(default_factory=list)
     active_skill_slugs: List[str] = field(default_factory=list)
+    active_skill_ids: List[int] = field(default_factory=list)
     skill_selection_mode: str = ""
     skill_injection_details: List[dict] = field(default_factory=list)
     content_filter: str = ""           # "" | "strict"

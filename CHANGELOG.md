@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.45
+
+- Added account-bound ImageLab MCP connections with tokenless Shared access for unmapped users and no private-to-Shared fallback.
+- Added frozen text skill bundles, validated folder imports, complete main instructions and selected-turn reference-file reads for the native Skills manager.
+- Preserved private generated-image references in chat history and added an authenticated, owner-scoped read-only image preview bridge.
+- Kept image previews separate from workspace exports and recorded the follow-up local-inference resource coordination sprint.
+
 ## v0.7.44
 
 - Added authenticated My Workspace browsing with lazy directory pages and complete, bounded text-file inspection.

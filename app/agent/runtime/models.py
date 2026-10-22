@@ -21,17 +21,20 @@ class ToolOutputText(str):
     """String-compatible tool output carrying optional MCP structured content."""
 
     structured_content: dict[str, Any] | None
+    source_server: str | None
 
     def __new__(
         cls,
         value: Any,
         *,
         structured_content: Mapping[str, Any] | None = None,
+        source_server: str | None = None,
     ) -> "ToolOutputText":
         instance = super().__new__(cls, str(value or ""))
         instance.structured_content = (
             dict(structured_content) if structured_content is not None else None
         )
+        instance.source_server = source_server
         return instance
 
 
@@ -141,12 +144,14 @@ def _normalize_artifacts(
     if isinstance(single_artifact, Mapping):
         candidates.insert(0, single_artifact)
     image_path = str(structured.get("image_path") or "").strip()
-    if image_path:
+    asset_id = str(structured.get("asset_id") or "").strip()
+    if image_path or (asset_id and tool_name == "generate_image"):
         candidates.insert(
             0,
             {
                 "kind": "image",
                 "path": image_path,
+                **({"asset_id": asset_id} if asset_id else {}),
                 **{
                     key: structured[key]
                     for key in ("prompt", "workflow", "seed", "width", "height")
@@ -159,6 +164,7 @@ def _normalize_artifacts(
         if not isinstance(item, Mapping):
             continue
         artifact = dict(item)
+        artifact.pop("source_server", None)
         if {
             "type",
             "schema_version",
@@ -169,7 +175,7 @@ def _normalize_artifacts(
             artifacts.append(artifact)
             continue
         artifact.setdefault("source_tool", tool_name)
-        if artifact.get("path") or artifact.get("url"):
+        if artifact.get("path") or artifact.get("url") or artifact.get("asset_id"):
             artifacts.append(artifact)
     return artifacts
 
@@ -198,13 +204,19 @@ def build_tool_call_result(
         or (lowered.startswith(("tool ", "mcp server")) and "failed" in lowered[:120])
         or (lowered.startswith("mcp server") and "not available" in lowered[:160])
     )
+    artifacts = _normalize_artifacts(structured, tool_name=str(name or "").strip())
+    source_server = getattr(content, "source_server", None)
+    for artifact in artifacts:
+        if artifact.get("asset_id") and isinstance(source_server, str):
+            # Routing provenance comes from the registry, never model/server prose.
+            artifact["source_server"] = source_server
     return ToolCallResult(
         tool_call_id=str(tool_call_id or ""),
         name=str(name or "").strip() or "unknown",
         content=text,
         is_error=inferred_error if is_error is None else bool(is_error),
         structured_content=structured,
-        artifacts=_normalize_artifacts(structured, tool_name=str(name or "").strip()),
+        artifacts=artifacts,
         citations=_normalize_citations(structured),
         approval_state=approval_state,
     )

@@ -16,6 +16,7 @@ from app.mcp.registry import MCPAppApprovalRequired
 
 @pytest.mark.asyncio
 async def test_mcp_app_resource_endpoint_uses_authenticated_bridge():
+    user = MagicMock(id=1)
     registry = MagicMock()
     registry.read_mcp_app_resource = AsyncMock(return_value={
         "server": "weather",
@@ -28,13 +29,14 @@ async def test_mcp_app_resource_endpoint_uses_authenticated_bridge():
         response = await get_mcp_app_resource(
             server="weather",
             uri="ui://weather/dashboard.html",
-            current_user=MagicMock(id=1),
+            current_user=user,
         )
 
     assert response["html"] == "<html></html>"
     registry.read_mcp_app_resource.assert_awaited_once_with(
         "weather",
         "ui://weather/dashboard.html",
+        user_context=user,
     )
 
 
