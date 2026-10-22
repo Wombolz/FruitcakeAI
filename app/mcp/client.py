@@ -57,13 +57,30 @@ class MCPClient:
         self._stderr_ring: deque[str] = deque(maxlen=200)
 
     def _error_text(self, exc: BaseException) -> str:
-        text = str(exc) or type(exc).__name__
+        text = self._redact(str(exc) or type(exc).__name__)
         for value in [*self.headers.values(), *self.env.values()]:
             if value:
                 text = text.replace(value, "[REDACTED]")
         return text[:500]
 
+    def _redact(self, value: Any) -> Any:
+        """Keep reflected bearer credentials out of catalogs, results and errors."""
+        if isinstance(value, str):
+            for name, header in self.headers.items():
+                if name.lower() == "authorization" and header:
+                    value = value.replace(header, "[REDACTED]")
+                    scheme, _, token = header.partition(" ")
+                    if scheme.lower() == "bearer" and token:
+                        value = value.replace(token, "[REDACTED]")
+            return value
+        if isinstance(value, dict):
+            return {self._redact(key): self._redact(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._redact(item) for item in value]
+        return value
+
     def _publish_tools(self, tools: list[dict[str, Any]]) -> None:
+        tools = self._redact(tools)
         self._tools = tools
         if self._on_tools_changed is not None:
             self._on_tools_changed(list(tools))
@@ -259,6 +276,7 @@ class MCPClient:
                 assert self._sdk is not None
                 response = await self._sdk.call_tool(tool_name, arguments, read_timeout_seconds=self.timeout)
                 result = response.model_dump(by_alias=True, exclude_none=True)
+            result = self._redact(result)
             if result.get("isError"):
                 error = "\n".join(item.get("text", "") for item in result.get("content", []) if item.get("type") == "text")
                 return {"success": False, "result": result, "error": error or "MCP tool reported an error"}
@@ -283,7 +301,7 @@ class MCPClient:
                 assert self._sdk is not None
                 response = await self._sdk.read_resource(uri, cache_mode="bypass")
                 result = response.model_dump(by_alias=True, exclude_none=True)
-            return {"success": True, "result": result}
+            return {"success": True, "result": self._redact(result)}
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -53,6 +53,10 @@ def resolve_execution_profile(task, user) -> ExecutionProfile:
     tools = get_tools_for_user(ctx)
     allowed_tools = sorted({t["function"]["name"] for t in tools})
     blocked_tools = sorted(set(ctx.blocked_tools))
+    # Profile resolution precedes skill selection. Permit the scoped reader as
+    # a capability; it is offered only after hydration selects a visible bundle.
+    if "read_skill_file" not in blocked_tools:
+        allowed_tools = sorted({*allowed_tools, "read_skill_file"})
 
     return ExecutionProfile(
         persona=persona_name,

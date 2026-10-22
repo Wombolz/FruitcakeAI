@@ -1655,6 +1655,7 @@ class Skill(Base):
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=False)
     system_prompt_addition = Column(Text, nullable=False)
+    bundle_files_json = Column(Text, nullable=True)
     _allowed_tool_additions = Column("allowed_tool_additions", Text, default="[]", nullable=False)
     scope = Column(String(20), default="shared", nullable=False, index=True)
     personal_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)

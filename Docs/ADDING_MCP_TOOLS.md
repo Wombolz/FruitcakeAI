@@ -5,6 +5,13 @@ New tools are added via `config/mcp_config.yaml` — no Python code changes requ
 For a new standalone MCP server or interactive companion application, start
 with [Fruitcake MCP Companion App Onboarding](MCP_COMPANION_APP_ONBOARDING.md).
 
+For per-user ImageLab bearer tokens and tokenless Shared access, see
+[ImageLab Account Tokens](imagelab_accounts.md). Do not configure a shared
+Authorization header for that server.
+
+To import companion skill instructions and reference documents, use the native
+[Skills Manager](skill_bundles.md); copying files into `skills/` does not activate them.
+
 Alpha shipping policy:
 - only clearly necessary first-party/internal MCPs ship enabled by default
 - Docker/third-party MCPs are optional and should be left disabled unless the operator explicitly needs them

@@ -252,6 +252,7 @@ class SkillOut(BaseModel):
     installed_by: Optional[int]
     installed_by_username: Optional[str] = None
     supersedes_skill_id: Optional[int] = None
+    bundle_file_count: int = 0
 
 
 class SkillInjectionPreviewOut(BaseModel):
@@ -554,6 +555,7 @@ def _skill_to_out(skill: Skill, installer: Optional[User] = None) -> SkillOut:
         installed_by=skill.installed_by,
         installed_by_username=getattr(installer, "username", None),
         supersedes_skill_id=skill.supersedes_skill_id,
+        bundle_file_count=len(json.loads(skill.bundle_files_json)) if skill.bundle_files_json else 0,
     )
 
 
@@ -958,6 +960,8 @@ async def update_skill(
         )
         await db.commit()
         await db.refresh(skill)
+    except SkillConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except SkillValidationError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     except SkillNotFoundError as exc:

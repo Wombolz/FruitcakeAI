@@ -16,6 +16,7 @@ Adding a new server requires only a config entry — no code changes.
 from __future__ import annotations
 
 import importlib
+import asyncio
 import base64
 import json
 import os
@@ -30,6 +31,10 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from app.agent.runtime.models import ToolOutputText
 from app.artifacts import artifact_registry
 from app.mcp.client import MCP_APP_MIME_TYPE, MCPClient
+from app.mcp.image_previews import decode_preview, preview_uri
+from app.mcp.imagelab_accounts import (
+    IMAGELAB_SERVER, context_user_id, parse_user_tokens, shared_config,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -200,6 +205,10 @@ class MCPRegistry:
         self._invalid_tools: List[Dict[str, Any]] = []
         self._is_ready = False
         self._server_tools: Dict[str, Tuple[str, List[Dict[str, Any]]]] = {}
+        self._account_views: Dict[int, MCPRegistry] = {}
+
+    def _for_user(self, user_context: Any) -> MCPRegistry:
+        return self._account_views.get(context_user_id(user_context), self)
 
     def _register_tool(self, tool: Dict[str, Any], server_name: str, server_type: str) -> None:
         """
@@ -263,6 +272,9 @@ class MCPRegistry:
             server_kind, entries = self._server_tools.get(server, ("", []))
             for tool in entries:
                 self._register_tool(tool, server, server_kind)
+        if name != IMAGELAB_SERVER:
+            for view in self._account_views.values():
+                view._set_server_tools(name, kind, tools)
 
     @staticmethod
     def _config_values(config: Dict[str, Any], key: str) -> Dict[str, str]:
@@ -277,6 +289,11 @@ class MCPRegistry:
 
     async def startup(self, config_path: Optional[Path] = None) -> None:
         """Load config/mcp_config.yaml and initialize all enabled servers."""
+        from app.config import settings
+
+        # Validate before connecting anything. Bad configuration must not silently
+        # turn a private account into tokenless Shared access.
+        tokens = parse_user_tokens(settings.imagelab_user_tokens_json)
         path = config_path or _CONFIG_PATH
         if not path.exists():
             log.warning("MCP config not found — no MCP tools will be available", path=str(path))
@@ -287,6 +304,11 @@ class MCPRegistry:
             self._raw_config = yaml.safe_load(f) or {}
 
         servers = self._raw_config.get("mcp_servers", {})
+        if IMAGELAB_SERVER in servers:
+            servers[IMAGELAB_SERVER] = shared_config(servers[IMAGELAB_SERVER])
+            config = servers[IMAGELAB_SERVER]
+            if tokens and config.get("enabled", True) and config.get("type") not in {"http", "streamable_http"}:
+                raise ValueError("Per-user ImageLab tokens require an HTTP MCP transport")
         for server_name, config in servers.items():
             self._server_configs[server_name] = dict(config)
             if not config.get("enabled", True):
@@ -302,6 +324,28 @@ class MCPRegistry:
                 await self._init_external(server_name, config, server_type)
             else:
                 log.warning("Unknown MCP server type", server=server_name, type=server_type)
+
+        config = self._server_configs.get(IMAGELAB_SERVER)
+        if config and config.get("enabled", True):
+            kind = config.get("type")
+            for user_id, token in tokens.items():
+                view = MCPRegistry()
+                view._server_configs = dict(self._server_configs)
+                view._modules = dict(self._modules)
+                view._clients = {
+                    name: client for name, client in self._clients.items()
+                    if name != IMAGELAB_SERVER
+                }
+                view._server_tools = dict(self._server_tools)
+                # Start empty, even if authenticated discovery fails. Never
+                # inherit Shared tool definitions or resource links.
+                view._set_server_tools(IMAGELAB_SERVER, kind, [])
+                self._account_views[user_id] = view
+                await view._init_external(
+                    IMAGELAB_SERVER, config, kind,
+                    authorization=f"Bearer {token.get_secret_value()}",
+                )
+                view._is_ready = True
 
         self._is_ready = True
         log.info(
@@ -344,19 +388,25 @@ class MCPRegistry:
     async def _init_http(self, server_name: str, config: Dict[str, Any]) -> None:
         await self._init_external(server_name, config, "http")
 
-    async def _init_external(self, server_name: str, config: Dict[str, Any], kind: str) -> None:
+    async def _init_external(
+        self, server_name: str, config: Dict[str, Any], kind: str,
+        *, authorization: str | None = None,
+    ) -> None:
         client = None
         try:
             transport = "stdio" if kind == "docker_stdio" else kind
             if not config.get("command" if transport == "stdio" else "url"):
                 raise ValueError("MCP server requires command for stdio or url for HTTP")
+            headers = self._config_values(config, "headers")
+            if authorization is not None:
+                headers["Authorization"] = authorization
             client = MCPClient(
                 server_name=server_name,
                 command=config.get("command"), args=list(config.get("args", []) or []),
                 server_url=config.get("url"), transport=transport,
                 timeout=config.get("timeout", 60 if transport == "stdio" else 30),
                 cwd=config.get("cwd"), env=self._config_values(config, "env"),
-                headers=self._config_values(config, "headers"),
+                headers=headers,
                 on_tools_changed=lambda tools: self._set_server_tools(server_name, kind, tools),
             )
             self._clients[server_name] = client
@@ -373,13 +423,13 @@ class MCPRegistry:
 
     # ── Tool access ───────────────────────────────────────────────────────────
 
-    def get_tools_for_agent(self) -> List[Dict[str, Any]]:
+    def get_tools_for_agent(self, user_context: Any = None) -> List[Dict[str, Any]]:
         """Return all registered MCP tools in LiteLLM function-calling schema format."""
-        return list(self._litellm_schemas)
+        return list(self._for_user(user_context)._litellm_schemas)
 
-    def knows_tool(self, tool_name: str) -> bool:
+    def knows_tool(self, tool_name: str, user_context: Any = None) -> bool:
         """Return True if this tool is registered in the MCP registry."""
-        return tool_name in self._tool_map
+        return tool_name in self._for_user(user_context)._tool_map
 
     # ── Tool execution ────────────────────────────────────────────────────────
 
@@ -393,6 +443,9 @@ class MCPRegistry:
         Dispatch a tool call to the appropriate server and return a plain string result.
         The string is appended to conversation history as a tool-role message.
         """
+        view = self._for_user(user_context)
+        if view is not self:
+            return await view.call_tool(tool_name, arguments, user_context)
         if tool_name not in self._tool_map:
             return f"Unknown MCP tool: {tool_name}"
 
@@ -407,6 +460,7 @@ class MCPRegistry:
                 return ToolOutputText(
                     _extract_text(result),
                     structured_content=_extract_structured_content(result),
+                    source_server=server_name,
                 )
             except Exception as e:
                 log.error("Internal MCP tool failed", tool=tool_name, error=str(e))
@@ -438,6 +492,7 @@ class MCPRegistry:
                 return ToolOutputText(
                     _extract_text(raw["result"]),
                     structured_content=structured_content,
+                    source_server=server_name,
                 )
             return f"Tool {tool_name} failed: {raw.get('error', 'unknown error')}"
 
@@ -499,8 +554,31 @@ class MCPRegistry:
             )
             return None
 
-    async def read_mcp_app_resource(self, server_name: str, uri: str) -> Dict[str, Any]:
+    async def read_image_preview(
+        self, server_name: str, asset_id: str, user_context: Any,
+    ) -> tuple[bytes, str]:
+        """Resolve a persisted asset using the current caller's fixed MCP identity."""
+        if server_name != IMAGELAB_SERVER:
+            raise ValueError("Unsupported image resource provider")
+        uri = preview_uri(asset_id)
+        view = self._for_user(user_context)
+        if view is not self:
+            return await view.read_image_preview(server_name, asset_id, user_context)
+        client = self._clients.get(server_name)
+        if client is None:
+            raise RuntimeError("Image preview provider unavailable")
+        raw = await asyncio.wait_for(client.read_resource(uri), timeout=30)
+        if not raw.get("success") or not isinstance(raw.get("result"), dict):
+            raise RuntimeError("Image preview unavailable")
+        return await asyncio.to_thread(decode_preview, raw["result"], uri)
+
+    async def read_mcp_app_resource(
+        self, server_name: str, uri: str, user_context: Any = None,
+    ) -> Dict[str, Any]:
         """Resolve one linked MCP App UI resource through its owning server."""
+        view = self._for_user(user_context)
+        if view is not self:
+            return await view.read_mcp_app_resource(server_name, uri, user_context)
         if not uri.startswith("ui://"):
             raise ValueError("MCP App resources must use the ui:// scheme")
         if uri not in self._ui_resources.get(server_name, set()):
@@ -555,6 +633,13 @@ class MCPRegistry:
         approved: bool = False,
     ) -> Dict[str, Any]:
         """Call one linked app-only tool after enforcing host policy."""
+        view = self._for_user(user_context)
+        if view is not self:
+            return await view.call_mcp_app_tool(
+                server_name=server_name, resource_uri=resource_uri,
+                tool_name=tool_name, arguments=arguments,
+                user_context=user_context, approved=approved,
+            )
         if not resource_uri.startswith("ui://"):
             raise ValueError("MCP App resources must use the ui:// scheme")
         if resource_uri not in self._ui_resources.get(server_name, set()):
@@ -716,15 +801,26 @@ class MCPRegistry:
             "duplicate_tools": list(self._duplicate_tools),
             "invalid_tools": list(self._invalid_tools),
             "servers": servers,
+            "imagelab_accounts": [
+                {"user_id": user_id, "connection": client.get_status() if client else None}
+                for user_id, view in self._account_views.items()
+                for client in [view._clients.get(IMAGELAB_SERVER)]
+            ],
         }
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def shutdown(self) -> None:
         """Disconnect all external servers and clear their tool catalogs."""
+        for view in self._account_views.values():
+            client = view._clients.get(IMAGELAB_SERVER)
+            if client is not None:
+                await client.disconnect()
+        self._account_views.clear()
         for client in self._clients.values():
             await client.disconnect()
         self._clients.clear()
+        self._is_ready = False
         log.info("MCP registry shut down")
 
 

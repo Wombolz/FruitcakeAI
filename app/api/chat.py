@@ -3303,9 +3303,15 @@ def _normalize_assistant_metadata_payload(metadata: Dict[str, Any]) -> Dict[str,
                 if not isinstance(item, dict):
                     continue
                 path = str(item.get("path") or item.get("image_path") or "").strip()
-                if not path:
+                asset_id = str(item.get("asset_id") or "").strip()
+                if not path and not asset_id:
                     continue
                 cleaned_item: Dict[str, Any] = {"path": path[:500]}
+                if asset_id:
+                    cleaned_item["asset_id"] = asset_id[:160]
+                    server = str(item.get("source_server") or "").strip()
+                    if server:
+                        cleaned_item["source_server"] = server[:160]
                 for source_key, target_key, max_len in (
                     ("title", "title", 160),
                     ("prompt", "prompt", 500),
@@ -3435,6 +3441,8 @@ def _build_assistant_image_artifacts(executed_tools: List[Dict[str, Any]]) -> Li
         tool_name = str(record.get("tool") or "").strip()
         if tool_name not in _IMAGE_EVIDENCE_TOOL_NAMES:
             continue
+        if record.get("is_error"):
+            continue
         normalized_artifacts = record.get("artifacts")
         payload = (
             next(
@@ -3442,26 +3450,35 @@ def _build_assistant_image_artifacts(executed_tools: List[Dict[str, Any]]) -> Li
                     dict(item)
                     for item in normalized_artifacts
                     if isinstance(item, dict)
-                    and str(item.get("path") or item.get("image_path") or "").strip()
+                    and str(item.get("path") or item.get("image_path") or item.get("asset_id") or "").strip()
                 ),
                 None,
             )
             if isinstance(normalized_artifacts, list)
             else None
         )
+        from_normalized_artifact = payload is not None
         if payload is None:
             payload = _parse_image_tool_result(record.get("result_summary"))
         if not payload:
             continue
         image_path = str(payload.get("image_path") or payload.get("path") or "").strip()
-        if not image_path or image_path in seen_paths:
+        asset_id = str(payload.get("asset_id") or "").strip()
+        source_server = str(payload.get("source_server") or "").strip()
+        identity = image_path or f"{source_server}:{asset_id}"
+        if (not image_path and not asset_id) or identity in seen_paths:
             continue
-        seen_paths.add(image_path)
+        seen_paths.add(identity)
 
         item: Dict[str, Any] = {
             "path": image_path,
             "source_tool": tool_name,
         }
+        if asset_id:
+            item["asset_id"] = asset_id
+            # Only normalized runtime artifacts carry registry-attested provenance.
+            if source_server and from_normalized_artifact:
+                item["source_server"] = source_server
         prompt = str(payload.get("prompt") or (record.get("arguments") or {}).get("prompt") or "").strip()
         if prompt:
             item["prompt"] = prompt
@@ -3491,7 +3508,7 @@ def _parse_image_tool_result(raw: Any) -> Dict[str, Any] | None:
     if not isinstance(raw, str):
         return None
     text = raw.strip()
-    if not text or "image_path" not in text:
+    if not text or not any(key in text for key in ("image_path", "asset_id")):
         return None
     for parser in (json.loads, ast.literal_eval):
         try:
@@ -3500,7 +3517,7 @@ def _parse_image_tool_result(raw: Any) -> Dict[str, Any] | None:
             continue
         if isinstance(value, dict):
             return value
-    match = re.search(r"(\{.*?image_path.*?\})", text, flags=re.DOTALL)
+    match = re.search(r"(\{.*?(?:image_path|asset_id).*?\})", text, flags=re.DOTALL)
     if match:
         snippet = match.group(1)
         for parser in (json.loads, ast.literal_eval):
@@ -4245,7 +4262,7 @@ def _apply_tool_overrides(
     if registry._is_ready:
         all_tools.update(
             tool["function"]["name"]
-            for tool in registry.get_tools_for_agent()
+            for tool in registry.get_tools_for_agent(user_context)
         )
 
     normalized_allowed = {

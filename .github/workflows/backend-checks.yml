@@ -58,7 +58,7 @@ jobs:
           HF_HUB_OFFLINE: "1"
         run: |
           python -m pytest -q tests/test_auth_crypto.py tests/test_credential_hardening.py tests/test_integrations.py \
-            tests/test_rag.py tests/test_mcp_transports.py tests/test_model_stream.py \
+            tests/test_rag.py tests/test_mcp_transports.py tests/test_imagelab_accounts.py tests/test_skill_bundles.py tests/test_skills.py tests/test_image_previews.py tests/test_artifacts_api.py tests/test_model_stream.py \
             tests/test_dependency_baseline.py tests/test_dependency_bootstrap.py \
             tests/test_runtime_configuration.py tests/test_container_baseline.py tests/test_database_roles.py \
             tests/test_coding_lifecycle.py tests/test_coding_review_privacy.py tests/test_persona_policy_api.py \

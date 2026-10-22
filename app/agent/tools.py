@@ -223,6 +223,14 @@ def _soften_unsupported_summary_totals(summary: str, source_text: str) -> str:
 # These are sent to the LLM so it knows what tools it can call.
 
 TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    {"type": "function", "function": {
+        "name": "read_skill_file",
+        "description": "Read a supporting document from a skill bundle selected for this turn. Continue with next_offset until null. This cannot read filesystem paths.",
+        "parameters": {"type": "object", "properties": {
+            "skill_id": {"type": "integer"}, "path": {"type": "string"},
+            "offset": {"type": "integer", "minimum": 0},
+        }, "required": ["skill_id", "path"]},
+    }},
     {
         "type": "function",
         "function": {
@@ -1003,11 +1011,12 @@ def get_tools_for_user(user_context: UserContext) -> List[Dict[str, Any]]:
     blocked = set(user_context.blocked_tools)
     allowed_cap = set(user_context.allowed_tool_cap or [])
 
-    tools = [t for t in TOOL_SCHEMAS if t["function"]["name"] not in blocked]
+    tools = [t for t in TOOL_SCHEMAS if t["function"]["name"] not in blocked
+             and (t["function"]["name"] != "read_skill_file" or user_context.active_skill_ids)]
 
     registry = get_mcp_registry()
     if registry._is_ready:
-        mcp_tools = registry.get_tools_for_agent()
+        mcp_tools = registry.get_tools_for_agent(user_context)
         has_web_search = any(t["function"]["name"] == "web_search" for t in mcp_tools)
         for tool in mcp_tools:
             tool_name = tool["function"]["name"]
@@ -1090,7 +1099,7 @@ def _tool_policy_error(name: str, user_context: UserContext) -> str | None:
     names = {name}
     if name == "search":
         from app.mcp.registry import get_mcp_registry
-        if get_mcp_registry().knows_tool("web_search"):
+        if get_mcp_registry().knows_tool("web_search", user_context):
             names.add("web_search")
     for target in sorted(names):
         if target in user_context.blocked_tools or (
@@ -1232,6 +1241,17 @@ async def _call_tool(
                 ),
             )
 
+    if name == "read_skill_file":
+        from app.db.session import AsyncSessionLocal
+        from app.skills.bundle_service import read_skill_file
+        async with AsyncSessionLocal() as db:
+            page = await read_skill_file(db, user_context, **arguments)
+            header = (
+                f"skill_id={page['skill_id']}; offset={page['offset']}; "
+                f"next_offset={json.dumps(page['next_offset'])}; total_characters={page['total_characters']}"
+            )
+            return ToolOutputText(f"{header}\n\n{page['content']}", structured_content=page)
+
     if name == "create_memory":
         return await _create_memory(arguments, user_context)
 
@@ -1307,7 +1327,7 @@ async def _call_tool(
 
     # Compatibility bridge: if a model still emits generic "search", route it
     # through internal web_search when available.
-    if name == "search" and registry.knows_tool("web_search"):
+    if name == "search" and registry.knows_tool("web_search", user_context):
         mapped_args: Dict[str, Any] = {
             "query": arguments.get("query", ""),
             "max_results": arguments.get("max_results", arguments.get("limit", 5)),
@@ -1316,7 +1336,7 @@ async def _call_tool(
             mapped_args["region"] = arguments.get("region")
         return await registry.call_tool("web_search", mapped_args, user_context)
 
-    if registry.knows_tool(name):
+    if registry.knows_tool(name, user_context):
         return await registry.call_tool(name, arguments, user_context)
 
     return f"Unknown tool: {name}"

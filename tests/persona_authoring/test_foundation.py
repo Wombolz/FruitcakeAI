@@ -111,7 +111,7 @@ async def test_search_alias_cannot_bypass_target_policy(monkeypatch, replay, cap
         ctx.allowed_tool_cap = ["search"]
     else:
         ctx.blocked_tools = ["web_search"]
-    registry = SimpleNamespace(knows_tool=lambda name: name == "web_search", call_tool=AsyncMock())
+    registry = SimpleNamespace(knows_tool=lambda name, context=None: name == "web_search", call_tool=AsyncMock())
     monkeypatch.setattr("app.mcp.registry.get_mcp_registry", lambda: registry)
     if replay:
         with pytest.raises(PermissionError, match="web_search"):

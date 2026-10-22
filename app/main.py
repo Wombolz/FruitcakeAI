@@ -184,6 +184,9 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_router, prefix="/auth", tags=["auth"])
     app.include_router(admin_router, prefix="/admin", tags=["admin"])
+    from app.api.skill_bundles import BundleBodyLimit, router as skill_bundles_router
+    app.add_middleware(BundleBodyLimit)
+    app.include_router(skill_bundles_router, prefix="/admin/skill-bundles", tags=["admin"])
     app.include_router(library_router, prefix="/library", tags=["library"])
     app.include_router(chat_router, prefix="/chat", tags=["chat"])
     app.include_router(personas_router, prefix="/personas", tags=["personas"])

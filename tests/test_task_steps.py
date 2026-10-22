@@ -543,7 +543,7 @@ async def test_approved_append_file_replays_exact_waiting_tool_call_and_advances
     # The runtime cap is derived from the offered tools. The fixture must expose
     # append_file, not only mock its implementation after policy resolution.
     from types import SimpleNamespace
-    registry = SimpleNamespace(_is_ready=True, get_tools_for_agent=lambda: [{"type": "function", "function": {
+    registry = SimpleNamespace(_is_ready=True, get_tools_for_agent=lambda context=None: [{"type": "function", "function": {
         "name": "append_file", "description": "Append fixture file", "parameters": {"type": "object", "properties": {}}}}])
     monkeypatch.setattr("app.mcp.registry.get_mcp_registry", lambda: registry)
 

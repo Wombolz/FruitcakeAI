@@ -235,10 +235,13 @@ def test_real_role_permissions_default_grants_and_alembic(tmp_path):
             "chat_run_persona_snapshots", "persona_visual_assets", "persona_test_options"}
         Base.metadata.create_all(engine, tables=[table for table in Base.metadata.sorted_tables
             if table.name not in migrated_tables])
+        # Model metadata includes the later bundle column; revision 056 did not.
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE skills DROP COLUMN bundle_files_json"))
         assert admin.migrate(env, directory, ["stamp", "056_coding_workspace_lifecycle"]) == 0
         assert admin.migrate(env, directory, ["upgrade", "head"]) == 0
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "061_persona_visual_assets"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "062_skill_bundles"
             assert connection.scalar(text("SELECT pg_get_userbyid(extowner) FROM pg_extension WHERE extname='vector'")) == admin.ADMIN_ROLE
             protect_migration_ledger(connection)
             connection.commit()
@@ -246,7 +249,7 @@ def test_real_role_permissions_default_grants_and_alembic(tmp_path):
         with admin.connect(url, admin.APP_ROLE, credentials["app_password"]) as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT version_num FROM alembic_version")
-                assert cursor.fetchone()[0] == "061_persona_visual_assets"
+                assert cursor.fetchone()[0] == "062_skill_bundles"
                 with pytest.raises(psycopg2.errors.InsufficientPrivilege):
                     cursor.execute("UPDATE alembic_version SET version_num='corrupt'")
 

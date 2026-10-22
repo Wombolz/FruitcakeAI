@@ -7,6 +7,7 @@ import os
 from functools import lru_cache
 from typing import List
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The HF tokenizers Rust library reads this from the real process
@@ -24,7 +25,7 @@ class Settings(BaseSettings):
 
     # ── Application ──────────────────────────────────────────────────────────
     app_name: str = "FruitcakeAI"
-    app_version: str = "0.7.44"
+    app_version: str = "0.7.45"
     debug: bool = False
     log_level: str = "INFO"
     app_port: int = 30417
@@ -58,6 +59,8 @@ class Settings(BaseSettings):
     gemini_models: str = ""
     local_models: str = ""
     secrets_master_key: str = ""
+    # Deployment-owned per-user ImageLab tokens; never expose through tool arguments.
+    imagelab_user_tokens_json: SecretStr = SecretStr("{}")
     # Web search. Brave is preferred when configured; DuckDuckGo remains a
     # no-key fallback during the provider transition.
     web_search_provider: str = "auto"
@@ -172,6 +175,9 @@ class Settings(BaseSettings):
     skills_max_injected: int = 3
     skills_max_tokens_per_skill: int = 250
     skills_total_max_tokens: int = 500
+    # Bundles include their complete main instructions; references load on demand.
+    skills_bundle_max_tokens: int = 4000
+    skills_bundle_total_max_tokens: int = 6000
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"
